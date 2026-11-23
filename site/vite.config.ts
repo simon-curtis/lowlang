@@ -42,7 +42,7 @@ export default defineConfig({
         cache: false,
       },
       playground: {
-        command: "low build compiler/playground -target browser/wasm32 -o site/public/playground.wasm",
+        command: "low build compiler/playground --target browser/wasm32 -o site/public/playground.wasm",
         cwd: "..",
         cache: false,
       },

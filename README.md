@@ -42,22 +42,26 @@ fn main() {
 ./bootstrap.sh
 ./low run testdata/run/fib.low
 ./low build testdata/run/fib.low -o fib
-./low build testdata/run/fib.low -target windows/amd64
+./low build testdata/run/fib.low --target windows/amd64
 ./low asm testdata/run/fib.low
 ./low lint app.low
-./low test app/ -run parse
+./low test app/ --run parse
 ./low doc std
 ./low names app.low
 ./low dev app.low
 ./low run app/
+./low protogen -I protos -o gen messages.proto
 ./low version
+./low help build
 ```
 
-- `low` runs on Linux and on Windows. The target defaults to the host; `-target linux/amd64` or `-target windows/amd64` selects one.
+- `low` runs on Linux and on Windows. The target defaults to the host; `--target linux/amd64` or `--target windows/amd64` selects one.
+- `low --help` lists the commands and `low help <command>` or `low <command> --help` lists the options of one, with `-V` or `--version` printing the version. A short option is `-o path` or `-opath`, short switches group as `-vj4` does, and a long one is `--output path` or `--output=path`. `--` ends the options. A mistake on the command line exits with status 2. `docs/design.md` describes the syntax under its command table.
 - A directory is a module. `import ui/text` loads `ui/text/` under the project root, marked by a `build.low` file that names the project's dependencies, the directory that holds its modules (`modules`) and the programs a bare `low build`, `low run` and `low install` take (`program` and `gui`, which links a program for Windows with the GUI subsystem). `docs/design.md` `### Projects` describes it.
 - The standard library imports as `std/...`.
-- `low test [path]...` builds the tests of each module, the `_test.low` files, and runs each test in its own process with a timeout, replaying a passing result whose test program and recorded inputs are unchanged unless `-nocache` is given; `app/...` names every module below `app/`. `docs/design.md` `### Modules` lists the flags.
+- `low test [path]...` builds the tests of each module, the `_test.low` files, and runs each test in its own process with a timeout, replaying a passing result whose test program and recorded inputs are unchanged unless `--nocache` is given; `app/...` names every module below `app/`. `docs/design.md` `### Modules` lists the options.
 - `low dev` runs the program and patches changed functions into it on every save, keeping its state.
+- `low protogen -o dir file.proto...` generates a Low module for each `.proto` file and each file it imports with `std/protobuf/proto` and writes them under `dir`; `-I dir,...` lists the directories imports are resolved against, `.` by default, and `--module path` is the import path of the output directory when it is not the project root.
 - On the Windows target the standard library calls Win32: files, processes, sockets, DNS, terminals and the environment work. Signals, file watches and pseudo-terminals fail with `Unsupported`; `docs/design.md` `## Compiler` lists the differences.
 - The tests are Low programs: `compiler/lowtest` runs the fixtures and each `compiler/tests/<name>` runs with `low run`. `docs/design.md` `## Tests` says what they cover and which tools they use.
 
@@ -87,24 +91,22 @@ Each `bench/<name>/` holds one program as `main.low` and, for most, `main.ts`. T
 | jsonpar | JSON parsing and tree walking |
 | channels | unbuffered ping-pong and a buffered worker pool |
 
-`compiler/abbench` compares two programs running the same command on Windows, such as two compilers building one project:
+`low abbench` compares two programs running the same command, such as two compilers building one project:
 
 ```sh
-./low build compiler/abbench -o abbench.exe
-./abbench.exe -a old.exe -b new.exe -runs 15 -dir ../app -same out-{side}.exe -- {exe} build src/app -o out-{side}.exe
+./low abbench -a low-a.exe -b low-b.exe --runs 15 --dir ../app --same out-{side}.exe -- {exe} build src/app -o out-{side}.exe
 ```
 
-`{exe}` in the command becomes the `-a` or `-b` program and `{side}` becomes `a` or `b`. `-same`, relative to `-dir`, deletes both files before the first run and fails unless both sides wrote identical files, checked after the `-warmup` runs and after the last timed run. The timed runs alternate `ab` and `ba`, and each run's process is measured on its own: wall time, CPU time, cycles from `QueryProcessCycleTime` and peak private memory. For each metric the report gives the median and spread of each side, the median of the paired `b/a` ratios and its 95% bootstrap interval; the verdict names a difference only when the interval excludes 1. `-affinity` restricts every run to a hexadecimal CPU mask.
+`{exe}` in the command becomes the `-a` or `-b` program and `{side}` becomes `a` or `b`. Options end at the command. `--same`, relative to `--dir`, deletes both files before the first run and fails unless both sides wrote identical files, checked after the `--warmup` runs and after the last timed run. The timed runs alternate `ab` and `ba`, and each run's process is measured on its own: wall time and, on Windows, CPU time, cycles from `QueryProcessCycleTime` and peak private memory. For each metric the report gives the median and spread of each side, the median of the paired `b/a` ratios and its 95% bootstrap interval; the verdict names a difference only when the interval excludes 1. `--affinity` restricts every run to a hexadecimal CPU mask and fails on other hosts.
 
-`compiler/lowprof` samples a Windows program and reports where its cycles go:
+`low prof` samples a Windows program and reports where its cycles go; on other hosts it fails:
 
 ```sh
-./low build compiler/lowprof -o lowprof.exe
-./low build compiler/low -o low-mapped.exe -map low.map
-./lowprof.exe -map low.map -folded stacks.txt -- ./low-mapped.exe build ../app
+./low build compiler/low -o low-mapped.exe --map low.map
+./low prof --map low.map --folded stacks.txt -- ./low-mapped.exe build ../app
 ```
 
-Every `-interval` milliseconds it reads the state of the program's threads with `NtQuerySystemInformation`, suspends each thread that is running on a CPU, reads its instruction pointer and walks its `rbp` chain. A thread that is waiting is not sampled, so the work it did before it parked is not charged to the wait. Each sample stands for the time since the previous one, and the samples are scaled to the process's cycles from `QueryProcessCycleTime`. The query takes a few milliseconds, so a run gets a few hundred samples a second. A thread stopped outside the image, in Windows code, is attributed to the first return address into the image found on its stack and the frame record above it. The report gives the process's cycles and the number of samples, the cycles by category (`runtime` for the assembly runtime, `prelude`, `std`, `program` and `system` for code outside the image), and the functions with the most cycles of their own and the most cycles including callees. `-folded` writes each stack root first with its cycles, the input of flame graph tools.
+Every `--interval` milliseconds it reads the state of the program's threads with `NtQuerySystemInformation`, suspends each thread that is running on a CPU, reads its instruction pointer and walks its `rbp` chain. A thread that is waiting is not sampled, so the work it did before it parked is not charged to the wait. Each sample stands for the time since the previous one, and the samples are scaled to the process's cycles from `QueryProcessCycleTime`. The query takes a few milliseconds, so a run gets a few hundred samples a second. A thread stopped outside the image, in Windows code, is attributed to the first return address into the image found on its stack and the frame record above it. The report gives the process's cycles and the number of samples, the cycles by category (`runtime` for the assembly runtime, `prelude`, `std`, `program` and `system` for code outside the image), and the `--top` functions with the most cycles of their own and the most cycles including callees. `--folded` writes each stack root first with its cycles, the input of flame graph tools. Options end at the program, and every argument after it goes to the program.
 
 ## Releases
 
@@ -138,11 +140,11 @@ npm run render --prefix ../assets/brand/video
 | `site/public/playground.wasm` | `compiler/playground` built for `browser/wasm32`, ignored by git. |
 | `site/dist/` | The bundled site, ignored by git. |
 
-`npm run build` runs the `site` task in `site/vite.config.ts`: `low run site/gen` and `low build compiler/playground -target browser/wasm32 -o site/public/playground.wasm`, then `node check/highlight.mjs`, then `vp build`. The check colours every generated snippet outside a signature with `site/src/highlight.js` and fails when a class differs from the generator's, `m` aside, since the generator takes modules from the checker. Both `low` commands run the `low` on `PATH`, which is built from this tree (`low build compiler/low`) because the bootstrap release has no WebAssembly back end. `npm run dev` generates once, builds the playground module and serves the pages, reloading styles and scripts as they change. `vp build` bundles every generated page and gives each stylesheet, script, font and the search index a content-hashed name under `assets/`; `site/public/_headers` lets browsers cache `assets/` without revalidating.
+`npm run build` runs the `site` task in `site/vite.config.ts`: `low run site/gen` and `low build compiler/playground --target browser/wasm32 -o site/public/playground.wasm`, then `node check/highlight.mjs`, then `vp build`. The check colours every generated snippet outside a signature with `site/src/highlight.js` and fails when a class differs from the generator's, `m` aside, since the generator takes modules from the checker. Both `low` commands run the `low` on `PATH`, which is built from this tree (`low build compiler/low`) because the bootstrap release has no WebAssembly back end. `npm run dev` generates once, builds the playground module and serves the pages, reloading styles and scripts as they change. `vp build` bundles every generated page and gives each stylesheet, script, font and the search index a content-hashed name under `assets/`; `site/public/_headers` lets browsers cache `assets/` without revalidating.
 
 The generator:
 
-- runs `low doc std` once for the standard library, and `low names` and `low build -target browser/wasm32` once per Low snippet, several at a time. `low names` type-checks the snippet and prints every name in it with its hover text, its doc comment, its definition and the first name that refers to the same definition, so the generator needs no language server;
+- runs `low doc std` once for the standard library, and `low names` and `low build --target browser/wasm32` once per Low snippet, several at a time. `low names` type-checks the snippet and prints every name in it with its hover text, its doc comment, its definition and the first name that refers to the same definition, so the generator needs no language server;
 - renders `site/content/index.html` and `404.html` into `site/index.html` and `site/404.html`, wrapping each in the head, masthead, footer and scripts from `site/gen/layout.low`; the footer links the commit `git rev-parse HEAD` names, so a deployed page shows the commit it was built from; `site/gen/pages.low` lists each page's title and description, and `{{origin}}` and `{{repository}}` in the content expand to the URLs in `site/gen/config.low`, `{{words}}` to the playground's word list attributes from `site/gen/highlight.low`; `{{examples}}` expands to the programs under `docs/examples/`, found recursively in path order and grouped by folder: each group is an `<h3>` with the title and first paragraph of the folder's `README.md`, then one collapsible entry per program with its highlighted source and a link to the file on GitHub, and a table row in the README that links the program's file name supplies the entry's description; every program is type-checked with the other snippets, with an empty file standing in for each `embed("...")` path;
 - renders `docs/design.md` and `editors/README.md` into `site/docs/` with `std/markdown`, linking each code span that names a heading, such as `### Strings`, to that heading; a heading on the same page wins, and the build fails when the span names no heading or several;
 - renders `site/docs/roadmap.html`, the last docs page, from the issues of the repository in `site/gen/config.low` that carry the `roadmap` label (state open or closed, in ascending number order) and each issue's sub-issues, recursively, in sub-issue order. It fetches them from the GitHub REST API with `std/http`, sends `Authorization: Bearer $GITHUB_TOKEN` when `GITHUB_TOKEN` is set and makes anonymous requests otherwise, and fails the build on a network error or a response that is not 2xx. Anonymous requests share GitHub's low rate limit, so set `GITHUB_TOKEN` for repeated builds. Each issue becomes a list item that links its title to the issue, renders its body as markdown and marks a closed issue `Done`. An issue closed as not planned is left out, with its sub-issues;
