@@ -20,7 +20,8 @@ finally {
 $environmentKey = 'HKCU:\Environment'
 $userPath = (Get-Item -Path $environmentKey).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
 $entries = @($userPath -split ';' | Where-Object { $_ })
-if ($entries -notcontains $dir) {
+$resolved = $entries | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_).Replace('/', '\').TrimEnd('\') }
+if ($resolved -notcontains $dir.Replace('/', '\').TrimEnd('\')) {
     $updated = (@($dir) + $entries) -join ';'
     Set-ItemProperty -Path $environmentKey -Name 'Path' -Value $updated -Type ExpandString
     $env:Path = "$dir;$env:Path"
