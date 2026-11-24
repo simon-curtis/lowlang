@@ -2,6 +2,7 @@ import native
 import oracletool
 import target
 import std/file
+import std/io
 import std/os
 import std/path
 import std/process
@@ -11,6 +12,16 @@ import std/text
 const peek_source = "import std/file\nimport std/os\n\nfn main() {{\n    let image = file.read_file(os.args()[0]) catch {{\n        _ => {{\n            print(\"unreadable\")\n            return\n        }}\n    }}\n    let header = i64(image[60]) + i64(image[61]) * 256\n    let at = header + 24 + 68\n    print(\"{{i64(image[at]) + i64(image[at + 1]) * 256}}\")\n}}\n"
 
 const harness_test_source = "import std/file\nimport std/os\nimport std/testing\n\nfn test_harness_is_a_console_program(t: *testing.T) {{\n    let image = file.read_file(os.args()[0]) catch {{\n        e => {{\n            t.fatal(\"read: {{e}}\")\n            return\n        }}\n    }}\n    let header = i64(image[60]) + i64(image[61]) * 256\n    let at = header + 24 + 68\n    t.equal(i64(image[at]) + i64(image[at + 1]) * 256, 3)\n}}\n"
+
+struct Resource {
+    kind: i64
+    data: []u8
+}
+
+struct ResourceEntry {
+    id: i64
+    target: i64
+}
 
 struct Declared {
     low: str
@@ -98,19 +109,65 @@ fn image_subsystem(t: *testing.T, location: str) -> i64 {
     image_header(t, location).subsystem
 }
 
-fn image_has_resources(t: *testing.T, location: str) -> bool {
-    let header = image_header(t, location)
-    header.directories.len > 2 && header.directories[2].virtual_address != 0
+fn image_resources(t: *testing.T, location: str) -> []Resource {
+    let image = file.read_file(location) catch {
+        e => {
+            t.fatal("read {location}: {e}")
+            return []
+        }
+    }
+    let parsed = oracletool.read_pe(image) catch {
+        e => {
+            t.fatal("parse {location}: {oracletool.message(e)}")
+            return []
+        }
+    }
+    let section = oracletool.pe_section(parsed, ".rsrc") ?? return []
+    let data = oracletool.pe_data(parsed, section) catch {
+        e => {
+            t.fatal("read .rsrc of {location}: {oracletool.message(e)}")
+            return []
+        }
+    }
+    var found: []Resource = []
+    for kind in resource_entries(data, 0) {
+        for name in resource_entries(data, kind.target & 0x7FFFFFFF) {
+            for language in resource_entries(data, name.target & 0x7FFFFFFF) {
+                let start = io.le32(data, language.target) - section.virtual_address
+                found.push(Resource { kind: kind.id, data: data[start..start + io.le32(data, language.target + 4)] })
+            }
+        }
+    }
+    found
 }
 
-fn built_has_resources(t: *testing.T, d: Declared, args: []str) -> bool {
+fn resource_entries(data: []u8, at: i64) -> []ResourceEntry {
+    var entries: []ResourceEntry = []
+    for i in 0..io.le16(data, at + 12) + io.le16(data, at + 14) {
+        let entry = at + 16 + i * 8
+        entries.push(ResourceEntry { id: io.le32(data, entry), target: io.le32(data, entry + 4) })
+    }
+    entries
+}
+
+fn resource_kinds(resources: []Resource) -> []i64 {
+    var kinds: []i64 = []
+    for r in resources {
+        if kinds.len == 0 || kinds[kinds.len - 1] != r.kind {
+            kinds.push(r.kind)
+        }
+    }
+    kinds
+}
+
+fn built_resources(t: *testing.T, d: Declared, args: []str) -> []Resource {
     let output = file.child_path(d.dir, "built.exe")
     var all = ["build", "--target", "windows/amd64", "-o", output]
     for a in args {
         all.push(a)
     }
     low_succeeds(t, d, ".", all)
-    image_has_resources(t, output)
+    image_resources(t, output)
 }
 
 fn icon_file() -> []u8 {
@@ -342,14 +399,51 @@ fn test_declared_icon_reaches_every_windows_program(t: *testing.T) {
     file.write_file(ico, icon_file()) catch {
         e => t.fatal("write {ico}: {e}")
     }
-    testing.equal(t, built_has_resources(t, d, ["./src/app"]), true)
-    testing.equal(t, built_has_resources(t, d, ["./src/tool"]), true)
-    testing.equal(t, built_has_resources(t, d, ["./other"]), false)
+    testing.equal_slice(t, resource_kinds(built_resources(t, d, ["./src/app"])), [3, 14])
+    testing.equal_slice(t, resource_kinds(built_resources(t, d, ["./src/tool"])), [3, 14])
+    testing.equal_slice(t, resource_kinds(built_resources(t, d, ["./other"])), [])
     low_succeeds(t, d, ".", ["build", "--target", "linux/amd64", "-o", file.child_path(d.dir, "built"), "./src/app"])
     if !windows_host() {
         return
     }
     low_succeeds(t, d, ".", ["install", "./src/app"])
-    testing.equal(t, image_has_resources(t, executable(d, "app")), true)
+    testing.equal_slice(t, resource_kinds(image_resources(t, executable(d, "app"))), [3, 14])
     testing.equal(t, run_executable(t, executable(d, "app")), "2")
+}
+
+const resource_manifest_text = "<assembly manifestVersion=\"1.0\"/>\n"
+
+fn test_declared_version_and_manifest_reach_every_windows_program(t: *testing.T) {
+    let d = new_declared(t)
+    defer file.remove_all(path.dir(d.dir)) or {}
+    if t.failed() {
+        return
+    }
+    windowed_project(t, d)
+    place_file(t, d, "assets/app.manifest", resource_manifest_text)
+    place_file(t, d, "build.low", "import std/build\n\nbuild.gui(\"src/app\")\nbuild.program(\"src/tool\")\nbuild.version(\"1.4.0\")\n")
+    let version_only = built_resources(t, d, ["./src/tool"])
+    testing.equal_slice(t, resource_kinds(version_only), [16])
+    testing.is_true(t, text.contains(str(version_only[0].data), wide_text("1.4.0")))
+    place_file(t, d, "build.low", "import std/build\n\nbuild.gui(\"src/app\")\nbuild.program(\"src/tool\")\nbuild.manifest(\"assets/app.manifest\")\n")
+    for program in ["./src/app", "./src/tool"] {
+        let manifest_only = built_resources(t, d, [program])
+        testing.equal_slice(t, resource_kinds(manifest_only), [24])
+        testing.equal(t, str(manifest_only[0].data), resource_manifest_text)
+    }
+    place_file(t, d, "build.low", "import std/build\n\nbuild.gui(\"src/app\")\nbuild.program(\"src/tool\")\nbuild.version(\"1.4.0\")\nbuild.file_info(\"CompanyName\", \"Example Ltd\")\nbuild.manifest(\"assets/app.manifest\")\n")
+    let both = built_resources(t, d, ["./src/app"])
+    testing.equal_slice(t, resource_kinds(both), [16, 24])
+    testing.is_true(t, text.contains(str(both[0].data), wide_text("Example Ltd")))
+    testing.equal_slice(t, resource_kinds(built_resources(t, d, ["./other"])), [])
+    low_succeeds(t, d, ".", ["build", "--target", "linux/amd64", "-o", file.child_path(d.dir, "built"), "./src/app"])
+}
+
+fn wide_text(s: str) -> str {
+    var out: []u8 = []
+    for i in 0..s.len {
+        out.push(s[i])
+        out.push(0)
+    }
+    str(out)
 }
