@@ -1,0 +1,363 @@
+import asm
+import link
+import oracletool
+import std/io
+import std/slices
+import std/testing
+import std/text
+import std/unicode
+import std/unicode/utf16
+
+const resource_icon = 3
+const resource_group_icon = 14
+const resource_version = 16
+const resource_manifest = 24
+const resource_language = 0x409
+const subdirectory_bit = 0x80000000
+const manifest_text = "<assembly manifestVersion=\"1.0\"/>"
+
+struct Leaf {
+    kind: i64
+    name: i64
+    language: i64
+    data: []u8
+}
+
+struct VersionNode {
+    key: str
+    kind: i64
+    value_length: i64
+    value: []u8
+    children: []VersionNode
+    length: i64
+}
+
+struct TableEntry {
+    id: i64
+    target: i64
+}
+
+struct VersionNumbers {
+    name: str
+    version: str
+    want: []i64
+}
+
+struct RejectedResources {
+    name: str
+    resources: link.Resources
+    want: str
+}
+
+fn string_entry(key: str, value: str) -> link.VersionString {
+    link.VersionString { key, value }
+}
+
+fn sample_images() -> [][]u8 {
+    [[1, 2, 3], [4, 5, 6, 7], [8, 9], [10, 11, 12, 13, 14]]
+}
+
+fn sample_resources() -> link.Resources {
+    link.Resources {
+        icon: ico_file(sample_images())
+        manifest: bytes(manifest_text)
+        strings: [
+            string_entry("FileVersion", "1.4.0")
+            string_entry("ProductVersion", "1.4.0")
+            string_entry("CompanyName", "Example Ltd")
+            string_entry("ProductName", "Resources")
+        ]
+    }
+}
+
+fn link_resources(t: *testing.T, resources: link.Resources) -> LinkedPe {
+    link_pe_with(t, pe_object(PeOptions {}), link.PeOptions { resources })
+}
+
+fn table_entries(data: []u8, at: i64) -> []TableEntry {
+    let count = io.le16(data, at + 12) + io.le16(data, at + 14)
+    var entries: []TableEntry = []
+    for i in 0..count {
+        let entry = at + 16 + i * 8
+        entries.push(TableEntry { id: io.le32(data, entry), target: io.le32(data, entry + 4) })
+    }
+    entries
+}
+
+fn section_leaves(t: *testing.T, linked: LinkedPe) -> []Leaf {
+    let section = pe_section_of(t, linked.file, ".rsrc")
+    let data = oracletool.pe_data(linked.file, section) catch {
+        e => {
+            t.fatal("read .rsrc: {oracletool.message(e)}")
+            return []
+        }
+    }
+    var leaves: []Leaf = []
+    var last_kind = -1
+    for kind in table_entries(data, 0) {
+        if kind.id <= last_kind || kind.target & subdirectory_bit == 0 {
+            t.error("type entry {kind.id} is out of order or not a directory")
+        }
+        last_kind = kind.id
+        for name in table_entries(data, kind.target & ~subdirectory_bit) {
+            for language in table_entries(data, name.target & ~subdirectory_bit) {
+                if language.target & subdirectory_bit != 0 {
+                    t.error("language entry {language.id} is a directory")
+                    continue
+                }
+                let start = io.le32(data, language.target) - section.virtual_address
+                let size = io.le32(data, language.target + 4)
+                if start < 0 || start + size > data.len {
+                    t.fatal("resource {kind.id}/{name.id} lies outside the section")
+                    return leaves
+                }
+                leaves.push(Leaf { kind: kind.id, name: name.id, language: language.id, data: data[start..start + size] })
+            }
+        }
+    }
+    leaves
+}
+
+fn leaf_of(t: *testing.T, leaves: []Leaf, kind: i64, name: i64) -> Leaf {
+    for l in leaves {
+        if l.kind == kind && l.name == name {
+            return l
+        }
+    }
+    t.fatal("no resource {kind}/{name}")
+    Leaf { kind, name, language: 0, data: [] }
+}
+
+fn align4(n: i64) -> i64 {
+    (n + 3) & ~3
+}
+
+fn read_node(data: []u8, at: i64) -> VersionNode {
+    let length = io.le16(data, at)
+    let value_length = io.le16(data, at + 2)
+    let kind = io.le16(data, at + 4)
+    var end_of_key = at + 6
+    for io.le16(data, end_of_key) != 0 {
+        end_of_key += 2
+    }
+    let key = utf16.decode_bytes(data[at + 6..end_of_key], unicode.Order.Little) or ""
+    let value_at = at + align4(end_of_key + 2 - at)
+    var value_size = value_length
+    if kind == 1 {
+        value_size = value_length * 2
+    }
+    var children: []VersionNode = []
+    var next = at + align4(value_at + value_size - at)
+    for next < at + length {
+        let child = read_node(data, next)
+        children.push(child)
+        next += align4(child.length)
+    }
+    VersionNode { key, kind, value_length, value: data[value_at..value_at + value_size], children, length }
+}
+
+fn child_named(t: *testing.T, node: VersionNode, key: str) -> VersionNode {
+    for c in node.children {
+        if c.key == key {
+            return c
+        }
+    }
+    t.fatal("{node.key} has no {key}")
+    node
+}
+
+fn version_root(t: *testing.T, data: []u8) -> VersionNode {
+    let root = read_node(data, 0)
+    testing.equal(t, root.length, data.len)
+    testing.equal(t, root.key, "VS_VERSION_INFO")
+    testing.equal(t, root.value_length, 52)
+    root
+}
+
+fn version_strings(t: *testing.T, root: VersionNode) -> [str: str] {
+    var strings: [str: str] = [:]
+    let table = child_named(t, child_named(t, root, "StringFileInfo"), "040904B0")
+    for s in table.children {
+        let value = utf16.decode_bytes(s.value, unicode.Order.Little) or ""
+        strings[s.key] = text.trim_suffix(value, "\0")
+    }
+    strings
+}
+
+fn fixed_version(root: VersionNode, at: i64) -> []i64 {
+    let v = root.value
+    [io.le32(v, at) >> 16, io.le32(v, at) & 0xFFFF, io.le32(v, at + 4) >> 16, io.le32(v, at + 4) & 0xFFFF]
+}
+
+fn version_of(t: *testing.T, strings: []link.VersionString) -> VersionNode {
+    let leaves = section_leaves(t, link_resources(t, link.Resources { strings }))
+    version_root(t, leaf_of(t, leaves, resource_version, 1).data)
+}
+
+
+fn test_pe_resource_tree_holds_every_resource(t: *testing.T) {
+    let obj = pe_object(PeOptions { data_fixups: [fixup(0, asm.abs64, "text_label", 0)] })
+    let linked = link_pe_with(t, obj, link.PeOptions { resources: sample_resources() })
+    let section = pe_section_of(t, linked.file, ".rsrc")
+    let directory = pe_header_of(t, linked.file).directories[2]
+    testing.equal(t, directory.virtual_address, section.virtual_address)
+    testing.equal(t, directory.size, section.virtual_size)
+    let names = pe_section_names(linked.file)
+    testing.equal(t, names[names.len - 2], ".rsrc")
+    testing.equal(t, names[names.len - 1], ".reloc")
+    check_section_chain(t, linked.file)
+    let leaves = section_leaves(t, linked)
+    var order: []i64 = []
+    for l in leaves {
+        order.push(l.kind)
+        testing.equal(t, l.language, resource_language)
+    }
+    testing.equal_slice(t, order, [resource_icon, resource_icon, resource_icon, resource_icon, resource_group_icon, resource_version, resource_manifest])
+    for i, image in sample_images() {
+        if !slices.equal(leaf_of(t, leaves, resource_icon, i + 1).data, image) {
+            t.error("icon {i + 1} differs from the image in the file")
+        }
+    }
+    testing.equal(t, str(leaf_of(t, leaves, resource_manifest, 1).data), manifest_text)
+}
+
+fn test_pe_resources_alone(t: *testing.T) {
+    let cases = [
+        link.Resources { manifest: bytes(manifest_text) }
+        link.Resources { strings: [string_entry("CompanyName", "Example Ltd")] }
+    ]
+    let kinds = [resource_manifest, resource_version]
+    for i, resources in cases {
+        let leaves = section_leaves(t, link_resources(t, resources))
+        if leaves.len != 1 || leaves[0].kind != kinds[i] || leaves[0].name != 1 {
+            t.error("case {i}: {leaves.len} resources, want only {kinds[i]}/1")
+        }
+    }
+}
+
+fn test_pe_version_information(t: *testing.T) {
+    let leaves = section_leaves(t, link_resources(t, sample_resources()))
+    let root = version_root(t, leaf_of(t, leaves, resource_version, 1).data)
+    testing.equal(t, io.le32(root.value, 0), 0xFEEF04BD)
+    testing.equal(t, io.le32(root.value, 4), 0x10000)
+    testing.equal_slice(t, fixed_version(root, 8), [1, 4, 0, 0])
+    testing.equal_slice(t, fixed_version(root, 16), [1, 4, 0, 0])
+    testing.equal(t, io.le32(root.value, 24), 0x3F)
+    testing.equal(t, io.le32(root.value, 32), 0x40004)
+    testing.equal(t, io.le32(root.value, 36), 1)
+    let strings = version_strings(t, root)
+    testing.equal(t, strings["FileVersion"] ?? "", "1.4.0")
+    testing.equal(t, strings["ProductVersion"] ?? "", "1.4.0")
+    testing.equal(t, strings["CompanyName"] ?? "", "Example Ltd")
+    testing.equal(t, strings["ProductName"] ?? "", "Resources")
+    let translation = child_named(t, child_named(t, root, "VarFileInfo"), "Translation")
+    testing.equal(t, io.le32(translation.value, 0), 0x04B00409)
+}
+
+fn test_pe_version_information_is_utf16(t: *testing.T) {
+    let root = version_of(t, [string_entry("LegalCopyright", "© Éditeur 日本語 𝄞")])
+    testing.equal(t, version_strings(t, root)["LegalCopyright"] ?? "", "© Éditeur 日本語 𝄞")
+}
+
+fn test_pe_version_information_matches_llvm_rc(t: *testing.T) {
+    let strings = [
+        string_entry("FileVersion", "1.4.0")
+        string_entry("ProductVersion", "1.4.0")
+        string_entry("CompanyName", "Example Ltd")
+        string_entry("ProductName", "Resources")
+    ]
+    let leaves = section_leaves(t, link_resources(t, link.Resources { strings }))
+    testing.equal(t, text.encode_hex(leaf_of(t, leaves, resource_version, 1).data), llvm_rc_version())
+}
+
+fn version_numbers() -> []VersionNumbers {
+    [
+        VersionNumbers { name: "release", version: "2.0.1", want: [2, 0, 1, 0] }
+        VersionNumbers { name: "four numbers", version: "7.8.9.10", want: [7, 8, 9, 10] }
+        VersionNumbers { name: "pre-release", version: "1.4.0-rc.1", want: [1, 4, 0, 0] }
+        VersionNumbers { name: "build", version: "3.2.1+abc.4", want: [3, 2, 1, 0] }
+        VersionNumbers { name: "largest parts", version: "65535.65535.65535.65535", want: [65535, 65535, 65535, 65535] }
+        VersionNumbers { name: "text", version: "nightly", want: [0, 0, 0, 0] }
+        VersionNumbers { name: "one number", version: "5", want: [5, 0, 0, 0] }
+    ]
+}
+
+fn test_pe_version_numbers_come_from_the_version_strings(t: *testing.T) {
+    for c in version_numbers() {
+        let root = version_of(t, [string_entry("FileVersion", c.version), string_entry("ProductVersion", "9.9.9.9")])
+        let file = fixed_version(root, 8)
+        if !slices.equal(file, c.want) {
+            t.error("{c.name}: file version {file}, want {c.want}")
+        }
+        testing.equal_slice(t, fixed_version(root, 16), [9, 9, 9, 9])
+        testing.equal(t, version_strings(t, root)["FileVersion"] ?? "", c.version)
+    }
+}
+
+fn oversized_strings() -> []link.VersionString {
+    var strings: []link.VersionString = []
+    for i in 0..40 {
+        strings.push(string_entry("Key{i}", text.repeat("x", 1000)))
+    }
+    strings
+}
+
+fn rejected_resources() -> []RejectedResources {
+    [
+        RejectedResources { name: "icon", resources: link.Resources { icon: [0, 0, 1] }, want: "link: icon: not an .ico file" }
+        RejectedResources { name: "not xml", resources: link.Resources { manifest: bytes("not a manifest") }, want: "link: manifest: 1:1:" }
+        RejectedResources { name: "unclosed", resources: link.Resources { manifest: bytes("<assembly>") }, want: "link: manifest: " }
+        RejectedResources { name: "other root", resources: link.Resources { manifest: bytes("<application/>") }, want: "link: manifest: the root element is application, not assembly" }
+        RejectedResources { name: "empty key", resources: link.Resources { strings: [string_entry("", "x")] }, want: "link: version information: a version string has no key" }
+        RejectedResources { name: "repeated key", resources: link.Resources { strings: [string_entry("A", "x"), string_entry("A", "y")] }, want: "link: version information A: the key is given twice" }
+        RejectedResources { name: "wide part", resources: link.Resources { strings: [string_entry("ProductVersion", "1.65536.0")] }, want: "link: version information ProductVersion: a number of the version is over 65535" }
+        RejectedResources { name: "huge part", resources: link.Resources { strings: [string_entry("FileVersion", "99999999999999999999")] }, want: "link: version information FileVersion: a number of the version is over 65535" }
+        RejectedResources { name: "too long", resources: link.Resources { strings: oversized_strings() }, want: "link: version information: the version information is " }
+    ]
+}
+
+fn test_pe_rejects_bad_resources(t: *testing.T) {
+    for c in rejected_resources() {
+        link.pe(pe_object(PeOptions {}), link.PeOptions { resources: c.resources }) catch {
+            e => {
+                let got = link.message(e)
+                if !text.starts_with(got, c.want) {
+                    t.error("{c.name}: got {got}, want {c.want}")
+                }
+                continue
+            }
+        }
+        t.error("{c.name}: linked")
+    }
+}
+
+fn test_check_resources_reports_what_pe_would(t: *testing.T) {
+    for c in rejected_resources() {
+        link.check_resources(c.resources) catch {
+            e => {
+                let got = link.message(e)
+                if !text.starts_with(got, c.want) {
+                    t.error("{c.name}: got {got}, want {c.want}")
+                }
+                continue
+            }
+        }
+        t.error("{c.name}: accepted")
+    }
+    link.check_resources(sample_resources()) catch {
+        e => t.error("sample resources: {link.message(e)}")
+    }
+}
+
+fn llvm_rc_version() -> str {
+    text.join([
+        "a40134000000560053005f00560045005200530049004f004e005f0049004e0046004f0000000000bd04effe000001000400010000000000",
+        "04000100000000003f00000000000000040004000100000000000000000000000000000004010000010053007400720069006e0067004600",
+        "69006c00650049006e0066006f000000e000000001003000340030003900300034004200300000002c0006000100460069006c0065005600",
+        "65007200730069006f006e000000000031002e0034002e0030000000300006000100500072006f0064007500630074005600650072007300",
+        "69006f006e00000031002e0034002e003000000038000c00010043006f006d00700061006e0079004e0061006d0065000000000045007800",
+        "61006d0070006c00650020004c0074006400000034000a000100500072006f0064007500630074004e0061006d0065000000000052006500",
+        "73006f00750072006300650073000000440000000100560061007200460069006c00650049006e0066006f00000000002400040000005400",
+        "720061006e0073006c006100740069006f006e00000000000904b004"
+    ], "")
+}
