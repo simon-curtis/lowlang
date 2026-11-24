@@ -1335,7 +1335,8 @@ rt_alloc_refill:
 7:
 	mov rax, [rip+rt_alloc_since]
 	mov rcx, [rip+rt_gc_threshold]
-	shr rcx, 1
+	shr rcx, 2
+	lea rcx, [rcx+2*rcx]
 	cmp rax, rcx
 	jb 17f
 	call rt_gc
@@ -1436,7 +1437,8 @@ rt_alloc_body:
 5:
 	mov rax, [rip+rt_alloc_since]
 	mov rcx, [rip+rt_gc_threshold]
-	shr rcx, 1
+	shr rcx, 2
+	lea rcx, [rcx+2*rcx]
 	cmp rax, rcx
 	jb 9f
 	push rsi
