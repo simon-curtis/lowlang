@@ -1876,6 +1876,7 @@ rt_gcw_donate:
 	push r13
 	push r14
 	xor ebx, ebx
+	mov qword ptr [rbp+W_FLUSHED], 0
 6:
 	cmp r15, [rbp+W_LO]
 	jbe 9f
@@ -1929,18 +1930,25 @@ rt_gcw_donate:
 	call rt_mark_grow
 	jmp 23b
 9:
-	xor r13d, r13d
+	mov r13, [rbp+W_FLUSHED]
+	lea rax, [rbx-32]
+	cmp r13, rax
+	cmovl r13, rax
+	mov [rbp+W_FLUSHED], rbx
 10:
+	cmp r13, rbx
+	jae 11f
+	mov rax, r13
+	and eax, 31
 	lea rcx, [rbp+W_RING]
-	mov rdi, [rcx+8*r13]
-	mov qword ptr [rcx+8*r13], 0
+	mov rdi, [rcx+8*rax]
+	mov qword ptr [rcx+8*rax], 0
 	inc r13
 	test rdi, rdi
-	jz 11f
+	jz 10b
 	MARK_CANDIDATE \solo
+	jmp 10b
 11:
-	cmp r13, 32
-	jb 10b
 	cmp r15, [rbp+W_LO]
 	ja 6b
 .if \solo

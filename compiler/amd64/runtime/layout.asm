@@ -79,6 +79,7 @@
 	.set W_COMMIT, 16
 	.set W_LIVE, 24
 	.set W_BASE, 32
+	.set W_FLUSHED, 40
 	.set W_RING, 64
 	.set W_STACK, 4096
 	.set W_GROW, 16777216
