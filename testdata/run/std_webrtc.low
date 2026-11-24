@@ -2,6 +2,7 @@ import std/datachannel
 import std/rtp
 import std/sdp
 import std/slices
+import std/text
 import std/webrtc
 
 fn check(name: str, ok: bool) {
@@ -12,7 +13,17 @@ fn check(name: str, ok: bool) {
     }
 }
 
-fn trickle(from: webrtc.Handle, to: webrtc.Handle, tracks: chan[webrtc.RemoteTrack]) {
+struct Side {
+    tracks: chan[webrtc.RemoteTrack]
+    selected: chan[bool]
+    failed: chan[bool]
+}
+
+fn side() -> Side {
+    Side { tracks: chan[webrtc.RemoteTrack](4), selected: chan[bool](16), failed: chan[bool](4) }
+}
+
+fn trickle(from: webrtc.Handle, to: webrtc.Handle, s: Side) {
     for {
         let e = (<-from.events) ?? break
         match e {
@@ -20,12 +31,91 @@ fn trickle(from: webrtc.Handle, to: webrtc.Handle, tracks: chan[webrtc.RemoteTra
                 webrtc.add_remote_candidate(to, value) or {}
             }
             GatheringComplete => {}
-            StateChanged(_) => {}
+            StateChanged(state) => {
+                if state == webrtc.State.Failed || state == webrtc.State.Disconnected {
+                    s.failed <- true
+                }
+            }
             Track(t) => {
-                tracks <- t
+                s.tracks <- t
+            }
+            Selected(_, _) => {
+                s.selected <- true
             }
         }
     }
+}
+
+fn selected_again(s: Side) -> bool {
+    select {
+        _ = <-s.selected => true
+        after(10000) => false
+    }
+}
+
+fn drain(s: Side) {
+    for {
+        select {
+            _ = <-s.selected => {}
+            else => return
+        }
+    }
+}
+
+fn ended(t: webrtc.RemoteTrack) -> bool {
+    for {
+        let next: rtp.Packet?? = select {
+            p = <-t.packets => some(p)
+            after(5000) => none
+        }
+        let got = next ?? return false
+        if got == none {
+            return true
+        }
+    }
+    false
+}
+
+fn refuses_glare(h: webrtc.Handle, offer: sdp.Session) -> bool {
+    let answered = webrtc.create_answer(h, offer) catch {
+        WrongState => return true
+        _ => return false
+    }
+    print("answered {answered.media.len} sections in have-local-offer")
+    false
+}
+
+fn refuses_channel(h: webrtc.Handle) -> bool {
+    let opened = webrtc.create_data_channel(h, datachannel.Options { label: "refused" }) catch {
+        _ => return true
+    }
+    datachannel.close_channel(opened)
+    false
+}
+
+fn mids(s: sdp.Session) -> str {
+    var out: str[] = []
+    for m in s.media {
+        out.push("{sdp.mid(m) ?? "?"}:{m.kind}:{if m.port == 0 { "rejected" } else { sdp.direction_name(sdp.direction(s, m)) }}")
+    }
+    text.join(out, " ")
+}
+
+fn ufrag(s: sdp.Session) -> str {
+    sdp.ice_ufrag(s, s.media[0]) ?? ""
+}
+
+fn reparse(s: sdp.Session) -> sdp.Session {
+    sdp.parse(sdp.format(s)) or panic("a description does not parse")
+}
+
+fn chat_round(from: datachannel.Channel, to: datachannel.Channel, message: str) -> bool {
+    datachannel.send_text(from, message) or return false
+    let got: datachannel.Message? = select {
+        m = <-to.messages => m
+        after(5000) => none
+    }
+    str((got ?? return false).data) == message
 }
 
 fn next_track(tracks: chan[webrtc.RemoteTrack]) -> webrtc.RemoteTrack? {
@@ -65,10 +155,12 @@ fn main() {
     check("answer setup active", (sdp.setup(answer, answer.media[0]) or none) == some(sdp.Setup.Active))
     check("answer sends and receives audio", sdp.direction(answer, answer.media[0]) == sdp.Direction.SendRecv)
     webrtc.apply_answer(caller.handle, sdp.parse(sdp.format(answer)) or panic("answer does not parse")) or panic("apply answer")
-    let at_caller = chan[webrtc.RemoteTrack](4)
-    let at_callee = chan[webrtc.RemoteTrack](4)
-    spawn trickle(caller.handle, callee.handle, at_caller)
-    spawn trickle(callee.handle, caller.handle, at_callee)
+    let caller_side = side()
+    let callee_side = side()
+    let at_caller = caller_side.tracks
+    let at_callee = callee_side.tracks
+    spawn trickle(caller.handle, callee.handle, caller_side)
+    spawn trickle(callee.handle, caller.handle, callee_side)
     webrtc.wait_connected(caller.handle) or panic("caller connect")
     webrtc.wait_connected(callee.handle) or panic("callee connect")
     print("connected")
@@ -112,10 +204,101 @@ fn main() {
         after(5000) => none
     }
     check("rtcp reaches the caller", (report ?? []).len == 1)
+    check("selected a pair", selected_again(caller_side) && selected_again(callee_side))
+
+    let camera = webrtc.add_track(caller.handle, webrtc.Kind.Video, [webrtc.vp8()]) or panic("video track")
+    let added = webrtc.create_offer(caller.handle) or panic("offer with video")
+    check("signalling have-local-offer", (webrtc.signaling(caller.handle) or panic("signaling")) == webrtc.Signaling.HaveLocalOffer)
+    print("offer adds video: {mids(added)}")
+    let added_answer = webrtc.create_answer(callee.handle, reparse(added)) or panic("answer with video")
+    print("answer adds video: {mids(added_answer)}")
+    webrtc.apply_answer(caller.handle, reparse(added_answer)) or panic("apply the video answer")
+    check("signalling stable", (webrtc.signaling(caller.handle) or panic("signaling")) == webrtc.Signaling.Stable)
+    let watched = next_track(at_callee) ?? panic("no video track at the callee")
+    check("callee sees the new video source", watched.kind == webrtc.Kind.Video && watched.mid == "2" && watched.ssrc == camera.ssrc)
+    webrtc.send_rtp(camera, rtp.Packet { payload_type: 96, sequence: 1, timestamp: 0, ssrc: 0, payload: pattern(900) }) or panic("send video")
+    let frame = next_packet(watched) ?? panic("no video packet")
+    check("video packet under the new source", frame.ssrc == camera.ssrc && slices.equal(frame.payload, pattern(900)))
+    check("data channel after adding video", chat_round(chat, accepted, "after video"))
+
+    webrtc.set_direction(callee.handle, "0", sdp.Direction.RecvOnly) or panic("set direction")
+    let turned = webrtc.create_offer(callee.handle) or panic("offer from the answerer")
+    print("answerer offers recvonly audio: {mids(turned)}")
+    let turned_answer = webrtc.create_answer(caller.handle, reparse(turned)) or panic("answer the direction change")
+    print("answer to the direction change: {mids(turned_answer)}")
+    check("dtls role kept", (sdp.setup(turned_answer, turned_answer.media[0]) or none) == some(sdp.Setup.Passive))
+    webrtc.apply_answer(callee.handle, reparse(turned_answer)) or panic("apply the direction answer")
+    check("callee's audio ends at the caller", ended(replied))
+    webrtc.send_rtp(microphone, rtp.Packet { payload_type: 111, sequence: 1, timestamp: 0, ssrc: 0, payload: pattern(20) }) or panic("send audio after the change")
+    check("caller's audio still flows", (next_packet(heard) ?? panic("no audio after the change")).sequence == 1)
+
+    webrtc.remove_track(camera) or panic("remove track")
+    let removed = webrtc.create_offer(caller.handle) or panic("offer without video")
+    print("offer after removing video: {mids(removed)}")
+    let removed_answer = webrtc.create_answer(callee.handle, reparse(removed)) or panic("answer without video")
+    webrtc.apply_answer(caller.handle, reparse(removed_answer)) or panic("apply the removal answer")
+    check("video track ends at the callee", ended(watched))
+    var silenced = false
+    webrtc.send_rtp(camera, rtp.Packet { payload_type: 96, sequence: 2, timestamp: 0, ssrc: 0, payload: [] }) or {
+        silenced = true
+    }
+    check("removed track cannot send", silenced)
+
+    webrtc.restart_ice(caller.handle) or panic("restart ice")
+    let crossed_restart = webrtc.create_offer(caller.handle) or panic("restart offer")
+    webrtc.stop_section(callee.handle, "2") or panic("stop video section")
+    let crossed_stop = webrtc.create_offer(callee.handle) or panic("crossing offer")
+    check("glare refused", refuses_glare(callee.handle, reparse(crossed_restart)))
+    webrtc.rollback(caller.handle) or panic("rollback")
+    check("rollback to stable", (webrtc.signaling(caller.handle) or panic("signaling")) == webrtc.Signaling.Stable)
+    let polite = webrtc.create_answer(caller.handle, reparse(crossed_stop)) or panic("answer after rollback")
+    print("answer after rollback: {mids(polite)}")
+    check("rolled back restart keeps the new credentials", ufrag(polite) == ufrag(crossed_restart) && ufrag(polite) != ufrag(answer))
+    webrtc.apply_answer(callee.handle, reparse(polite)) or panic("apply the polite answer")
+    let sections = webrtc.transceivers(caller.handle) or panic("transceivers")
+    check("stopped section keeps its mid", sections.len == 3 && sections[2].mid == "2" && sections[2].stopped)
+    check("reselected after the asymmetric restart", selected_again(caller_side) && selected_again(callee_side))
+    drain(caller_side)
+    drain(callee_side)
+
+    webrtc.restart_ice(callee.handle) or panic("restart ice at the callee")
+    let restart = webrtc.create_offer(callee.handle) or panic("ice restart offer")
+    print("ice restart offer: {mids(restart)}")
+    check("restart offer has new credentials", ufrag(restart) != ufrag(crossed_stop))
+    webrtc.send_rtp(microphone, rtp.Packet { payload_type: 111, sequence: 2, timestamp: 0, ssrc: 0, payload: pattern(20) }) or panic("send audio during the restart")
+    check("audio reaches the restarting peer", (next_packet(heard) ?? panic("no audio during the restart")).sequence == 2)
+    check("data channel during the restart", chat_round(chat, accepted, "during the restart") && chat_round(accepted, chat, "back during the restart"))
+    let restarted = webrtc.create_answer(caller.handle, reparse(restart)) or panic("answer the restart")
+    check("restart answer has new credentials", ufrag(restarted) != ufrag(polite))
+    check("data channel before the answer is applied", chat_round(chat, accepted, "before the answer"))
+    webrtc.apply_answer(callee.handle, reparse(restarted)) or panic("apply the restart answer")
+    check("reselected after the restart", selected_again(caller_side) && selected_again(callee_side))
+    check("data channel after the restart", chat_round(chat, accepted, "after the restart") && chat_round(accepted, chat, "back after the restart"))
+    webrtc.send_rtp(microphone, rtp.Packet { payload_type: 111, sequence: 3, timestamp: 0, ssrc: 0, payload: pattern(20) }) or panic("send audio after the restart")
+    check("audio after the restart", (next_packet(heard) ?? panic("no audio after the restart")).sequence == 3)
+    webrtc.stop_section(caller.handle, "1") or panic("stop the data channel section")
+    let closing = webrtc.create_offer(caller.handle) or panic("offer without data channels")
+    print("offer stopping the data channels: {mids(closing)}")
+    let closed_answer = webrtc.create_answer(callee.handle, reparse(closing)) or panic("answer without data channels")
+    webrtc.apply_answer(caller.handle, reparse(closed_answer)) or panic("apply the answer without data channels")
+    let gone: bool = select {
+        m = <-chat.messages => m == none
+        after(5000) => false
+    }
+    check("data channel ends with its section", gone)
+    check("no data channel after the section stops", refuses_channel(caller.handle))
+    webrtc.send_rtp(microphone, rtp.Packet { payload_type: 111, sequence: 4, timestamp: 0, ssrc: 0, payload: pattern(20) }) or panic("send audio without data channels")
+    check("audio without data channels", (next_packet(heard) ?? panic("no audio without data channels")).sequence == 4)
+    let stayed: bool? = select {
+        f = <-caller_side.failed => f
+        f = <-callee_side.failed => f
+        else => none
+    }
+    check("never disconnected", stayed == none)
     webrtc.close_peer(caller.handle)
-    let ended = datachannel.receive(chat) or {
+    webrtc.transceivers(caller.handle) or {
         print("closed")
         return
     }
-    print("unexpected {ended.data.len}")
+    print("still open after close_peer")
 }

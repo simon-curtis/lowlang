@@ -7,6 +7,7 @@ import std/mdns
 import std/net
 import std/rtp
 import std/sdp
+import std/slices
 import std/text
 
 /// Returns Opus at payload type 111, 48000 Hz and two channels, with in-band forward error correction and transport-wide congestion control feedback, as browsers offer it.
@@ -185,17 +186,28 @@ fn rtp_section(c: *Core, kind: Kind, codecs: Codec[], mid: str, setup: sdp.Setup
     m
 }
 
+
 fn rejected(m: sdp.Media, mid: str) -> sdp.Media {
     sdp.Media { kind: m.kind, port: 0, protocol: m.protocol, formats: m.formats, connections: [sdp.Connection { address: "0.0.0.0" }], attributes: [sdp.attribute("mid", mid)] }
 }
 
-fn described_session(c: *Core, media: sdp.Media[], mids: str[]) -> sdp.Session ! Error {
+fn rejected_line(l: Line) -> sdp.Media {
+    sdp.Media { kind: l.media, port: 0, protocol: l.protocol, formats: l.formats, connections: [sdp.Connection { address: "0.0.0.0" }], attributes: [sdp.attribute("mid", l.mid)] }
+}
+
+fn described_session(c: *Core, media: sdp.Media[]) -> sdp.Session ! Error {
     var all = media
     if all.len == 0 {
         fail Invalid("no media section to describe")
     }
     let link = c.ice ?? fail Closed
     let gathered = icesession.candidates(link) or fail Closed
+    var mids: str[] = []
+    for m in all {
+        if m.port != 0 {
+            mids.push(sdp.mid(m) ?? "")
+        }
+    }
     for at, m in all {
         if m.port != 0 {
             for candidate in gathered {
@@ -212,36 +224,155 @@ fn described_session(c: *Core, media: sdp.Media[], mids: str[]) -> sdp.Session !
     }
 }
 
+fn formats_of(codecs: Codec[]) -> str[] {
+    var out: str[] = []
+    for codec in codecs {
+        out.push("{codec.payload_type}")
+    }
+    out
+}
+
+fn track_line(kind: Kind, track: i64, codecs: Codec[]) -> Line {
+    Line { media: kind_name(kind), protocol: "UDP/TLS/RTP/SAVPF", formats: formats_of(codecs), track, used: true, codecs }
+}
+
+fn data_line() -> Line {
+    Line { media: "application", protocol: "UDP/DTLS/SCTP", formats: ["webrtc-datachannel"], data: true }
+}
+
+fn remote_line(m: sdp.Media, mid: str) -> Line {
+    Line { mid, media: m.kind, protocol: m.protocol, formats: m.formats, data: sdp.is_data_channel(m), wanted: sdp.Direction.RecvOnly }
+}
+
+fn line_of(c: *Core, mid: str) -> i64 {
+    if mid.len == 0 {
+        return -1
+    }
+    for i, l in c.lines {
+        if l.mid == mid {
+            return i
+        }
+    }
+    -1
+}
+
+fn new_mid(c: *Core) -> str {
+    for {
+        let mid = "{c.next_mid}"
+        c.next_mid += 1
+        if line_of(c, mid) < 0 {
+            return mid
+        }
+    }
+    ""
+}
+
+fn mid_at(m: sdp.Media, i: i64) -> str {
+    sdp.mid(m) ?? "{i}"
+}
+
+fn has_data_line(c: *Core) -> bool {
+    for l in c.lines {
+        if l.data {
+            return true
+        }
+    }
+    false
+}
+
+fn data_stopping(c: *Core) -> bool {
+    for l in c.lines {
+        if l.data && l.stopping {
+            return true
+        }
+    }
+    false
+}
+
+fn live_data_line(c: *Core) -> i64 {
+    for i, l in c.lines {
+        if l.data && !l.stopped {
+            return i
+        }
+    }
+    -1
+}
+
+fn with_send(d: sdp.Direction) -> sdp.Direction {
+    direction_of(true, receives(d))
+}
+
+fn without_send(d: sdp.Direction) -> sdp.Direction {
+    direction_of(false, receives(d))
+}
+
+fn reusable_line(c: *Core, kind: Kind) -> i64 {
+    for i, l in c.lines {
+        if l.media == kind_name(kind) && l.track < 0 && !l.used && !l.stopped && !l.stopping {
+            return i
+        }
+    }
+    -1
+}
+
 fn offer_now(c: *Core) -> Described {
-    if c.phase != Phase.Idle {
+    if c.offering {
         return Described.Refused(Error.WrongState)
     }
     let session = make_offer(c) catch {
         e => return Described.Refused(e)
     }
-    c.phase = Phase.Offered
+    c.offering = true
     Described.Done(session)
 }
 
 fn make_offer(c: *Core) -> sdp.Session ! Error {
-    if c.locals.len == 0 && !c.config.data_channels {
+    if c.lines.len == 0 && !c.config.data_channels {
         fail Invalid("no track and no data channel to offer")
     }
-    open_ice(c, true)?
+    if c.ice == none {
+        open_ice(c, true)?
+    } else if c.restart_wanted {
+        restart_ice_now(c)?
+    }
+    c.restart_wanted = false
+    var kept: Line[] = []
+    for l in c.lines {
+        if l.mid.len > 0 || !l.stopping {
+            kept.push(l)
+        }
+    }
+    c.lines = kept
+    if c.config.data_channels && !has_data_line(c) {
+        c.lines.push(data_line())
+    }
     var media: sdp.Media[] = []
-    var mids: str[] = []
-    for i in 0..c.locals.len {
-        let mid = "{i}"
-        c.locals[i].mid = mid
-        media.push(rtp_section(c, c.locals[i].kind, c.locals[i].codecs, mid, sdp.Setup.ActPass, sdp.Direction.SendRecv, c.locals[i]))
-        mids.push(mid)
+    for i in 0..c.lines.len {
+        if c.lines[i].mid.len == 0 {
+            c.lines[i].mid = new_mid(c)
+        }
+        media.push(offer_section(c, i))
     }
-    if c.config.data_channels {
-        let mid = "{c.locals.len}"
-        media.push(data_section(c, mid, sdp.Setup.ActPass))
-        mids.push(mid)
+    c.offered = c.lines.len
+    described_session(c, media)?
+}
+
+fn offer_section(c: *Core, i: i64) -> sdp.Media {
+    let l = c.lines[i]
+    if l.stopped || l.stopping {
+        return rejected_line(l)
     }
-    described_session(c, media, mids)?
+    if l.data {
+        return data_section(c, l.mid, sdp.Setup.ActPass)
+    }
+    let kind = kind_of(l.media) ?? return rejected_line(l)
+    var sender: Local? = none
+    if l.track >= 0 && sends(l.wanted) {
+        sender = c.tracks[l.track]
+    }
+    let d = direction_of(sender != none, receives(l.wanted))
+    c.lines[i].offered = d
+    rtp_section(c, kind, l.codecs, l.mid, sdp.Setup.ActPass, d, sender)
 }
 
 fn transport_of(s: sdp.Session) -> sdp.Media ! Error {
@@ -251,6 +382,21 @@ fn transport_of(s: sdp.Session) -> sdp.Media ! Error {
         }
     }
     fail Invalid("every media section is rejected")
+}
+
+fn same_prints(a: dtls.Fingerprint[], b: dtls.Fingerprint[]) -> bool {
+    for x in a {
+        var found = false
+        for y in b {
+            if x.algorithm == y.algorithm && slices.equal(x.digest, y.digest) {
+                found = true
+            }
+        }
+        if !found {
+            return false
+        }
+    }
+    true
 }
 
 fn read_transport(c: *Core, s: sdp.Session, m: sdp.Media) ! Error {
@@ -264,7 +410,22 @@ fn read_transport(c: *Core, s: sdp.Session, m: sdp.Media) ! Error {
     if prints.len == 0 {
         fail Invalid("fingerprint missing")
     }
+    if c.dtls != none && !same_prints(prints, c.remote_fingerprints) {
+        fail Invalid("the fingerprint changed while DTLS is up")
+    }
     c.remote_fingerprints = prints
+}
+
+fn check_order(c: *Core, s: sdp.Session, count: i64) ! Error {
+    if s.media.len < count {
+        fail Invalid("the description has {s.media.len} media sections where {count} were negotiated")
+    }
+    for i in 0..count {
+        let mid = mid_at(s.media[i], i)
+        if mid != c.lines[i].mid {
+            fail Invalid("section {i} has mid {mid} where {c.lines[i].mid} was negotiated")
+        }
+    }
 }
 
 fn add_remote(c: *Core, link: icesession.Handle, value: str) -> Error? {
@@ -289,10 +450,38 @@ fn add_remote(c: *Core, link: icesession.Handle, value: str) -> Error? {
     none
 }
 
-fn apply_transport(c: *Core, s: sdp.Session, m: sdp.Media) ! Error {
+fn forget_remote(c: *Core) {
+    c.remote_candidates = [:]
+    c.remote_ended = false
+}
+
+fn restart_ice_now(c: *Core) ! Error {
+    let link = c.ice ?? fail Closed
+    let credentials = icesession.restart(link) or fail Closed
+    c.ufrag = credentials.ufrag
+    c.pwd = credentials.pwd
+    c.remote_ufrag = ""
+    c.remote_pwd = ""
+    forget_remote(c)
+    icesession.gather(link) or fail Closed
+}
+
+fn apply_transport(c: *Core, s: sdp.Session, m: sdp.Media, answering: bool) ! Error {
     let link = c.ice ?? fail Closed
     icesession.set_remote_lite(link, sdp.ice_lite(s)) or fail Closed
-    icesession.set_remote_credentials(link, sdp.ice_ufrag(s, m) ?? "", sdp.ice_pwd(s, m) ?? "") or fail Closed
+    let ufrag = sdp.ice_ufrag(s, m) ?? ""
+    let pwd = sdp.ice_pwd(s, m) ?? ""
+    if ufrag != c.remote_ufrag || pwd != c.remote_pwd {
+        if c.remote_ufrag.len > 0 && answering {
+            restart_ice_now(c)?
+        } else if c.remote_ufrag.len > 0 {
+            forget_remote(c)
+        }
+        c.remote_ufrag = ufrag
+        c.remote_pwd = pwd
+        icesession.set_remote_credentials(link, ufrag, pwd) or fail Closed
+    }
+    c.described = true
     for each in s.media {
         for value in sdp.candidates(each) {
             add_remote(c, link, value)
@@ -304,10 +493,17 @@ fn apply_transport(c: *Core, s: sdp.Session, m: sdp.Media) ! Error {
 }
 
 fn accept_data(c: *Core, m: sdp.Media) ! Error {
-    c.data = true
     c.remote_sctp_port = (sdp.sctp_port(m) or fail Invalid("sctp-port")) ?? 5000
     let limit = (sdp.max_message_size(m) or fail Invalid("max-message-size")) ?? default_remote_message
     c.remote_max_message = if limit == 0 { unlimited_message } else { limit }
+    if c.data {
+        return
+    }
+    c.data = true
+    if c.dtls_up {
+        let link = c.dtls ?? return
+        open_channels(c, link)
+    }
 }
 
 fn codecs_of(m: sdp.Media) -> Codec[] ! Error {
@@ -354,15 +550,6 @@ fn first_ssrc(m: sdp.Media) -> i64 {
     if sources.len == 0 { 0 } else { sources[0].id }
 }
 
-fn add_remote_track(c: *Core, m: sdp.Media, mid: str, kind: Kind, codecs: Codec[]) {
-    let track = RemoteTrack { mid, kind, ssrc: first_ssrc(m), codecs, packets: chan[rtp.Packet](256) }
-    if track.ssrc != 0 {
-        c.by_ssrc[track.ssrc] = c.remotes.len
-    }
-    c.remotes.push(track)
-    publish(c, Event.Track(track))
-}
-
 fn direction_of(sends: bool, receives: bool) -> sdp.Direction {
     if sends && receives {
         sdp.Direction.SendRecv
@@ -383,133 +570,278 @@ fn receives(d: sdp.Direction) -> bool {
     d == sdp.Direction.SendRecv || d == sdp.Direction.RecvOnly
 }
 
-fn unused_local(c: *Core, kind: Kind, used: bool[]) -> i64 {
-    for i, l in c.locals {
-        if l.kind == kind && !used[i] {
+fn rebind(c: *Core) {
+    c.by_ssrc = [:]
+    for i, l in c.lines {
+        match l.remote {
+            some(t) => {
+                if t.ssrc != 0 {
+                    c.by_ssrc[t.ssrc] = i
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+fn end_remote_track(c: *Core, i: i64) {
+    let t = c.lines[i].remote ?? return
+    close(t.packets)
+    c.lines[i].remote = none
+    rebind(c)
+}
+
+fn sync_remote(c: *Core, i: i64, m: sdp.Media, kind: Kind, receiving: bool) {
+    if !receiving {
+        end_remote_track(c, i)
+        return
+    }
+    let ssrc = first_ssrc(m)
+    match c.lines[i].remote {
+        some(t) => {
+            if t.ssrc == ssrc {
+                var kept = t
+                kept.codecs = c.lines[i].codecs
+                c.lines[i].remote = kept
+                return
+            }
+            end_remote_track(c, i)
+        }
+        none => {}
+    }
+    let track = RemoteTrack { mid: c.lines[i].mid, kind, ssrc, codecs: c.lines[i].codecs, packets: chan[rtp.Packet](256) }
+    c.lines[i].remote = track
+    rebind(c)
+    publish(c, Event.Track(track))
+}
+
+fn end_line(c: *Core, i: i64) {
+    end_remote_track(c, i)
+    if c.lines[i].data && !c.lines[i].stopped {
+        stop_channels(c)
+    }
+    c.lines[i].stopped = true
+    c.lines[i].stopping = false
+    c.lines[i].current = sdp.Direction.Inactive
+}
+
+fn answer_now(c: *Core, offer: sdp.Session) -> Described {
+    if c.offering {
+        return Described.Refused(Error.WrongState)
+    }
+    let session = make_answer(c, offer) catch {
+        e => return Described.Refused(e)
+    }
+    c.negotiated = true
+    Described.Done(session)
+}
+
+fn negotiated_count(c: *Core) -> i64 {
+    var n = 0
+    for l in c.lines {
+        if l.negotiated {
+            n += 1
+        }
+    }
+    n
+}
+
+fn make_answer(c: *Core, offer: sdp.Session) -> sdp.Session ! Error {
+    let known = negotiated_count(c)
+    check_order(c, offer, known)?
+    let transport = transport_of(offer)?
+    read_transport(c, offer, transport)?
+    if !c.negotiated {
+        let remote_setup = sdp.setup(offer, transport) or fail Invalid("setup")
+        c.dtls_client = remote_setup != some(sdp.Setup.Active)
+    }
+    let setup = if c.dtls_client { sdp.Setup.Active } else { sdp.Setup.Passive }
+    if c.ice == none {
+        open_ice(c, false)?
+    }
+    apply_transport(c, offer, transport, true)?
+    associate(c, offer, known)
+    var media: sdp.Media[] = []
+    for i, m in offer.media {
+        media.push(answer_section(c, offer, m, i, setup)?)
+        c.lines[i].negotiated = true
+    }
+    described_session(c, media)?
+}
+
+fn waiting_match(c: *Core, waiting: Line[], m: sdp.Media) -> i64 {
+    if m.port == 0 || sdp.is_data_channel(m) {
+        return -1
+    }
+    let offered = codecs_of(m) or []
+    for i, l in waiting {
+        if l.media == m.kind && l.track >= 0 && !l.stopping && shared(offered, c.tracks[l.track].codecs).len > 0 {
             return i
         }
     }
     -1
 }
 
-fn answer_now(c: *Core, offer: sdp.Session) -> Described {
-    if c.phase != Phase.Idle {
-        return Described.Refused(Error.WrongState)
-    }
-    let session = make_answer(c, offer) catch {
-        e => return Described.Refused(e)
-    }
-    c.phase = Phase.Stable
-    Described.Done(session)
-}
-
-fn make_answer(c: *Core, offer: sdp.Session) -> sdp.Session ! Error {
-    let transport = transport_of(offer)?
-    read_transport(c, offer, transport)?
-    let remote_setup = sdp.setup(offer, transport) or fail Invalid("setup")
-    c.dtls_client = remote_setup != some(sdp.Setup.Active)
-    let setup = if c.dtls_client { sdp.Setup.Active } else { sdp.Setup.Passive }
-    open_ice(c, false)?
-    apply_transport(c, offer, transport)?
-    var used: bool[] = []
-    for _ in c.locals {
-        used.push(false)
-    }
-    var media: sdp.Media[] = []
-    var mids: str[] = []
-    for i, m in offer.media {
-        let mid = sdp.mid(m) ?? "{i}"
-        let answered = answer_section(c, offer, m, mid, setup, mut used)?
-        if answered.port != 0 {
-            mids.push(mid)
+fn associate(c: *Core, offer: sdp.Session, known: i64) {
+    var lines: Line[] = []
+    var waiting: Line[] = []
+    for i, l in c.lines {
+        if i < known {
+            lines.push(l)
+        } else {
+            waiting.push(l)
         }
-        media.push(answered)
     }
-    described_session(c, media, mids)?
+    for i in known..offer.media.len {
+        let m = offer.media[i]
+        let at = waiting_match(c, waiting, m)
+        if at < 0 {
+            lines.push(remote_line(m, mid_at(m, i)))
+            continue
+        }
+        var l = waiting[at]
+        l.mid = mid_at(m, i)
+        lines.push(l)
+        var rest: Line[] = []
+        for j, w in waiting {
+            if j != at {
+                rest.push(w)
+            }
+        }
+        waiting = rest
+    }
+    for l in waiting {
+        lines.push(l)
+    }
+    c.lines = lines
 }
 
-fn answer_section(c: *Core, offer: sdp.Session, m: sdp.Media, mid: str, setup: sdp.Setup, mut used: bool[]) -> sdp.Media ! Error {
-    if m.port == 0 {
-        return rejected(m, mid)
+fn answer_section(c: *Core, offer: sdp.Session, m: sdp.Media, i: i64, setup: sdp.Setup) -> sdp.Media ! Error {
+    let l = c.lines[i]
+    if m.port == 0 || l.stopped || l.stopping {
+        end_line(c, i)
+        return rejected(m, l.mid)
     }
-    if sdp.is_data_channel(m) {
-        if !c.config.data_channels || c.data {
-            return rejected(m, mid)
+    if l.data {
+        let live = live_data_line(c)
+        if !c.config.data_channels || live != i {
+            end_line(c, i)
+            return rejected(m, l.mid)
         }
         accept_data(c, m)?
-        return data_section(c, mid, setup)
+        return data_section(c, l.mid, setup)
     }
-    let kind = kind_of(m.kind) ?? return rejected(m, mid)
+    let kind = kind_of(m.kind) ?? {
+        end_line(c, i)
+        return rejected(m, l.mid)
+    }
     if !text.ends_with(m.protocol, "RTP/SAVPF") {
-        return rejected(m, mid)
+        end_line(c, i)
+        return rejected(m, l.mid)
     }
     let offered = codecs_of(m)?
     let remote = sdp.direction(offer, m)
-    let at = unused_local(c, kind, used)
     var chosen = offered
     var sender: Local? = none
-    if at >= 0 && receives(remote) {
-        chosen = shared(offered, c.locals[at].codecs)
-        if chosen.len == 0 {
-            return rejected(m, mid)
+    if l.track >= 0 {
+        let own = shared(offered, c.tracks[l.track].codecs)
+        if own.len > 0 {
+            chosen = own
+            c.tracks[l.track].codecs = own
+            if sends(l.wanted) && receives(remote) {
+                sender = c.tracks[l.track]
+            }
         }
-        used[at] = true
-        c.locals[at].codecs = chosen
-        c.locals[at].mid = mid
-        sender = c.locals[at]
     }
-    if sends(remote) {
-        add_remote_track(c, m, mid, kind, chosen)
-    }
-    rtp_section(c, kind, chosen, mid, setup, direction_of(sender != none, sends(remote)), sender)
+    c.lines[i].codecs = chosen
+    c.lines[i].current = direction_of(sender != none, receives(l.wanted) && sends(remote))
+    sync_remote(c, i, m, kind, receives(l.wanted) && sends(remote))
+    rtp_section(c, kind, chosen, l.mid, setup, c.lines[i].current, sender)
 }
 
 fn accept_now(c: *Core, answer: sdp.Session) -> Error? {
-    if c.phase != Phase.Offered {
+    if !c.offering {
         return Error.WrongState
     }
     take_answer(c, answer) catch {
         e => return e
     }
-    c.phase = Phase.Stable
+    c.offering = false
+    c.negotiated = true
     none
 }
 
 fn take_answer(c: *Core, answer: sdp.Session) ! Error {
-    let sections = c.locals.len + if c.config.data_channels { 1 } else { 0 }
-    if answer.media.len != sections {
-        fail Invalid("the answer has {answer.media.len} media sections and the offer {sections}")
+    if answer.media.len != c.offered {
+        fail Invalid("the answer has {answer.media.len} media sections and the offer {c.offered}")
     }
+    check_order(c, answer, c.offered)?
     let transport = transport_of(answer)?
     read_transport(c, answer, transport)?
-    let remote_setup = sdp.setup(answer, transport) or fail Invalid("setup")
-    c.dtls_client = match remote_setup {
-        some(s) => match s {
-            Active => false
-            Passive => true
-            _ => fail Invalid("setup {sdp.setup_name(s)} in an answer")
-        }
-        none => fail Invalid("setup missing")
-    }
-    apply_transport(c, answer, transport)?
-    for i, m in answer.media {
-        if m.port == 0 {
-            continue
-        }
-        if i == c.locals.len {
-            if !sdp.is_data_channel(m) {
-                fail Invalid("section {i} is not a data channel")
+    if !c.negotiated {
+        let remote_setup = sdp.setup(answer, transport) or fail Invalid("setup")
+        c.dtls_client = match remote_setup {
+            some(s) => match s {
+                Active => false
+                Passive => true
+                _ => fail Invalid("setup {sdp.setup_name(s)} in an answer")
             }
-            accept_data(c, m)?
-            continue
-        }
-        if m.kind != kind_name(c.locals[i].kind) {
-            fail Invalid("section {i} is {m.kind}")
-        }
-        let answered = codecs_of(m)?
-        c.locals[i].codecs = shared(answered, c.locals[i].codecs)
-        if sends(sdp.direction(answer, m)) {
-            add_remote_track(c, m, c.locals[i].mid, c.locals[i].kind, c.locals[i].codecs)
+            none => fail Invalid("setup missing")
         }
     }
+    apply_transport(c, answer, transport, false)?
+    for i, m in answer.media {
+        take_section(c, answer, m, i)?
+        c.lines[i].negotiated = true
+    }
+}
+
+fn take_section(c: *Core, answer: sdp.Session, m: sdp.Media, i: i64) ! Error {
+    let l = c.lines[i]
+    if m.port == 0 || l.stopped || l.stopping {
+        end_line(c, i)
+        return
+    }
+    if l.data {
+        if !sdp.is_data_channel(m) {
+            fail Invalid("section {i} is not a data channel")
+        }
+        accept_data(c, m)?
+        return
+    }
+    if m.kind != l.media {
+        fail Invalid("section {i} is {m.kind}")
+    }
+    let kind = kind_of(l.media) ?? fail Invalid("section {i} is {m.kind}")
+    let answered = codecs_of(m)?
+    var own = answered
+    if l.track >= 0 {
+        own = shared(answered, c.tracks[l.track].codecs)
+        c.tracks[l.track].codecs = own
+    }
+    c.lines[i].codecs = own
+    let remote = sdp.direction(answer, m)
+    let receiving = receives(l.offered) && sends(remote)
+    c.lines[i].current = direction_of(sends(l.offered) && receives(remote), receiving)
+    sync_remote(c, i, m, kind, receiving)
+}
+
+fn rollback_now(c: *Core) -> Error? {
+    if !c.offering {
+        return Error.WrongState
+    }
+    var kept: Line[] = []
+    for l in c.lines {
+        if l.negotiated {
+            kept.push(l)
+        } else if !l.data {
+            var w = l
+            w.mid = ""
+            kept.push(w)
+        }
+    }
+    c.lines = kept
+    c.offering = false
+    c.offered = 0
+    none
 }

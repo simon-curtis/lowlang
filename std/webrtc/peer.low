@@ -45,15 +45,25 @@ pub enum Event {
     GatheringComplete
     /// The connection state changed.
     StateChanged(state: State)
-    /// The remote description announced a track the remote peer sends.
+    /// A description announced a track the remote peer sends: a new media section, or a new synchronization source on one, which ends the track that section had.
     Track(track: RemoteTrack)
+    /// ICE selected a candidate pair: after the first checks, and again after each ICE restart.
+    Selected(local: ice.Candidate, remote: ice.Candidate)
+}
+
+/// Where the offer and answer exchange stands, as the W3C `RTCSignalingState` names it.
+pub enum Signaling {
+    /// No offer is outstanding: `create_offer` and `create_answer` may be called.
+    Stable
+    /// `create_offer` made an offer that awaits `apply_answer` or `rollback`.
+    HaveLocalOffer
 }
 
 /// Why a description or a candidate was not applied.
 pub enum Error {
     /// The peer has closed.
     Closed
-    /// The call does not fit the offer and answer exchange: an offer was already made or applied, or an answer arrived without an offer.
+    /// The call does not fit the offer and answer exchange: an offer is already outstanding, an answer or a rollback came without one, or a candidate came before any remote description.
     WrongState
     /// The remote description or candidate lacks something the peer needs or has a value it cannot use, named by `reason`.
     Invalid(reason: str)
@@ -122,18 +132,45 @@ pub struct RemoteTrack {
     pub packets: chan[rtp.Packet]
 }
 
+/// A media section as `transceivers` reports it, the W3C `RTCRtpTransceiver`.
+pub struct Transceiver {
+    /// The media section identifier, empty until an offer or an answer places the section.
+    pub mid: str
+    /// The media type: `audio`, `video` or `application` for data channels.
+    pub media: str
+    /// The direction the next offer or answer asks for, set by `set_direction`.
+    pub direction: sdp.Direction
+    /// The direction the last exchange agreed, `inactive` before one.
+    pub current: sdp.Direction
+    /// Whether the section was rejected or stopped; it keeps its place at port 0.
+    pub stopped: bool
+    /// The synchronization source of the local track the section sends, or 0 for none.
+    pub ssrc: i64
+}
+
 struct Local {
     kind: Kind
     ssrc: i64
     codecs: Codec[]
     track_id: str
-    mid: str
 }
 
-enum Phase {
-    Idle
-    Offered
-    Stable
+struct Line {
+    mid: str = ""
+    media: str
+    protocol: str
+    formats: str[]
+    data: bool = false
+    track: i64 = -1
+    used: bool = false
+    wanted: sdp.Direction = sdp.Direction.SendRecv
+    offered: sdp.Direction = sdp.Direction.Inactive
+    current: sdp.Direction = sdp.Direction.Inactive
+    codecs: Codec[] = []
+    remote: RemoteTrack? = none
+    negotiated: bool = false
+    stopping: bool = false
+    stopped: bool = false
 }
 
 enum Described {
@@ -153,8 +190,20 @@ enum Command {
     SendRtp(ssrc: i64, packet: rtp.Packet, reply: chan[io.Error?])
     SendRtcp(packets: rtp.Rtcp[], reply: chan[io.Error?])
     Negotiated(ssrc: i64, reply: chan[Codec[]])
+    RemoveTrack(ssrc: i64, reply: chan[bool])
+    SetDirection(mid: str, direction: sdp.Direction, reply: chan[Error?])
+    StopSection(mid: str, reply: chan[Error?])
+    RestartIce(reply: chan[bool])
+    Rollback(reply: chan[Error?])
+    Transceivers(reply: chan[Transceiver[]])
+    GetSignaling(reply: chan[Signaling])
     WaitConnected(reply: chan[State])
     Close
+}
+
+struct Opening {
+    options: datachannel.Options
+    reply: chan[Opened]
 }
 
 enum Opened {
@@ -185,7 +234,12 @@ struct Core {
     rtcp: chan[rtp.Rtcp[]]
     gone: chan[bool]
     stop: chan[bool]
-    phase: Phase
+    offering: bool
+    negotiated: bool
+    described: bool
+    offered: i64
+    next_mid: i64
+    restart_wanted: bool
     state: State
     waiters: chan[State][]
     session_id: str
@@ -195,6 +249,8 @@ struct Core {
     ice_incoming: chan[icesession.Datagram]
     ufrag: str
     pwd: str
+    remote_ufrag: str
+    remote_pwd: str
     dtls_client: bool
     remote_fingerprints: dtls.Fingerprint[]
     remote_candidates: [str: bool]
@@ -208,11 +264,14 @@ struct Core {
     dtls_in: chan[u8[]]
     dtls: dtlssession.Handle?
     dtls_events: chan[dtls.Event]
+    dtls_up: bool
     srtp: srtp.Pair?
     channel_peer: datachannel.Handle?
+    sctp_up: bool
+    opening: Opening[]
     sctp_events: chan[datachannel.Event]
-    locals: Local[]
-    remotes: RemoteTrack[]
+    tracks: Local[]
+    lines: Line[]
     by_ssrc: [i64: i64]
 }
 
@@ -258,7 +317,12 @@ pub fn open(config: Config) -> Peer ! io.Error {
         rtcp: chan[rtp.Rtcp[]](256)
         gone: chan[bool]()
         stop: chan[bool]()
-        phase: Phase.Idle
+        offering: false
+        negotiated: false
+        described: false
+        offered: 0
+        next_mid: 0
+        restart_wanted: false
         state: State.New
         waiters: []
         session_id: "{random_digits(18)}"
@@ -268,6 +332,8 @@ pub fn open(config: Config) -> Peer ! io.Error {
         ice_incoming: chan[icesession.Datagram]()
         ufrag: ""
         pwd: ""
+        remote_ufrag: ""
+        remote_pwd: ""
         dtls_client: false
         remote_fingerprints: []
         remote_candidates: [:]
@@ -281,11 +347,14 @@ pub fn open(config: Config) -> Peer ! io.Error {
         dtls_in: chan[u8[]](256)
         dtls: none
         dtls_events: chan[dtls.Event]()
+        dtls_up: false
         srtp: none
         channel_peer: none
+        sctp_up: false
+        opening: []
         sctp_events: chan[datachannel.Event]()
-        locals: []
-        remotes: []
+        tracks: []
+        lines: []
         by_ssrc: [:]
     })
     spawn run(core)
@@ -444,7 +513,21 @@ fn open_channels(c: *Core, link: dtlssession.Handle) {
     spawn forward_channels(h.incoming, c.channels)
 }
 
+fn stop_channels(c: *Core) {
+    c.data = false
+    end_channels(c)
+}
+
+fn end_channels(c: *Core) {
+    let h = c.channel_peer ?? return
+    datachannel.close_peer(h)
+    c.channel_peer = none
+    c.sctp_up = false
+    flush_opening(c)
+}
+
 fn on_dtls_connected(c: *Core, link: dtlssession.Handle) {
+    c.dtls_up = true
     let info = dtlssession.describe_session(link) or return
     if info.srtp_profile != 0 {
         let size = srtp.keying_material_size(info.srtp_profile) or 0
@@ -467,7 +550,8 @@ fn on_ice(c: *Core, e: ice.Event) {
     match e {
         LocalCandidate(candidate) => publish(c, Event.Candidate(candidate_value(c, candidate)))
         GatheringComplete => publish(c, Event.GatheringComplete)
-        Selected(_, _) => {
+        Selected(local, remote) => {
+            publish(c, Event.Selected(local, remote))
             if c.dtls == none {
                 let link = c.ice ?? return
                 open_dtls(c, link)
@@ -503,9 +587,18 @@ fn on_dtls(c: *Core, e: dtls.Event) {
 
 fn on_sctp(c: *Core, e: datachannel.Event) {
     match e {
-        Connected => set_state(c, State.Connected)
-        Failed(_) => set_state(c, State.Failed)
-        Closed => {}
+        Connected => {
+            c.sctp_up = true
+            flush_opening(c)
+            set_state(c, State.Connected)
+        }
+        Failed(_) => {
+            end_channels(c)
+            if c.data && !c.offering && !data_stopping(c) {
+                set_state(c, State.Failed)
+            }
+        }
+        Closed => end_channels(c)
     }
 }
 
@@ -532,8 +625,9 @@ fn receive_rtp(c: *Core, data: u8[]) {
         _ => return
     }
     let at = route(c, packet) ?? return
+    let t = c.lines[at].remote ?? return
     select {
-        c.remotes[at].packets <- packet => {}
+        t.packets <- packet => {}
         else => {}
     }
 }
@@ -566,7 +660,8 @@ fn route(c: *Core, p: rtp.Packet) -> i64? {
         some(at) => return at
         none => {}
     }
-    for i, t in c.remotes {
+    for i, l in c.lines {
+        let t = l.remote ?? continue
         if t.ssrc == 0 && carries(t, p.payload_type) {
             c.by_ssrc[p.ssrc] = i
             return i
@@ -575,7 +670,19 @@ fn route(c: *Core, p: rtp.Packet) -> i64? {
     none
 }
 
+fn sending(c: *Core, ssrc: i64) -> bool {
+    for l in c.lines {
+        if l.track >= 0 && c.tracks[l.track].ssrc == ssrc && !l.stopped {
+            return true
+        }
+    }
+    false
+}
+
 fn send_rtp_now(c: *Core, ssrc: i64, packet: rtp.Packet) -> io.Error? {
+    if !sending(c, ssrc) {
+        return io.Error.NotConnected
+    }
     let pair = c.srtp ?? return io.Error.NotConnected
     let link = c.ice ?? return io.Error.NotConnected
     var p = packet
@@ -615,24 +722,94 @@ fn open_channel_now(c: *Core, options: datachannel.Options) -> Opened {
     Opened.Ready(channel)
 }
 
+fn open_channel_later(c: *Core, options: datachannel.Options, reply: chan[Opened]) {
+    if c.channel_peer != none && !c.sctp_up {
+        c.opening.push(Opening { options, reply })
+        return
+    }
+    reply <- open_channel_now(c, options)
+}
+
+fn flush_opening(c: *Core) {
+    for o in c.opening {
+        o.reply <- open_channel_now(c, o.options)
+    }
+    c.opening = []
+}
+
 fn add_track_now(c: *Core, kind: Kind, codecs: Codec[]) -> Track {
     let ssrc = random_ssrc()
-    c.locals.push(Local { kind, ssrc, codecs, track_id: random_token(16), mid: "" })
+    c.tracks.push(Local { kind, ssrc, codecs, track_id: random_token(16) })
+    let t = c.tracks.len - 1
+    let reuse = reusable_line(c, kind)
+    if reuse < 0 {
+        c.lines.push(track_line(kind, t, codecs))
+    } else {
+        c.lines[reuse].track = t
+        c.lines[reuse].used = true
+        c.lines[reuse].wanted = with_send(c.lines[reuse].wanted)
+    }
     Track { kind, ssrc, core: c }
 }
 
-fn negotiated_codecs(c: *Core, ssrc: i64) -> Codec[] {
-    for l in c.locals {
+fn track_of(c: *Core, ssrc: i64) -> i64 {
+    for i, l in c.tracks {
         if l.ssrc == ssrc {
-            return l.codecs
+            return i
         }
     }
-    []
+    -1
+}
+
+fn negotiated_codecs(c: *Core, ssrc: i64) -> Codec[] {
+    let t = track_of(c, ssrc)
+    if t < 0 { [] } else { c.tracks[t].codecs }
+}
+
+fn remove_track_now(c: *Core, ssrc: i64) {
+    let t = track_of(c, ssrc)
+    if t < 0 {
+        return
+    }
+    for i, l in c.lines {
+        if l.track == t {
+            c.lines[i].track = -1
+            c.lines[i].wanted = without_send(l.wanted)
+            c.lines[i].stopping = l.stopping || l.mid.len == 0
+        }
+    }
+}
+
+fn set_direction_now(c: *Core, mid: str, d: sdp.Direction) -> Error? {
+    let i = line_of(c, mid)
+    if i < 0 || c.lines[i].data || c.lines[i].stopped {
+        return Error.Invalid("no audio or video section {mid}")
+    }
+    c.lines[i].wanted = d
+    none
+}
+
+fn stop_section_now(c: *Core, mid: str) -> Error? {
+    let i = line_of(c, mid)
+    if i < 0 {
+        return Error.Invalid("no section {mid}")
+    }
+    c.lines[i].stopping = !c.lines[i].stopped
+    none
+}
+
+fn transceivers_now(c: *Core) -> Transceiver[] {
+    var out: Transceiver[] = []
+    for l in c.lines {
+        let ssrc = if l.track >= 0 { c.tracks[l.track].ssrc } else { 0 }
+        out.push(Transceiver { mid: l.mid, media: l.media, direction: l.wanted, current: l.current, stopped: l.stopped, ssrc })
+    }
+    out
 }
 
 fn add_candidate_now(c: *Core, value: str) -> Error? {
     let link = c.ice ?? return Error.WrongState
-    if c.phase == Phase.Idle || c.phase == Phase.Offered {
+    if !c.described {
         return Error.WrongState
     }
     add_remote(c, link, value)
@@ -679,9 +856,7 @@ fn handle(c: *Core, command: Command) -> bool {
             reply <- end_candidates_now(c)
         }
         Resolved(value) => resolved_now(c, value)
-        OpenChannel(options, reply) => {
-            reply <- open_channel_now(c, options)
-        }
+        OpenChannel(options, reply) => open_channel_later(c, options, reply)
         SendRtp(ssrc, packet, reply) => {
             reply <- send_rtp_now(c, ssrc, packet)
         }
@@ -690,6 +865,29 @@ fn handle(c: *Core, command: Command) -> bool {
         }
         Negotiated(ssrc, reply) => {
             reply <- negotiated_codecs(c, ssrc)
+        }
+        RemoveTrack(ssrc, reply) => {
+            remove_track_now(c, ssrc)
+            reply <- true
+        }
+        SetDirection(mid, d, reply) => {
+            reply <- set_direction_now(c, mid, d)
+        }
+        StopSection(mid, reply) => {
+            reply <- stop_section_now(c, mid)
+        }
+        RestartIce(reply) => {
+            c.restart_wanted = true
+            reply <- true
+        }
+        Rollback(reply) => {
+            reply <- rollback_now(c)
+        }
+        Transceivers(reply) => {
+            reply <- transceivers_now(c)
+        }
+        GetSignaling(reply) => {
+            reply <- if c.offering { Signaling.HaveLocalOffer } else { Signaling.Stable }
         }
         WaitConnected(reply) => {
             if c.state == State.Connected || c.state == State.Failed || c.state == State.Closed {
@@ -777,8 +975,11 @@ fn finish(c: *Core) {
     }
     close(c.stop)
     set_state(c, State.Closed)
-    for t in c.remotes {
-        close(t.packets)
+    for l in c.lines {
+        match l.remote {
+            some(t) => close(t.packets)
+            none => {}
+        }
     }
     close(c.events)
     close(c.channels)
@@ -825,15 +1026,15 @@ fn applied(h: Handle, command: Command, reply: chan[Error?]) ! Error {
 
 /// Adds a local track of `kind` that sends with `codecs`, for the next `create_offer` or `create_answer` to describe.
 ///
-/// Fails with `NotConnected` once the peer has closed.
+/// The track takes the first audio or video section of its kind that a remote offer made and no track has sent on, which then asks to send as well; otherwise it gets a section of its own, which the next offer appends or the next remote offer's first new section of its kind takes. Fails with `NotConnected` once the peer has closed.
 pub fn add_track(h: Handle, kind: Kind, codecs: Codec[]) -> Track ! io.Error {
     let reply = chan[Track](1)
     ask(h.core, Command.AddTrack(kind, codecs, reply), reply)?
 }
 
-/// Creates an offer and makes it the local description: one media section per local track, then a data channel section when `Config.data_channels` is set, all in one BUNDLE group.
+/// Creates an offer and makes it the local description, which leaves the signalling state `HaveLocalOffer`: the negotiated media sections in their order and with their `mid`s, then one new section per local track without one, then a data channel section when `Config.data_channels` is set and no exchange has had one, all in one BUNDLE group.
 ///
-/// The ICE sockets open here and the peer is the controlling agent and offers `actpass`. The offer carries the host candidates; the others arrive as `Event.Candidate`. Fails with `WrongState` when an offer was already made or applied, with `Unavailable` when no socket could be opened and with `Closed` once the peer has closed.
+/// The first offer opens the ICE sockets, and the peer is the controlling agent; every offer says `actpass`. After `restart_ice` the offer carries new ICE credentials and gathers again. A stopped or rejected section keeps its place at port 0. The offer carries the candidates gathered so far; the others arrive as `Event.Candidate`. Fails with `WrongState` while an offer is outstanding, with `Unavailable` when no socket could be opened and with `Closed` once the peer has closed.
 pub fn create_offer(h: Handle) -> sdp.Session ! Error {
     let reply = chan[Described](1)
     described(h, Command.Offer(reply), reply)?
@@ -841,15 +1042,15 @@ pub fn create_offer(h: Handle) -> sdp.Session ! Error {
 
 /// Applies `offer` as the remote description and returns the answer, which becomes the local description.
 ///
-/// The ICE sockets open here and the peer is the controlled agent. The answer takes the DTLS client role unless the offer said `active`, accepts the first data channel section when `Config.data_channels` is set, and answers each audio and video section with the first unused local track of its kind, keeping the payload types of the offered codecs that share a name and clock rate with the track's. A section the peer cannot use is rejected with port 0. Fails with `Invalid` for an offer without ICE credentials or a fingerprint, with `WrongState` after another offer, and as `create_offer` does.
+/// The first exchange opens the ICE sockets when no offer did, and the peer is the controlled agent; the answer takes the DTLS client role unless the offer said `active`, and later answers keep the role. The answer accepts one data channel section when `Config.data_channels` is set and gives each new audio or video section the first local track of its kind without a section that shares a codec, keeping the payload types of the offered codecs that share a name and clock rate with the track's. Each section sends when its track and its direction let it and the remote receives, and receives when its direction lets it and the remote sends. An offer whose ICE credentials changed restarts ICE here too. A section the peer cannot use, and one stopped with `stop_section`, is rejected with port 0. Fails with `Invalid` for an offer without ICE credentials or a fingerprint, with a changed fingerprint once DTLS is up, or whose sections do not start with the negotiated `mid`s in their order, with `WrongState` while this peer's own offer is outstanding (call `rollback` first), and as `create_offer` does.
 pub fn create_answer(h: Handle, offer: sdp.Session) -> sdp.Session ! Error {
     let reply = chan[Described](1)
     described(h, Command.Answer(offer, reply), reply)?
 }
 
-/// Applies `answer` as the remote description of the offer `create_offer` made.
+/// Applies `answer` as the remote description of the offer `create_offer` made, which returns the signalling state to `Stable`.
 ///
-/// Fails with `WrongState` when no offer is outstanding and with `Invalid` for an answer whose sections do not match the offer or that lacks ICE credentials or a fingerprint.
+/// Fails with `WrongState` when no offer is outstanding and with `Invalid` for an answer whose sections or `mid`s do not match the offer, that lacks ICE credentials or a fingerprint, or whose fingerprint changed once DTLS is up.
 pub fn apply_answer(h: Handle, answer: sdp.Session) ! Error {
     let reply = chan[Error?](1)
     applied(h, Command.Accept(answer, reply), reply)?
@@ -857,7 +1058,7 @@ pub fn apply_answer(h: Handle, answer: sdp.Session) ! Error {
 
 /// Adds a remote candidate that arrived by trickle, the value of an `a=candidate` attribute with or without the `candidate:` prefix.
 ///
-/// A candidate whose address is a `.local` name is added once mDNS resolves the name, and dropped when no answer comes within 5 seconds; a TCP candidate, another host name and a candidate of component 2 are skipped. Fails with `WrongState` before the remote description is applied and with `Invalid` for a value that is not a candidate.
+/// A candidate whose address is a `.local` name is added once mDNS resolves the name, and dropped when no answer comes within 5 seconds; a TCP candidate, another host name and a candidate of component 2 are skipped. Fails with `WrongState` before a remote description is applied and with `Invalid` for a value that is not a candidate.
 pub fn add_remote_candidate(h: Handle, value: str) ! Error {
     let reply = chan[Error?](1)
     applied(h, Command.AddCandidate(value, reply), reply)?
@@ -888,7 +1089,7 @@ pub fn wait_connected(h: Handle) ! io.Error {
 
 /// Opens a data channel with `options` over the negotiated SCTP association.
 ///
-/// Fails with `NotConnected` before the state is `Connected`, when no data channel section was negotiated and once the peer has closed, and as `datachannel.open_channel` does.
+/// Waits while the association of a negotiated data channel section is still connecting, as after a later exchange adds the section. Fails with `NotConnected` before DTLS is up, when no data channel section was negotiated or its association ended, and once the peer has closed, and as `datachannel.open_channel` does.
 pub fn create_data_channel(h: Handle, options: datachannel.Options) -> datachannel.Channel ! io.Error {
     let reply = chan[Opened](1)
     let answer = ask(h.core, Command.OpenChannel(options, reply), reply)?
@@ -908,7 +1109,7 @@ pub fn codecs(t: Track) -> Codec[] ! io.Error {
 
 /// Encrypts `packet` with SRTP and sends it on the selected ICE pair, with the track's synchronization source in place of `packet.ssrc`.
 ///
-/// Fails with `NotConnected` before DTLS has produced the SRTP keys and once the peer has closed, with `Invalid` when the packet does not encode or SRTP refuses it, and with the error of the socket.
+/// Fails with `NotConnected` before DTLS has produced the SRTP keys, after `remove_track`, when the track's section is stopped and once the peer has closed, with `Invalid` when the packet does not encode or SRTP refuses it, and with the error of the socket.
 pub fn send_rtp(t: Track, packet: rtp.Packet) ! io.Error {
     let reply = chan[io.Error?](1)
     let failure = ask(t.core, Command.SendRtp(t.ssrc, packet, reply), reply)?
@@ -926,6 +1127,62 @@ pub fn send_rtcp(h: Handle, packets: rtp.Rtcp[]) ! io.Error {
         some(e) => fail e
         none => {}
     }
+}
+
+/// Stops `t` sending: its section stops asking to send, `sendrecv` becoming `recvonly` and `sendonly` becoming `inactive`, from the next exchange, and `send_rtp` on it fails from now on.
+///
+/// The section keeps its `mid`, and a later `add_track` does not reuse it. Fails with `NotConnected` once the peer has closed.
+pub fn remove_track(t: Track) ! io.Error {
+    let reply = chan[bool](1)
+    ask(t.core, Command.RemoveTrack(t.ssrc, reply), reply)?
+}
+
+/// Sets the direction the audio or video section `mid` asks for from the next exchange, the W3C `RTCRtpTransceiver.direction`; a section without a track never offers to send.
+///
+/// Fails with `Invalid` for a `mid` no audio or video section has and for a stopped section, and with `Closed` once the peer has closed.
+pub fn set_direction(h: Handle, mid: str, direction: sdp.Direction) ! Error {
+    let reply = chan[Error?](1)
+    applied(h, Command.SetDirection(mid, direction, reply), reply)?
+}
+
+/// Stops the section `mid`: the next offer or answer rejects it with port 0, after which its remote track ends, a data channel section closes its association, and the section keeps its place.
+///
+/// Fails with `Invalid` for a `mid` no section has and with `Closed` once the peer has closed.
+pub fn stop_section(h: Handle, mid: str) ! Error {
+    let reply = chan[Error?](1)
+    applied(h, Command.StopSection(mid, reply), reply)?
+}
+
+/// Asks the next `create_offer` to restart ICE (RFC 8445 section 9): the peer takes new credentials, forgets the remote candidates and gathers again, and the selected pair carries DTLS, SRTP and SCTP until the new checks select one, reported by `Event.Selected`.
+///
+/// A `rollback` of that offer keeps the new credentials, so the next answer or offer carries them. Fails with `NotConnected` once the peer has closed.
+pub fn restart_ice(h: Handle) ! io.Error {
+    let reply = chan[bool](1)
+    ask(h.core, Command.RestartIce(reply), reply)?
+}
+
+/// Discards the outstanding local offer and returns the signalling state to `Stable`, so the peer can answer a remote offer that crossed it (glare).
+///
+/// Sections the offer added lose their `mid`s and a data channel section it added goes. Fails with `WrongState` when no offer is outstanding and with `Closed` once the peer has closed.
+pub fn rollback(h: Handle) ! Error {
+    let reply = chan[Error?](1)
+    applied(h, Command.Rollback(reply), reply)?
+}
+
+/// Returns the media sections in their order, the negotiated ones first.
+///
+/// Fails with `NotConnected` once the peer has closed.
+pub fn transceivers(h: Handle) -> Transceiver[] ! io.Error {
+    let reply = chan[Transceiver[]](1)
+    ask(h.core, Command.Transceivers(reply), reply)?
+}
+
+/// Returns the signalling state.
+///
+/// Fails with `NotConnected` once the peer has closed.
+pub fn signaling(h: Handle) -> Signaling ! io.Error {
+    let reply = chan[Signaling](1)
+    ask(h.core, Command.GetSignaling(reply), reply)?
 }
 
 /// Closes the peer: the data channels, the SCTP association, DTLS with `close_notify` and the ICE sockets, in that order.
