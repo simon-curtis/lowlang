@@ -396,6 +396,18 @@ rt_has_context:
 	movzx eax, al
 	ret
 
+	.globl rt_os_error
+rt_os_error:
+	TLS_GET rax, TLS_G
+	mov rax, [rax+G_OSERR]
+	ret
+
+	.globl rt_set_os_error
+rt_set_os_error:
+	TLS_GET rax, TLS_G
+	mov [rax+G_OSERR], rdi
+	ret
+
 	.globl rt_lock_thread
 rt_lock_thread:
 	TLS_GET rax, TLS_G
@@ -1005,6 +1017,7 @@ rt_spawn_start:
 	mov qword ptr [rbx+G_LOCK], 0
 	mov qword ptr [rbx+G_LOCKEDM], 0
 	mov qword ptr [rbx+G_REGION], 0
+	mov qword ptr [rbx+G_OSERR], 0
 	TLS_GET rax, TLS_G
 	test rax, rax
 	jz 1f
@@ -1053,6 +1066,7 @@ rt_spawn_main:
 	mov [rbx+G_SCANLO], rax
 	mov qword ptr [rbx+G_CTX], 0
 	mov qword ptr [rbx+G_REGION], 0
+	mov qword ptr [rbx+G_OSERR], 0
 	mov qword ptr [rbx+G_STATUS], G_RUNNABLE
 	mov rdi, rbx
 	call rt_gq_put
