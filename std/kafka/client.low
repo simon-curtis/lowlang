@@ -1,0 +1,490 @@
+import std/sync
+import std/text
+import std/time
+import std/tls
+
+/// The timestamp for `list_offsets` that asks for the first offset of a partition.
+pub const earliest = -2
+
+/// The timestamp for `list_offsets` that asks for the offset after the last record of a partition.
+pub const latest = -1
+
+/// Settings for `connect`.
+///
+/// Every field has a default, so `Options {}` connects to a broker on `127.0.0.1:9092` without TLS or authentication.
+pub struct Options {
+    /// The bootstrap brokers as `host:port`, tried in order. The cluster's other brokers come from the metadata, so one reachable address is enough. Defaults to `["127.0.0.1:9092"]`.
+    pub brokers: str[] = ["127.0.0.1:9092"]
+    /// The client id the brokers log and use for quotas. Defaults to `"low"`.
+    pub client_id: str = "low"
+    /// TLS settings for every broker connection, or `none` for plain TCP. An empty `server_name` becomes the broker's host.
+    pub tls: tls.Config? = none
+    /// The SASL mechanism and credentials, or `none`.
+    pub sasl: Mechanism? = none
+    /// The time limit in milliseconds to dial a broker. Defaults to `10000`.
+    pub connect_timeout: i64 = 10000
+    /// The time limit in milliseconds for one request, and for each write. Defaults to `30000`.
+    pub timeout: i64 = 30000
+    /// How many times a request is repeated after a retriable error, such as a leader change or a connection lost. Defaults to `5`.
+    pub retries: i64 = 5
+    /// The pause in milliseconds between attempts, multiplied by the attempt number. Defaults to `200`.
+    pub retry_backoff: i64 = 200
+    /// The largest response in bytes the client accepts; a larger one ends the connection with `TooLarge`. Defaults to `134217728`.
+    pub max_response: i64 = 134217728
+}
+
+struct State {
+    o: Options
+    gate: sync.Mutex
+    conns: [str: *Conn]
+    nodes: [i64: Node]
+    topics: [str: Topic]
+    spread: i64
+    closed: bool
+}
+
+/// A connection to a Kafka cluster: bootstrap addresses, the cluster metadata and one connection per broker.
+///
+/// A `Client` is safe to share between green threads. Requests to one broker run one at a time.
+pub struct Client {
+    state: *State
+}
+
+fn split_address(addr: str) -> Node ! Error {
+    let at = text.last_index_byte(addr, ':')
+    if at <= 0 {
+        fail Argument
+    }
+    let port = text.parse_int(addr[at + 1..]) or fail Argument
+    if port < 1 || port > 65535 {
+        fail Argument
+    }
+    Node { id: -1, host: addr[..at], port }
+}
+
+fn check_options(o: Options) ! Error {
+    if o.brokers.len == 0 || o.timeout < 1 || o.connect_timeout < 0 || o.retries < 0 || o.retry_backoff < 0 || o.max_response < 4 {
+        fail Argument
+    }
+    for addr in o.brokers {
+        split_address(addr)?
+    }
+}
+
+/// Connects to the first bootstrap broker that answers, negotiates the API versions and loads the cluster's broker list.
+///
+/// With `o.sasl` set, authenticates every connection. Fails with `Argument` for an option out of range, `Connect`, `Timeout` or `Tls` when no bootstrap broker can be reached, `Auth` when the broker refuses the credentials, and `Unsupported` when the broker offers no version of the ApiVersions request the client speaks or does not offer the SASL mechanism.
+pub fn connect(o: Options) -> Client ! Error {
+    check_options(o)?
+    let s = new(State { o, gate: sync.mutex(), conns: [:], nodes: [:], topics: [:], spread: 0, closed: false })
+    var last = Error.Connect
+    for addr in o.brokers {
+        let node = split_address(addr)?
+        let c = open(o, node.host, node.port) catch {
+            e => {
+                last = e
+                continue
+            }
+        }
+        s.conns[addr] = c
+        refresh(s, none, false) catch {
+            e => {
+                close_all(s)
+                fail e
+            }
+        }
+        return Client { state: s }
+    }
+    fail last
+}
+
+fn close_all(s: *State) {
+    sync.lock(s.gate)
+    defer sync.unlock(s.gate)
+    s.closed = true
+    for key, c in s.conns {
+        close_conn(c)
+    }
+    s.conns = [:]
+}
+
+/// Closes every connection. A call after `close` fails with `Closed`. Closing twice is harmless.
+pub fn close(c: Client) {
+    close_all(c.state)
+}
+
+fn is_closed(s: *State) -> bool {
+    sync.lock(s.gate)
+    defer sync.unlock(s.gate)
+    s.closed
+}
+
+fn live(s: *State, key: str) -> *Conn? {
+    match s.conns[key] {
+        some(c) => {
+            if !c.closed {
+                return some(c)
+            }
+            s.conns.delete(key)
+        }
+        none => {}
+    }
+    none
+}
+
+fn connection_to(s: *State, host: str, port: i64) -> *Conn ! Error {
+    sync.lock(s.gate)
+    defer sync.unlock(s.gate)
+    if s.closed {
+        fail Closed
+    }
+    let key = "{host}:{port}"
+    match live(s, key) {
+        some(c) => return c
+        none => {}
+    }
+    let c = open(s.o, host, port)?
+    s.conns[key] = c
+    c
+}
+
+fn connection_to_node(s: *State, id: i64) -> *Conn ! Error {
+    sync.lock(s.gate)
+    let known = s.nodes[id]
+    sync.unlock(s.gate)
+    match known {
+        some(node) => connection_to(s, node.host, node.port)?
+        none => fail Protocol
+    }
+}
+
+fn open_connection(s: *State) -> *Conn? {
+    sync.lock(s.gate)
+    defer sync.unlock(s.gate)
+    var keys: str[] = []
+    for key in s.conns {
+        keys.push(key)
+    }
+    for key in keys {
+        match live(s, key) {
+            some(c) => return some(c)
+            none => {}
+        }
+    }
+    none
+}
+
+fn known_addresses(s: *State) -> Node[] {
+    sync.lock(s.gate)
+    defer sync.unlock(s.gate)
+    var out: Node[] = []
+    for id, node in s.nodes {
+        out.push(node)
+    }
+    out
+}
+
+fn any_connection(s: *State) -> *Conn ! Error {
+    if is_closed(s) {
+        fail Closed
+    }
+    match open_connection(s) {
+        some(c) => return c
+        none => {}
+    }
+    var last = Error.Connect
+    var candidates = known_addresses(s)
+    for addr in s.o.brokers {
+        candidates.push(split_address(addr)?)
+    }
+    for node in candidates {
+        return connection_to(s, node.host, node.port) catch {
+            e => {
+                last = e
+                continue
+            }
+        }
+    }
+    fail last
+}
+
+fn refresh(s: *State, names: str[]?, create: bool) -> Topic[] ! Error {
+    let c = any_connection(s)?
+    let got = api_metadata_request(c, names, create)?
+    sync.lock(s.gate)
+    defer sync.unlock(s.gate)
+    for n in got.nodes {
+        s.nodes[n.id] = n
+    }
+    for t in got.topics {
+        if t.error == 0 {
+            s.topics[t.name] = t
+        } else {
+            s.topics.delete(t.name)
+        }
+    }
+    got.topics
+}
+
+/// Returns the metadata of `names`, or of every topic when it is empty.
+///
+/// The metadata of a topic that does not exist has `error` `3`, `UNKNOWN_TOPIC_OR_PARTITION`; the call does not create it. The call refreshes the partition leaders the client routes by.
+pub fn metadata(c: Client, names: str[]) -> Topic[] ! Error {
+    if names.len == 0 {
+        return refresh(c.state, none, false)
+    }
+    refresh(c.state, some(names), false)
+}
+
+/// Returns the names of the topics in the cluster, including the internal ones.
+pub fn list_topics(c: Client) -> str[] ! Error {
+    var names: str[] = []
+    for t in refresh(c.state, none, false)? {
+        names.push(t.name)
+    }
+    names
+}
+
+/// Creates `name` with `partitions` partitions and `replication` replicas, with the topic `configs`, such as `["cleanup.policy": "compact"]`.
+///
+/// Fails with `Broker` code `36` when the topic exists, `37` for a partition count below `1` and `38` for a replication factor the cluster cannot hold.
+pub fn create_topic(c: Client, name: str, partitions: i64, replication: i64, configs: [str: str]) ! Error {
+    if name.len == 0 || partitions < 1 || replication < 1 {
+        fail Argument
+    }
+    let conn = any_connection(c.state)?
+    check(api_create_topic_request(conn, name, partitions, replication, configs)?)?
+}
+
+/// Deletes the topic `name`.
+pub fn delete_topic(c: Client, name: str) ! Error {
+    if name.len == 0 {
+        fail Argument
+    }
+    let conn = any_connection(c.state)?
+    check(api_delete_topic_request(conn, name)?)?
+    forget(c.state, name)
+}
+
+fn retriable_code(code: i64) -> bool {
+    match code {
+        3 => true
+        5 => true
+        6 => true
+        8 => true
+        9 => true
+        13 => true
+        14 => true
+        15 => true
+        16 => true
+        74 => true
+        75 => true
+        _ => false
+    }
+}
+
+fn retriable(s: *State, e: Error) -> bool {
+    match e {
+        Broker(code, name) => retriable_code(code)
+        Closed => !is_closed(s)
+        Connect => true
+        Timeout => true
+        _ => false
+    }
+}
+
+fn pause(o: Options, attempt: i64) {
+    sleep(o.retry_backoff * (attempt + 1))
+}
+
+fn forget(s: *State, topic: str) {
+    sync.lock(s.gate)
+    s.topics.delete(topic)
+    sync.unlock(s.gate)
+}
+
+fn retried[T](s: *State, topic: str, attempt: fn() -> T ! Error) -> T ! Error {
+    var tries = 0
+    for {
+        return attempt() catch {
+            e => {
+                if tries >= s.o.retries || !retriable(s, e) {
+                    fail e
+                }
+                forget(s, topic)
+                pause(s.o, tries)
+                tries += 1
+                continue
+            }
+        }
+    }
+}
+
+fn cached_topic(s: *State, topic: str) -> Topic? {
+    sync.lock(s.gate)
+    defer sync.unlock(s.gate)
+    s.topics[topic]
+}
+
+fn known_topic(s: *State, topic: str, create: bool) -> Topic ! Error {
+    match cached_topic(s, topic) {
+        some(t) => return t
+        none => {}
+    }
+    for t in refresh(s, some([topic]), create)? {
+        if t.name == topic {
+            check(t.error)?
+            return t
+        }
+    }
+    fail broker_error(3)
+}
+
+fn partition_leader(s: *State, topic: str, partition: i64, create: bool) -> i64 ! Error {
+    let known = known_topic(s, topic, create)?
+    for p in known.partitions {
+        if p.id == partition {
+            if p.leader < 0 {
+                fail broker_error(5)
+            }
+            return p.leader
+        }
+    }
+    fail broker_error(3)
+}
+
+fn leader_connection(s: *State, topic: str, partition: i64, create: bool) -> *Conn ! Error {
+    let id = partition_leader(s, topic, partition, create)?
+    connection_to_node(s, id) catch {
+        e => {
+            forget(s, topic)
+            fail e
+        }
+    }
+}
+
+/// How a `produce` call is acknowledged and packed.
+pub struct ProduceOptions {
+    /// How many replicas must have the batch before the broker answers: `-1` for all in-sync replicas, `1` for the leader, `0` for none, which returns before the broker has seen the batch and reports offset `-1`. Defaults to `-1`.
+    pub acks: i64 = -1
+    /// The compression of the batch. Defaults to `Compression.None`.
+    pub compression: Compression = Compression.None
+    /// The time in milliseconds the broker may wait for the replicas. Defaults to `30000`.
+    pub timeout: i64 = 30000
+}
+
+/// Appends `records` to `partition` of `topic` as one batch and returns the offset of the first record, or `-1` with `acks` `0`.
+///
+/// A topic that does not exist is created when the broker allows it (`auto.create.topics.enable`).
+/// Records with `timestamp` `0` take the current time. Retries a leader change, a lost connection and the other retriable errors up to `Options.retries` times after refreshing the metadata. A batch whose answer is lost to a timeout or a closed connection may have been appended, so a retry can append it twice. Fails with `Argument` for an empty batch, a negative partition or an empty topic, `TooLarge` when the batch exceeds a limit, and `Broker` for the broker's refusal, such as `10` `MESSAGE_TOO_LARGE`, `29` `TOPIC_AUTHORIZATION_FAILED` or `3` `UNKNOWN_TOPIC_OR_PARTITION`.
+pub fn produce(c: Client, topic: str, partition: i64, records: Record[], o: ProduceOptions) -> i64 ! Error {
+    if topic.len == 0 || partition < 0 || records.len == 0 {
+        fail Argument
+    }
+    let batch = encode_batch(records, o.compression, time.now_millis())?
+    retried(c.state, topic, fn() -> i64 ! Error { produce_once(c.state, topic, partition, batch, o) })
+}
+
+fn produce_once(s: *State, topic: str, partition: i64, batch: u8[], o: ProduceOptions) -> i64 ! Error {
+    let conn = leader_connection(s, topic, partition, true)?
+    let got = api_produce_request(conn, topic, partition, batch, o.acks, o.timeout)?
+    check(got.error)?
+    got.base_offset
+}
+
+/// Where `send` put a record.
+pub struct Sent {
+    /// The partition the record went to.
+    pub partition: i64
+    /// The offset of the record, or `-1` with `acks` `0`.
+    pub offset: i64
+}
+
+/// Appends one record to the partition `partition_for` picks from its key, or to the partitions in turn when it has none.
+///
+/// Records with the same key reach the same partition for as long as the topic keeps its partition count, with the placement of the Java client. Fails and retries as `produce` does.
+pub fn send(c: Client, topic: str, record: Record, o: ProduceOptions) -> Sent ! Error {
+    if topic.len == 0 {
+        fail Argument
+    }
+    let known = retried(c.state, topic, fn() -> Topic ! Error { known_topic(c.state, topic, true) })?
+    let partition = choose_partition(c.state, known, record)
+    let offset = produce(c, topic, partition, [record], o)?
+    Sent { partition, offset }
+}
+
+fn choose_partition(s: *State, t: Topic, record: Record) -> i64 {
+    match record.key {
+        some(key) => t.partitions[partition_for(key, t.partitions.len)].id
+        none => {
+            sync.lock(s.gate)
+            let turn = s.spread
+            s.spread += 1
+            sync.unlock(s.gate)
+            t.partitions[turn % t.partitions.len].id
+        }
+    }
+}
+
+/// Settings for one `fetch`.
+pub struct FetchOptions {
+    /// How long in milliseconds the broker waits for `min_bytes` before it answers with what it has. Defaults to `500`.
+    pub max_wait: i64 = 500
+    /// The amount of data in bytes that ends the wait. Defaults to `1`.
+    pub min_bytes: i64 = 1
+    /// The most bytes of records the response may hold. Defaults to `52428800`.
+    pub max_bytes: i64 = 52428800
+    /// The most bytes of records for the partition. The broker returns the first batch whole even when it is larger. Defaults to `1048576`.
+    pub partition_bytes: i64 = 1048576
+}
+
+/// What `fetch` returns.
+pub struct FetchResult {
+    /// The records from the requested offset on.
+    pub records: Record[]
+    /// The offset after the last record the broker has replicated.
+    pub high_watermark: i64
+    /// The first offset the partition still holds.
+    pub log_start_offset: i64
+    /// The offset to fetch next. It is above the last record when the response ends in a transaction marker or a batch removed by compaction, and equals the requested offset when the response holds nothing.
+    pub next_offset: i64
+}
+
+/// Reads records of `partition` of `topic` from `offset` on.
+///
+/// Waits up to `o.max_wait` milliseconds for data, then returns what the broker has, possibly no records. Reads every record, including those of transactions that are open or aborted. Fails with `Broker` code `1`, `OFFSET_OUT_OF_RANGE`, when `offset` is outside the partition, and retries leader changes as `produce` does.
+pub fn fetch(c: Client, topic: str, partition: i64, offset: i64, o: FetchOptions) -> FetchResult ! Error {
+    if topic.len == 0 || partition < 0 || offset < 0 {
+        fail Argument
+    }
+    retried(c.state, topic, fn() -> FetchResult ! Error { fetch_once(c.state, topic, partition, offset, o) })
+}
+
+fn fetch_once(s: *State, topic: str, partition: i64, offset: i64, o: FetchOptions) -> FetchResult ! Error {
+    let conn = leader_connection(s, topic, partition, false)?
+    let got = api_fetch_request(conn, topic, partition, offset, o.max_wait, o.min_bytes, o.max_bytes, o.partition_bytes)?
+    check(got.error)?
+    let decoded = decode_fetched(got.data, offset)?
+    var next = offset
+    if decoded.next_offset > next {
+        next = decoded.next_offset
+    }
+    FetchResult { records: decoded.records, high_watermark: got.high_watermark, log_start_offset: got.log_start_offset, next_offset: next }
+}
+
+/// Returns the offset of `partition` of `topic` for `timestamp`: the first offset whose record is at or after the time in milliseconds, or `earliest` or `latest` for the ends of the partition.
+///
+/// Returns `-1` when no record is that recent. Retries as `fetch` does.
+pub fn list_offsets(c: Client, topic: str, partition: i64, timestamp: i64) -> i64 ! Error {
+    if topic.len == 0 || partition < 0 {
+        fail Argument
+    }
+    retried(c.state, topic, fn() -> i64 ! Error { list_offsets_once(c.state, topic, partition, timestamp) })
+}
+
+fn list_offsets_once(s: *State, topic: str, partition: i64, timestamp: i64) -> i64 ! Error {
+    let conn = leader_connection(s, topic, partition, false)?
+    let got = api_list_offsets_request(conn, topic, partition, timestamp)?
+    check(got.error)?
+    got.offset
+}

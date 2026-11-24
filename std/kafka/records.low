@@ -1,0 +1,331 @@
+import std/compress/deflate
+import std/compress/lz4
+import std/compress/snappy
+import std/compress/zstd
+import std/hash
+import std/io
+
+const decompressed_limit = 268435456
+const snappy_block = 32768
+const lz4_block = 65536
+
+/// A header of a record: a name and a value.
+pub struct Header {
+    /// The header name.
+    pub key: str
+    /// The header value, which may be empty.
+    pub value: u8[]
+}
+
+/// A Kafka record: the unit `produce` sends and `fetch` returns.
+pub struct Record {
+    /// The offset in the partition. Ignored when producing, because the broker assigns it.
+    pub offset: i64 = 0
+    /// The timestamp in milliseconds since the Unix epoch. `0` when producing means the time of the call.
+    pub timestamp: i64 = 0
+    /// The key, or `none` for a record without one. The key picks the partition of a producer and is the identity of a record in a compacted topic.
+    pub key: u8[]? = none
+    /// The value, or `none` for a tombstone.
+    pub value: u8[]? = none
+    /// The headers, in order.
+    pub headers: Header[] = []
+}
+
+/// The compression of a record batch.
+pub enum Compression {
+    /// No compression.
+    None
+    /// gzip, from `std/compress/deflate`.
+    Gzip
+    /// Snappy in the framing of the Java client, which Kafka brokers and every client read, from `std/compress/snappy`.
+    Snappy
+    /// The LZ4 frame format with independent 64 KiB blocks, which Kafka brokers require, from `std/compress/lz4`.
+    Lz4
+    /// Zstandard, from `std/compress/zstd`.
+    Zstd
+}
+
+fn compression_bits(c: Compression) -> i64 {
+    match c {
+        None => 0
+        Gzip => 1
+        Snappy => 2
+        Lz4 => 3
+        Zstd => 4
+    }
+}
+
+fn io_error(e: io.Error) -> Error {
+    match e {
+        TooLarge => TooLarge
+        _ => Malformed
+    }
+}
+
+fn snappy_pack(data: u8[]) -> u8[] {
+    var out: u8[] = [0x82, 0x53, 0x4E, 0x41, 0x50, 0x50, 0x59, 0]
+    put_i32(mut out, 1)
+    put_i32(mut out, 1)
+    var at = 0
+    for at < data.len {
+        let end = if at + snappy_block < data.len { at + snappy_block } else { data.len }
+        let block = snappy.compress_block(data[at..end])
+        put_i32(mut out, block.len)
+        io.append(mut out, block)
+        at = end
+    }
+    out
+}
+
+fn snappy_unpack(data: u8[]) -> u8[] ! Error {
+    let magic: u8[] = [0x82, 0x53, 0x4E, 0x41, 0x50, 0x50, 0x59, 0]
+    if data.len < 16 || str(data[..8]) != str(magic) {
+        return snappy.decompress_block(data, decompressed_limit) catch io_error
+    }
+    let c = cursor(data[16..])
+    var out: u8[] = []
+    for left(c) > 0 {
+        let n = take_i32(c)?
+        let block = take(c, n)?
+        io.append(mut out, snappy.decompress_block(block, decompressed_limit - out.len) catch io_error)
+    }
+    out
+}
+
+fn lz4_pack(data: u8[]) -> u8[] {
+    let descriptor: u8[] = [0x60, 0x40]
+    var out: u8[] = [0x04, 0x22, 0x4D, 0x18, 0x60, 0x40, u8((hash.xxh32(descriptor, 0) >> 8) & 0xFF)]
+    var at = 0
+    for at < data.len {
+        let end = if at + lz4_block < data.len { at + lz4_block } else { data.len }
+        let block = lz4.block_compress(data[at..end], 1)
+        if block.len < end - at {
+            io.put_le32(mut out, block.len)
+            io.append(mut out, block)
+        } else {
+            io.put_le32(mut out, (end - at) | 0x80000000)
+            io.append(mut out, data[at..end])
+        }
+        at = end
+    }
+    io.put_le32(mut out, 0)
+    out
+}
+
+fn compress(c: Compression, data: u8[]) -> u8[] {
+    match c {
+        None => data
+        Gzip => deflate.gzip_compress(data, 6)
+        Snappy => snappy_pack(data)
+        Lz4 => lz4_pack(data)
+        Zstd => zstd.compress(data, 3)
+    }
+}
+
+fn decompress(bits: i64, data: u8[]) -> u8[] ! Error {
+    match bits {
+        0 => data
+        1 => deflate.gzip_decompress(data, decompressed_limit) catch io_error
+        2 => snappy_unpack(data)?
+        3 => lz4.decompress(data, decompressed_limit) catch io_error
+        4 => zstd.decompress(data, decompressed_limit) catch io_error
+        _ => fail Unsupported
+    }
+}
+
+fn put_optional(mut b: u8[], v: u8[]?) {
+    match v {
+        some(data) => {
+            put_varlong(mut b, data.len)
+            io.append(mut b, data)
+        }
+        none => put_varlong(mut b, -1)
+    }
+}
+
+fn encode_record(r: Record, index: i64, base_timestamp: i64) -> u8[] {
+    var body: u8[] = [0]
+    put_varlong(mut body, r.timestamp - base_timestamp)
+    put_varlong(mut body, index)
+    put_optional(mut body, r.key)
+    put_optional(mut body, r.value)
+    put_varlong(mut body, r.headers.len)
+    for h in r.headers {
+        put_varlong(mut body, h.key.len)
+        io.append(mut body, bytes(h.key))
+        put_varlong(mut body, h.value.len)
+        io.append(mut body, h.value)
+    }
+    var out: u8[] = []
+    put_varlong(mut out, body.len)
+    io.append(mut out, body)
+    out
+}
+
+fn checksum(data: u8[]) -> i64 {
+    let c = hash.crc32c_new()
+    hash.crc32_update(c, data)
+    i64(hash.crc32_sum(c))
+}
+
+/// Encodes `records` as one record batch of format 2, compressed with `compression`, for a broker to append.
+///
+/// Offsets are written as `0` to `n - 1` and replaced by the broker. A record whose `timestamp` is `0` is stamped with `now`, in milliseconds. The batch carries no producer id, epoch or sequence. Fails with `Argument` when `records` is empty and `TooLarge` when the batch exceeds `2^31` bytes.
+pub fn encode_batch(records: Record[], compression: Compression, now: i64) -> u8[] ! Error {
+    if records.len == 0 {
+        fail Argument
+    }
+    var stamped: Record[] = []
+    var first = 0
+    var newest = 0
+    for i, r in records {
+        var copy = r
+        if copy.timestamp == 0 {
+            copy.timestamp = now
+        }
+        if i == 0 {
+            first = copy.timestamp
+        }
+        if copy.timestamp > newest {
+            newest = copy.timestamp
+        }
+        stamped.push(copy)
+    }
+    var section: u8[] = []
+    for i, r in stamped {
+        io.append(mut section, encode_record(r, i, first))
+    }
+    let packed = compress(compression, section)
+    var tail: u8[] = []
+    put_i16(mut tail, compression_bits(compression))
+    put_i32(mut tail, records.len - 1)
+    put_i64(mut tail, first)
+    put_i64(mut tail, newest)
+    put_i64(mut tail, -1)
+    put_i16(mut tail, -1)
+    put_i32(mut tail, -1)
+    put_i32(mut tail, records.len)
+    io.append(mut tail, packed)
+    if tail.len + 9 > 2147483647 {
+        fail TooLarge
+    }
+    var out: u8[] = []
+    put_i64(mut out, 0)
+    put_i32(mut out, tail.len + 9)
+    put_i32(mut out, -1)
+    put_i8(mut out, 2)
+    put_i32(mut out, checksum(tail))
+    io.append(mut out, tail)
+    out
+}
+
+fn take_optional(c: *Cursor) -> u8[]? ! Error {
+    let n = take_varint(c)?
+    if n < 0 {
+        return none
+    }
+    some(take(c, n)?)
+}
+
+fn decode_record(c: *Cursor, base_offset: i64, base_timestamp: i64) -> Record ! Error {
+    let size = take_varint(c)?
+    let body = cursor(take(c, size)?)
+    take_i8(body)?
+    let stamp = take_varlong(body)?
+    let delta = take_varint(body)?
+    let key = take_optional(body)?
+    let value = take_optional(body)?
+    let count = take_varint(body)?
+    if count < 0 || count > left(body) {
+        fail Malformed
+    }
+    var headers: Header[] = []
+    for i in 0..count {
+        let kn = take_varint(body)?
+        if kn < 0 {
+            fail Malformed
+        }
+        let name = str(take(body, kn)?)
+        let data = take_optional(body)? ?? []
+        headers.push(Header { key: name, value: data })
+    }
+    finish(body)?
+    Record { offset: base_offset + delta, timestamp: base_timestamp + stamp, key, value, headers }
+}
+
+fn decode_one(data: u8[], mut out: Record[]) -> i64 ! Error {
+    let c = cursor(data)
+    let base_offset = take_i64(c)?
+    take_i32(c)?
+    take_i32(c)?
+    let magic = take_i8(c)?
+    if magic != 2 {
+        fail Unsupported
+    }
+    let crc = take_i32(c)?
+    let covered = c.data[c.at..]
+    if checksum(covered) != (crc & 0xFFFFFFFF) {
+        fail Malformed
+    }
+    let attributes = take_i16(c)?
+    let last_delta = take_i32(c)?
+    let base_timestamp = take_i64(c)?
+    let max_timestamp = take_i64(c)?
+    take_i64(c)?
+    take_i16(c)?
+    take_i32(c)?
+    let count = take_i32(c)?
+    if attributes & 0x20 != 0 {
+        return base_offset + last_delta + 1
+    }
+    let section = cursor(decompress(attributes & 7, c.data[c.at..])?)
+    if count < 0 || count > left(section) {
+        fail Malformed
+    }
+    for i in 0..count {
+        var r = decode_record(section, base_offset, base_timestamp)?
+        if attributes & 8 != 0 {
+            r.timestamp = max_timestamp
+        }
+        out.push(r)
+    }
+    finish(section)?
+    base_offset + last_delta + 1
+}
+
+/// The records a fetch response carries and the offset to fetch next.
+pub struct Fetched {
+    /// The records at or after the requested offset, in order.
+    pub records: Record[]
+    /// The offset after the last batch in the response, including batches without records, such as transaction markers and batches compacted to nothing. `0` when the response holds no complete batch.
+    pub next_offset: i64
+}
+
+/// Decodes the record batches in `data`, as a broker returns them in a fetch response, and drops the records below `from`, which a batch that starts before the requested offset carries.
+///
+/// A batch cut short at the end of `data` is dropped, as a fetch response may end in the middle of a batch. The CRC-32C of every batch is checked. Fails with `Malformed` for a batch that is not valid or whose checksum differs, and `Unsupported` for a batch of an older format or a compression codec the client does not know.
+pub fn decode_fetched(data: u8[], from: i64) -> Fetched ! Error {
+    var all: Record[] = []
+    var next = 0
+    var at = 0
+    for data.len - at >= 12 {
+        let length = io.be32(data, at + 8)
+        if length < 0 || length > data.len - at - 12 {
+            break
+        }
+        next = decode_one(data[at..at + 12 + length], mut all)?
+        at += 12 + length
+    }
+    var records: Record[] = []
+    for r in all {
+        if r.offset >= from {
+            records.push(r)
+        }
+    }
+    Fetched { records, next_offset: next }
+}
+
+/// Decodes the record batches in `data` into their records, whatever their offsets, as `decode_fetched` does from offset `0`.
+pub fn decode_batches(data: u8[]) -> Record[] ! Error {
+    decode_fetched(data, 0)?.records
+}
