@@ -1,0 +1,153 @@
+import std/math
+import std/ui/geometry
+import std/ui/scene
+
+const intermediate_granule: i64 = 256
+
+extern struct RasterVertex {
+    position: geometry.Point
+    st: geometry.Point
+    color: geometry.Color
+    clip: geometry.Rect
+}
+
+extern struct PathSprite {
+    bounds: geometry.Rect
+}
+
+struct PathBatch {
+    first_vertex: i64
+    vertex_count: i64
+    first_sprite: i64
+    sprite_count: i64
+    area: VkRect2D
+    drawn: bool
+}
+
+struct PathPlan {
+    vertices: RasterVertex[] = []
+    sprites: PathSprite[] = []
+    batches: PathBatch[] = []
+}
+
+struct Drawing {
+    runs: scene.Batch[] = []
+    plan: PathPlan = PathPlan {}
+}
+
+fn plan_paths(sc: scene.Scene, runs: scene.Batch[], width: i64, height: i64) -> PathPlan {
+    var plan = PathPlan {}
+    for b in runs {
+        if b.kind == scene.Kind.Paths {
+            let planned = plan_batch(mut plan, sc, b, width, height)
+            plan.batches.push(planned)
+        }
+    }
+    plan
+}
+
+fn plan_batch(mut plan: PathPlan, sc: scene.Scene, b: scene.Batch, width: i64, height: i64) -> PathBatch {
+    let first_vertex = plan.vertices.len
+    for i in b.first..b.first + b.count {
+        plan.add_path(sc.paths[i])
+    }
+    let first_sprite = plan.sprites.len
+    let copies = scene.path_copies(sc, b)
+    var spanning = copies[0]
+    for c in copies {
+        plan.sprites.push(PathSprite { bounds: c })
+        spanning = geometry.union(spanning, c)
+    }
+    let area = pixel_area(spanning, width, height)
+    PathBatch {
+        first_vertex
+        vertex_count: plan.vertices.len - first_vertex
+        first_sprite
+        sprite_count: copies.len
+        area
+        drawn: area.extent.width > 0 && area.extent.height > 0
+    }
+}
+
+fn add_path(mut plan: PathPlan, p: scene.Path) {
+    let clipped = geometry.intersect(p.bounds, p.clip)
+    for v in p.vertices {
+        plan.vertices.push(RasterVertex { position: v.position, st: v.st, color: p.color, clip: clipped })
+    }
+}
+
+fn pixel_area(r: geometry.Rect, width: i64, height: i64) -> VkRect2D {
+    let left = math.max(i64(floor(r.x)), 0)
+    let top = math.max(i64(floor(r.y)), 0)
+    let right = math.min(i64(-floor(-geometry.right(r))), width)
+    let bottom = math.min(i64(-floor(-geometry.bottom(r))), height)
+    let offset = VkOffset2D { x: i32(left), y: i32(top) }
+    let extent = VkExtent2D { width: u32(math.max(right - left, 0)), height: u32(math.max(bottom - top, 0)) }
+    VkRect2D { offset, extent }
+}
+
+fn align_up(v: i64) -> i64 {
+    (v + intermediate_granule - 1) / intermediate_granule * intermediate_granule
+}
+
+fn ensure_intermediate(s: *DeviceState, width: i64, height: i64) ! Error {
+    if s.resolved.width >= width && s.resolved.height >= height {
+        return
+    }
+    let d = s.device
+    let grown_width = align_up(math.max(width, s.resolved.width))
+    let grown_height = align_up(math.max(height, s.resolved.height))
+    let rasterised = create_image(d, intermediate_format, grown_width, grown_height, path_samples, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)?
+    let resolved = create_image(d, intermediate_format, grown_width, grown_height, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) catch {
+        e => {
+            destroy_image(d, rasterised)
+            fail e
+        }
+    }
+    check(vkDeviceWaitIdle(d.handle), "vkDeviceWaitIdle") catch {
+        e => {
+            destroy_image(d, rasterised)
+            destroy_image(d, resolved)
+            fail e
+        }
+    }
+    destroy_image(d, s.rasterised)
+    destroy_image(d, s.resolved)
+    s.rasterised = rasterised
+    s.resolved = resolved
+    for f in s.frames {
+        write_image_binding(d, f.composite_set, s.sampler, resolved)
+    }
+}
+
+fn record_rasterise(mut pins: Pins, cmd: VkCommandBuffer, s: *DeviceState, p: Pipelines, a: Attachment, planned: PathBatch, set: ptr[VkDescriptorSet]) {
+    image_barrier(mut pins, cmd, s.rasterised.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)
+    image_barrier(mut pins, cmd, s.resolved.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)
+    let attachment = VkRenderingAttachmentInfo {
+        imageView: s.rasterised.view
+        imageLayout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        resolveMode: VK_RESOLVE_MODE_AVERAGE_BIT
+        resolveImageView: s.resolved.view
+        resolveImageLayout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        loadOp: VK_ATTACHMENT_LOAD_OP_CLEAR
+        storeOp: VK_ATTACHMENT_STORE_OP_DONT_CARE
+    }
+    let attachments = pins.hold(attachment)
+    var rendering = VkRenderingInfo { renderArea: planned.area, layerCount: 1, colorAttachmentCount: 1, pColorAttachments: attachments }
+    vkCmdBeginRendering(cmd, mut rendering)
+    set_viewport(mut pins, cmd, a, planned.area)
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.made[scene.Kind.Paths.index])
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipeline_layout, 0, 1, set, 0, null)
+    vkCmdDraw(cmd, u32(planned.vertex_count), 1, u32(planned.first_vertex), 0)
+    vkCmdEndRendering(cmd)
+    image_barrier(mut pins, cmd, s.resolved.handle, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
+    image_barrier(mut pins, cmd, a.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT)
+}

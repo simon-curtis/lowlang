@@ -1,3 +1,4 @@
+import std/math
 import std/ui/scene
 
 struct Frame {
@@ -6,7 +7,10 @@ struct Frame {
     acquired: VkSemaphore = VkSemaphore {}
     submitted: bool = false
     instances: Buffer[] = []
-    sets: VkDescriptorSet[] = []
+    sets: VkDescriptorSet[][] = []
+    composite: Buffer = Buffer {}
+    composite_set: VkDescriptorSet = VkDescriptorSet {}
+    drawing: Drawing = Drawing {}
     staging: Buffer = Buffer {}
 }
 
@@ -15,12 +19,14 @@ struct DeviceState {
     command_pool: VkCommandPool = VkCommandPool {}
     set_layout: VkDescriptorSetLayout = VkDescriptorSetLayout {}
     pipeline_layout: VkPipelineLayout = VkPipelineLayout {}
-    descriptor_pool: VkDescriptorPool = VkDescriptorPool {}
+    descriptor_pools: VkDescriptorPool[] = []
+    free_sets: i64 = 0
     sampler: VkSampler = VkSampler {}
     dual_source: bool = false
     pipelines: [i32: Pipelines] = [:]
-    atlas: Image = Image {}
-    atlas_ready: bool = false
+    textures: Texture[] = []
+    rasterised: Image = Image {}
+    resolved: Image = Image {}
     frames: *Frame[] = []
     next_frame: i64 = 0
     presenters: *PresenterState[] = []
@@ -40,9 +46,9 @@ struct GpuState {
     presenter: *PresenterState
 }
 
-/// A Vulkan 1.3 instance and device with the pipelines, glyph atlas texture and frame resources that draw a `scene.Scene`, shared by every window of a program.
+/// A Vulkan 1.3 instance and device with the pipelines, atlas textures and frame resources that draw a `scene.Scene`, shared by every window of a program.
 ///
-/// A `Device` draws into any number of `Presenter`s and `Target`s. It keeps one atlas texture that mirrors the `scene.Atlas` it was last given, so a `Device` draws with one atlas. Releasing it waits for the device to go idle, destroys the swapchain and surface of every `Presenter` and the image of every `Target` still alive, and then everything it created, so release order between a `Device` and its `Presenter`s and `Target`s does not matter. A `Presenter` or `Target` released afterwards does nothing, and `present_to` with a `Presenter` fails with `NoDevice`. `handle` is the copyable view for code that cannot hold the owner, such as a closure, a slice or a pointer.
+/// A `Device` draws into any number of `Presenter`s and `Target`s. It keeps one texture for each atlas of the list it was last given, each mirroring its `scene.Atlas`, so every call that draws on a `Device` passes the same atlases in the same order; a sprite names its atlas by index in that list. Releasing it waits for the device to go idle, destroys the swapchain and surface of every `Presenter` and the image of every `Target` still alive, and then everything it created, so release order between a `Device` and its `Presenter`s and `Target`s does not matter. A `Presenter` or `Target` released afterwards does nothing, and `present_to` with a `Presenter` fails with `NoDevice`. `handle` is the copyable view for code that cannot hold the owner, such as a closure, a slice or a pointer.
 pub struct Device {
     /// The copyable view of the device.
     pub handle: DeviceHandle
@@ -86,17 +92,7 @@ pub struct Gpu {
 }
 
 const frames_in_flight = 2
-const kinds = 5
-
-fn slot(kind: scene.Kind) -> i64 {
-    match kind {
-        Quads => 0
-        Shadows => 1
-        Sprites => 2
-        SubpixelSprites => 3
-        PolychromeSprites => 4
-    }
-}
+const descriptor_pool_sets = 64
 
 /// Reports whether the device can blend each colour channel by its own coverage, which subpixel text needs.
 pub fn supports_subpixel(g: Gpu) -> bool {
@@ -201,7 +197,6 @@ fn build_device(s: *DeviceState, instance_extensions: str[], device_extensions: 
     s.set_layout = create_set_layout(s.device)?
     s.pipeline_layout = create_pipeline_layout(s.device, s.set_layout)?
     s.sampler = create_sampler(s.device)?
-    create_descriptor_pool(s)?
     for i in 0..frames_in_flight {
         let frame = new(Frame {})
         s.frames.push(frame)
@@ -239,15 +234,36 @@ fn create_command_pool(s: *DeviceState) ! Error {
     check(vkCreateCommandPool(s.device.handle, mut info, null, mut s.command_pool), "vkCreateCommandPool")?
 }
 
-fn create_descriptor_pool(s: *DeviceState) ! Error {
+fn add_descriptor_pool(s: *DeviceState, sets: i64) ! Error {
     using var pins = new_pins()
-    let sets = frames_in_flight * kinds
     let storage = VkDescriptorPoolSize { type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: u32(sets) }
     let sampled = VkDescriptorPoolSize { type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, descriptorCount: u32(sets) }
     let sizes: VkDescriptorPoolSize[] = [storage, sampled]
     let data = pins.hold_all(sizes)
     var info = VkDescriptorPoolCreateInfo { maxSets: u32(sets), poolSizeCount: 2, pPoolSizes: data }
-    check(vkCreateDescriptorPool(s.device.handle, mut info, null, mut s.descriptor_pool), "vkCreateDescriptorPool")?
+    var pool = VkDescriptorPool {}
+    check(vkCreateDescriptorPool(s.device.handle, mut info, null, mut pool), "vkCreateDescriptorPool")?
+    s.descriptor_pools.push(pool)
+    s.free_sets = sets
+}
+
+fn allocate_sets(s: *DeviceState, count: i64) -> VkDescriptorSet[] ! Error {
+    if count > s.free_sets {
+        add_descriptor_pool(s, math.max(count, descriptor_pool_sets))?
+    }
+    using var pins = new_pins()
+    var layouts: VkDescriptorSetLayout[] = []
+    for _ in 0..count {
+        layouts.push(s.set_layout)
+    }
+    let layout_data = pins.hold_all(layouts)
+    let pool = s.descriptor_pools[s.descriptor_pools.len - 1]
+    var info = VkDescriptorSetAllocateInfo { descriptorPool: pool, descriptorSetCount: u32(count), pSetLayouts: layout_data }
+    let sets: VkDescriptorSet[] = __make(count)
+    let data = pins.hold_all(sets)
+    check(vkAllocateDescriptorSets(s.device.handle, mut info, data), "vkAllocateDescriptorSets")?
+    s.free_sets -= count
+    sets
 }
 
 fn build_frame(s: *DeviceState, f: *Frame) ! Error {
@@ -261,18 +277,17 @@ fn build_frame(s: *DeviceState, f: *Frame) ! Error {
     check(vkCreateFence(s.device.handle, mut fence_info, null, mut f.fence), "vkCreateFence")?
     f.acquired = create_semaphore(s.device)?
 
-    let layouts: VkDescriptorSetLayout[] = [s.set_layout, s.set_layout, s.set_layout, s.set_layout, s.set_layout]
-    let layout_data = pins.hold_all(layouts)
-    var set_info = VkDescriptorSetAllocateInfo { descriptorPool: s.descriptor_pool, descriptorSetCount: u32(kinds), pSetLayouts: layout_data }
-    let sets: VkDescriptorSet[] = __make(kinds)
-    let set_data = pins.hold_all(sets)
-    check(vkAllocateDescriptorSets(s.device.handle, mut set_info, set_data), "vkAllocateDescriptorSets")?
-    f.sets = sets
+    let kinds = scene.kinds().len
+    let sets = allocate_sets(s, kinds + 1)?
+    f.composite_set = sets[kinds]
     for i in 0..kinds {
+        f.sets.push([sets[i]])
         f.instances.push(Buffer {})
         ensure_buffer(s.device, mut f.instances[i], 1, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)?
-        write_instances_binding(s.device, f.sets[i], f.instances[i])
+        write_instances_binding(s.device, sets[i], f.instances[i])
     }
+    ensure_buffer(s.device, mut f.composite, 1, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)?
+    write_instances_binding(s.device, f.composite_set, f.composite)
 }
 
 fn write_instances_binding(d: Handles, set: VkDescriptorSet, b: Buffer) {
@@ -290,9 +305,9 @@ fn write_instances_binding(d: Handles, set: VkDescriptorSet, b: Buffer) {
     vkUpdateDescriptorSets(d.handle, 1, writes, 0, null)
 }
 
-fn write_atlas_binding(d: Handles, set: VkDescriptorSet, sampler: VkSampler, atlas: Image) {
+fn write_image_binding(d: Handles, set: VkDescriptorSet, sampler: VkSampler, image: Image) {
     using var pins = new_pins()
-    let info = VkDescriptorImageInfo { sampler, imageView: atlas.view, imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }
+    let info = VkDescriptorImageInfo { sampler, imageView: image.view, imageLayout: VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL }
     let infos = pins.hold(info)
     let write = VkWriteDescriptorSet {
         dstSet: set
@@ -392,14 +407,21 @@ fn destroy_device_objects(s: *DeviceState) {
         for b in f.instances {
             destroy_buffer(d, b)
         }
+        destroy_buffer(d, f.composite)
         destroy_buffer(d, f.staging)
         vkDestroyFence(d.handle, f.fence, null)
     }
     for _, p in s.pipelines {
         destroy_pipelines(d, p)
     }
-    destroy_image(d, s.atlas)
-    vkDestroyDescriptorPool(d.handle, s.descriptor_pool, null)
+    for t in s.textures {
+        destroy_image(d, t.image)
+    }
+    destroy_image(d, s.rasterised)
+    destroy_image(d, s.resolved)
+    for pool in s.descriptor_pools {
+        vkDestroyDescriptorPool(d.handle, pool, null)
+    }
     vkDestroySampler(d.handle, s.sampler, null)
     vkDestroyPipelineLayout(d.handle, s.pipeline_layout, null)
     vkDestroyDescriptorSetLayout(d.handle, s.set_layout, null)
