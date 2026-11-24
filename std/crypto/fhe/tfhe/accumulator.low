@@ -1,0 +1,172 @@
+import std/crypto/fhe/ring
+
+struct Accumulator {
+    a: u32[]
+    b: u32[]
+}
+
+struct Workspace {
+    digits: u64[][]
+    sum_a: u64[]
+    sum_b: u64[]
+    shifted_a: u32[]
+    shifted_b: u32[]
+}
+
+fn lift(ctx: *Context, x: u32) -> u64 {
+    let v = i64(i32(x))
+    let q = i64(ctx.transform.modulus.value)
+    u64(if v < 0 { q + v } else { v })
+}
+
+fn lower(ctx: *Context, r: u64) -> u32 {
+    let q = ctx.transform.modulus.value
+    u32(if r > q / 2 { r - q } else { r })
+}
+
+fn transformed(ctx: *Context, p: u32[]) -> u64[] {
+    let out: u64[] = __make(p.len)
+    for j in 0..p.len {
+        out[j] = lift(ctx, p[j])
+    }
+    ring.forward(ctx.transform, out)
+    out
+}
+
+fn lowered(ctx: *Context, hat: u64[]) -> u32[] {
+    ring.backward(ctx.transform, hat)
+    let out: u32[] = __make(hat.len)
+    for j in 0..hat.len {
+        out[j] = lower(ctx, hat[j])
+    }
+    out
+}
+
+fn multiply(ctx: *Context, p: u32[], hat: u64[]) -> u32[] {
+    let m = ctx.transform.modulus
+    let product = transformed(ctx, p)
+    for j in 0..product.len {
+        product[j] = ring.mul_mod(m, product[j], hat[j])
+    }
+    lowered(ctx, product)
+}
+
+fn shift_into(dst: u32[], src: u32[], k: i64) {
+    let n = src.len
+    for j in 0..n {
+        let to = j + k
+        if to < n {
+            dst[to] = src[j]
+        } else if to < 2 * n {
+            dst[to - n] = 0 - src[j]
+        } else {
+            dst[to - 2 * n] = src[j]
+        }
+    }
+}
+
+fn shifted(src: u32[], k: i64) -> u32[] {
+    let out: u32[] = __make(src.len)
+    shift_into(out, src, k)
+    out
+}
+
+fn shift_minus_one(dst: u32[], src: u32[], k: i64) {
+    shift_into(dst, src, k)
+    for j in 0..src.len {
+        dst[j] -= src[j]
+    }
+}
+
+fn decompose(ctx: *Context, src: u32[], out: u64[][], first: i64) {
+    let p = ctx.parameters
+    let q = i64(ctx.transform.modulus.value)
+    let half = i64(1) << u64(p.gadget_bits - 1)
+    let mask = (u32(1) << u32(p.gadget_bits)) - 1
+    for level in 0..p.gadget_levels {
+        let row = out[first + level]
+        let shift = u32(32 - (level + 1) * p.gadget_bits)
+        for j in 0..src.len {
+            let d = i64((src[j] + ctx.gadget_offset) >> shift & mask) - half
+            row[j] = u64(if d < 0 { q + d } else { d })
+        }
+    }
+}
+
+fn workspace(ctx: *Context) -> *Workspace {
+    let p = ctx.parameters
+    var digits: u64[][] = []
+    for _ in 0..2 * p.gadget_levels {
+        let row: u64[] = __make(p.degree)
+        digits.push(row)
+    }
+    new(Workspace {
+        digits,
+        sum_a: __make(p.degree),
+        sum_b: __make(p.degree),
+        shifted_a: __make(p.degree),
+        shifted_b: __make(p.degree),
+    })
+}
+
+fn add_products(ctx: *Context, w: *Workspace, key: u64[]) {
+    let m = ctx.transform.modulus
+    let n = ctx.parameters.degree
+    let rows = w.digits.len
+    for j in 0..n {
+        var high_a: u64 = 0
+        var low_a: u64 = 0
+        var high_b: u64 = 0
+        var low_b: u64 = 0
+        for r in 0..rows {
+            let digit = w.digits[r][j]
+            let ka = key[2 * r * n + j]
+            let kb = key[(2 * r + 1) * n + j]
+            let next_a = low_a + digit * ka
+            high_a += __mulhi(digit, ka) + (if next_a < low_a { 1 } else { 0 })
+            low_a = next_a
+            let next_b = low_b + digit * kb
+            high_b += __mulhi(digit, kb) + (if next_b < low_b { 1 } else { 0 })
+            low_b = next_b
+        }
+        w.sum_a[j] = ring.reduce_wide(m, high_a, low_a)
+        w.sum_b[j] = ring.reduce_wide(m, high_b, low_b)
+    }
+}
+
+fn external_step(ctx: *Context, w: *Workspace, key: u64[], acc: *Accumulator, k: i64) {
+    let levels = ctx.parameters.gadget_levels
+    shift_minus_one(w.shifted_a, acc.a, k)
+    shift_minus_one(w.shifted_b, acc.b, k)
+    decompose(ctx, w.shifted_a, w.digits, 0)
+    decompose(ctx, w.shifted_b, w.digits, levels)
+    for row in w.digits {
+        ring.forward(ctx.transform, row)
+    }
+    add_products(ctx, w, key)
+    let da = lowered(ctx, w.sum_a)
+    let db = lowered(ctx, w.sum_b)
+    for j in 0..acc.a.len {
+        acc.a[j] += da[j]
+        acc.b[j] += db[j]
+    }
+}
+
+fn blind_rotate(ctx: *Context, cloud: *CloudKey, rotations: i64[], acc: *Accumulator) {
+    let w = workspace(ctx)
+    for i in 0..cloud.bootstrapping.len {
+        if rotations[i] != 0 {
+            external_step(ctx, w, cloud.bootstrapping[i], acc, rotations[i])
+        }
+    }
+}
+
+fn extract(acc: *Accumulator) -> Ciphertext {
+    let n = acc.a.len
+    let a: u32[] = __make(n)
+    a[0] = acc.a[0]
+    for j in 1..n {
+        a[j] = 0 - acc.a[n - j]
+    }
+    Ciphertext { a, b: acc.b[0] }
+}
