@@ -1,0 +1,205 @@
+import std/crypto/cipher
+import std/crypto/hash
+import std/io
+import std/rtp
+
+fn xor_be(b: u8[], at: i64, v: i64, size: i64) {
+    for i in 0..size {
+        b[at + i] = b[at + i] ^ u8(v >> (8 * (size - 1 - i)))
+    }
+}
+
+fn counter_iv(salt: u8[], ssrc: i64, index: i64) -> u8[] {
+    let iv = io.buffer(16)
+    io.copy(iv, salt)
+    xor_be(iv, 4, ssrc, 4)
+    xor_be(iv, 8, index, 6)
+    iv
+}
+
+fn galois_iv(salt: u8[], ssrc: i64, index: i64) -> u8[] {
+    let iv = io.buffer(12)
+    xor_be(iv, 2, ssrc, 4)
+    xor_be(iv, 6, index, 6)
+    for i in 0..12 {
+        iv[i] = iv[i] ^ salt[i]
+    }
+    iv
+}
+
+fn tag_of(mac: hash.Keyed, body: u8[], trailer: u8[], size: i64) -> u8[] {
+    let inner = mac.inner.clone()
+    let outer = mac.outer.clone()
+    inner.update(body)
+    inner.update(trailer)
+    outer.update(inner.finish())
+    outer.finish()[..size]
+}
+
+fn be32_bytes(v: i64) -> u8[] {
+    var out: u8[] = []
+    io.put_be32(mut out, v)
+    out
+}
+
+fn stream_for(streams: [i64: *Stream], ssrc: i64) -> *Stream {
+    streams[ssrc] ?? new(Stream { started: false, top: 0, window: 0 })
+}
+
+fn xor_payload(b: *cipher.Block, iv: u8[], payload: u8[]) -> u8[] {
+    cipher.ctr(b, iv, payload) or panic("srtp: counter block of 16 bytes")
+}
+
+fn join(parts: u8[][]) -> u8[] {
+    var out: u8[] = []
+    for p in parts {
+        io.append(mut out, p)
+    }
+    out
+}
+
+/// Returns the SRTP packet for the RTP packet `packet`.
+///
+/// The payload is encrypted, the header and its extension are authenticated and left as they are, and the tag is appended: 10 or 4 bytes for the counter mode profiles, 16 for the GCM profiles. The rollover counter of the source follows the sequence numbers sent, so a packet may be protected again, such as a retransmission, as long as it is within half the sequence space of the newest. Fails with `Malformed` when `packet` is not an RTP packet or its sequence number falls before the first packet of the source, and with `Exhausted` once the rollover counter of the source would pass 2^32 - 1.
+pub fn protect(c: *Context, packet: u8[]) -> u8[] ! Error {
+    let header = rtp.header_length(packet) or fail Malformed
+    let ssrc = io.be32(packet, 8)
+    let s = stream_for(c.rtp_streams, ssrc)
+    let index = estimate_index(s, io.be16(packet, 2))
+    if index < 0 {
+        fail Malformed
+    }
+    if index > rtp_index_limit {
+        fail Exhausted
+    }
+    mark(s, index)
+    c.rtp_streams[ssrc] = s
+    let head = packet[..header]
+    let body = packet[header..]
+    match c.rtp.mode {
+        Counter(block, mac, tag) => {
+            let sealed = join([head, xor_payload(block, counter_iv(c.rtp.salt, ssrc, index), body)])
+            join([sealed, tag_of(mac, sealed, be32_bytes(index >> 16), tag)])
+        }
+        Galois(sealer) => join([head, sealer.seal(galois_iv(c.rtp.salt, ssrc, index), body, head)])
+    }
+}
+
+/// Returns the RTP packet inside the SRTP packet `packet`.
+///
+/// The tag is checked before anything is decrypted or remembered, so a forged packet changes no state. Fails with `Malformed` when `packet` is too short for its header and tag, `Replay` when the packet was received before or is more than 64 behind the newest, and `AuthFailed` when the tag does not match. A source is remembered only after one of its packets authenticates.
+pub fn unprotect(c: *Context, packet: u8[]) -> u8[] ! Error {
+    let header = rtp.header_length(packet) or fail Malformed
+    if packet.len < header + c.params.rtp_tag {
+        fail Malformed
+    }
+    let ssrc = io.be32(packet, 8)
+    let s = stream_for(c.rtp_streams, ssrc)
+    let index = estimate_index(s, io.be16(packet, 2))
+    if index < 0 || index > rtp_index_limit || !fresh(s, index) {
+        fail Replay
+    }
+    let head = packet[..header]
+    let plain = match c.rtp.mode {
+        Counter(block, mac, tag) => {
+            let end = packet.len - tag
+            let expected = tag_of(mac, packet[..end], be32_bytes(index >> 16), tag)
+            if !hash.equal(expected, packet[end..]) {
+                fail AuthFailed
+            }
+            join([head, xor_payload(block, counter_iv(c.rtp.salt, ssrc, index), packet[header..end])])
+        }
+        Galois(sealer) => {
+            let opened = sealer.open(galois_iv(c.rtp.salt, ssrc, index), packet[header..], head) or fail AuthFailed
+            join([head, opened])
+        }
+    }
+    mark(s, index)
+    c.rtp_streams[ssrc] = s
+    plain
+}
+
+fn seal_rtcp(c: *Context, packet: u8[], index: i64) -> u8[] ! Error {
+    let ssrc = io.be32(packet, 4)
+    let head = packet[..8]
+    let word = be32_bytes(0x80000000 | index)
+    match c.rtcp.mode {
+        Counter(block, mac, tag) => {
+            let sealed = join([head, xor_payload(block, counter_iv(c.rtcp.salt, ssrc, index), packet[8..]), word])
+            join([sealed, tag_of(mac, sealed, [], tag)])
+        }
+        Galois(sealer) => join([head, sealer.seal(galois_iv(c.rtcp.salt, ssrc, index), packet[8..], join([head, word])), word])
+    }
+}
+
+/// Returns the SRTCP packet for the RTCP packet or compound packet `packet`.
+///
+/// Everything after the first 8 bytes is encrypted, and the E bit and a 31-bit index, counted per source from 0, and the 10-byte tag (the 16-byte tag for GCM, inside the encrypted part) are appended. Fails with `Malformed` when `packet` is shorter than 8 bytes or is not version 2, and with `Exhausted` after 2^31 packets of one source.
+pub fn protect_rtcp(c: *Context, packet: u8[]) -> u8[] ! Error {
+    if packet.len < 8 || packet[0] >> 6 != 2 {
+        fail Malformed
+    }
+    let s = stream_for(c.rtcp_streams, io.be32(packet, 4))
+    let index = if s.started { s.top + 1 } else { 0 }
+    if index > rtcp_index_limit {
+        fail Exhausted
+    }
+    let sealed = seal_rtcp(c, packet, index)?
+    mark(s, index)
+    c.rtcp_streams[io.be32(packet, 4)] = s
+    sealed
+}
+
+fn open_rtcp(c: *Context, packet: u8[], word_at: i64, index: i64, ssrc: i64) -> u8[] ! Error {
+    let encrypted = io.be32(packet, word_at) & 0x80000000 != 0
+    let head = packet[..8]
+    match c.rtcp.mode {
+        Counter(block, mac, tag) => {
+            let end = word_at + 4
+            let expected = tag_of(mac, packet[..end], [], tag)
+            if !hash.equal(expected, packet[end..]) {
+                fail AuthFailed
+            }
+            if !encrypted {
+                return packet[..word_at]
+            }
+            join([head, xor_payload(block, counter_iv(c.rtcp.salt, ssrc, index), packet[8..word_at])])
+        }
+        Galois(sealer) => {
+            let word = packet[word_at..word_at + 4]
+            let iv = galois_iv(c.rtcp.salt, ssrc, index)
+            if encrypted {
+                let opened = sealer.open(iv, packet[8..word_at], join([head, word])) or fail AuthFailed
+                return join([head, opened])
+            }
+            let tag_at = word_at - 16
+            sealer.open(iv, packet[tag_at..word_at], join([packet[..tag_at], word])) or fail AuthFailed
+            packet[..tag_at]
+        }
+    }
+}
+
+/// Returns the RTCP packet inside the SRTCP packet `packet`, whether or not its E bit says it was encrypted.
+///
+/// The tag is checked before anything is decrypted or remembered. Fails with `Malformed` when `packet` is too short, `Replay` for an index that was received or is more than 64 behind the newest of its source, and `AuthFailed` when the tag does not match.
+pub fn unprotect_rtcp(c: *Context, packet: u8[]) -> u8[] ! Error {
+    let tag = match c.rtcp.mode {
+        Counter(_, _, size) => size
+        Galois(_) => 0
+    }
+    let minimum = 8 + 4 + (if tag == 0 { 16 } else { tag })
+    if packet.len < minimum || packet[0] >> 6 != 2 {
+        fail Malformed
+    }
+    let word_at = packet.len - 4 - tag
+    let index = io.be32(packet, word_at) & 0x7FFFFFFF
+    let ssrc = io.be32(packet, 4)
+    let s = stream_for(c.rtcp_streams, ssrc)
+    if !fresh(s, index) {
+        fail Replay
+    }
+    let plain = open_rtcp(c, packet, word_at, index, ssrc)?
+    mark(s, index)
+    c.rtcp_streams[ssrc] = s
+    plain
+}

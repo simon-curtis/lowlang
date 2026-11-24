@@ -1,0 +1,199 @@
+import std/crypto/aead
+import std/crypto/cipher
+import std/crypto/hash
+import std/io
+
+/// The profile AES_CM_128_HMAC_SHA1_80 of RFC 3711: AES-128 counter mode and an 80-bit HMAC-SHA1 tag. It is `use_srtp` profile 1 of RFC 5764.
+pub const profile_aes128_cm_sha1_80 = 1
+
+/// The profile AES_CM_128_HMAC_SHA1_32: AES-128 counter mode and a 32-bit HMAC-SHA1 tag on RTP, an 80-bit one on RTCP. It is `use_srtp` profile 2.
+pub const profile_aes128_cm_sha1_32 = 2
+
+/// The profile AEAD_AES_128_GCM of RFC 7714 with a 128-bit tag. It is `use_srtp` profile 7.
+pub const profile_aead_aes_128_gcm = 7
+
+/// The profile AEAD_AES_256_GCM of RFC 7714 with a 128-bit tag. It is `use_srtp` profile 8.
+pub const profile_aead_aes_256_gcm = 8
+
+/// Why a packet was refused or a context could not be made.
+pub enum Error {
+    /// The packet is not RTP or RTCP version 2, or is shorter than its headers and tag.
+    Malformed
+    /// The profile is not one of the four this module implements.
+    Unsupported
+    /// A master key or salt, or the keying material, has the wrong length for the profile.
+    InvalidKey
+    /// The authentication tag does not match.
+    AuthFailed
+    /// The packet was received before or is older than the replay window.
+    Replay
+    /// The 32-bit rollover counter of an RTP source or the 31-bit SRTCP index of a source is used up, so the session needs new keys.
+    Exhausted
+}
+
+const label_rtp_key = 0
+const label_rtp_auth = 1
+const label_rtp_salt = 2
+const label_rtcp_key = 3
+const label_rtcp_auth = 4
+const label_rtcp_salt = 5
+const window_size = 64
+const rtcp_index_limit = 0x7FFFFFFF
+const rtp_index_limit = 0xFFFFFFFFFFFF
+const rtcp_tag_size = 10
+
+struct Params {
+    key_size: i64
+    salt_size: i64
+    rtp_tag: i64
+    gcm: bool
+}
+
+fn params(profile: i64) -> Params ! Error {
+    match profile {
+        1 => Params { key_size: 16, salt_size: 14, rtp_tag: 10, gcm: false }
+        2 => Params { key_size: 16, salt_size: 14, rtp_tag: 4, gcm: false }
+        7 => Params { key_size: 16, salt_size: 12, rtp_tag: 16, gcm: true }
+        8 => Params { key_size: 32, salt_size: 12, rtp_tag: 16, gcm: true }
+        _ => fail Unsupported
+    }
+}
+
+enum Mode {
+    Counter(block: *cipher.Block, mac: hash.Keyed, tag: i64)
+    Galois(sealer: aead.Aead)
+}
+
+struct Suite {
+    mode: Mode
+    salt: u8[]
+}
+
+struct Stream {
+    started: bool
+    top: i64
+    window: u64
+}
+
+/// The keys and per-source state of one direction of an SRTP session.
+///
+/// A context protects the packets a peer sends or unprotects the packets it receives, and tracks the rollover counter and the replay window of each synchronization source it sees. It is not safe to share between green threads without a lock.
+pub struct Context {
+    params: Params
+    rtp: Suite
+    rtcp: Suite
+    rtp_streams: [i64: *Stream] = [:]
+    rtcp_streams: [i64: *Stream] = [:]
+}
+
+/// The two contexts of a DTLS-SRTP session.
+pub struct Pair {
+    /// The context that protects what this endpoint sends.
+    pub send: *Context
+    /// The context that unprotects what this endpoint receives.
+    pub receive: *Context
+}
+
+/// Returns the number of bytes `export_keying_material(c, "EXTRACTOR-dtls_srtp", n)` must ask for to key `profile`: a key and a salt for each direction.
+///
+/// Fails with `Unsupported` for a profile this module does not implement.
+pub fn keying_material_size(profile: i64) -> i64 ! Error {
+    let p = params(profile)?
+    2 * (p.key_size + p.salt_size)
+}
+
+fn derive(master_key: u8[], master_salt: u8[], label: i64, length: i64) -> u8[] ! Error {
+    let block = cipher.aes(master_key) or fail InvalidKey
+    let counter = io.buffer(16)
+    io.copy(counter, master_salt)
+    counter[7] = counter[7] ^ u8(label)
+    cipher.ctr(block, counter, io.buffer(length)) or fail InvalidKey
+}
+
+fn suite(p: Params, key: u8[], salt: u8[], label_key: i64, label_auth: i64, label_salt: i64, tag: i64) -> Suite ! Error {
+    let session_key = derive(key, salt, label_key, p.key_size)?
+    let session_salt = derive(key, salt, label_salt, p.salt_size)?
+    if p.gcm {
+        let sealer = aead.aes_gcm(session_key) or fail InvalidKey
+        return Suite { mode: Mode.Galois(sealer), salt: session_salt }
+    }
+    let block = cipher.aes(session_key) or fail InvalidKey
+    let mac = hash.hmac_keyed(hash.sha1(), derive(key, salt, label_auth, 20)?)
+    Suite { mode: Mode.Counter(block, mac, tag), salt: session_salt }
+}
+
+/// Returns the context of `profile` keyed from the master key and master salt of one direction (RFC 3711 section 4.3).
+///
+/// The key is 16 bytes, or 32 for `profile_aead_aes_256_gcm`, and the salt 14 bytes, or 12 for the GCM profiles. Fails with `Unsupported` for another profile and `InvalidKey` for a wrong length. MKI is not supported and the key derivation rate is 0.
+pub fn context(profile: i64, master_key: u8[], master_salt: u8[]) -> *Context ! Error {
+    let p = params(profile)?
+    if master_key.len != p.key_size || master_salt.len != p.salt_size {
+        fail InvalidKey
+    }
+    let rtp = suite(p, master_key, master_salt, label_rtp_key, label_rtp_auth, label_rtp_salt, p.rtp_tag)?
+    let rtcp = suite(p, master_key, master_salt, label_rtcp_key, label_rtcp_auth, label_rtcp_salt, if p.gcm { 16 } else { rtcp_tag_size })?
+    new(Context { params: p, rtp, rtcp })
+}
+
+/// Returns the send and receive contexts for the keying material the DTLS handshake exported with the label `EXTRACTOR-dtls_srtp` (RFC 5764 section 4.2).
+///
+/// `material` is the client key, the server key, the client salt and the server salt, `keying_material_size(profile)` bytes. `client` is whether this endpoint is the DTLS client, which sends with the client key. Fails with `Unsupported` or `InvalidKey` as `context` does.
+pub fn from_dtls(profile: i64, material: u8[], client: bool) -> Pair ! Error {
+    let p = params(profile)?
+    if material.len != 2 * (p.key_size + p.salt_size) {
+        fail InvalidKey
+    }
+    let client_key = material[..p.key_size]
+    let server_key = material[p.key_size..2 * p.key_size]
+    let salts = material[2 * p.key_size..]
+    let client_salt = salts[..p.salt_size]
+    let server_salt = salts[p.salt_size..]
+    let from_client = context(profile, client_key, client_salt)?
+    let from_server = context(profile, server_key, server_salt)?
+    if client {
+        Pair { send: from_client, receive: from_server }
+    } else {
+        Pair { send: from_server, receive: from_client }
+    }
+}
+
+fn fresh(s: *Stream, index: i64) -> bool {
+    if !s.started || index > s.top {
+        return true
+    }
+    let behind = s.top - index
+    if behind >= window_size {
+        return false
+    }
+    ((s.window >> behind) & 1) == 0
+}
+
+fn mark(s: *Stream, index: i64) {
+    if !s.started || index > s.top {
+        let shift = if s.started { index - s.top } else { window_size }
+        s.window = if shift >= window_size { 0 } else { s.window << shift }
+        s.window = s.window | 1
+        s.top = index
+        s.started = true
+        return
+    }
+    let one: u64 = 1
+    s.window = s.window | (one << (s.top - index))
+}
+
+fn estimate_index(s: *Stream, seq: i64) -> i64 {
+    if !s.started {
+        return seq
+    }
+    let roc = s.top >> 16
+    let last = s.top & 0xFFFF
+    var v = roc
+    if last < 0x8000 {
+        if seq - last > 0x8000 {
+            v = roc - 1
+        }
+    } else if last - 0x8000 > seq {
+        v = roc + 1
+    }
+    v * 0x10000 + seq
+}

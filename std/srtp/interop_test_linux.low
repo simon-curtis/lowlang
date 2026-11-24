@@ -1,0 +1,145 @@
+import std/file
+import std/process
+import std/rtp
+import std/slices
+import std/testing
+import std/text
+
+const script = "testdata/srtp/gst_peer.py"
+const first_sequence = 65530
+const packets = 12
+const ssrc = 0x12345678
+
+struct Peer {
+    profile: i64
+    cipher: str
+    rtp_auth: str
+    rtcp_auth: str
+    key: u8[]
+    salt: u8[]
+}
+
+fn counting(n: i64) -> u8[] {
+    var out: u8[] = []
+    for i in 0..n {
+        out.push(u8(i))
+    }
+    out
+}
+
+fn peers() -> Peer[] {
+    let key = counting(32)
+    let salt = counting(14)
+    [
+        Peer { profile: profile_aes128_cm_sha1_80, cipher: "aes-128-icm", rtp_auth: "hmac-sha1-80", rtcp_auth: "hmac-sha1-80", key: key[..16], salt }
+        Peer { profile: profile_aes128_cm_sha1_32, cipher: "aes-128-icm", rtp_auth: "hmac-sha1-32", rtcp_auth: "hmac-sha1-80", key: key[..16], salt }
+        Peer { profile: profile_aead_aes_128_gcm, cipher: "aes-128-gcm", rtp_auth: "null", rtcp_auth: "null", key: key[..16], salt: salt[..12] }
+        Peer { profile: profile_aead_aes_256_gcm, cipher: "aes-256-gcm", rtp_auth: "null", rtcp_auth: "null", key, salt: salt[..12] }
+    ]
+}
+
+fn gstreamer_missing() -> str {
+    for name in ["python3", "timeout"] {
+        if process.find(name) == none {
+            return "{name} is not installed"
+        }
+    }
+    let probe = "import gi; gi.require_version('Gst', '1.0'); from gi.repository import Gst; Gst.init(None); assert Gst.ElementFactory.find('srtpenc') and Gst.ElementFactory.find('srtpdec')"
+    let ran = process.run(process.command("python3", ["-I", "-c", probe]), []) catch {
+        _ => return "python3 does not run"
+    }
+    if !process.success(ran.status) {
+        return "GStreamer with srtpenc and srtpdec is not installed for python3"
+    }
+    ""
+}
+
+fn gst(p: Peer, args: str[]) {
+    let key = text.encode_hex(p.key) + text.encode_hex(p.salt)
+    var all = ["60", "python3", "-I", script, args[0], p.cipher, p.rtp_auth, p.rtcp_auth, key]
+    for a in args[1..] {
+        all.push(a)
+    }
+    let ran = process.run(process.command("timeout", all), []) or panic("start {script}")
+    if !process.success(ran.status) {
+        panic("{script} {args[0]}: {str(ran.stderr)}")
+    }
+}
+
+fn sender_report() -> u8[] {
+    let block = rtp.ReportBlock { ssrc: 0x0A0B0C0D, fraction_lost: 25, lost: -2, highest_sequence: 0x00010005, jitter: 7, last_sender_report: 0x11223344, delay_since_last_sender_report: 65536 }
+    let report = rtp.SenderReport { ssrc, ntp_seconds: 0xE5000000, ntp_fraction: 0x80000000, rtp_timestamp: 0x1000, packets: 10, octets: 1200, reports: [block] }
+    rtp.marshal_rtcp([rtp.Rtcp.Sender(report)]) or panic("marshal")
+}
+
+fn numbered(dir: str, n: i64, suffix: str) -> str {
+    let digits = "{n}"
+    "{dir}/{text.repeat("0", 3 - digits.len)}{digits}.{suffix}"
+}
+
+fn read(path: str) -> u8[] {
+    file.read_file(path) or panic("read {path}")
+}
+
+fn check_media(t: *testing.T, p: Peer, i: i64, plain: u8[]) {
+    let packet = rtp.parse(plain) or {
+        testing.error(t, "profile {p.profile} packet {i} does not parse")
+        return
+    }
+    testing.error_if(t, packet.sequence != (first_sequence + i) & 0xFFFF || packet.ssrc != ssrc, "profile {p.profile} packet {i} header")
+    testing.error_if(t, !slices.equal(packet.payload, slices.repeat([u8(0)], 16)), "profile {p.profile} packet {i} payload")
+}
+
+fn open_from_gstreamer(t: *testing.T, p: Peer, dir: str) -> u8[][] {
+    gst(p, ["encrypt", dir, "{first_sequence}", "{packets}"])
+    let receiver = context(p.profile, p.key, p.salt) or panic("context")
+    var plain: u8[][] = []
+    for i in 0..packets {
+        let opened = unprotect(receiver, read(numbered(dir, i, "srtp"))) or {
+            testing.error(t, "profile {p.profile} packet {i} refused")
+            continue
+        }
+        check_media(t, p, i, opened)
+        plain.push(opened)
+    }
+    let report = unprotect_rtcp(receiver, read("{dir}/rtcp0.srtcp")) or {
+        testing.error(t, "profile {p.profile} SRTCP refused")
+        return plain
+    }
+    testing.error_if(t, !slices.equal(report, sender_report()), "profile {p.profile} report {text.encode_hex(report)}")
+    plain
+}
+
+fn seal_for_gstreamer(t: *testing.T, p: Peer, plain: u8[][], dir: str) {
+    let sender = context(p.profile, p.key, p.salt) or panic("context")
+    for i, packet in plain {
+        file.write_file(numbered(dir, i, "srtp"), protect(sender, packet) or panic("protect")) or panic("write")
+    }
+    file.write_file("{dir}/rtcp0.srtcp", protect_rtcp(sender, sender_report()) or panic("protect_rtcp")) or panic("write")
+    gst(p, ["decrypt", dir])
+    for i, packet in plain {
+        let path = numbered(dir, i, "rtp")
+        testing.error_if(t, !file.exists(path), "profile {p.profile} packet {i} refused by srtpdec")
+        testing.error_if(t, file.exists(path) && !slices.equal(read(path), packet), "profile {p.profile} packet {i} opened differently")
+    }
+    let report = "{dir}/rtcp0.rtcp"
+    testing.error_if(t, !file.exists(report), "profile {p.profile} SRTCP refused by srtpdec")
+    testing.error_if(t, file.exists(report) && !slices.equal(read(report), sender_report()), "profile {p.profile} report opened differently")
+}
+
+fn test_libsrtp_in_gstreamer_reads_and_writes_every_profile(t: *testing.T) {
+    let missing = gstreamer_missing()
+    if missing != "" {
+        testing.skip(t, missing)
+        return
+    }
+    for p in peers() {
+        let from_peer = file.temp_dir("srtp-from-gst") or panic("temp dir")
+        let to_peer = file.temp_dir("srtp-to-gst") or panic("temp dir")
+        let plain = open_from_gstreamer(t, p, from_peer)
+        testing.error_if(t, plain.len != packets, "profile {p.profile} opened {plain.len} packets")
+        seal_for_gstreamer(t, p, plain, to_peer)
+        file.remove_all(from_peer) or panic("remove")
+        file.remove_all(to_peer) or panic("remove")
+    }
+}
