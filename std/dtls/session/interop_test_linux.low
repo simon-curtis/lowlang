@@ -1,0 +1,211 @@
+import std/dtls
+import std/file
+import std/io
+import std/net
+import std/process
+import std/testing
+import std/tls
+import std/text
+import std/time
+import std/time/duration
+
+struct Material {
+    certificate: str
+    key: str
+    fingerprint: dtls.Fingerprint
+}
+
+struct Case {
+    name: str
+    suite: i64
+    cipher: str
+    groups: i64[]
+    group_name: str
+    mtu: i64
+}
+
+fn cases() -> Case[] {
+    [
+        Case { name: "aes128-gcm x25519", suite: 0xC02B, cipher: "ECDHE-ECDSA-AES128-GCM-SHA256", groups: [tls.group_x25519, tls.group_p256], group_name: "X25519:P-256", mtu: 1200 }
+        Case { name: "aes256-gcm p256", suite: 0xC02C, cipher: "ECDHE-ECDSA-AES256-GCM-SHA384", groups: [tls.group_p256], group_name: "P-256", mtu: 1200 }
+        Case { name: "chacha20-poly1305 x25519", suite: 0xCCA9, cipher: "ECDHE-ECDSA-CHACHA20-POLY1305", groups: [tls.group_x25519, tls.group_p256], group_name: "X25519:P-256", mtu: 1200 }
+        Case { name: "aes128-gcm p256 fragmented", suite: 0xC02B, cipher: "ECDHE-ECDSA-AES128-GCM-SHA256", groups: [tls.group_p256], group_name: "P-256", mtu: 300 }
+    ]
+}
+
+struct Captured {
+    text: str
+    ready: chan[bool]
+}
+
+fn missing_tool() -> str {
+    for name in ["openssl", "timeout"] {
+        if process.find(name) == none {
+            return name
+        }
+    }
+    ""
+}
+
+fn make_material(dir: str) -> Material {
+    let certificate = "{dir}/cert.pem"
+    let key = "{dir}/key.pem"
+    let made = process.run(process.command("openssl", ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", key, "-out", certificate, "-subj", "/CN=openssl", "-days", "30"]), []) or panic("openssl req")
+    if !process.success(made.status) {
+        panic("openssl req: {str(made.stderr)}")
+    }
+    let printed = process.run(process.command("openssl", ["x509", "-noout", "-fingerprint", "-sha256", "-in", certificate]), []) or panic("openssl x509")
+    let line = text.trim(str(printed.stdout))
+    let digest = line[text.index(line, "=") + 1..]
+    Material { certificate, key, fingerprint: dtls.parse_fingerprint("sha-256 {digest}") or panic("fingerprint {digest}") }
+}
+
+fn free_port() -> i64 {
+    using var probe = net.bind_udp("127.0.0.1", 0) or panic("bind")
+    probe.handle.addr.port
+}
+
+fn pump(h: net.SocketHandle, incoming: chan[u8[]], first: chan[net.Addr]) {
+    let buf = io.buffer(65536)
+    var announced = false
+    for {
+        let packet = net.receive_from_on(h, buf) catch {
+            _ => break
+        }
+        if !announced {
+            first <- packet.from
+            announced = true
+        }
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        select {
+            incoming <- data => {}
+            else => {}
+        }
+    }
+}
+
+fn collect(stream: io.Stream, into: *Captured, marker: str) {
+    let buf = io.buffer(4096)
+    var announced = false
+    for {
+        let n = stream.read(buf) catch {
+            _ => break
+        }
+        if n == 0 {
+            break
+        }
+        into.text = "{into.text}{str(buf[..n])}"
+        if !announced && text.contains(into.text, marker) {
+            announced = true
+            into.ready <- true
+        }
+    }
+}
+
+fn keying_material(output: str) -> str {
+    let at = text.index(output, "Keying material: ")
+    if at < 0 {
+        return ""
+    }
+    let rest = output[at + 17..]
+    let end = text.index(rest, "\n")
+    text.lower(text.trim(if end < 0 { rest } else { rest[..end] }))
+}
+
+fn server_case(t: *testing.T, material: Material, c: Case) {
+    using var socket = net.bind_udp("127.0.0.1", 0) or panic("bind")
+    let h = net.detach_socket(mut socket)
+    let incoming = chan[u8[]](64)
+    let first = chan[net.Addr](1)
+    spawn pump(h, incoming, first)
+    let command = process.Command {
+        program: "timeout"
+        args: ["30", "openssl", "s_client", "-dtls1_2", "-connect", "127.0.0.1:{h.addr.port}", "-cert", material.certificate, "-key", material.key, "-cipher", c.cipher, "-groups", c.group_name, "-mtu", "{c.mtu}", "-use_srtp", "SRTP_AES128_CM_SHA1_80", "-keymatexport", "EXTRACTOR-dtls_srtp", "-keymatexportlen", "60"]
+        stdin: process.Stdio.Piped
+        stdout: process.Stdio.Piped
+        stderr: process.Stdio.Null
+    }
+    using child = process.start(command) or panic("start s_client")
+    let seen = new(Captured { text: "", ready: chan[bool](1) })
+    spawn collect(child.handle.stdout ?? panic("no stdout"), seen, "pong")
+    let remote = (<-first) ?? panic("no datagram")
+    let identity = dtls.generate_identity("low", 1700000000, 4102444800) or panic("identity")
+    let config = dtls.Config { client: false, identity, fingerprints: [material.fingerprint], cipher_suites: [c.suite], groups: c.groups, mtu: c.mtu, retransmit_initial: 200, srtp_profiles: [dtls.srtp_aes128_cm_sha1_80] }
+    using s = open(config, Transport { send: fn(d) { net.send_to_on(h, d, remote) or 0 }, incoming })
+    wait_connected(s.handle) or panic("handshake")
+    let stdin = child.handle.stdin ?? panic("no stdin")
+    stdin.write(bytes("hello\n")) or panic("write")
+    let message = receive(s.handle) or panic("receive")
+    testing.error_if(t, str(message) != "hello\n", "server received {str(message)}")
+    let info = describe_session(s.handle) or panic("describe")
+    testing.error_if(t, info.cipher_suite != c.suite, "suite {info.cipher_suite}")
+    testing.error_if(t, info.srtp_profile != dtls.srtp_aes128_cm_sha1_80, "profile {info.srtp_profile}")
+    let mine = text.encode_hex(export_keying_material(s.handle, "EXTRACTOR-dtls_srtp", 60) or panic("export"))
+    send(s.handle, bytes("pong\n")) or panic("send")
+    close_session(s.handle)
+    <-seen.ready
+    testing.error_if(t, !text.contains(seen.text, "SRTP Extension negotiated, profile=SRTP_AES128_CM_SHA1_80"), "openssl did not negotiate SRTP")
+    testing.error_if(t, !text.contains(seen.text, "Cipher is {c.cipher}"), "openssl negotiated another cipher")
+    testing.error_if(t, keying_material(seen.text) != mine, "keying material differs: openssl {keying_material(seen.text)} low {mine}")
+}
+
+fn client_case(t: *testing.T, material: Material, c: Case) {
+    let port = free_port()
+    let command = process.Command {
+        program: "timeout"
+        args: ["30", "openssl", "s_server", "-dtls1_2", "-accept", "127.0.0.1:{port}", "-cert", material.certificate, "-key", material.key, "-Verify", "1", "-cipher", c.cipher, "-groups", c.group_name, "-mtu", "{c.mtu}", "-use_srtp", "SRTP_AES128_CM_SHA1_80", "-keymatexport", "EXTRACTOR-dtls_srtp", "-keymatexportlen", "60", "-listen"]
+        stdin: process.Stdio.Piped
+        stdout: process.Stdio.Piped
+        stderr: process.Stdio.Null
+    }
+    using child = process.start(command) or panic("start s_server")
+    let seen = new(Captured { text: "", ready: chan[bool](1) })
+    spawn collect(child.handle.stdout ?? panic("no stdout"), seen, "hello")
+    using var socket = net.bind_udp("127.0.0.1", 0) or panic("bind")
+    let h = net.detach_socket(mut socket)
+    let incoming = chan[u8[]](64)
+    spawn pump(h, incoming, chan[net.Addr](1))
+    let remote = net.parse_addr("127.0.0.1:{port}") or panic("addr")
+    let identity = dtls.generate_identity("low", 1700000000, 4102444800) or panic("identity")
+    let config = dtls.Config { client: true, identity, fingerprints: [material.fingerprint], cipher_suites: [c.suite], groups: c.groups, mtu: c.mtu, retransmit_initial: 200, srtp_profiles: [dtls.srtp_aes128_cm_sha1_80] }
+    using s = open(config, Transport { send: fn(d) { net.send_to_on(h, d, remote) or 0 }, incoming })
+    wait_connected(s.handle) or panic("handshake")
+    let mine = text.encode_hex(export_keying_material(s.handle, "EXTRACTOR-dtls_srtp", 60) or panic("export"))
+    send(s.handle, bytes("hello\n")) or panic("send")
+    <-seen.ready
+    testing.error_if(t, keying_material(seen.text) != mine, "keying material differs: openssl {keying_material(seen.text)} low {mine}")
+    testing.error_if(t, !text.contains(seen.text, "CIPHER is {c.cipher}"), "openssl negotiated another cipher")
+    testing.error_if(t, !text.contains(seen.text, "SRTP Extension negotiated, profile=SRTP_AES128_CM_SHA1_80"), "openssl did not negotiate SRTP")
+    close_session(s.handle)
+}
+
+fn test_openssl_client_against_the_low_server(t: *testing.T) {
+    let absent = missing_tool()
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    let dir = file.temp_dir("dtls-interop-server") or panic("temp dir")
+    let material = make_material(dir)
+    for c in cases() {
+        testing.sub(t, c.name, fn(t) {
+            server_case(t, material, c)
+        })
+    }
+    file.remove_all(dir) or panic("remove")
+}
+
+fn test_low_client_against_the_openssl_server(t: *testing.T) {
+    let absent = missing_tool()
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    let dir = file.temp_dir("dtls-interop-client") or panic("temp dir")
+    let material = make_material(dir)
+    for c in cases() {
+        testing.sub(t, c.name, fn(t) {
+            client_case(t, material, c)
+        })
+    }
+    file.remove_all(dir) or panic("remove")
+}
