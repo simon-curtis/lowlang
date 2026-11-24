@@ -1,0 +1,121 @@
+import std/datachannel
+import std/rtp
+import std/sdp
+import std/slices
+import std/webrtc
+
+fn check(name: str, ok: bool) {
+    if ok {
+        print("{name}: ok")
+    } else {
+        print("{name}: FAIL")
+    }
+}
+
+fn trickle(from: webrtc.Handle, to: webrtc.Handle, tracks: chan[webrtc.RemoteTrack]) {
+    for {
+        let e = (<-from.events) ?? break
+        match e {
+            Candidate(value) => {
+                webrtc.add_remote_candidate(to, value) or {}
+            }
+            GatheringComplete => {}
+            StateChanged(_) => {}
+            Track(t) => {
+                tracks <- t
+            }
+        }
+    }
+}
+
+fn next_track(tracks: chan[webrtc.RemoteTrack]) -> webrtc.RemoteTrack? {
+    select {
+        t = <-tracks => t
+        after(5000) => none
+    }
+}
+
+fn next_packet(t: webrtc.RemoteTrack) -> rtp.Packet? {
+    select {
+        p = <-t.packets => p
+        after(5000) => none
+    }
+}
+
+fn pattern(n: i64) -> u8[] {
+    var out: u8[] = []
+    for i in 0..n {
+        out.push(u8(i * 7 % 251))
+    }
+    out
+}
+
+fn main() {
+    let config = webrtc.Config { bind: ["127.0.0.1"] }
+    using caller = webrtc.open(config) or panic("open caller")
+    using callee = webrtc.open(config) or panic("open callee")
+    let microphone = webrtc.add_track(caller.handle, webrtc.Kind.Audio, [webrtc.opus()]) or panic("audio track")
+    let speaker = webrtc.add_track(callee.handle, webrtc.Kind.Audio, [webrtc.opus()]) or panic("callee audio track")
+    let offer = webrtc.create_offer(caller.handle) or panic("offer")
+    let text = sdp.format(offer)
+    let reread = sdp.parse(text) or panic("offer does not parse")
+    check("offer bundles audio and data", (sdp.bundle(reread) or []).len == 2 && sdp.is_data_channel(reread.media[1]))
+    check("offer setup actpass", (sdp.setup(reread, reread.media[0]) or none) == some(sdp.Setup.ActPass))
+    let answer = webrtc.create_answer(callee.handle, reread) or panic("answer")
+    check("answer setup active", (sdp.setup(answer, answer.media[0]) or none) == some(sdp.Setup.Active))
+    check("answer sends and receives audio", sdp.direction(answer, answer.media[0]) == sdp.Direction.SendRecv)
+    webrtc.apply_answer(caller.handle, sdp.parse(sdp.format(answer)) or panic("answer does not parse")) or panic("apply answer")
+    let at_caller = chan[webrtc.RemoteTrack](4)
+    let at_callee = chan[webrtc.RemoteTrack](4)
+    spawn trickle(caller.handle, callee.handle, at_caller)
+    spawn trickle(callee.handle, caller.handle, at_callee)
+    webrtc.wait_connected(caller.handle) or panic("caller connect")
+    webrtc.wait_connected(callee.handle) or panic("callee connect")
+    print("connected")
+
+    let chat = webrtc.create_data_channel(caller.handle, datachannel.Options { label: "chat" }) or panic("data channel")
+    datachannel.send_text(chat, "hello") or panic("send text")
+    let accepted = (<-callee.handle.channels) ?? panic("no incoming channel")
+    check("label", accepted.label == "chat")
+    let hello = datachannel.receive(accepted) or panic("receive text")
+    check("text", hello.text && str(hello.data) == "hello")
+    let big = pattern(20000)
+    datachannel.send_binary(accepted, big) or panic("send binary")
+    let back = datachannel.receive(chat) or panic("receive binary")
+    check("binary 20000 bytes", !back.text && slices.equal(back.data, big))
+    let reverse = webrtc.create_data_channel(callee.handle, datachannel.Options { label: "reverse", ordered: false }) or panic("reverse channel")
+    datachannel.send_text(reverse, "from the answerer") or panic("send reverse")
+    let reversed = (<-caller.handle.channels) ?? panic("no reverse channel")
+    let first = datachannel.receive(reversed) or panic("receive reverse")
+    check("reverse channel", reversed.label == "reverse" && !reversed.ordered && str(first.data) == "from the answerer")
+
+    let heard = next_track(at_callee) ?? panic("no audio track at the callee")
+    check("callee sees the caller's audio", heard.kind == webrtc.Kind.Audio && heard.ssrc == microphone.ssrc)
+    let replied = next_track(at_caller) ?? panic("no audio track at the caller")
+    check("caller sees the callee's audio", replied.ssrc == speaker.ssrc)
+    for i in 0..3 {
+        webrtc.send_rtp(microphone, rtp.Packet { payload_type: 111, sequence: (65534 + i) % 65536, timestamp: 960 * i, ssrc: 0, payload: pattern(160) }) or panic("send rtp")
+    }
+    var sequences: i64[] = []
+    for _ in 0..3 {
+        let p = next_packet(heard) ?? break
+        sequences.push(p.sequence)
+        check("audio payload", slices.equal(p.payload, pattern(160)) && p.ssrc == microphone.ssrc && p.payload_type == 111)
+    }
+    check("audio sequence across the wrap", slices.equal(sequences, [65534, 65535, 0]))
+    webrtc.send_rtp(speaker, rtp.Packet { payload_type: 111, sequence: 9, timestamp: 0, ssrc: 0, payload: pattern(40) }) or panic("send rtp back")
+    let answered = next_packet(replied) ?? panic("no packet at the caller")
+    check("audio back", answered.sequence == 9 && slices.equal(answered.payload, pattern(40)))
+    webrtc.send_rtcp(callee.handle, [rtp.Rtcp.Pli(rtp.PictureLoss { sender: speaker.ssrc, media: microphone.ssrc })]) or panic("send rtcp")
+    let report: rtp.Rtcp[]? = select {
+        r = <-caller.handle.rtcp => r
+        after(5000) => none
+    }
+    check("rtcp reaches the caller", (report ?? []).len == 1)
+    webrtc.close_peer(caller.handle)
+    let ended = datachannel.receive(chat) or {
+        print("closed")
+        return
+    }
+    print("unexpected {ended.data.len}")
+}
