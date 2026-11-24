@@ -1,0 +1,199 @@
+import compiler
+import target
+import std/file
+import std/path
+import std/semver
+import std/slices
+import std/text
+
+/// Adds the tagged version `written` of the package `source` to the package index of `docs`, a git checkout, and commits the change there.
+///
+/// The tag is read from the repository at `https://<source>`, so the commit is one that dependents can fetch. The tree of that commit is extracted to a scratch directory, hashed as `build.lock` hashes it, and must resolve its own dependencies, type-check in every module and, when its `build.low` declares a version, declare the tag's. A version that the index already lists, under any spelling of its tag, is refused and the index is left as it was.
+pub fn publish(docs: *compiler.Overlay, source: str, written: str) -> Entry ! Error {
+    let location = index_file(docs.disk.index, source)?
+    let wanted = semver.parse(written) or fail Failed("{written} is not a semantic version such as 1.2.3")
+    let held = read_entries(location)?
+    for e in held {
+        let existing = semver.parse(e.tag) or continue
+        if semver.compare(existing, wanted) == 0 {
+            fail Failed("{source} {e.tag} is already in the package index at {e.commit}; a published version never changes")
+        }
+    }
+    let tag = remote_tag(source, wanted)?
+    let picked = compiler.Locked { source, version: tag.name, commit: tag.commit, hash: "" }
+    need_cache(docs.disk.cache, source)?
+    let archive = archive_of(docs.disk.cache, picked)?
+    let scratch = file.temp_dir("low-publish-") catch {
+        e => fail Failed("create a scratch directory: {e}")
+    }
+    defer file.remove_all(scratch) or {}
+    extract_archive(archive, picked, scratch)?
+    let hash = hash_tree(scratch)?
+    verify(docs, scratch, source, tag)?
+    let entry = Entry { tag: tag.name, commit: tag.commit, hash, yanked: false }
+    var content = ""
+    if file.exists(location) {
+        content = file.read_text(location) catch {
+            e => fail Failed("read {location}: {e}")
+        }
+    }
+    if content != "" && !text.ends_with(content, "\n") {
+        content = "{content}\n"
+    }
+    change_file(docs.disk.index, source, "{content}{format_entry(entry)}\n", "publish {source} {entry.tag}")?
+    entry
+}
+
+/// Marks the version `written` of the package `source` as yanked in the package index of `docs`, or with `undo` as available again, and commits the change there.
+///
+/// Only the flag at the end of the version's line changes, so the commit, the hash and every other line stay as they were. A yanked version is skipped when a resolution picks a version and is still built, with a warning, where `build.lock` holds it.
+pub fn yank(docs: *compiler.Overlay, source: str, written: str, undo: bool) -> Entry ! Error {
+    let location = index_file(docs.disk.index, source)?
+    let wanted = semver.parse(written) or fail Failed("{written} is not a semantic version such as 1.2.3")
+    if !file.exists(location) {
+        fail Failed("{source} is not in the package index")
+    }
+    let content = file.read_text(location) catch {
+        e => fail Failed("read {location}: {e}")
+    }
+    parse_entries(content, location)?
+    let lines = text.split(content, '\n')
+    var at = -1
+    for i, line in lines {
+        let fields = text.fields(line)
+        if fields.len == 0 {
+            continue
+        }
+        let existing = semver.parse(fields[0]) or continue
+        if semver.compare(existing, wanted) == 0 {
+            at = i
+        }
+    }
+    if at < 0 {
+        fail Failed("{source} {written} is not in the package index")
+    }
+    var entry = parse_entries(lines[at], location)?[0]
+    if entry.yanked != undo {
+        let state = if undo { "is not yanked" } else { "is already yanked" }
+        fail Failed("{source} {entry.tag} {state}")
+    }
+    entry.yanked = !undo
+    lines[at] = format_entry(entry)
+    var verb = "yank"
+    if undo {
+        verb = "unyank"
+    }
+    change_file(docs.disk.index, source, text.join(lines, "\n"), "{verb} {source} {entry.tag}")?
+    entry
+}
+
+fn remote_tag(source: str, wanted: semver.Version) -> Tag ! Error {
+    for tag in list_remote(source)? {
+        if semver.compare(tag.version, wanted) == 0 {
+            return tag
+        }
+    }
+    fail Failed("{source} has no tag for version {semver.format(wanted)}; tag the commit and push the tag")
+}
+
+fn verify(docs: *compiler.Overlay, tree: str, source: str, tag: Tag) ! Error {
+    let at = "{source} {tag.name}"
+    let manifest = compiler.project_manifest(docs, tree) catch Manifest
+    match manifest {
+        some(m) => {
+            if m.version != "" {
+                let declared = semver.parse(m.version) or fail Failed("{at}: build.low declares version {m.version}")
+                if semver.compare(declared, tag.version) != 0 {
+                    fail Failed("{at}: build.low declares version {m.version}")
+                }
+            }
+        }
+        none => {}
+    }
+    sync(docs, tree, false)?
+    let modules = modules_of(tree)?
+    if modules.len == 0 {
+        fail Failed("{at}: the tree holds no module")
+    }
+    for module in modules {
+        compiler.check_library(module, target.host(), docs) catch {
+            e => fail Failed("{at}: {relative(tree, module)} does not build: {compiler.message(e)}")
+        }
+    }
+}
+
+fn relative(tree: str, dir: str) -> str {
+    text.strip_prefix(dir, "{tree}/") ?? "."
+}
+
+fn modules_of(tree: str) -> []str ! Error {
+    var found: []str = []
+    let platform = target.host()
+    let visit = fn(v: file.Visit) -> file.Step {
+        if v.dir {
+            if v.depth > 0 && left_out(v.name) {
+                return file.Step.Skip
+            }
+            return file.Step.Continue
+        }
+        if v.regular && is_module_source(v.name, platform) {
+            let dir = path.dir(v.path)
+            if !slices.contains(found, dir) {
+                found.push(dir)
+            }
+        }
+        file.Step.Continue
+    }
+    file.walk(tree, visit) catch {
+        e => fail Failed("list {tree}: {e}")
+    }
+    found
+}
+
+fn is_module_source(name: str, platform: target.OS) -> bool {
+    text.ends_with(name, ".low") && name != compiler.manifest_file && target.builds(platform, name) && !target.is_test(name)
+}
+
+fn left_out(name: str) -> bool {
+    name == "testdata" || name == "examples" || text.starts_with(name, ".") || text.starts_with(name, "_")
+}
+
+fn change_file(index: str, source: str, content: str, message: str) ! Error {
+    if !file.is_dir(index) {
+        fail Failed("{index} is not a directory; LOW_INDEX names a checkout of the package index")
+    }
+    let location = path.join([index, source])
+    let existed = file.exists(location)
+    var previous = ""
+    if existed {
+        previous = file.read_text(location) catch {
+            e => fail Failed("read {location}: {e}")
+        }
+    }
+    file.mkdir_all(path.dir(location)) catch {
+        e => fail Failed("create {path.dir(location)}: {e}")
+    }
+    file.write_text(location, content) catch {
+        e => fail Failed("write {location}: {e}")
+    }
+    commit_file(index, source, message) catch {
+        e => {
+            restore(index, source, location, existed, previous)
+            fail e
+        }
+    }
+}
+
+fn commit_file(index: str, source: str, message: str) ! Error {
+    git(["-C", index, "add", "--", source])?
+    git(["-C", index, "commit", "--quiet", "-m", message, "--", source])?
+}
+
+fn restore(index: str, source: str, location: str, existed: bool, previous: str) {
+    git_succeeds(["-C", index, "reset", "--quiet", "--", source]) or false
+    if existed {
+        file.write_text(location, previous) or {}
+        return
+    }
+    file.remove(location) or {}
+}

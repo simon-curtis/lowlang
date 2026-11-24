@@ -27,11 +27,18 @@ struct Tag {
     version: semver.Version
     name: str
     commit: str
+    hash: str = ""
+    yanked: bool = false
 }
 
 struct Want {
     range: compiler.Range
     pos: diag.Pos
+}
+
+struct Expected {
+    hash: str
+    holder: str
 }
 
 struct Resolution {
@@ -44,12 +51,14 @@ struct Resolution {
     wants: [str: []Want] = [:]
     tags: [str: []Tag] = [:]
     walked: [str: bool] = [:]
+    warned: [str: bool] = [:]
+    warnings: []str = []
 }
 
-/// Resolves the version-control dependencies of the project at `root` and of every dependency, places each chosen commit in the module cache of `docs` and writes `build.lock` when the resolution changes. With `update`, each source moves to the newest version its ranges accept.
-pub fn sync(docs: *compiler.Overlay, root: str, update: bool) ! Error {
+/// Resolves the version-control dependencies of the project at `root` and of every dependency, places each chosen commit in the module cache of `docs` and writes `build.lock` when the resolution changes. With `update`, each source moves to the newest version its ranges accept. A source that the package index of `docs` lists takes its versions, commits and hashes from the index. Returns a warning for each locked version that the index has yanked.
+pub fn sync(docs: *compiler.Overlay, root: str, update: bool) -> []str ! Error {
     let manifest = compiler.project_manifest(docs, root) catch Manifest
-    let m = manifest ?? return
+    let m = manifest ?? return []
     let locked = compiler.read_lock(docs, root) catch Manifest
     let r = new(Resolution { docs, root, cache: docs.disk.cache, update, locked })
     r.walked[root] = true
@@ -59,6 +68,7 @@ pub fn sync(docs: *compiler.Overlay, root: str, update: bool) ! Error {
     if update || !same_entries(entries, previous) {
         write_lock(root, entries)?
     }
+    r.warnings
 }
 
 fn walk(r: *Resolution, dir: str, m: *compiler.Manifest) ! Error {
@@ -77,15 +87,19 @@ fn walk(r: *Resolution, dir: str, m: *compiler.Manifest) ! Error {
 }
 
 fn check_source(d: compiler.Dependency) ! Error {
-    var valid = d.source != "" && !text.contains(d.source, "\\") && !text.contains(d.source, ":") && !text.contains(d.source, "@")
-    for part in text.split(d.source, '/') {
+    if !is_source(d.source) {
+        fail Failed("{diag.text(d.pos)}: {d.source} is not a repository path such as github.com/acme/ui")
+    }
+}
+
+fn is_source(source: str) -> bool {
+    var valid = source != "" && !text.contains(source, "\\") && !text.contains(source, ":") && !text.contains(source, "@")
+    for part in text.split(source, '/') {
         if part == "" || part == "." || part == ".." {
             valid = false
         }
     }
-    if !valid {
-        fail Failed("{diag.text(d.pos)}: {d.source} is not a repository path such as github.com/acme/ui")
-    }
+    valid
 }
 
 fn local(r: *Resolution, dir: str) ! Error {
@@ -122,6 +136,7 @@ fn pick(r: *Resolution, source: str) -> compiler.Locked ! Error {
         match r.locked[source] {
             some(held) => {
                 if satisfies(wants, held.version) {
+                    r.check_listed(held)?
                     return held
                 }
             }
@@ -129,16 +144,37 @@ fn pick(r: *Resolution, source: str) -> compiler.Locked ! Error {
         }
     }
     let tags = r.tags_of(source)?
+    var withheld: []str = []
     for tag in tags {
-        if satisfies(wants, tag.name) {
-            return compiler.Locked { source, version: tag.name, commit: tag.commit, hash: "" }
+        if !satisfies(wants, tag.name) {
+            continue
         }
+        if tag.yanked {
+            withheld.push(tag.name)
+            continue
+        }
+        return compiler.Locked { source, version: tag.name, commit: tag.commit, hash: tag.hash }
     }
     var ranges: []str = []
     for w in wants {
         ranges.push("{w.range.written} at {diag.text(w.pos)}")
     }
-    fail Failed("no tagged version of {source} satisfies {text.join(ranges, ", ")}")
+    var yanked = ""
+    if withheld.len > 0 {
+        yanked = "; yanked: {text.join(withheld, ", ")}"
+    }
+    fail Failed("no tagged version of {source} satisfies {text.join(ranges, ", ")}{yanked}")
+}
+
+fn check_listed(r: *Resolution, held: compiler.Locked) ! Error {
+    let listed = r.indexed(held.source)? ?? return
+    r.unmoved(held.source, listed)?
+    for tag in listed {
+        if tag.name == held.version && tag.yanked && r.warned[held.source] == none {
+            r.warned[held.source] = true
+            r.warnings.push("{held.source} {held.version} is yanked from the package index; run low update to move to another version")
+        }
+    }
 }
 
 fn satisfies(wants: []Want, version: str) -> bool {
@@ -156,18 +192,28 @@ fn tags_of(r: *Resolution, source: str) -> []Tag ! Error {
         some(known) => return known
         none => {}
     }
-    let listed = git(["ls-remote", "--tags", url_of(source)])?
-    let found = parse_tags(listed)
+    let found = r.indexed(source)? ?? list_remote(source)?
     r.unmoved(source, found)?
     r.tags[source] = found
     found
 }
 
+fn list_remote(source: str) -> []Tag ! Error {
+    let listed = git(["ls-remote", "--tags", url_of(source)])?
+    parse_tags(listed)
+}
+
 fn unmoved(r: *Resolution, source: str, found: []Tag) ! Error {
     let held = r.locked[source] ?? return
     for tag in found {
-        if tag.name == held.version && tag.commit != held.commit {
+        if tag.name != held.version {
+            continue
+        }
+        if tag.commit != held.commit {
             fail Failed("{source}: tag {tag.name} moved from {held.commit} to {tag.commit}; a published version never changes")
+        }
+        if tag.hash != "" && tag.hash != held.hash {
+            fail Failed("{source}: {tag.name} has the hash {tag.hash} in the package index and {held.hash} in build.lock; a published version never changes")
         }
     }
 }
@@ -193,8 +239,12 @@ fn parse_tags(listed: str) -> []Tag {
         let commit = peeled[name] ?? commits[name] ?? continue
         tags.push(Tag { version, name, commit })
     }
-    slices.sort_by(mut tags, fn(a: Tag, b: Tag) -> bool { semver.compare(a.version, b.version) > 0 })
+    newest_first(mut tags)
     tags
+}
+
+fn newest_first(mut tags: []Tag) {
+    slices.sort_by(mut tags, fn(a: Tag, b: Tag) -> bool { semver.compare(a.version, b.version) > 0 })
 }
 
 fn url_of(source: str) -> str {
@@ -202,43 +252,60 @@ fn url_of(source: str) -> str {
 }
 
 fn place(r: *Resolution, picked: compiler.Locked) -> compiler.Locked ! Error {
-    if r.cache == "" {
-        fail Failed("{picked.source}: there is no module cache; set LOW_CACHE to a directory")
-    }
+    need_cache(r.cache, picked.source)?
     let tree = compiler.cached_dir(r.cache, picked.source, picked.commit)
     let expected = r.expected_hash(picked)
-    var tree_hash = expected
+    var tree_hash = expected.hash
     if !file.is_dir(tree) {
         tree_hash = materialise(r.cache, picked, expected)?
-    } else if expected == "" {
+    } else if expected.hash == "" {
         tree_hash = hash_tree(tree)?
     }
     compiler.Locked { source: picked.source, version: picked.version, commit: picked.commit, hash: tree_hash }
 }
 
-fn expected_hash(r: *Resolution, picked: compiler.Locked) -> str {
-    let held = r.locked[picked.source] ?? return ""
-    if held.commit != picked.commit {
-        return ""
+fn need_cache(cache: str, source: str) ! Error {
+    if cache == "" {
+        fail Failed("{source}: there is no module cache; set LOW_CACHE to a directory")
     }
-    held.hash
 }
 
-fn materialise(cache: str, picked: compiler.Locked, expected: str) -> str ! Error {
+fn expected_hash(r: *Resolution, picked: compiler.Locked) -> Expected {
+    match r.locked[picked.source] {
+        some(held) => {
+            if held.commit == picked.commit {
+                return Expected { hash: held.hash, holder: "build.lock" }
+            }
+        }
+        none => {}
+    }
+    Expected { hash: picked.hash, holder: "the package index" }
+}
+
+fn archive_of(cache: str, picked: compiler.Locked) -> []u8 ! Error {
     let mirror = ensure_mirror(cache, picked.source, picked.commit)?
+    let archived = run_git(["-c", "core.autocrlf=false", "-c", "core.eol=lf", "--git-dir", mirror, "archive", "--format=tar", picked.commit])?
+    require_plain_entries(archived.stdout, picked)?
+    archived.stdout
+}
+
+fn extract_archive(archive: []u8, picked: compiler.Locked, dir: str) ! Error {
+    tar.extract(archive, dir) catch {
+        e => fail Failed("extract {picked.source} {picked.version}: {e}")
+    }
+}
+
+fn materialise(cache: str, picked: compiler.Locked, expected: Expected) -> str ! Error {
     let tree = compiler.cached_dir(cache, picked.source, picked.commit)
     let parent = path.dir(tree)
     make_dir(parent)?
-    let archived = run_git(["-c", "core.autocrlf=false", "-c", "core.eol=lf", "--git-dir", mirror, "archive", "--format=tar", picked.commit])?
+    let archive = archive_of(cache, picked)?
     let staging = staging_dir(parent, "{path.base(tree)}.tmp-*")?
     defer file.remove_all(staging) or {}
-    require_plain_entries(archived.stdout, picked)?
-    tar.extract(archived.stdout, staging) catch {
-        e => fail Failed("extract {picked.source} {picked.version}: {e}")
-    }
+    extract_archive(archive, picked, staging)?
     let actual = hash_tree(staging)?
-    if expected != "" && actual != expected {
-        fail Failed("{picked.source} {picked.version}: build.lock holds {expected} but the fetched tree hashes to {actual}")
+    if expected.hash != "" && actual != expected.hash {
+        fail Failed("{picked.source} {picked.version}: {expected.holder} holds {expected.hash} but the fetched tree hashes to {actual}")
     }
     adopt(staging, tree)?
     actual
