@@ -11,6 +11,7 @@ pub struct Curve {
     /// A primitive cube root of unity of the scalar field.
     pub zeta: u64[]
     name: str
+    roots: u64[][]
     b: u64[]
     generator_x: u64[]
     generator_y: u64[]
@@ -55,6 +56,7 @@ fn curve_over(base: *nistec.Field, scalar: *nistec.Field, name: str, zeta: str, 
         scalar,
         zeta: constant(scalar, zeta),
         name,
+        roots: root_powers(base),
         b: field_from_u64(base, 5),
         generator_x: field_neg(base, field_one(base)),
         generator_y: field_from_u64(base, 2),
@@ -210,56 +212,275 @@ pub fn mul(c: *Curve, p: Point, k: u64[]) -> Point {
     out
 }
 
-fn window_bits(count: i64) -> i64 {
-    var bits = 1
-    for (1 << (bits + 2)) < count && bits < 12 {
-        bits += 1
+/// Returns `p + q` for the affine point `(qx, qy)`, which is not the point at infinity.
+fn add_affine(c: *Curve, p: Point, qx: u64[], qy: u64[]) -> Point {
+    let f = c.base
+    if is_identity(p) {
+        return Point { x: qx, y: qy, z: f.one }
     }
-    bits
+    let z1z1 = field_square(f, p.z)
+    let h = field_sub(f, field_mul(f, qx, z1z1), p.x)
+    let r = field_sub(f, field_mul(f, field_mul(f, qy, p.z), z1z1), p.y)
+    if field_is_zero(h) {
+        if field_is_zero(r) {
+            return double(c, p)
+        }
+        return identity(c)
+    }
+    let hh = field_square(f, h)
+    var i = field_add(f, hh, hh)
+    i = field_add(f, i, i)
+    let j = field_mul(f, h, i)
+    let r2 = field_add(f, r, r)
+    let v = field_mul(f, p.x, i)
+    let x3 = field_sub(f, field_sub(f, field_square(f, r2), j), field_add(f, v, v))
+    let yj = field_mul(f, p.y, j)
+    let y3 = field_sub(f, field_mul(f, r2, field_sub(f, v, x3)), field_add(f, yj, yj))
+    let z3 = field_sub(f, field_sub(f, field_square(f, field_add(f, p.z, h)), z1z1), hh)
+    Point { x: x3, y: y3, z: z3 }
+}
+
+struct Affine {
+    xs: u64[][]
+    ys: u64[][]
+    kept: i64[]
+}
+
+/// Returns the affine coordinates of the points of `points` that are not the point at infinity, with one field inversion for all of those not already affine, and the index of each in `points`.
+fn affine(c: *Curve, points: Point[]) -> Affine {
+    let f = c.base
+    var kept: i64[] = []
+    var xs: u64[][] = []
+    var ys: u64[][] = []
+    var projective: i64[] = []
+    var prefix: u64[][] = []
+    var running = f.one
+    for i, p in points {
+        if is_identity(p) {
+            continue
+        }
+        if !field_equal(p.z, f.one) {
+            projective.push(kept.len)
+            prefix.push(running)
+            running = field_mul(f, running, p.z)
+        }
+        kept.push(i)
+        xs.push(p.x)
+        ys.push(p.y)
+    }
+    if projective.len == 0 {
+        return Affine { xs, ys, kept }
+    }
+    var inverse = field_invert(f, running)
+    var k = projective.len - 1
+    for k >= 0 {
+        let at = projective[k]
+        let p = points[kept[at]]
+        let zi = field_mul(f, inverse, prefix[k])
+        inverse = field_mul(f, inverse, p.z)
+        let zi2 = field_square(f, zi)
+        xs[at] = field_mul(f, p.x, zi2)
+        ys[at] = field_mul(f, field_mul(f, p.y, zi2), zi)
+        k -= 1
+    }
+    Affine { xs, ys, kept }
+}
+
+/// Returns the points of `points` in affine form, `z = 1`, with one field inversion for all of them, so that sums with them cost less; the point at infinity stays as it is.
+pub fn normalize(c: *Curve, points: Point[]) -> Point[] {
+    let a = affine(c, points)
+    var out: Point[] = []
+    for p in points {
+        out.push(p)
+    }
+    for k, i in a.kept {
+        out[i] = Point { x: a.xs[k], y: a.ys[k], z: c.base.one }
+    }
+    out
+}
+
+fn bucket_cost(count: i64, top: i64, bits: i64) -> i64 {
+    (top / bits + 1) * (count * 11 + (1 << bits) * 16) + top * 9
+}
+
+fn naf_cost(count: i64, top: i64, width: i64) -> i64 {
+    let normalising = if width > 2 { 400 } else { 0 }
+    top * 9 + count * (top / (width + 1) * 11 + (1 << (width - 2)) * 22) + normalising
+}
+
+fn cheapest(cost: fn(i64) -> i64, from: i64, to: i64) -> i64 {
+    var best = from
+    for x in from + 1..to {
+        if cost(x) < cost(best) {
+            best = x
+        }
+    }
+    best
 }
 
 fn digit(plain: u64[], at: i64, bits: i64) -> i64 {
-    var out = 0
-    for i in 0..bits {
-        let position = at + i
-        if position < plain.len * 64 && (plain[position / 64] >> (position % 64)) & 1 == 1 {
-            out |= 1 << i
+    let word = at / 64
+    if word >= plain.len {
+        return 0
+    }
+    let offset = at % 64
+    var v = plain[word] >> offset
+    if offset + bits > 64 && word + 1 < plain.len {
+        v |= plain[word + 1] << (64 - offset)
+    }
+    i64(v & ((u64(1) << bits) - 1))
+}
+
+/// Returns the digits of `plain` in base `2^bits`, least significant first, each from `-2^(bits - 1)` to `2^(bits - 1)`.
+fn signed_digits(plain: u64[], bits: i64, windows: i64) -> i64[] {
+    let half = 1 << (bits - 1)
+    var out: i64[] = []
+    var carry = 0
+    for w in 0..windows {
+        let raw = digit(plain, w * bits, bits) + carry
+        if raw > half {
+            out.push(raw - (1 << bits))
+            carry = 1
+        } else {
+            out.push(raw)
+            carry = 0
         }
     }
     out
 }
 
-/// Returns the sum of `scalars[i] points[i]`, by bucket accumulation. The two slices must have the same length. The running time depends on the scalars.
+/// Returns the width-`width` non-adjacent form of `plain` over `length` positions, least significant first: each digit is zero or odd and below `2^(width - 1)` in magnitude, and of any `width` consecutive digits at most one is not zero.
+fn naf(plain: u64[], width: i64, length: i64) -> i64[] {
+    var out: i64[] = []
+    for _ in 0..length {
+        out.push(0)
+    }
+    var carry = 0
+    var at = 0
+    for at < length {
+        let window = carry + digit(plain, at, width)
+        if window & 1 == 0 {
+            at += 1
+            continue
+        }
+        if window < 1 << (width - 1) {
+            out[at] = window
+            carry = 0
+        } else {
+            out[at] = window - (1 << width)
+            carry = 1
+        }
+        at += width
+    }
+    out
+}
+
+/// Returns the sum of `scalars[i] points[i]`, by bucket accumulation over signed digits for many points or by interleaved non-adjacent forms over tables of odd multiples for few, with the points in affine form. The two slices must have the same length. The running time depends on the scalars.
 pub fn msm(c: *Curve, points: Point[], scalars: u64[][]) -> Point {
-    let plains = slices.map(scalars, fn(k) field_to_plain(c.scalar, k))
-    let bits = window_bits(points.len)
+    var used: Point[] = []
+    var used_scalars: u64[][] = []
+    for i in 0..points.len {
+        if !field_is_zero(scalars[i]) {
+            used.push(points[i])
+            used_scalars.push(scalars[i])
+        }
+    }
+    let a = affine(c, used)
+    var plains: u64[][] = []
+    for k in 0..a.kept.len {
+        plains.push(field_to_plain(c.scalar, used_scalars[a.kept[k]]))
+    }
+    let count = a.kept.len
     let top = c.scalar.m.len * 64
+    let bits = cheapest(fn(x) bucket_cost(count, top, x), 1, 17)
+    let width = cheapest(fn(x) naf_cost(count, top, x), 2, 9)
+    if naf_cost(count, top, width) < bucket_cost(count, top, bits) {
+        return interleaved(c, a, plains, width)
+    }
+    buckets(c, a, plains, bits)
+}
+
+fn interleaved(c: *Curve, a: Affine, plains: u64[][], width: i64) -> Point {
+    let f = c.base
+    let size = 1 << (width - 2)
+    var multiples: Point[] = []
+    for k in 0..a.kept.len {
+        let p = Point { x: a.xs[k], y: a.ys[k], z: f.one }
+        let twice = double(c, p)
+        var odd = p
+        multiples.push(odd)
+        for _ in 1..size {
+            odd = add(c, odd, twice)
+            multiples.push(odd)
+        }
+    }
+    let table = affine(c, multiples)
+    let length = c.scalar.m.len * 64 + 1
+    var digits: i64[][] = []
+    for plain in plains {
+        digits.push(naf(plain, width, length))
+    }
     var out = identity(c)
-    var at = ((top + bits - 1) / bits - 1) * bits
+    var at = length - 1
     for at >= 0 {
-        for _ in 0..bits {
+        if !is_identity(out) {
             out = double(c, out)
         }
-        var buckets: Point[] = []
-        for _ in 0..(1 << bits) {
-            buckets.push(identity(c))
-        }
-        for i in 0..points.len {
-            let d = digit(plains[i], at, bits)
+        for k in 0..digits.len {
+            let d = digits[k][at]
             if d > 0 {
-                buckets[d] = add(c, buckets[d], points[i])
+                let i = k * size + (d - 1) / 2
+                out = add_affine(c, out, table.xs[i], table.ys[i])
+            } else if d < 0 {
+                let i = k * size + (-d - 1) / 2
+                out = add_affine(c, out, table.xs[i], field_neg(f, table.ys[i]))
+            }
+        }
+        at -= 1
+    }
+    out
+}
+
+fn buckets(c: *Curve, a: Affine, plains: u64[][], bits: i64) -> Point {
+    let f = c.base
+    let windows = c.scalar.m.len * 64 / bits + 1
+    var digits: i64[][] = []
+    var negated: u64[][] = []
+    for k in 0..plains.len {
+        digits.push(signed_digits(plains[k], bits, windows))
+        negated.push(field_neg(f, a.ys[k]))
+    }
+    let half = 1 << (bits - 1)
+    var out = identity(c)
+    var w = windows - 1
+    for w >= 0 {
+        if !is_identity(out) {
+            for _ in 0..bits {
+                out = double(c, out)
+            }
+        }
+        var sums: Point[] = []
+        for _ in 0..half + 1 {
+            sums.push(identity(c))
+        }
+        for k in 0..plains.len {
+            let d = digits[k][w]
+            if d > 0 {
+                sums[d] = add_affine(c, sums[d], a.xs[k], a.ys[k])
+            } else if d < 0 {
+                sums[-d] = add_affine(c, sums[-d], a.xs[k], negated[k])
             }
         }
         var running = identity(c)
         var total = identity(c)
-        var d = (1 << bits) - 1
+        var d = half
         for d > 0 {
-            running = add(c, running, buckets[d])
+            running = add(c, running, sums[d])
             total = add(c, total, running)
             d -= 1
         }
         out = add(c, out, total)
-        at -= bits
+        w -= 1
     }
     out
 }
@@ -270,6 +491,9 @@ pub fn coordinates(c: *Curve, p: Point) -> u64[][]? {
         return none
     }
     let f = c.base
+    if field_equal(p.z, f.one) {
+        return [p.x, p.y]
+    }
     let inverse = field_invert(f, p.z)
     let inverse2 = field_square(f, inverse)
     [field_mul(f, p.x, inverse2), field_mul(f, field_mul(f, p.y, inverse2), inverse)]
@@ -301,7 +525,7 @@ pub fn from_bytes(c: *Curve, data: u8[]) -> Point? {
     if field_is_zero(x) && !odd {
         return identity(c)
     }
-    var y = field_sqrt(c.base, curve_rhs(c, x)) ?? return none
+    var y = square_root(c.base, curve_rhs(c, x), c.roots) ?? return none
     if field_is_odd(c.base, y) != odd {
         y = field_neg(c.base, y)
     }
