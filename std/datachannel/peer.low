@@ -1,0 +1,582 @@
+import std/io
+import std/sctp
+import std/sctp/session
+
+/// What the peer reports about its association.
+pub enum Event {
+    /// The SCTP association is established and channels can open.
+    Connected
+    /// The association shut down in an orderly way.
+    Closed
+    /// The association failed.
+    Failed(reason: str)
+}
+
+/// A message on a channel.
+pub struct Message {
+    /// Whether the sender sent it as text. A text message holds UTF-8 that the receiver does not check.
+    pub text: bool
+    /// The payload, which is empty for an empty message.
+    pub data: u8[]
+}
+
+/// What a channel is opened with.
+pub struct Options {
+    /// The channel name, which may be empty.
+    pub label: str = ""
+    /// The subprotocol name, which is empty when none is specified.
+    pub protocol: str = ""
+    /// Whether messages arrive in the order they were sent. The default is true.
+    pub ordered: bool = true
+    /// The most times a message is retransmitted, or -1 for no limit. At most one of this and `max_lifetime` is set.
+    pub max_retransmits: i64 = -1
+    /// The milliseconds after which an unacknowledged message is abandoned, or -1 for no limit.
+    pub max_lifetime: i64 = -1
+    /// The priority sent in the open message. The default is 0.
+    pub priority: i64 = 0
+    /// Whether both sides agreed on `id` out of band, as an SDP negotiation does: no open message is sent and none is expected.
+    pub negotiated: bool = false
+    /// The stream identifier of a negotiated channel. Other channels take the lowest unused identifier of the role's parity.
+    pub id: i64 = -1
+}
+
+/// An open data channel, copyable into a green thread or a closure.
+///
+/// A channel opened by the peer arrives on `Handle.incoming`; one opened locally comes from `open_channel`. Messages reach `messages` in the order the channel delivers them, and the channel closes `messages` when it ends.
+pub struct Channel {
+    /// The SCTP stream the channel uses.
+    pub id: i64
+    /// The channel name.
+    pub label: str
+    /// The subprotocol name.
+    pub protocol: str
+    /// Whether messages arrive in the order they were sent.
+    pub ordered: bool
+    /// The most times a message is retransmitted, or -1.
+    pub max_retransmits: i64
+    /// The milliseconds after which a message is abandoned, or -1.
+    pub max_lifetime: i64
+    /// Whether the channel was negotiated out of band.
+    pub negotiated: bool
+    /// The messages the peer sent. Closed when the channel ends.
+    pub messages: chan[Message]
+    core: *Core
+}
+
+struct Chan {
+    channel: Channel
+    delivery: sctp.Delivery
+    closing: bool
+}
+
+struct Pending {
+    chan: *Chan
+    message: Message
+}
+
+enum Opened {
+    Ready(channel: Channel)
+    Refused(error: io.Error)
+}
+
+enum Command {
+    Open(options: Options, reply: chan[Opened])
+    Send(id: i64, text: bool, data: u8[], reply: chan[io.Error?])
+    Close(id: i64)
+    Shutdown
+    Stop
+}
+
+enum Step {
+    Command(command: Command)
+    Message(message: sctp.Message)
+    Event(event: sctp.Event)
+    Drained
+    Ended
+}
+
+struct Core {
+    commands: chan[Command]
+    incoming: chan[Channel]
+    events: chan[Event]
+    gone: chan[bool]
+}
+
+struct Router {
+    core: *Core
+    link: session.Handle
+    client: bool
+    channels: [i64: *Chan]
+    early: [i64: sctp.Message[]]
+    pending: Pending[]
+}
+
+const pending_limit = 256
+const early_limit = 64
+
+/// A data channel peer's view that can be copied into a green thread or a closure, and used with every function of this module.
+pub struct Handle {
+    /// The channels the peer opened. Closed when the peer ends.
+    pub incoming: chan[Channel]
+    /// The association's events. The peer drops an event when 64 wait.
+    pub events: chan[Event]
+    core: *Core
+}
+
+/// A data channel peer: an SCTP association over a datagram path with the green thread that runs DCEP and the channels, closed when dropped.
+pub struct Peer {
+    /// The copyable view that every function of the module takes.
+    pub handle: Handle
+    drop stop(handle.core)
+}
+
+/// Creates the association and starts the peer's green thread over `transport`.
+///
+/// `config.client` must be true for the side that is the DTLS client: it starts the SCTP handshake and chooses even stream identifiers, and the other side chooses odd ones.
+pub fn open(config: sctp.Config, transport: session.Transport) -> Peer {
+    let core = new(Core {
+        commands: chan[Command](16)
+        incoming: chan[Channel](64)
+        events: chan[Event](64)
+        gone: chan[bool]()
+    })
+    spawn run(core, config, transport)
+    Peer { handle: Handle { incoming: core.incoming, events: core.events, core } }
+}
+
+fn delivery_of(options: Options) -> sctp.Delivery {
+    sctp.Delivery { ordered: options.ordered, max_retransmits: options.max_retransmits, lifetime: options.max_lifetime }
+}
+
+fn open_message(options: Options) -> Open {
+    let timed = options.max_lifetime >= 0
+    let limited = options.max_retransmits >= 0
+    Open {
+        reliability: if timed { Reliability.Timed } else if limited { Reliability.Retransmits } else { Reliability.Reliable }
+        ordered: options.ordered
+        priority: options.priority
+        parameter: if timed { options.max_lifetime } else if limited { options.max_retransmits } else { 0 }
+        label: options.label
+        protocol: options.protocol
+    }
+}
+
+fn options_of(open: Open, id: i64) -> Options {
+    Options {
+        label: open.label
+        protocol: open.protocol
+        ordered: open.ordered
+        max_retransmits: if open.reliability == Reliability.Retransmits { open.parameter } else { -1 }
+        max_lifetime: if open.reliability == Reliability.Timed { open.parameter } else { -1 }
+        priority: open.priority
+        negotiated: false
+        id
+    }
+}
+
+fn register(r: *Router, options: Options, id: i64) -> *Chan {
+    let ch = new(Chan {
+        channel: Channel {
+            id
+            label: options.label
+            protocol: options.protocol
+            ordered: options.ordered
+            max_retransmits: options.max_retransmits
+            max_lifetime: options.max_lifetime
+            negotiated: options.negotiated
+            messages: chan[Message](256)
+            core: r.core
+        }
+        delivery: delivery_of(options)
+        closing: false
+    })
+    r.channels[id] = ch
+    ch
+}
+
+fn own_parity(r: *Router, id: i64) -> bool {
+    (id % 2 == 0) == r.client
+}
+
+fn free_id(r: *Router) -> i64 {
+    var id = if r.client { 0 } else { 1 }
+    for {
+        if r.channels[id] == none {
+            return id
+        }
+        id += 2
+    }
+}
+
+fn open_channel_now(r: *Router, options: Options) -> Opened {
+    var id = options.id
+    if options.negotiated {
+        if id < 0 || id > 65534 || r.channels[id] != none {
+            return Opened.Refused(io.Error.Invalid)
+        }
+    } else {
+        id = free_id(r)
+        if id > 65534 {
+            return Opened.Refused(io.Error.Invalid)
+        }
+    }
+    if options.max_retransmits >= 0 && options.max_lifetime >= 0 {
+        return Opened.Refused(io.Error.Invalid)
+    }
+    if !options.negotiated {
+        session.send(r.link, id, ppid_dcep, encode_open(open_message(options)), sctp.Delivery {}) catch {
+            e => return Opened.Refused(e)
+        }
+    }
+    let ch = register(r, options, id)
+    deliver_early(r, ch)
+    Opened.Ready(ch.channel)
+}
+
+/// Opens a channel with `options`.
+///
+/// The channel is usable at once: the peer's acknowledgement is not awaited. Fails with `Invalid` for a negotiated identifier that is out of range or in use and for options that set both limits, with `NotConnected` before the association is established or after the peer ends, and with the error of the association when the open message cannot be sent.
+pub fn open_channel(h: Handle, options: Options) -> Channel ! io.Error {
+    let reply = chan[Opened](1)
+    let answer = ask(h.core, Command.Open(options, reply), reply)?
+    match answer {
+        Ready(channel) => channel
+        Refused(error) => fail error
+    }
+}
+
+fn send_now(r: *Router, id: i64, text: bool, data: u8[]) -> io.Error? {
+    let ch = r.channels[id] ?? return io.Error.NotConnected
+    if ch.closing {
+        return io.Error.NotConnected
+    }
+    let empty = data.len == 0
+    let ppid = if text {
+        if empty { ppid_text_empty } else { ppid_text }
+    } else {
+        if empty { ppid_binary_empty } else { ppid_binary }
+    }
+    var failure: io.Error? = none
+    session.send(r.link, id, ppid, if empty { [u8(0)] } else { data }, ch.delivery) catch {
+        e => {
+            failure = e
+        }
+    }
+    failure
+}
+
+fn send(c: Channel, text: bool, data: u8[]) ! io.Error {
+    let reply = chan[io.Error?](1)
+    let failure = ask(c.core, Command.Send(c.id, text, data, reply), reply)?
+    match failure {
+        some(e) => fail e
+        none => {}
+    }
+}
+
+/// Sends `text` as one message.
+///
+/// Fails with `NotConnected` after the channel or the peer closed, with `TooLarge` above `sctp.Config.max_message_size` and with `Invalid` when the channel's stream does not exist in the association.
+pub fn send_text(c: Channel, text: str) ! io.Error {
+    send(c, true, bytes(text))?
+}
+
+/// Sends `data` as one binary message. Fails as `send_text` does.
+pub fn send_binary(c: Channel, data: u8[]) ! io.Error {
+    send(c, false, data)?
+}
+
+/// Waits for the next message of the channel.
+///
+/// Fails with `NotConnected` once the channel is closed and every message was read.
+pub fn receive(c: Channel) -> Message ! io.Error {
+    let item = <-c.messages
+    match item {
+        some(m) => m
+        none => fail NotConnected
+    }
+}
+
+/// Closes the channel: the peer is asked to reset the stream after the messages queued before it, and the channel ends when the peer's reset arrives.
+pub fn close_channel(c: Channel) {
+    select {
+        c.core.commands <- Command.Close(c.id) => {}
+        <-c.core.gone => {}
+    }
+}
+
+fn close_now(r: *Router, id: i64) {
+    let ch = r.channels[id] ?? return
+    if ch.closing {
+        return
+    }
+    ch.closing = true
+    session.reset_stream(r.link, id) catch {
+        _ => {}
+    }
+}
+
+fn finish(r: *Router, id: i64) {
+    let ch = r.channels[id] ?? return
+    r.channels.delete(id)
+    close(ch.channel.messages)
+}
+
+fn on_reset(r: *Router, id: i64) {
+    let ch = r.channels[id] ?? return
+    if !ch.closing {
+        session.reset_stream(r.link, id) catch {
+            _ => {}
+        }
+    }
+    finish(r, id)
+}
+
+fn is_text(ppid: i64) -> bool {
+    ppid == ppid_text || ppid == ppid_text_empty
+}
+
+fn message_of(m: sctp.Message) -> Message {
+    let empty = m.ppid == ppid_text_empty || m.ppid == ppid_binary_empty
+    Message { text: is_text(m.ppid), data: if empty { [] } else { m.data } }
+}
+
+fn is_user(ppid: i64) -> bool {
+    ppid == ppid_text || ppid == ppid_binary || ppid == ppid_text_empty || ppid == ppid_binary_empty
+}
+
+fn deliver(r: *Router, ch: *Chan, m: sctp.Message) {
+    let message = message_of(m)
+    var sent = false
+    if r.pending.len == 0 {
+        select {
+            ch.channel.messages <- message => {
+                sent = true
+            }
+            else => {}
+        }
+    }
+    if !sent {
+        r.pending.push(Pending { chan: ch, message })
+    }
+}
+
+fn deliver_early(r: *Router, ch: *Chan) {
+    let held = r.early[ch.channel.id] ?? return
+    r.early.delete(ch.channel.id)
+    for m in held {
+        deliver(r, ch, m)
+    }
+}
+
+fn hold(r: *Router, m: sctp.Message) {
+    var held = r.early[m.stream] ?? []
+    if held.len < early_limit {
+        held.push(m)
+        r.early[m.stream] = held
+    }
+}
+
+fn on_open(r: *Router, m: sctp.Message) {
+    if r.channels[m.stream] != none || own_parity(r, m.stream) {
+        session.reset_stream(r.link, m.stream) catch {
+            _ => {}
+        }
+        return
+    }
+    let open = parse_open(m.data) or {
+        session.reset_stream(r.link, m.stream) catch {
+            _ => {}
+        }
+        return
+    }
+    let ch = register(r, options_of(open, m.stream), m.stream)
+    session.send(r.link, m.stream, ppid_dcep, encode_ack(), sctp.Delivery {}) catch {
+        _ => {}
+    }
+    let announced = ch.channel
+    select {
+        r.core.incoming <- announced => {}
+        else => {
+            close_now(r, m.stream)
+            return
+        }
+    }
+    deliver_early(r, ch)
+}
+
+fn on_message(r: *Router, m: sctp.Message) {
+    if m.ppid == ppid_dcep {
+        if !is_ack(m.data) {
+            on_open(r, m)
+        }
+        return
+    }
+    if !is_user(m.ppid) {
+        return
+    }
+    match r.channels[m.stream] {
+        some(ch) => deliver(r, ch, m)
+        none => hold(r, m)
+    }
+}
+
+fn on_event(r: *Router, e: sctp.Event) {
+    match e {
+        StreamReset(id) => on_reset(r, id)
+        Connected => announce(r, Event.Connected)
+        Closed => announce(r, Event.Closed)
+        Failed(reason) => announce(r, Event.Failed(reason))
+    }
+}
+
+fn announce(r: *Router, e: Event) {
+    select {
+        r.core.events <- e => {}
+        else => {}
+    }
+}
+
+fn handle_command(r: *Router, command: Command) -> bool {
+    match command {
+        Open(options, reply) => {
+            reply <- open_channel_now(r, options)
+        }
+        Send(id, text, data, reply) => {
+            reply <- send_now(r, id, text, data)
+        }
+        Close(id) => close_now(r, id)
+        Shutdown => session.shutdown_session(r.link)
+        Stop => return false
+    }
+    true
+}
+
+fn next_step(r: *Router) -> Step {
+    if r.pending.len > 0 {
+        let front = r.pending[0]
+        if r.pending.len >= pending_limit {
+            return select {
+                command = <-r.core.commands => match command {
+                    some(x) => Step.Command(x)
+                    none => Step.Ended
+                }
+                front.chan.channel.messages <- front.message => Step.Drained
+            }
+        }
+        return select {
+            command = <-r.core.commands => match command {
+                some(x) => Step.Command(x)
+                none => Step.Ended
+            }
+            m = <-r.link.messages => match m {
+                some(x) => Step.Message(x)
+                none => Step.Ended
+            }
+            e = <-r.link.events => match e {
+                some(x) => Step.Event(x)
+                none => Step.Ended
+            }
+            front.chan.channel.messages <- front.message => Step.Drained
+        }
+    }
+    select {
+        command = <-r.core.commands => match command {
+            some(x) => Step.Command(x)
+            none => Step.Ended
+        }
+        m = <-r.link.messages => match m {
+            some(x) => Step.Message(x)
+            none => Step.Ended
+        }
+        e = <-r.link.events => match e {
+            some(x) => Step.Event(x)
+            none => Step.Ended
+        }
+    }
+}
+
+fn run(core: *Core, config: sctp.Config, transport: session.Transport) {
+    using link = session.open(config, transport)
+    let r = new(Router { core, link: link.handle, client: config.client, channels: [:], early: [:], pending: [] })
+    serve(r)
+    for id, ch in r.channels {
+        close(ch.channel.messages)
+    }
+    close(core.incoming)
+    close(core.events)
+    close(core.gone)
+}
+
+fn serve(r: *Router) {
+    for {
+        var running = true
+        match next_step(r) {
+            Command(command) => {
+                running = handle_command(r, command)
+            }
+            Message(m) => on_message(r, m)
+            Event(e) => on_event(r, e)
+            Drained => {
+                r.pending = r.pending[1..]
+            }
+            Ended => {
+                running = false
+            }
+        }
+        if !running {
+            break
+        }
+    }
+}
+
+fn stop(c: *Core) {
+    select {
+        c.commands <- Command.Stop => {}
+        <-c.gone => {}
+    }
+}
+
+fn ask[T](core: *Core, command: Command, reply: chan[T]) -> T ! io.Error {
+    select {
+        core.commands <- command => {}
+        <-core.gone => fail NotConnected
+    }
+    select {
+        answer = <-reply => match answer {
+            some(v) => v
+            none => fail NotConnected
+        }
+        <-core.gone => fail NotConnected
+    }
+}
+
+/// Waits until the association is established.
+///
+/// Fails with `Refused` when it fails and with `NotConnected` when the peer ends first. Events that arrive before the result are consumed.
+pub fn wait_connected(h: Handle) ! io.Error {
+    for {
+        let event = <-h.events
+        match event {
+            some(e) => match e {
+                Connected => return
+                Failed(_) => fail Refused
+                Closed => fail NotConnected
+            }
+            none => fail NotConnected
+        }
+    }
+}
+
+/// Begins an orderly shutdown of the association. `events` reports `Closed` when the peer acknowledged.
+pub fn shutdown_peer(h: Handle) {
+    select {
+        h.core.commands <- Command.Shutdown => {}
+        <-h.core.gone => {}
+    }
+}
+
+/// Aborts the association and ends the peer. Every channel closes.
+pub fn close_peer(h: Handle) {
+    stop(h.core)
+}

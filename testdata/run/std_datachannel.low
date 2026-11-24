@@ -1,0 +1,164 @@
+import std/datachannel
+import std/sctp
+import std/sctp/session
+import std/slices
+
+struct Path {
+    seen: i64
+    every: i64
+}
+
+fn check(name: str, ok: bool) {
+    if ok {
+        print("{name}: ok")
+    } else {
+        print("{name}: FAIL")
+    }
+}
+
+fn lossy(path: *Path, to: chan[u8[]], incoming: chan[u8[]]) -> session.Transport {
+    session.Transport {
+        send: fn(packet) {
+            path.seen += 1
+            if path.every > 0 && path.seen % path.every == 0 {
+                return
+            }
+            select {
+                to <- packet => {}
+                else => {}
+            }
+        }
+        incoming
+    }
+}
+
+fn config(client: bool) -> sctp.Config {
+    sctp.Config { client, rto_initial: 40, rto_min: 20, rto_max: 160, sack_delay: 10 }
+}
+
+fn pattern(n: i64) -> u8[] {
+    var data: u8[] = []
+    for i in 0..n {
+        data.push(u8((i * 11 + 5) & 255))
+    }
+    data
+}
+
+fn next_message(c: datachannel.Channel) -> datachannel.Message? {
+    select {
+        m = <-c.messages => m
+        after(10000) => none
+    }
+}
+
+struct Inbox {
+    handle: datachannel.Handle
+    seen: [i64: datachannel.Channel]
+}
+
+fn next_incoming(h: datachannel.Handle) -> datachannel.Channel? {
+    select {
+        c = <-h.incoming => c
+        after(10000) => none
+    }
+}
+
+fn channel_with(inbox: *Inbox, id: i64) -> datachannel.Channel? {
+    for {
+        match inbox.seen[id] {
+            some(c) => return c
+            none => {}
+        }
+        let c = next_incoming(inbox.handle) ?? return none
+        inbox.seen[c.id] = c
+    }
+}
+
+fn run(every: i64) {
+    let to_client = chan[u8[]](256)
+    let to_server = chan[u8[]](256)
+    let path = new(Path { seen: 0, every })
+    using client = datachannel.open(config(true), lossy(path, to_server, to_client))
+    using server = datachannel.open(config(false), lossy(path, to_client, to_server))
+    datachannel.wait_connected(client.handle) or {
+        print("connect: FAIL")
+        return
+    }
+    datachannel.wait_connected(server.handle) or {
+        print("accept: FAIL")
+        return
+    }
+    let at_server = new(Inbox { handle: server.handle, seen: [:] })
+    let at_client = new(Inbox { handle: client.handle, seen: [:] })
+    let a = datachannel.open_channel(client.handle, datachannel.Options { label: "chat", protocol: "json" }) or return
+    let b = datachannel.open_channel(client.handle, datachannel.Options { label: "bulk", ordered: false, max_retransmits: 0 }) or return
+    let s = datachannel.open_channel(server.handle, datachannel.Options { label: "from server", max_lifetime: 5000 }) or return
+    check("client channels take even identifiers", a.id == 0 && b.id == 2)
+    check("server channels take odd identifiers", s.id == 1)
+    datachannel.send_text(a, "hello") or return
+    datachannel.send_binary(a, pattern(20000)) or return
+    datachannel.send_text(a, "") or return
+    datachannel.send_binary(a, []) or return
+    let got = channel_with(at_server, 0) ?? return
+    check("the server learns the label and protocol", got.id == 0 && got.label == "chat" && got.protocol == "json" && got.ordered)
+    let m1 = next_message(got) ?? return
+    let m2 = next_message(got) ?? return
+    let m3 = next_message(got) ?? return
+    let m4 = next_message(got) ?? return
+    check("a text message arrives as text", m1.text && str(m1.data) == "hello")
+    check("a large binary message arrives intact", !m2.text && slices.equal(m2.data, pattern(20000)))
+    check("an empty text message stays empty", m3.text && m3.data.len == 0)
+    check("an empty binary message stays empty", !m4.text && m4.data.len == 0)
+    let other = channel_with(at_server, 2) ?? return
+    check("reliability parameters reach the peer", other.id == 2 && !other.ordered && other.max_retransmits == 0 && other.max_lifetime == -1)
+    let back = channel_with(at_client, 1) ?? return
+    check("the server's channel arrives with its lifetime", back.id == 1 && back.label == "from server" && back.max_lifetime == 5000)
+    datachannel.send_text(got, "echo") or return
+    let echo = next_message(a) ?? return
+    check("a channel is bidirectional", str(echo.data) == "echo")
+    let n = datachannel.open_channel(client.handle, datachannel.Options { label: "agreed", negotiated: true, id: 6 }) or return
+    let n2 = datachannel.open_channel(server.handle, datachannel.Options { label: "agreed", negotiated: true, id: 6 }) or return
+    datachannel.send_text(n, "no open message") or return
+    let agreed = next_message(n2) ?? return
+    check("a negotiated channel needs no open message", str(agreed.data) == "no open message")
+    check("a negotiated identifier in use is refused", refuses(client.handle, datachannel.Options { negotiated: true, id: 6 }))
+    check("both limits at once are refused", refuses(client.handle, datachannel.Options { max_retransmits: 1, max_lifetime: 10 }))
+    datachannel.close_channel(a)
+    check("closing ends the channel on both sides", ended(a) && ended(got))
+    check("a closed channel cannot send", sends_fail(a))
+    let again = datachannel.open_channel(client.handle, datachannel.Options { label: "again" }) or return
+    check("a closed identifier is reused", again.id == 0)
+    datachannel.send_text(again, "second life") or return
+    at_server.seen.delete(0)
+    let reborn = channel_with(at_server, 0) ?? return
+    let m5 = next_message(reborn) ?? return
+    check("the reused channel carries messages from sequence number 0", reborn.label == "again" && str(m5.data) == "second life")
+}
+
+fn refuses(h: datachannel.Handle, options: datachannel.Options) -> bool {
+    let c = datachannel.open_channel(h, options) catch {
+        _ => return true
+    }
+    c.id < 0
+}
+
+fn ended(c: datachannel.Channel) -> bool {
+    select {
+        m = <-c.messages => m == none
+        after(10000) => false
+    }
+}
+
+fn sends_fail(c: datachannel.Channel) -> bool {
+    datachannel.send_text(c, "late") catch {
+        _ => return true
+    }
+    false
+}
+
+fn main() {
+    print("clean path")
+    run(0)
+    print("every third packet lost")
+    run(3)
+}
