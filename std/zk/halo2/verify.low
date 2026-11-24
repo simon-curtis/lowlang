@@ -1,0 +1,387 @@
+import std/crypto/nistec
+import std/crypto/pasta
+
+struct Source {
+    scalars: u64[][]
+    points: pasta.Point[]
+}
+
+struct Openings {
+    sources: Source[]
+    ids: i64[]
+    points: u64[][]
+    evals: u64[][]
+}
+
+fn plain_source(f: *nistec.Field, point: pasta.Point) -> Source {
+    Source { scalars: [one(f)], points: [point] }
+}
+
+fn add_source(o: *Openings, source: Source) -> i64 {
+    o.sources.push(source)
+    o.sources.len - 1
+}
+
+fn open(o: *Openings, id: i64, point: u64[], eval: u64[]) {
+    o.ids.push(id)
+    o.points.push(point)
+    o.evals.push(eval)
+}
+
+fn read_points(t: *Transcript, count: i64) -> pasta.Point[] ! Error {
+    var out: pasta.Point[] = []
+    for _ in 0..count {
+        out.push(read_point(t)?)
+    }
+    out
+}
+
+fn read_scalars(t: *Transcript, count: i64) -> u64[][] ! Error {
+    var out: u64[][] = []
+    for _ in 0..count {
+        out.push(read_scalar(t)?)
+    }
+    out
+}
+
+fn chunk_count(columns: i64, chunk: i64) -> i64 {
+    (columns + chunk - 1) / chunk
+}
+
+fn column_query(cs: *ConstraintSystem, column: Column) -> i64 {
+    match column.kind {
+        Advice => query_index(cs.advice_queries, column.index, 0)
+        Fixed => query_index(cs.fixed_queries, column.index, 0)
+        Instance => query_index(cs.instance_queries, column.index, 0)
+    }
+}
+
+fn column_eval(cs: *ConstraintSystem, column: Column, fixed: u64[][], advice: u64[][], instance: u64[][]) -> u64[] {
+    let at = column_query(cs, column)
+    match column.kind {
+        Advice => advice[at]
+        Fixed => fixed[at]
+        Instance => instance[at]
+    }
+}
+
+struct SetEvals {
+    product: u64[]
+    next: u64[]
+    last: u64[]
+}
+
+struct LookupEvals {
+    product: u64[]
+    next: u64[]
+    input: u64[]
+    input_inv: u64[]
+    table: u64[]
+}
+
+struct Challenges {
+    theta: u64[]
+    beta: u64[]
+    gamma: u64[]
+    y: u64[]
+    x: u64[]
+}
+
+struct Evaluations {
+    fixed: u64[][]
+    advice: u64[][]
+    instance: u64[][]
+    random: u64[]
+    permutation: u64[][]
+    sets: SetEvals[]
+    lookups: LookupEvals[]
+}
+
+struct Basis {
+    l0: u64[]
+    last: u64[]
+    blind: u64[]
+}
+
+fn compress(f: *nistec.Field, exprs: Expr[], theta: u64[], e: Evaluations) -> u64[] {
+    var acc = zero(f)
+    for expr in exprs {
+        acc = sum(f, prod(f, acc, theta), evaluate_expr(f, expr, e.fixed, e.advice, e.instance))
+    }
+    acc
+}
+
+fn permutation_expressions(d: Domain, cs: *ConstraintSystem, e: Evaluations, ch: Challenges, b: Basis) -> u64[][] {
+    let f = d.f
+    var out: u64[][] = []
+    let sets = e.sets
+    if sets.len == 0 {
+        return out
+    }
+    out.push(prod(f, b.l0, diff(f, one(f), sets[0].product)))
+    let last = sets[sets.len - 1].product
+    out.push(prod(f, diff(f, square(f, last), last), b.last))
+    for i in 1..sets.len {
+        out.push(prod(f, diff(f, sets[i].product, sets[i - 1].last), b.l0))
+    }
+    let chunk_len = degree(cs) - 2
+    let active = diff(f, one(f), sum(f, b.last, b.blind))
+    for i, set in sets {
+        let from = i * chunk_len
+        var to = from + chunk_len
+        if to > cs.permutation.len {
+            to = cs.permutation.len
+        }
+        var left = set.next
+        var right = set.product
+        var current_delta = prod(f, prod(f, ch.beta, ch.x), power(f, d.delta, from))
+        for j in from..to {
+            let value = column_eval(cs, cs.permutation[j], e.fixed, e.advice, e.instance)
+            left = prod(f, left, sum(f, sum(f, value, prod(f, ch.beta, e.permutation[j])), ch.gamma))
+            right = prod(f, right, sum(f, sum(f, value, current_delta), ch.gamma))
+            current_delta = prod(f, current_delta, d.delta)
+        }
+        out.push(prod(f, diff(f, left, right), active))
+    }
+    out
+}
+
+fn lookup_expressions(f: *nistec.Field, l: Lookup, le: LookupEvals, e: Evaluations, ch: Challenges, b: Basis) -> u64[][] {
+    let active = diff(f, one(f), sum(f, b.last, b.blind))
+    let left = prod(f, prod(f, le.next, sum(f, le.input, ch.beta)), sum(f, le.table, ch.gamma))
+    let right = prod(f, prod(f, le.product, sum(f, compress(f, l.input, ch.theta, e), ch.beta)), sum(f, compress(f, l.table, ch.theta, e), ch.gamma))
+    let gap = diff(f, le.input, le.table)
+    [
+        prod(f, b.l0, diff(f, one(f), le.product)),
+        prod(f, b.last, diff(f, square(f, le.product), le.product)),
+        prod(f, diff(f, left, right), active),
+        prod(f, b.l0, gap),
+        prod(f, prod(f, gap, diff(f, le.input, le.input_inv)), active),
+    ]
+}
+
+fn expected_quotient(d: Domain, cs: *ConstraintSystem, e: Evaluations, ch: Challenges, b: Basis, xn: u64[]) -> u64[] {
+    let f = d.f
+    var expressions: u64[][] = []
+    for g in cs.gates {
+        expressions.push(evaluate_expr(f, g, e.fixed, e.advice, e.instance))
+    }
+    for v in permutation_expressions(d, cs, e, ch, b) {
+        expressions.push(v)
+    }
+    for i, l in cs.lookups {
+        for v in lookup_expressions(f, l, e.lookups[i], e, ch, b) {
+            expressions.push(v)
+        }
+    }
+    var h = zero(f)
+    for v in expressions {
+        h = sum(f, prod(f, h, ch.y), v)
+    }
+    prod(f, h, inverse(f, diff(f, xn, one(f))))
+}
+
+fn basis_at(d: Domain, cs: *ConstraintSystem, x: u64[], xn: u64[]) -> Basis {
+    let f = d.f
+    let bf = blinding_factors(cs)
+    var blind = zero(f)
+    for row in 1..bf + 1 {
+        blind = sum(f, blind, lagrange_at(d, x, xn, row - bf - 1))
+    }
+    Basis { l0: lagrange_at(d, x, xn, 0), last: lagrange_at(d, x, xn, -(bf + 1)), blind }
+}
+
+/// Checks `proof` against the circuit of `vk` with the public inputs `instances`, one list of values per instance column, and returns normally only when the proof is valid.
+/// Fails with `Instance` when `instances` do not fit the circuit, `Malformed` when the proof is cut short, has bytes left over, or holds an encoding that is not canonical or a point that is not on the curve or is at infinity, and `Rejected` when it is well formed and does not verify.
+pub fn verify(p: *Params, vk: *VerifyingKey, instances: u64[][][], proof: u8[]) ! Error {
+    let c = p.curve
+    let f = c.scalar
+    let d = vk.domain
+    let cs = vk.cs
+    if p.k != d.k {
+        fail Circuit
+    }
+    if instances.len != cs.instance_columns {
+        fail Instance
+    }
+    let usable = usable_rows(d, cs)
+    var instance_commitments: pasta.Point[] = []
+    for column in instances {
+        if column.len > usable {
+            fail Instance
+        }
+        instance_commitments.push(commit_lagrange(p, padded(f, column, d.n), one(f)))
+    }
+    let t = reader(c, proof)
+    common_scalar(t, vk.representative)
+    for commitment in instance_commitments {
+        common_point(t, commitment)?
+    }
+    let advice_commitments = read_points(t, cs.advice_columns)?
+    let theta = squeeze(t)
+    var permuted_inputs: pasta.Point[] = []
+    var permuted_tables: pasta.Point[] = []
+    for _ in cs.lookups {
+        permuted_inputs.push(read_point(t)?)
+        permuted_tables.push(read_point(t)?)
+    }
+    let beta = squeeze(t)
+    let gamma = squeeze(t)
+    let chunk_len = degree(cs) - 2
+    let set_count = chunk_count(cs.permutation.len, chunk_len)
+    let product_commitments = read_points(t, set_count)?
+    let lookup_products = read_points(t, cs.lookups.len)?
+    let random_commitment = read_point(t)?
+    let y = squeeze(t)
+    let h_commitments = read_points(t, d.quotient_degree)?
+    let x = squeeze(t)
+
+    let instance_evals = read_scalars(t, cs.instance_queries.len)?
+    let advice_evals = read_scalars(t, cs.advice_queries.len)?
+    let fixed_evals = read_scalars(t, cs.fixed_queries.len)?
+    let random_eval = read_scalar(t)?
+    let permutation_evals = read_scalars(t, cs.permutation.len)?
+    var sets: SetEvals[] = []
+    for i in 0..set_count {
+        let product = read_scalar(t)?
+        let next = read_scalar(t)?
+        var last = zero(f)
+        if i != set_count - 1 {
+            last = read_scalar(t)?
+        }
+        sets.push(SetEvals { product, next, last })
+    }
+    var lookups: LookupEvals[] = []
+    for _ in cs.lookups {
+        let product = read_scalar(t)?
+        let next = read_scalar(t)?
+        let input = read_scalar(t)?
+        let input_inv = read_scalar(t)?
+        let table = read_scalar(t)?
+        lookups.push(LookupEvals { product, next, input, input_inv, table })
+    }
+    let e = Evaluations { fixed: fixed_evals, advice: advice_evals, instance: instance_evals, random: random_eval, permutation: permutation_evals, sets, lookups }
+    let ch = Challenges { theta, beta, gamma, y, x }
+    let xn = power(f, x, d.n)
+    let basis = basis_at(d, cs, x, xn)
+    let expected = expected_quotient(d, cs, e, ch, basis, xn)
+
+    let o = new(Openings { sources: [], ids: [], points: [], evals: [] })
+    var instance_ids: i64[] = []
+    for commitment in instance_commitments {
+        instance_ids.push(add_source(o, plain_source(f, commitment)))
+    }
+    var advice_ids: i64[] = []
+    for commitment in advice_commitments {
+        advice_ids.push(add_source(o, plain_source(f, commitment)))
+    }
+    var set_ids: i64[] = []
+    for commitment in product_commitments {
+        set_ids.push(add_source(o, plain_source(f, commitment)))
+    }
+    for i, q in cs.instance_queries {
+        open(o, instance_ids[q.column], rotate_omega(d, x, q.rotation), instance_evals[i])
+    }
+    for i, q in cs.advice_queries {
+        open(o, advice_ids[q.column], rotate_omega(d, x, q.rotation), advice_evals[i])
+    }
+    let x_next = rotate_omega(d, x, 1)
+    let x_last = rotate_omega(d, x, -(blinding_factors(cs) + 1))
+    for i in 0..set_count {
+        open(o, set_ids[i], x, sets[i].product)
+        open(o, set_ids[i], x_next, sets[i].next)
+    }
+    var i = set_count - 2
+    for i >= 0 {
+        open(o, set_ids[i], x_last, sets[i].last)
+        i -= 1
+    }
+    let x_inv = rotate_omega(d, x, -1)
+    for k in 0..cs.lookups.len {
+        let product_id = add_source(o, plain_source(f, lookup_products[k]))
+        let input_id = add_source(o, plain_source(f, permuted_inputs[k]))
+        let table_id = add_source(o, plain_source(f, permuted_tables[k]))
+        open(o, product_id, x, lookups[k].product)
+        open(o, input_id, x, lookups[k].input)
+        open(o, table_id, x, lookups[k].table)
+        open(o, input_id, x_inv, lookups[k].input_inv)
+        open(o, product_id, x_next, lookups[k].next)
+    }
+    var fixed_ids: i64[] = []
+    for commitment in vk.fixed_commitments {
+        fixed_ids.push(add_source(o, plain_source(f, commitment)))
+    }
+    for i, q in cs.fixed_queries {
+        open(o, fixed_ids[q.column], rotate_omega(d, x, q.rotation), fixed_evals[i])
+    }
+    for i, commitment in vk.permutation_commitments {
+        open(o, add_source(o, plain_source(f, commitment)), x, permutation_evals[i])
+    }
+    var h_scalars: u64[][] = []
+    var h_power = one(f)
+    for _ in h_commitments {
+        h_scalars.push(h_power)
+        h_power = prod(f, h_power, xn)
+    }
+    open(o, add_source(o, Source { scalars: h_scalars, points: h_commitments }), x, expected)
+    open(o, add_source(o, plain_source(f, random_commitment)), x, random_eval)
+
+    let m = empty_msm(p)
+    verify_openings(p, o, t, m)?
+    if !finished(t) {
+        fail Malformed
+    }
+    if !msm_is_identity(m) {
+        fail Rejected
+    }
+}
+
+fn verify_openings(p: *Params, o: *Openings, t: *Transcript, m: *Msm) ! Error {
+    let f = p.curve.scalar
+    let x1 = squeeze(t)
+    let x2 = squeeze(t)
+    let pl = plan(o.ids, o.points)
+    var q_commitments: Msm[] = []
+    var q_evals: u64[][][] = []
+    var powers: u64[][] = []
+    for s in 0..pl.sets.len {
+        q_commitments.push(*empty_msm(p))
+        q_evals.push(zeros(f, pl.sets[s].len))
+        powers.push(one(f))
+    }
+    var ci = pl.ids.len - 1
+    for ci >= 0 {
+        let s = pl.set_of[ci]
+        let source = o.sources[pl.ids[ci]]
+        let target = new(q_commitments[s])
+        for k in 0..source.points.len {
+            append_term(target, prod(f, powers[s], source.scalars[k]), source.points[k])
+        }
+        q_commitments[s] = *target
+        for j in 0..pl.members[ci].len {
+            let place = pl.positions[ci][j]
+            q_evals[s][place] = sum(f, q_evals[s][place], prod(f, o.evals[pl.members[ci][j]], powers[s]))
+        }
+        powers[s] = prod(f, powers[s], x1)
+        ci -= 1
+    }
+    let q_prime = read_point(t)?
+    let x3 = squeeze(t)
+    let u = read_scalars(t, pl.sets.len)?
+    var v = zero(f)
+    for s in 0..pl.sets.len {
+        var term = diff(f, u[s], interpolate_at(f, pl.sets[s], q_evals[s], x3))
+        for point in pl.sets[s] {
+            term = prod(f, term, inverse(f, diff(f, x3, point)))
+        }
+        v = sum(f, prod(f, v, x2), term)
+    }
+    let x4 = squeeze(t)
+    append_term(m, one(f), q_prime)
+    for s in 0..pl.sets.len {
+        scale_msm(m, x4)
+        add_msm(m, new(q_commitments[s]))
+        v = sum(f, prod(f, v, x4), u[s])
+    }
+    ipa_verify(p, m, t, x3, v)?
+}

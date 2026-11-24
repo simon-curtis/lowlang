@@ -1,0 +1,229 @@
+import std/crypto/nistec
+import std/crypto/pasta
+
+/// One cell of a column: the value of `column` at `row`.
+pub struct Cell {
+    /// The column of the cell.
+    pub column: Column
+    /// The row of the cell, below the number of usable rows.
+    pub row: i64
+}
+
+/// The constraint that the cells `a` and `b` hold the same value. Both columns must have equality enabled.
+pub struct Equal {
+    /// One of the cells.
+    pub a: Cell
+    /// The other cell.
+    pub b: Cell
+}
+
+/// The data of a circuit that the verifier needs: its shape, the commitments to its fixed columns and to the permutation that its equality constraints describe, and the scalar that stands for all of them in the transcript.
+pub struct VerifyingKey {
+    curve: *pasta.Curve
+    domain: Domain
+    cs: *ConstraintSystem
+    /// The commitments to the fixed columns, in column order.
+    pub fixed_commitments: pasta.Point[]
+    /// The commitments to the permutation polynomials, one for each column with equality enabled.
+    pub permutation_commitments: pasta.Point[]
+    representative: u64[]
+}
+
+/// A verifying key and the polynomials the prover needs: the fixed columns and the permutation as values, coefficients and values on the extended domain, and the Lagrange basis polynomials of the first, last and blinding rows on the extended domain.
+pub struct ProvingKey {
+    /// The verifying key that the proving key extends.
+    pub vk: *VerifyingKey
+    fixed_values: u64[][][]
+    fixed_coeffs: u64[][][]
+    fixed_cosets: u64[][][]
+    permutation_values: u64[][][]
+    permutation_coeffs: u64[][][]
+    permutation_cosets: u64[][][]
+    l0: u64[][]
+    l_blind: u64[][]
+    l_last: u64[][]
+}
+
+struct Cycles {
+    mapping: i64[]
+    aux: i64[]
+    sizes: i64[]
+}
+
+fn column_position(cs: *ConstraintSystem, column: Column) -> i64 {
+    for i, existing in cs.permutation {
+        if same_column(existing, column) {
+            return i
+        }
+    }
+    -1
+}
+
+fn new_cycles(cells: i64) -> *Cycles {
+    var mapping: i64[] = []
+    var aux: i64[] = []
+    var sizes: i64[] = []
+    for i in 0..cells {
+        mapping.push(i)
+        aux.push(i)
+        sizes.push(1)
+    }
+    new(Cycles { mapping, aux, sizes })
+}
+
+fn join_cycles(cycles: *Cycles, left: i64, right: i64) {
+    var left_cycle = cycles.aux[left]
+    var right_cycle = cycles.aux[right]
+    if left_cycle == right_cycle {
+        return
+    }
+    if cycles.sizes[left_cycle] < cycles.sizes[right_cycle] {
+        let held = left_cycle
+        left_cycle = right_cycle
+        right_cycle = held
+    }
+    cycles.sizes[left_cycle] += cycles.sizes[right_cycle]
+    var at = right_cycle
+    for {
+        cycles.aux[at] = left_cycle
+        at = cycles.mapping[at]
+        if at == right_cycle {
+            break
+        }
+    }
+    let held = cycles.mapping[left]
+    cycles.mapping[left] = cycles.mapping[right]
+    cycles.mapping[right] = held
+}
+
+fn usable_rows(d: Domain, cs: *ConstraintSystem) -> i64 {
+    d.n - (blinding_factors(cs) + 1)
+}
+
+fn permutation_values(d: Domain, cycles: *Cycles, columns: i64) -> u64[][][] {
+    let f = d.f
+    var omega_powers: u64[][] = []
+    var current = one(f)
+    for _ in 0..d.n {
+        omega_powers.push(current)
+        current = prod(f, current, d.omega)
+    }
+    var delta_powers: u64[][] = []
+    current = one(f)
+    for _ in 0..columns {
+        delta_powers.push(current)
+        current = prod(f, current, d.delta)
+    }
+    var out: u64[][][] = []
+    for column in 0..columns {
+        var values: u64[][] = []
+        for row in 0..d.n {
+            let mapped = cycles.mapping[column * d.n + row]
+            values.push(prod(f, delta_powers[mapped / d.n], omega_powers[mapped % d.n]))
+        }
+        out.push(values)
+    }
+    out
+}
+
+fn padded(f: *nistec.Field, values: u64[][], n: i64) -> u64[][] {
+    var out: u64[][] = []
+    for v in values {
+        out.push(v)
+    }
+    for out.len < n {
+        out.push(zero(f))
+    }
+    out
+}
+
+fn to_coeffs(d: Domain, columns: u64[][][]) -> u64[][][] {
+    var out: u64[][][] = []
+    for values in columns {
+        out.push(lagrange_to_coeff(d, values))
+    }
+    out
+}
+
+fn to_cosets(d: Domain, columns: u64[][][]) -> u64[][][] {
+    var out: u64[][][] = []
+    for coeffs in columns {
+        out.push(coeff_to_extended(d, coeffs))
+    }
+    out
+}
+
+fn commit_columns(p: *Params, columns: u64[][][]) -> pasta.Point[] {
+    var out: pasta.Point[] = []
+    for values in columns {
+        out.push(commit_lagrange(p, values, one(p.curve.scalar)))
+    }
+    out
+}
+
+fn basis_coset(d: Domain, ones: i64[]) -> u64[][] {
+    var values = zeros(d.f, d.n)
+    for row in ones {
+        values[row] = one(d.f)
+    }
+    coeff_to_extended(d, lagrange_to_coeff(d, values))
+}
+
+/// Returns the proving key of the circuit `cs` over the `2^k` rows of `p`, where `fixed` holds the values of each fixed column from row 0 (rows after the last value are zero) and `equalities` the equality constraints in the order they are made. The key follows from its inputs alone, so the prover and the verifier derive the same one, and no ceremony is involved.
+/// Fails with `Circuit` when the rows do not suffice for the blinding factors, `fixed` holds the wrong number of columns or a column with more values than usable rows, or an equality names a column without equality enabled or a row beyond the usable rows.
+pub fn keygen(p: *Params, cs: *ConstraintSystem, fixed: u64[][][], equalities: Equal[]) -> *ProvingKey ! Error {
+    let c = p.curve
+    let f = c.scalar
+    if p.n < minimum_rows(cs) || fixed.len != cs.fixed_columns {
+        fail Circuit
+    }
+    let d = domain(c, degree(cs), p.k)
+    let usable = usable_rows(d, cs)
+    for values in fixed {
+        if values.len > usable {
+            fail Circuit
+        }
+    }
+    let columns = cs.permutation.len
+    let cycles = new_cycles(columns * d.n)
+    for e in equalities {
+        let left = column_position(cs, e.a.column)
+        let right = column_position(cs, e.b.column)
+        if left < 0 || right < 0 || e.a.row < 0 || e.b.row < 0 || e.a.row >= usable || e.b.row >= usable {
+            fail Circuit
+        }
+        join_cycles(cycles, left * d.n + e.a.row, right * d.n + e.b.row)
+    }
+    var fixed_values: u64[][][] = []
+    for values in fixed {
+        fixed_values.push(padded(f, values, d.n))
+    }
+    let permutation = permutation_values(d, cycles, columns)
+    var blinding_rows: i64[] = []
+    for i in 0..blinding_factors(cs) {
+        blinding_rows.push(d.n - 1 - i)
+    }
+    let vk = new(VerifyingKey {
+        curve: c,
+        domain: d,
+        cs,
+        fixed_commitments: commit_columns(p, fixed_values),
+        permutation_commitments: commit_columns(p, permutation),
+        representative: [],
+    })
+    vk.representative = vk_representative(vk)
+    let fixed_coeffs = to_coeffs(d, fixed_values)
+    let permutation_coeffs = to_coeffs(d, permutation)
+    new(ProvingKey {
+        vk,
+        fixed_values,
+        fixed_coeffs,
+        fixed_cosets: to_cosets(d, fixed_coeffs),
+        permutation_values: permutation,
+        permutation_coeffs,
+        permutation_cosets: to_cosets(d, permutation_coeffs),
+        l0: basis_coset(d, [0]),
+        l_blind: basis_coset(d, blinding_rows),
+        l_last: basis_coset(d, [d.n - blinding_factors(cs) - 1]),
+    })
+}
