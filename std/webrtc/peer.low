@@ -1,0 +1,882 @@
+import std/datachannel
+import std/dtls
+import dtlssession = std/dtls/session
+import std/ice
+import icesession = std/ice/session
+import std/io
+import std/net
+import std/rtp
+import std/sctp
+import sctpsession = std/sctp/session
+import std/sdp
+import std/srtp
+import std/time
+
+/// The connection state of a peer, as the W3C `RTCPeerConnectionState` names it.
+pub enum State {
+    /// No description has been applied that starts the transport.
+    New = 0
+    /// ICE, DTLS or SCTP is still connecting.
+    Connecting = 1
+    /// DTLS is up and, when a data channel section was negotiated, so is SCTP.
+    Connected = 2
+    /// ICE consent has gone stale; it may recover.
+    Disconnected = 3
+    /// ICE, DTLS or SCTP failed.
+    Failed = 4
+    /// `close_peer` was called or the peer was dropped.
+    Closed = 5
+}
+
+/// The media type of a track.
+pub enum Kind {
+    /// An `m=audio` section.
+    Audio
+    /// An `m=video` section.
+    Video
+}
+
+/// What a peer reports on `Handle.events`.
+pub enum Event {
+    /// A local candidate, the value of an `a=candidate` attribute, to send to the remote peer.
+    Candidate(value: str)
+    /// Gathering finished.
+    GatheringComplete
+    /// The connection state changed.
+    StateChanged(state: State)
+    /// The remote description announced a track the remote peer sends.
+    Track(track: RemoteTrack)
+}
+
+/// Why a description or a candidate was not applied.
+pub enum Error {
+    /// The peer has closed.
+    Closed
+    /// The call does not fit the offer and answer exchange: an offer was already made or applied, or an answer arrived without an offer.
+    WrongState
+    /// The remote description or candidate lacks something the peer needs or has a value it cannot use, named by `reason`.
+    Invalid(reason: str)
+    /// The sockets could not be opened.
+    Unavailable(error: io.Error)
+}
+
+/// An RTP payload format of a track: one `a=rtpmap`, its `a=fmtp` and its `a=rtcp-fb` lines.
+pub struct Codec {
+    /// The payload type.
+    pub payload_type: i64
+    /// The encoding name, such as `opus` or `VP8`.
+    pub name: str
+    /// The RTP clock rate in hertz.
+    pub clock_rate: i64
+    /// The number of audio channels, 0 for video.
+    pub channels: i64 = 0
+    /// The `a=fmtp` parameters, or empty for none.
+    pub parameters: str = ""
+    /// The `a=rtcp-fb` values after the payload type, such as `nack` or `nack pli`.
+    pub feedback: str[] = []
+}
+
+/// The settings of `open`.
+pub struct Config {
+    /// The STUN servers to ask for server-reflexive candidates.
+    pub stun_servers: net.Addr[] = []
+    /// The IP addresses to bind one UDP socket each on, in text form, or empty for the addresses of the host's interfaces.
+    pub bind: str[] = []
+    /// Whether the interface addresses include loopback addresses. Used only when `bind` is empty.
+    pub loopback: bool = false
+    /// Whether an offer carries a data channel section and an answer accepts one.
+    pub data_channels: bool = true
+    /// The SRTP protection profiles to offer in DTLS `use_srtp`, preferred first.
+    pub srtp_profiles: i64[] = [srtp.profile_aead_aes_128_gcm, srtp.profile_aes128_cm_sha1_80]
+    /// The largest DTLS datagram in bytes. SCTP packets are sized to fit one record of it.
+    pub mtu: i64 = 1200
+    /// The largest data channel message the peer accepts, stated in `a=max-message-size`.
+    pub max_message_size: i64 = 262144
+    /// The ICE consent and keepalive settings; `controlling`, `hosts` and `stun_servers` are set by the peer.
+    pub ice: ice.Config = ice.Config { controlling: false }
+}
+
+/// A local track: a media section this peer sends RTP on, made by `add_track`.
+pub struct Track {
+    /// The media type.
+    pub kind: Kind
+    /// The synchronization source every packet sent on the track carries.
+    pub ssrc: i64
+    core: *Core
+}
+
+/// A track the remote peer sends, announced by `Event.Track`.
+pub struct RemoteTrack {
+    /// The media section identifier.
+    pub mid: str
+    /// The media type.
+    pub kind: Kind
+    /// The synchronization source the remote description names, or 0 when it names none and packets are matched by payload type.
+    pub ssrc: i64
+    /// The payload formats of the section.
+    pub codecs: Codec[]
+    /// The RTP packets that arrive for the track, decrypted. Closed when the peer ends; a packet that arrives while 256 wait is dropped.
+    pub packets: chan[rtp.Packet]
+}
+
+struct Local {
+    kind: Kind
+    ssrc: i64
+    codecs: Codec[]
+    track_id: str
+    mid: str
+}
+
+enum Phase {
+    Idle
+    Offered
+    Stable
+}
+
+enum Described {
+    Done(session: sdp.Session)
+    Refused(error: Error)
+}
+
+enum Command {
+    AddTrack(kind: Kind, codecs: Codec[], reply: chan[Track])
+    Offer(reply: chan[Described])
+    Answer(offer: sdp.Session, reply: chan[Described])
+    Accept(answer: sdp.Session, reply: chan[Error?])
+    AddCandidate(value: str, reply: chan[Error?])
+    EndCandidates(reply: chan[Error?])
+    OpenChannel(options: datachannel.Options, reply: chan[Opened])
+    SendRtp(ssrc: i64, packet: rtp.Packet, reply: chan[io.Error?])
+    SendRtcp(packets: rtp.Rtcp[], reply: chan[io.Error?])
+    Negotiated(ssrc: i64, reply: chan[Codec[]])
+    WaitConnected(reply: chan[State])
+    Close
+}
+
+enum Opened {
+    Ready(channel: datachannel.Channel)
+    Refused(error: io.Error)
+}
+
+enum Step {
+    Command(command: Command)
+    Ice(event: ice.Event)
+    IceEnded
+    Datagram(datagram: icesession.Datagram)
+    DatagramsEnded
+    Dtls(event: dtls.Event)
+    DtlsEnded
+    Sctp(event: datachannel.Event)
+    SctpEnded
+    Ended
+}
+
+struct Core {
+    config: Config
+    identity: dtls.Identity
+    fingerprint: str
+    commands: chan[Command]
+    events: chan[Event]
+    channels: chan[datachannel.Channel]
+    rtcp: chan[rtp.Rtcp[]]
+    gone: chan[bool]
+    stop: chan[bool]
+    phase: Phase
+    state: State
+    waiters: chan[State][]
+    session_id: str
+    version: i64
+    ice: icesession.Handle?
+    ice_events: chan[ice.Event]
+    ice_incoming: chan[icesession.Datagram]
+    ufrag: str
+    pwd: str
+    dtls_client: bool
+    remote_fingerprints: dtls.Fingerprint[]
+    remote_candidates: [str: bool]
+    data: bool
+    remote_sctp_port: i64
+    remote_max_message: i64
+    dtls_in: chan[u8[]]
+    dtls: dtlssession.Handle?
+    dtls_events: chan[dtls.Event]
+    srtp: srtp.Pair?
+    channel_peer: datachannel.Handle?
+    sctp_events: chan[datachannel.Event]
+    locals: Local[]
+    remotes: RemoteTrack[]
+    by_ssrc: [i64: i64]
+}
+
+/// The copyable view of a peer, used with every function of the module.
+///
+/// `events` carries candidates, state changes and remote tracks and drops an event when 256 wait. `channels` carries the data channels the remote peer opens and `rtcp` the RTCP packets it sends. All three close when the peer ends.
+pub struct Handle {
+    /// The peer's events.
+    pub events: chan[Event]
+    /// The data channels the remote peer opened.
+    pub channels: chan[datachannel.Channel]
+    /// The compound RTCP packets that arrive, decrypted; one that arrives while 256 wait is dropped.
+    pub rtcp: chan[rtp.Rtcp[]]
+    core: *Core
+}
+
+/// A WebRTC peer connection: the ICE agent and its sockets, DTLS, SRTP, SCTP and the data channels, closed when dropped.
+pub struct Peer {
+    /// The copyable view that every function of the module takes.
+    pub handle: Handle
+    drop stop_core(handle.core)
+}
+
+const record_overhead = 37
+const unlimited_message = 1073741823
+const default_remote_message = 65536
+
+/// Creates a peer with a new self-signed certificate and starts its green thread.
+///
+/// No socket is opened until `create_offer` or `create_answer` fixes the ICE role. Fails with the error of `dtls.generate_identity`.
+pub fn open(config: Config) -> Peer ! io.Error {
+    let now = time.now()
+    let identity = dtls.generate_identity("WebRTC", now - 86400, now + 30 * 86400)?
+    let print = dtls.fingerprint("sha-256", identity.certificate)?
+    let core = new(Core {
+        config
+        identity
+        fingerprint: dtls.format_fingerprint(print)
+        commands: chan[Command](16)
+        events: chan[Event](256)
+        channels: chan[datachannel.Channel](64)
+        rtcp: chan[rtp.Rtcp[]](256)
+        gone: chan[bool]()
+        stop: chan[bool]()
+        phase: Phase.Idle
+        state: State.New
+        waiters: []
+        session_id: "{random_digits(18)}"
+        version: 1
+        ice: none
+        ice_events: chan[ice.Event]()
+        ice_incoming: chan[icesession.Datagram]()
+        ufrag: ""
+        pwd: ""
+        dtls_client: false
+        remote_fingerprints: []
+        remote_candidates: [:]
+        data: false
+        remote_sctp_port: 5000
+        remote_max_message: default_remote_message
+        dtls_in: chan[u8[]](256)
+        dtls: none
+        dtls_events: chan[dtls.Event]()
+        srtp: none
+        channel_peer: none
+        sctp_events: chan[datachannel.Event]()
+        locals: []
+        remotes: []
+        by_ssrc: [:]
+    })
+    spawn run(core)
+    Peer { handle: Handle { events: core.events, channels: core.channels, rtcp: core.rtcp, core } }
+}
+
+fn set_state(c: *Core, s: State) {
+    if c.state == s || c.state == State.Closed {
+        return
+    }
+    c.state = s
+    publish(c, Event.StateChanged(s))
+    if s == State.Connected || s == State.Failed || s == State.Closed {
+        for w in c.waiters {
+            w <- s
+        }
+        c.waiters = []
+    }
+}
+
+fn publish(c: *Core, e: Event) {
+    select {
+        c.events <- e => {}
+        else => {}
+    }
+}
+
+fn hold_ice(options: icesession.Options, reply: chan[icesession.Handle?], failure: chan[io.Error], stop: chan[bool]) {
+    using s = icesession.open(options) catch {
+        e => {
+            failure <- e
+            return
+        }
+    }
+    reply <- s.handle
+    <-stop
+}
+
+fn open_ice(c: *Core, controlling: bool) ! Error {
+    var config = c.config.ice
+    config.controlling = controlling
+    config.stun_servers = c.config.stun_servers
+    let options = icesession.Options { config, bind: c.config.bind, loopback: c.config.loopback }
+    let reply = chan[icesession.Handle?](1)
+    let failure = chan[io.Error](1)
+    spawn hold_ice(options, reply, failure, c.stop)
+    let h = select {
+        r = <-reply => r ?? none
+        e = <-failure => fail Unavailable(e ?? io.Error.NotConnected)
+    } ?? fail Closed
+    c.ice = h
+    c.ice_events = h.events
+    c.ice_incoming = h.incoming
+    let credentials = icesession.credentials(h) or fail Closed
+    c.ufrag = credentials.ufrag
+    c.pwd = credentials.pwd
+    icesession.gather(h) or fail Closed
+    set_state(c, State.Connecting)
+}
+
+fn hold_dtls(config: dtls.Config, transport: dtlssession.Transport, reply: chan[dtlssession.Handle], stop: chan[bool]) {
+    using s = dtlssession.open(config, transport)
+    reply <- s.handle
+    <-stop
+}
+
+fn open_dtls(c: *Core, link: icesession.Handle) {
+    let config = dtls.Config {
+        client: c.dtls_client
+        identity: c.identity
+        fingerprints: c.remote_fingerprints
+        srtp_profiles: c.config.srtp_profiles
+        mtu: c.config.mtu
+    }
+    let transport = dtlssession.Transport {
+        send: fn(d) {
+            icesession.send(link, d) catch {
+                _ => {}
+            }
+        }
+        incoming: c.dtls_in
+    }
+    let reply = chan[dtlssession.Handle](1)
+    spawn hold_dtls(config, transport, reply, c.stop)
+    let h = (<-reply) ?? return
+    c.dtls = h
+    c.dtls_events = h.events
+}
+
+fn hold_channels(config: sctp.Config, transport: sctpsession.Transport, reply: chan[datachannel.Handle], stop: chan[bool]) {
+    using p = datachannel.open(config, transport)
+    reply <- p.handle
+    <-stop
+}
+
+fn forward_channels(from: chan[datachannel.Channel], to: chan[datachannel.Channel]) {
+    for {
+        let channel = (<-from) ?? break
+        to <- channel
+    }
+}
+
+fn forward_sctp_events(from: chan[datachannel.Event], to: chan[datachannel.Event]) {
+    for {
+        let e = (<-from) ?? break
+        to <- e
+    }
+    close(to)
+}
+
+fn open_channels(c: *Core, link: dtlssession.Handle) {
+    let config = sctp.Config {
+        client: c.dtls_client
+        remote_port: c.remote_sctp_port
+        mtu: c.config.mtu - record_overhead
+        max_message_size: c.remote_max_message
+    }
+    let transport = sctpsession.Transport {
+        send: fn(p) {
+            dtlssession.send(link, p) catch {
+                _ => {}
+            }
+        }
+        incoming: link.data
+    }
+    let reply = chan[datachannel.Handle](1)
+    spawn hold_channels(config, transport, reply, c.stop)
+    let h = (<-reply) ?? return
+    c.channel_peer = h
+    c.sctp_events = chan[datachannel.Event](16)
+    spawn forward_sctp_events(h.events, c.sctp_events)
+    spawn forward_channels(h.incoming, c.channels)
+}
+
+fn on_dtls_connected(c: *Core, link: dtlssession.Handle) {
+    let info = dtlssession.describe_session(link) or return
+    if info.srtp_profile != 0 {
+        let size = srtp.keying_material_size(info.srtp_profile) or 0
+        let material = dtlssession.export_keying_material(link, "EXTRACTOR-dtls_srtp", size) or []
+        c.srtp = srtp.from_dtls(info.srtp_profile, material, c.dtls_client) catch {
+            _ => {
+                set_state(c, State.Failed)
+                return
+            }
+        }
+    }
+    if c.data {
+        open_channels(c, link)
+        return
+    }
+    set_state(c, State.Connected)
+}
+
+fn on_ice(c: *Core, e: ice.Event) {
+    match e {
+        LocalCandidate(candidate) => publish(c, Event.Candidate(candidate_value(candidate)))
+        GatheringComplete => publish(c, Event.GatheringComplete)
+        Selected(_, _) => {
+            if c.dtls == none {
+                let link = c.ice ?? return
+                open_dtls(c, link)
+            }
+        }
+        StateChanged(s) => match s {
+            Disconnected => {
+                if c.state == State.Connected {
+                    set_state(c, State.Disconnected)
+                }
+            }
+            Completed => {
+                if c.state == State.Disconnected {
+                    set_state(c, State.Connected)
+                }
+            }
+            Failed => set_state(c, State.Failed)
+            _ => {}
+        }
+    }
+}
+
+fn on_dtls(c: *Core, e: dtls.Event) {
+    match e {
+        Connected => {
+            let link = c.dtls ?? return
+            on_dtls_connected(c, link)
+        }
+        Failed(_) => set_state(c, State.Failed)
+        Closed => set_state(c, State.Closed)
+    }
+}
+
+fn on_sctp(c: *Core, e: datachannel.Event) {
+    match e {
+        Connected => set_state(c, State.Connected)
+        Failed(_) => set_state(c, State.Failed)
+        Closed => {}
+    }
+}
+
+fn on_datagram(c: *Core, d: icesession.Datagram) {
+    match rtp.classify(d.data) {
+        Dtls => {
+            select {
+                c.dtls_in <- d.data => {}
+                else => {}
+            }
+        }
+        Rtp => receive_rtp(c, d.data)
+        Rtcp => receive_rtcp(c, d.data)
+        _ => {}
+    }
+}
+
+fn receive_rtp(c: *Core, data: u8[]) {
+    let pair = c.srtp ?? return
+    let plain = srtp.unprotect(pair.receive, data) catch {
+        _ => return
+    }
+    let packet = rtp.parse(plain) catch {
+        _ => return
+    }
+    let at = route(c, packet) ?? return
+    select {
+        c.remotes[at].packets <- packet => {}
+        else => {}
+    }
+}
+
+fn receive_rtcp(c: *Core, data: u8[]) {
+    let pair = c.srtp ?? return
+    let plain = srtp.unprotect_rtcp(pair.receive, data) catch {
+        _ => return
+    }
+    let packets = rtp.parse_rtcp(plain) catch {
+        _ => return
+    }
+    select {
+        c.rtcp <- packets => {}
+        else => {}
+    }
+}
+
+fn carries(t: RemoteTrack, payload_type: i64) -> bool {
+    for codec in t.codecs {
+        if codec.payload_type == payload_type {
+            return true
+        }
+    }
+    false
+}
+
+fn route(c: *Core, p: rtp.Packet) -> i64? {
+    match c.by_ssrc[p.ssrc] {
+        some(at) => return at
+        none => {}
+    }
+    for i, t in c.remotes {
+        if t.ssrc == 0 && carries(t, p.payload_type) {
+            c.by_ssrc[p.ssrc] = i
+            return i
+        }
+    }
+    none
+}
+
+fn send_rtp_now(c: *Core, ssrc: i64, packet: rtp.Packet) -> io.Error? {
+    let pair = c.srtp ?? return io.Error.NotConnected
+    let link = c.ice ?? return io.Error.NotConnected
+    var p = packet
+    p.ssrc = ssrc
+    let plain = rtp.marshal(p) catch {
+        e => return e
+    }
+    let sealed = srtp.protect(pair.send, plain) catch {
+        _ => return io.Error.Invalid
+    }
+    icesession.send(link, sealed) catch {
+        e => return e
+    }
+    none
+}
+
+fn send_rtcp_now(c: *Core, packets: rtp.Rtcp[]) -> io.Error? {
+    let pair = c.srtp ?? return io.Error.NotConnected
+    let link = c.ice ?? return io.Error.NotConnected
+    let plain = rtp.marshal_rtcp(packets) catch {
+        e => return e
+    }
+    let sealed = srtp.protect_rtcp(pair.send, plain) catch {
+        _ => return io.Error.Invalid
+    }
+    icesession.send(link, sealed) catch {
+        e => return e
+    }
+    none
+}
+
+fn open_channel_now(c: *Core, options: datachannel.Options) -> Opened {
+    let h = c.channel_peer ?? return Opened.Refused(io.Error.NotConnected)
+    let channel = datachannel.open_channel(h, options) catch {
+        e => return Opened.Refused(e)
+    }
+    Opened.Ready(channel)
+}
+
+fn add_track_now(c: *Core, kind: Kind, codecs: Codec[]) -> Track {
+    let ssrc = random_ssrc()
+    c.locals.push(Local { kind, ssrc, codecs, track_id: random_token(16), mid: "" })
+    Track { kind, ssrc, core: c }
+}
+
+fn negotiated_codecs(c: *Core, ssrc: i64) -> Codec[] {
+    for l in c.locals {
+        if l.ssrc == ssrc {
+            return l.codecs
+        }
+    }
+    []
+}
+
+fn add_candidate_now(c: *Core, value: str) -> Error? {
+    let link = c.ice ?? return Error.WrongState
+    if c.phase == Phase.Idle || c.phase == Phase.Offered {
+        return Error.WrongState
+    }
+    add_remote(c, link, value)
+}
+
+fn end_candidates_now(c: *Core) -> Error? {
+    let link = c.ice ?? return Error.WrongState
+    icesession.end_of_remote_candidates(link) catch {
+        _ => {}
+    }
+    none
+}
+
+fn handle(c: *Core, command: Command) -> bool {
+    match command {
+        AddTrack(kind, codecs, reply) => {
+            reply <- add_track_now(c, kind, codecs)
+        }
+        Offer(reply) => {
+            reply <- offer_now(c)
+        }
+        Answer(offer, reply) => {
+            reply <- answer_now(c, offer)
+        }
+        Accept(answer, reply) => {
+            reply <- accept_now(c, answer)
+        }
+        AddCandidate(value, reply) => {
+            reply <- add_candidate_now(c, value)
+        }
+        EndCandidates(reply) => {
+            reply <- end_candidates_now(c)
+        }
+        OpenChannel(options, reply) => {
+            reply <- open_channel_now(c, options)
+        }
+        SendRtp(ssrc, packet, reply) => {
+            reply <- send_rtp_now(c, ssrc, packet)
+        }
+        SendRtcp(packets, reply) => {
+            reply <- send_rtcp_now(c, packets)
+        }
+        Negotiated(ssrc, reply) => {
+            reply <- negotiated_codecs(c, ssrc)
+        }
+        WaitConnected(reply) => {
+            if c.state == State.Connected || c.state == State.Failed || c.state == State.Closed {
+                reply <- c.state
+            } else {
+                c.waiters.push(reply)
+            }
+        }
+        Close => return false
+    }
+    true
+}
+
+fn next_step(c: *Core) -> Step {
+    select {
+        command = <-c.commands => match command {
+            some(x) => Step.Command(x)
+            none => Step.Ended
+        }
+        e = <-c.ice_events => match e {
+            some(x) => Step.Ice(x)
+            none => Step.IceEnded
+        }
+        d = <-c.ice_incoming => match d {
+            some(x) => Step.Datagram(x)
+            none => Step.DatagramsEnded
+        }
+        e = <-c.dtls_events => match e {
+            some(x) => Step.Dtls(x)
+            none => Step.DtlsEnded
+        }
+        e = <-c.sctp_events => match e {
+            some(x) => Step.Sctp(x)
+            none => Step.SctpEnded
+        }
+    }
+}
+
+fn run(c: *Core) {
+    for {
+        var running = true
+        match next_step(c) {
+            Command(command) => {
+                running = handle(c, command)
+            }
+            Ice(e) => on_ice(c, e)
+            IceEnded => {
+                c.ice_events = chan[ice.Event]()
+            }
+            Datagram(d) => on_datagram(c, d)
+            DatagramsEnded => {
+                c.ice_incoming = chan[icesession.Datagram]()
+            }
+            Dtls(e) => on_dtls(c, e)
+            DtlsEnded => {
+                c.dtls_events = chan[dtls.Event]()
+            }
+            Sctp(e) => on_sctp(c, e)
+            SctpEnded => {
+                c.sctp_events = chan[datachannel.Event]()
+            }
+            Ended => {
+                running = false
+            }
+        }
+        if !running {
+            break
+        }
+    }
+    finish(c)
+}
+
+fn finish(c: *Core) {
+    match c.channel_peer {
+        some(h) => datachannel.close_peer(h)
+        none => {}
+    }
+    match c.dtls {
+        some(h) => dtlssession.close_session(h)
+        none => {}
+    }
+    match c.ice {
+        some(h) => icesession.close_session(h)
+        none => {}
+    }
+    close(c.stop)
+    set_state(c, State.Closed)
+    for t in c.remotes {
+        close(t.packets)
+    }
+    close(c.events)
+    close(c.channels)
+    close(c.rtcp)
+    close(c.gone)
+}
+
+fn stop_core(c: *Core) {
+    select {
+        c.commands <- Command.Close => {}
+        <-c.gone => {}
+    }
+}
+
+fn ask[T](c: *Core, command: Command, reply: chan[T]) -> T ! io.Error {
+    select {
+        c.commands <- command => {}
+        <-c.gone => fail NotConnected
+    }
+    select {
+        answer = <-reply => match answer {
+            some(v) => v
+            none => fail NotConnected
+        }
+        <-c.gone => fail NotConnected
+    }
+}
+
+fn described(h: Handle, command: Command, reply: chan[Described]) -> sdp.Session ! Error {
+    let answer = ask(h.core, command, reply) or fail Closed
+    match answer {
+        Done(session) => session
+        Refused(error) => fail error
+    }
+}
+
+fn applied(h: Handle, command: Command, reply: chan[Error?]) ! Error {
+    let failure = ask(h.core, command, reply) or fail Closed
+    match failure {
+        some(e) => fail e
+        none => {}
+    }
+}
+
+/// Adds a local track of `kind` that sends with `codecs`, for the next `create_offer` or `create_answer` to describe.
+///
+/// Fails with `NotConnected` once the peer has closed.
+pub fn add_track(h: Handle, kind: Kind, codecs: Codec[]) -> Track ! io.Error {
+    let reply = chan[Track](1)
+    ask(h.core, Command.AddTrack(kind, codecs, reply), reply)?
+}
+
+/// Creates an offer and makes it the local description: one media section per local track, then a data channel section when `Config.data_channels` is set, all in one BUNDLE group.
+///
+/// The ICE sockets open here and the peer is the controlling agent and offers `actpass`. The offer carries the host candidates; the others arrive as `Event.Candidate`. Fails with `WrongState` when an offer was already made or applied, with `Unavailable` when no socket could be opened and with `Closed` once the peer has closed.
+pub fn create_offer(h: Handle) -> sdp.Session ! Error {
+    let reply = chan[Described](1)
+    described(h, Command.Offer(reply), reply)?
+}
+
+/// Applies `offer` as the remote description and returns the answer, which becomes the local description.
+///
+/// The ICE sockets open here and the peer is the controlled agent. The answer takes the DTLS client role unless the offer said `active`, accepts the first data channel section when `Config.data_channels` is set, and answers each audio and video section with the first unused local track of its kind, keeping the payload types of the offered codecs that share a name and clock rate with the track's. A section the peer cannot use is rejected with port 0. Fails with `Invalid` for an offer without ICE credentials or a fingerprint, with `WrongState` after another offer, and as `create_offer` does.
+pub fn create_answer(h: Handle, offer: sdp.Session) -> sdp.Session ! Error {
+    let reply = chan[Described](1)
+    described(h, Command.Answer(offer, reply), reply)?
+}
+
+/// Applies `answer` as the remote description of the offer `create_offer` made.
+///
+/// Fails with `WrongState` when no offer is outstanding and with `Invalid` for an answer whose sections do not match the offer or that lacks ICE credentials or a fingerprint.
+pub fn apply_answer(h: Handle, answer: sdp.Session) ! Error {
+    let reply = chan[Error?](1)
+    applied(h, Command.Accept(answer, reply), reply)?
+}
+
+/// Adds a remote candidate that arrived by trickle, the value of an `a=candidate` attribute with or without the `candidate:` prefix.
+///
+/// A TCP candidate, a host name candidate and a candidate of component 2 are skipped. Fails with `WrongState` before the remote description is applied and with `Invalid` for a value that is not a candidate.
+pub fn add_remote_candidate(h: Handle, value: str) ! Error {
+    let reply = chan[Error?](1)
+    applied(h, Command.AddCandidate(value, reply), reply)?
+}
+
+/// Tells the peer the remote peer has no more candidates.
+///
+/// Fails with `WrongState` before the ICE sockets are open.
+pub fn end_of_remote_candidates(h: Handle) ! Error {
+    let reply = chan[Error?](1)
+    applied(h, Command.EndCandidates(reply), reply)?
+}
+
+/// Waits until the state is `Connected`.
+///
+/// Fails with `Refused` when it becomes `Failed` and with `NotConnected` when the peer closes first.
+pub fn wait_connected(h: Handle) ! io.Error {
+    let reply = chan[State](1)
+    let reached = ask(h.core, Command.WaitConnected(reply), reply)?
+    match reached {
+        Connected => {}
+        Failed => fail Refused
+        _ => fail NotConnected
+    }
+}
+
+/// Opens a data channel with `options` over the negotiated SCTP association.
+///
+/// Fails with `NotConnected` before the state is `Connected`, when no data channel section was negotiated and once the peer has closed, and as `datachannel.open_channel` does.
+pub fn create_data_channel(h: Handle, options: datachannel.Options) -> datachannel.Channel ! io.Error {
+    let reply = chan[Opened](1)
+    let answer = ask(h.core, Command.OpenChannel(options, reply), reply)?
+    match answer {
+        Ready(channel) => channel
+        Refused(error) => fail error
+    }
+}
+
+/// Returns the codecs negotiated for `t`, whose payload types its packets must carry: the track's own before negotiation and the answer's after.
+///
+/// Fails with `NotConnected` once the peer has closed.
+pub fn codecs(t: Track) -> Codec[] ! io.Error {
+    let reply = chan[Codec[]](1)
+    ask(t.core, Command.Negotiated(t.ssrc, reply), reply)?
+}
+
+/// Encrypts `packet` with SRTP and sends it on the selected ICE pair, with the track's synchronization source in place of `packet.ssrc`.
+///
+/// Fails with `NotConnected` before DTLS has produced the SRTP keys and once the peer has closed, with `Invalid` when the packet does not encode or SRTP refuses it, and with the error of the socket.
+pub fn send_rtp(t: Track, packet: rtp.Packet) ! io.Error {
+    let reply = chan[io.Error?](1)
+    let failure = ask(t.core, Command.SendRtp(t.ssrc, packet, reply), reply)?
+    match failure {
+        some(e) => fail e
+        none => {}
+    }
+}
+
+/// Encrypts `packets` as one compound SRTCP packet and sends it. Fails as `send_rtp` does.
+pub fn send_rtcp(h: Handle, packets: rtp.Rtcp[]) ! io.Error {
+    let reply = chan[io.Error?](1)
+    let failure = ask(h.core, Command.SendRtcp(packets, reply), reply)?
+    match failure {
+        some(e) => fail e
+        none => {}
+    }
+}
+
+/// Closes the peer: the data channels, the SCTP association, DTLS with `close_notify` and the ICE sockets, in that order.
+pub fn close_peer(h: Handle) {
+    stop_core(h.core)
+}

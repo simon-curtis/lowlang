@@ -1,0 +1,441 @@
+import std/crypto
+import std/dtls
+import std/ice
+import icesession = std/ice/session
+import std/io
+import std/rtp
+import std/sdp
+import std/text
+
+/// Returns Opus at payload type 111, 48000 Hz and two channels, with in-band forward error correction and transport-wide congestion control feedback, as browsers offer it.
+pub fn opus() -> Codec {
+    Codec { payload_type: 111, name: "opus", clock_rate: 48000, channels: 2, parameters: "minptime=10;useinbandfec=1", feedback: ["transport-cc"] }
+}
+
+/// Returns VP8 at payload type 96 and 90000 Hz, with NACK, picture loss and transport-wide congestion control feedback, as browsers offer it.
+pub fn vp8() -> Codec {
+    Codec { payload_type: 96, name: "VP8", clock_rate: 90000, feedback: ["goog-remb", "transport-cc", "ccm fir", "nack", "nack pli"] }
+}
+
+/// Returns the media type name of `k`, `audio` or `video`.
+pub fn kind_name(k: Kind) -> str {
+    match k {
+        Audio => "audio"
+        Video => "video"
+    }
+}
+
+fn kind_of(name: str) -> Kind? {
+    match name {
+        "audio" => Kind.Audio
+        "video" => Kind.Video
+        _ => none
+    }
+}
+
+fn random_from(alphabet: str, n: i64) -> str {
+    let raw = crypto.random(n)
+    let out = io.buffer(n)
+    for i in 0..n {
+        out[i] = alphabet[i64(raw[i]) % alphabet.len]
+    }
+    str(out)
+}
+
+fn random_token(n: i64) -> str {
+    random_from("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", n)
+}
+
+fn random_digits(n: i64) -> str {
+    "{random_from("123456789", 1)}{random_from("0123456789", n - 1)}"
+}
+
+fn random_ssrc() -> i64 {
+    let raw = crypto.random(4)
+    let value = (i64(raw[0]) << 24) | (i64(raw[1]) << 16) | (i64(raw[2]) << 8) | i64(raw[3])
+    if value == 0 { 1 } else { value }
+}
+
+fn candidate_value(c: ice.Candidate) -> str {
+    text.trim_prefix(ice.format(c), "candidate:")
+}
+
+fn transport_attributes(c: *Core, setup: sdp.Setup) -> sdp.Attribute[] {
+    [
+        sdp.attribute("ice-ufrag", c.ufrag)
+        sdp.attribute("ice-pwd", c.pwd)
+        sdp.attribute("ice-options", "trickle")
+        sdp.attribute("fingerprint", c.fingerprint)
+        sdp.setup_attribute(setup)
+    ]
+}
+
+fn section(c: *Core, kind: str, protocol: str, formats: str[], mid: str, setup: sdp.Setup) -> sdp.Media {
+    var attributes = transport_attributes(c, setup)
+    attributes.push(sdp.attribute("mid", mid))
+    sdp.Media { kind, protocol, formats, connections: [sdp.Connection { address: "0.0.0.0" }], attributes }
+}
+
+fn data_section(c: *Core, mid: str, setup: sdp.Setup) -> sdp.Media {
+    var m = section(c, "application", "UDP/DTLS/SCTP", ["webrtc-datachannel"], mid, setup)
+    m.attributes.push(sdp.attribute("sctp-port", "5000"))
+    m.attributes.push(sdp.attribute("max-message-size", "{c.config.max_message_size}"))
+    m
+}
+
+fn rtp_section(c: *Core, kind: Kind, codecs: Codec[], mid: str, setup: sdp.Setup, d: sdp.Direction, sender: Local?) -> sdp.Media {
+    var formats: str[] = []
+    for codec in codecs {
+        formats.push("{codec.payload_type}")
+    }
+    var m = section(c, kind_name(kind), "UDP/TLS/RTP/SAVPF", formats, mid, setup)
+    m.attributes.push(sdp.direction_attribute(d))
+    match sender {
+        some(l) => m.attributes.push(sdp.msid_attribute(sdp.Msid { stream: "-", track: l.track_id }))
+        none => {}
+    }
+    m.attributes.push(sdp.property("rtcp-mux"))
+    for codec in codecs {
+        m.attributes.push(sdp.rtpmap_attribute(sdp.Rtpmap { payload_type: codec.payload_type, encoding: codec.name, clock_rate: codec.clock_rate, channels: codec.channels }))
+        for f in codec.feedback {
+            m.attributes.push(sdp.attribute("rtcp-fb", "{codec.payload_type} {f}"))
+        }
+        if codec.parameters.len > 0 {
+            m.attributes.push(sdp.fmtp_attribute(sdp.Fmtp { format: "{codec.payload_type}", parameters: codec.parameters }))
+        }
+    }
+    match sender {
+        some(l) => {
+            m.attributes.push(sdp.ssrc_attribute(sdp.Ssrc { id: l.ssrc, name: "cname", value: c.session_id }))
+            m.attributes.push(sdp.ssrc_attribute(sdp.Ssrc { id: l.ssrc, name: "msid", value: "- {l.track_id}" }))
+        }
+        none => {}
+    }
+    m
+}
+
+fn rejected(m: sdp.Media, mid: str) -> sdp.Media {
+    sdp.Media { kind: m.kind, port: 0, protocol: m.protocol, formats: m.formats, connections: [sdp.Connection { address: "0.0.0.0" }], attributes: [sdp.attribute("mid", mid)] }
+}
+
+fn described_session(c: *Core, media: sdp.Media[], mids: str[]) -> sdp.Session ! Error {
+    var all = media
+    if all.len == 0 {
+        fail Invalid("no media section to describe")
+    }
+    let link = c.ice ?? fail Closed
+    let gathered = icesession.candidates(link) or fail Closed
+    for at, m in all {
+        if m.port != 0 {
+            for candidate in gathered {
+                all[at].attributes.push(sdp.attribute("candidate", candidate_value(candidate)))
+            }
+            break
+        }
+    }
+    c.version += 1
+    sdp.Session {
+        origin: sdp.Origin { session_id: c.session_id, session_version: "{c.version}" }
+        attributes: [sdp.group_attribute(sdp.Group { semantics: "BUNDLE", mids })]
+        media: all
+    }
+}
+
+fn offer_now(c: *Core) -> Described {
+    if c.phase != Phase.Idle {
+        return Described.Refused(Error.WrongState)
+    }
+    let session = make_offer(c) catch {
+        e => return Described.Refused(e)
+    }
+    c.phase = Phase.Offered
+    Described.Done(session)
+}
+
+fn make_offer(c: *Core) -> sdp.Session ! Error {
+    if c.locals.len == 0 && !c.config.data_channels {
+        fail Invalid("no track and no data channel to offer")
+    }
+    open_ice(c, true)?
+    var media: sdp.Media[] = []
+    var mids: str[] = []
+    for i in 0..c.locals.len {
+        let mid = "{i}"
+        c.locals[i].mid = mid
+        media.push(rtp_section(c, c.locals[i].kind, c.locals[i].codecs, mid, sdp.Setup.ActPass, sdp.Direction.SendRecv, c.locals[i]))
+        mids.push(mid)
+    }
+    if c.config.data_channels {
+        let mid = "{c.locals.len}"
+        media.push(data_section(c, mid, sdp.Setup.ActPass))
+        mids.push(mid)
+    }
+    described_session(c, media, mids)?
+}
+
+fn transport_of(s: sdp.Session) -> sdp.Media ! Error {
+    for m in s.media {
+        if m.port != 0 {
+            return m
+        }
+    }
+    fail Invalid("every media section is rejected")
+}
+
+fn read_transport(c: *Core, s: sdp.Session, m: sdp.Media) ! Error {
+    if sdp.ice_ufrag(s, m) == none || sdp.ice_pwd(s, m) == none {
+        fail Invalid("ice-ufrag or ice-pwd missing")
+    }
+    var prints: dtls.Fingerprint[] = []
+    for value in sdp.fingerprints(s, m) {
+        prints.push(dtls.parse_fingerprint(value) or fail Invalid("fingerprint {value}"))
+    }
+    if prints.len == 0 {
+        fail Invalid("fingerprint missing")
+    }
+    c.remote_fingerprints = prints
+}
+
+fn add_remote(c: *Core, link: icesession.Handle, value: str) -> Error? {
+    let key = text.trim_prefix(text.trim_prefix(text.trim(value), "a="), "candidate:")
+    if c.remote_candidates[key] != none {
+        return none
+    }
+    c.remote_candidates[key] = true
+    let candidate = ice.parse(key) catch {
+        Unsupported => return none
+        _ => return Error.Invalid("candidate {key}")
+    }
+    if candidate.component != 1 {
+        return none
+    }
+    icesession.add_remote_candidate(link, candidate) catch {
+        _ => return Error.Closed
+    }
+    none
+}
+
+fn apply_transport(c: *Core, s: sdp.Session, m: sdp.Media) ! Error {
+    let link = c.ice ?? fail Closed
+    icesession.set_remote_lite(link, sdp.ice_lite(s)) or fail Closed
+    icesession.set_remote_credentials(link, sdp.ice_ufrag(s, m) ?? "", sdp.ice_pwd(s, m) ?? "") or fail Closed
+    for each in s.media {
+        for value in sdp.candidates(each) {
+            add_remote(c, link, value)
+        }
+    }
+    if sdp.end_of_candidates(s, m) {
+        icesession.end_of_remote_candidates(link) or fail Closed
+    }
+}
+
+fn accept_data(c: *Core, m: sdp.Media) ! Error {
+    c.data = true
+    c.remote_sctp_port = (sdp.sctp_port(m) or fail Invalid("sctp-port")) ?? 5000
+    let limit = (sdp.max_message_size(m) or fail Invalid("max-message-size")) ?? default_remote_message
+    c.remote_max_message = if limit == 0 { unlimited_message } else { limit }
+}
+
+fn codecs_of(m: sdp.Media) -> Codec[] ! Error {
+    let maps = sdp.rtpmaps(m) or fail Invalid("rtpmap")
+    let parameters = sdp.fmtps(m) or fail Invalid("fmtp")
+    let feedback = sdp.feedbacks(m) or fail Invalid("rtcp-fb")
+    var out: Codec[] = []
+    for r in maps {
+        var codec = Codec { payload_type: r.payload_type, name: r.encoding, clock_rate: r.clock_rate, channels: r.channels }
+        for f in parameters {
+            if f.format == "{r.payload_type}" {
+                codec.parameters = f.parameters
+            }
+        }
+        for f in feedback {
+            if f.format == "{r.payload_type}" {
+                codec.feedback.push(if f.parameter.len > 0 { "{f.kind} {f.parameter}" } else { f.kind })
+            }
+        }
+        out.push(codec)
+    }
+    out
+}
+
+fn same_format(a: Codec, b: Codec) -> bool {
+    text.lower(a.name) == text.lower(b.name) && a.clock_rate == b.clock_rate && (a.channels == b.channels || a.channels == 0 || b.channels == 0)
+}
+
+fn shared(offered: Codec[], own: Codec[]) -> Codec[] {
+    var out: Codec[] = []
+    for o in offered {
+        for k in own {
+            if same_format(o, k) {
+                out.push(o)
+                break
+            }
+        }
+    }
+    out
+}
+
+fn first_ssrc(m: sdp.Media) -> i64 {
+    let sources = sdp.ssrcs(m) or []
+    if sources.len == 0 { 0 } else { sources[0].id }
+}
+
+fn add_remote_track(c: *Core, m: sdp.Media, mid: str, kind: Kind, codecs: Codec[]) {
+    let track = RemoteTrack { mid, kind, ssrc: first_ssrc(m), codecs, packets: chan[rtp.Packet](256) }
+    if track.ssrc != 0 {
+        c.by_ssrc[track.ssrc] = c.remotes.len
+    }
+    c.remotes.push(track)
+    publish(c, Event.Track(track))
+}
+
+fn direction_of(sends: bool, receives: bool) -> sdp.Direction {
+    if sends && receives {
+        sdp.Direction.SendRecv
+    } else if sends {
+        sdp.Direction.SendOnly
+    } else if receives {
+        sdp.Direction.RecvOnly
+    } else {
+        sdp.Direction.Inactive
+    }
+}
+
+fn sends(d: sdp.Direction) -> bool {
+    d == sdp.Direction.SendRecv || d == sdp.Direction.SendOnly
+}
+
+fn receives(d: sdp.Direction) -> bool {
+    d == sdp.Direction.SendRecv || d == sdp.Direction.RecvOnly
+}
+
+fn unused_local(c: *Core, kind: Kind, used: bool[]) -> i64 {
+    for i, l in c.locals {
+        if l.kind == kind && !used[i] {
+            return i
+        }
+    }
+    -1
+}
+
+fn answer_now(c: *Core, offer: sdp.Session) -> Described {
+    if c.phase != Phase.Idle {
+        return Described.Refused(Error.WrongState)
+    }
+    let session = make_answer(c, offer) catch {
+        e => return Described.Refused(e)
+    }
+    c.phase = Phase.Stable
+    Described.Done(session)
+}
+
+fn make_answer(c: *Core, offer: sdp.Session) -> sdp.Session ! Error {
+    let transport = transport_of(offer)?
+    read_transport(c, offer, transport)?
+    let remote_setup = sdp.setup(offer, transport) or fail Invalid("setup")
+    c.dtls_client = remote_setup != some(sdp.Setup.Active)
+    let setup = if c.dtls_client { sdp.Setup.Active } else { sdp.Setup.Passive }
+    open_ice(c, false)?
+    apply_transport(c, offer, transport)?
+    var used: bool[] = []
+    for _ in c.locals {
+        used.push(false)
+    }
+    var media: sdp.Media[] = []
+    var mids: str[] = []
+    for i, m in offer.media {
+        let mid = sdp.mid(m) ?? "{i}"
+        let answered = answer_section(c, offer, m, mid, setup, mut used)?
+        if answered.port != 0 {
+            mids.push(mid)
+        }
+        media.push(answered)
+    }
+    described_session(c, media, mids)?
+}
+
+fn answer_section(c: *Core, offer: sdp.Session, m: sdp.Media, mid: str, setup: sdp.Setup, mut used: bool[]) -> sdp.Media ! Error {
+    if m.port == 0 {
+        return rejected(m, mid)
+    }
+    if sdp.is_data_channel(m) {
+        if !c.config.data_channels || c.data {
+            return rejected(m, mid)
+        }
+        accept_data(c, m)?
+        return data_section(c, mid, setup)
+    }
+    let kind = kind_of(m.kind) ?? return rejected(m, mid)
+    if !text.ends_with(m.protocol, "RTP/SAVPF") {
+        return rejected(m, mid)
+    }
+    let offered = codecs_of(m)?
+    let remote = sdp.direction(offer, m)
+    let at = unused_local(c, kind, used)
+    var chosen = offered
+    var sender: Local? = none
+    if at >= 0 && receives(remote) {
+        chosen = shared(offered, c.locals[at].codecs)
+        if chosen.len == 0 {
+            return rejected(m, mid)
+        }
+        used[at] = true
+        c.locals[at].codecs = chosen
+        c.locals[at].mid = mid
+        sender = c.locals[at]
+    }
+    if sends(remote) {
+        add_remote_track(c, m, mid, kind, chosen)
+    }
+    rtp_section(c, kind, chosen, mid, setup, direction_of(sender != none, sends(remote)), sender)
+}
+
+fn accept_now(c: *Core, answer: sdp.Session) -> Error? {
+    if c.phase != Phase.Offered {
+        return Error.WrongState
+    }
+    take_answer(c, answer) catch {
+        e => return e
+    }
+    c.phase = Phase.Stable
+    none
+}
+
+fn take_answer(c: *Core, answer: sdp.Session) ! Error {
+    let sections = c.locals.len + if c.config.data_channels { 1 } else { 0 }
+    if answer.media.len != sections {
+        fail Invalid("the answer has {answer.media.len} media sections and the offer {sections}")
+    }
+    let transport = transport_of(answer)?
+    read_transport(c, answer, transport)?
+    let remote_setup = sdp.setup(answer, transport) or fail Invalid("setup")
+    c.dtls_client = match remote_setup {
+        some(s) => match s {
+            Active => false
+            Passive => true
+            _ => fail Invalid("setup {sdp.setup_name(s)} in an answer")
+        }
+        none => fail Invalid("setup missing")
+    }
+    apply_transport(c, answer, transport)?
+    for i, m in answer.media {
+        if m.port == 0 {
+            continue
+        }
+        if i == c.locals.len {
+            if !sdp.is_data_channel(m) {
+                fail Invalid("section {i} is not a data channel")
+            }
+            accept_data(c, m)?
+            continue
+        }
+        if m.kind != kind_name(c.locals[i].kind) {
+            fail Invalid("section {i} is {m.kind}")
+        }
+        let answered = codecs_of(m)?
+        c.locals[i].codecs = shared(answered, c.locals[i].codecs)
+        if sends(sdp.direction(answer, m)) {
+            add_remote_track(c, m, c.locals[i].mid, c.locals[i].kind, c.locals[i].codecs)
+        }
+    }
+}
