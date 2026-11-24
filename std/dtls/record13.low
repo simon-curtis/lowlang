@@ -1,0 +1,195 @@
+import std/crypto/aead
+import std/io
+import std/tls
+
+/// The DTLS 1.3 protocol version code, `0xFEFC`.
+pub const dtls13 = 0xFEFC
+const type_ack = 26
+const tag_size = 16
+const sealed_overhead = 22
+const label_prefix = "dtls13"
+
+struct Keys13 {
+    epoch: i64
+    suite: tls.Suite
+    secret: u8[]
+    aead: aead.Aead
+    iv: u8[]
+    mask: fn(u8[]) -> u8[]
+}
+
+struct Sender {
+    keys: Keys13
+    seq: i64
+}
+
+struct Reader {
+    keys: Keys13
+    window: *Window
+}
+
+fn mask_aes(cipher: *aead.Aes) -> fn(u8[]) -> u8[] {
+    fn(sample: u8[]) -> u8[] {
+        aead.encrypt_block(cipher, sample)
+    }
+}
+
+fn mask_chacha(key: u8[]) -> fn(u8[]) -> u8[] {
+    fn(sample: u8[]) -> u8[] {
+        let zeros = io.buffer(2)
+        aead.chacha20_xor(key, u32(io.le32(sample, 0)), sample[4..16], zeros) or zeros
+    }
+}
+
+fn keys13(suite: tls.Suite, secret: u8[], epoch: i64) -> Keys13 ! io.Error {
+    let h = tls.suite_hash(suite)
+    let size = tls.key_size(suite)
+    let key = tls.expand_label_with(h, label_prefix, secret, "key", [], size)
+    let iv = tls.expand_label_with(h, label_prefix, secret, "iv", [], 12)
+    let sn = tls.expand_label_with(h, label_prefix, secret, "sn", [], size)
+    let mask = match suite {
+        ChaCha20Poly1305 => mask_chacha(sn)
+        _ => mask_aes(aead.aes_key(sn)?)
+    }
+    Keys13 { epoch, suite, secret, aead: tls.cipher(suite, key)?, iv, mask }
+}
+
+fn next_keys13(k: Keys13) -> Keys13 ! io.Error {
+    let h = tls.suite_hash(k.suite)
+    let secret = tls.expand_label_with(h, label_prefix, k.secret, "traffic upd", [], h.size)
+    keys13(k.suite, secret, k.epoch + 1)
+}
+
+fn nonce13(iv: u8[], seq: i64) -> u8[] {
+    let out = io.buffer(12)
+    io.copy(out, iv)
+    for i in 0..8 {
+        out[11 - i] = out[11 - i] ^ u8((seq >> (8 * i)) & 0xFF)
+    }
+    out
+}
+
+fn seal13(s: *Sender, kind: i64, plain: u8[]) -> u8[] {
+    let seq = s.seq
+    s.seq += 1
+    var inner: u8[] = []
+    io.append(mut inner, plain)
+    inner.push(u8(kind))
+    var header: u8[] = [u8(0x2C | (s.keys.epoch & 3))]
+    io.put_be16(mut header, seq & 0xFFFF)
+    io.put_be16(mut header, inner.len + tag_size)
+    let sealed = s.keys.aead.seal(nonce13(s.keys.iv, seq), inner, header)
+    let mask = s.keys.mask(sealed[..16])
+    header[1] = header[1] ^ mask[0]
+    header[2] = header[2] ^ mask[1]
+    io.append(mut header, sealed)
+    header
+}
+
+fn closest(bits: i64, width: i64, expected: i64) -> i64 {
+    let span = 1 << width
+    let candidate = (expected & ~(span - 1)) | bits
+    if candidate - expected > span / 2 && candidate >= span {
+        return candidate - span
+    }
+    if expected - candidate > span / 2 {
+        return candidate + span
+    }
+    candidate
+}
+
+struct Opened13 {
+    kind: i64
+    seq: i64
+    plain: u8[]
+}
+
+fn open13(r: *Reader, raw: Raw) -> Opened13? {
+    if raw.body.len < 16 {
+        return none
+    }
+    let mask = r.keys.mask(raw.body[..16])
+    let header = io.buffer(raw.header.len)
+    io.copy(header, raw.header)
+    let width = if header[0] & 0x08 != 0 { 16 } else { 8 }
+    var bits = 0
+    if width == 16 {
+        header[1] = header[1] ^ mask[0]
+        header[2] = header[2] ^ mask[1]
+        bits = io.be16(header, 1)
+    } else {
+        header[1] = header[1] ^ mask[0]
+        bits = i64(header[1])
+    }
+    let seq = closest(bits, width, r.window.top + 1)
+    if seq < 0 || !fresh(r.window, seq) {
+        return none
+    }
+    let inner = r.keys.aead.open(nonce13(r.keys.iv, seq), raw.body, header) or return none
+    var end = inner.len
+    for end > 0 && inner[end - 1] == 0 {
+        end -= 1
+    }
+    if end == 0 {
+        return none
+    }
+    mark(r.window, seq)
+    Opened13 { kind: i64(inner[end - 1]), seq, plain: inner[..end - 1] }
+}
+
+fn split_unified(datagram: u8[], at: i64, mut out: Raw[]) -> i64 {
+    let first = i64(datagram[at])
+    if first & 0x10 != 0 {
+        return -1
+    }
+    let width = if first & 0x08 != 0 { 2 } else { 1 }
+    let sized = first & 0x04 != 0
+    let fixed = 1 + width + if sized { 2 } else { 0 }
+    if at + fixed > datagram.len {
+        return -1
+    }
+    var stop = datagram.len
+    if sized {
+        stop = at + fixed + io.be16(datagram, at + 1 + width)
+        if stop > datagram.len {
+            return -1
+        }
+    }
+    out.push(Raw { kind: -1, epoch: first & 3, seq: 0, header: datagram[at..at + fixed], body: datagram[at + fixed..stop] })
+    stop
+}
+
+struct RecordNumber {
+    epoch: i64
+    seq: i64
+}
+
+fn ack_body(numbers: RecordNumber[]) -> u8[] {
+    var list: u8[] = []
+    for n in numbers {
+        io.put_be32(mut list, n.epoch >> 32)
+        io.put_be32(mut list, n.epoch & 0xFFFFFFFF)
+        io.put_be32(mut list, n.seq >> 32)
+        io.put_be32(mut list, n.seq & 0xFFFFFFFF)
+    }
+    var out: u8[] = []
+    put_vector16(mut out, list)
+    out
+}
+
+fn parse_ack(body: u8[]) -> RecordNumber[] ! io.Error {
+    let c = cursor(body)
+    let list = vector16(c)?
+    end(c)?
+    if list.len % 16 != 0 {
+        fail Malformed
+    }
+    var out: RecordNumber[] = []
+    for i in 0..list.len / 16 {
+        let at = 16 * i
+        let epoch = io.be32(list, at) << 32 | io.be32(list, at + 4)
+        let seq = io.be32(list, at + 8) << 32 | io.be32(list, at + 12)
+        out.push(RecordNumber { epoch, seq })
+    }
+    out
+}

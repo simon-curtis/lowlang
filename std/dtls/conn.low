@@ -51,8 +51,12 @@ pub struct Config {
     pub fingerprints: Fingerprint[] = []
     /// Whether to accept any peer certificate. Without it a peer whose certificate matches none of `fingerprints` is refused.
     pub unverified: bool = false
-    /// The ECDHE-ECDSA cipher suites in order of preference: `0xC02B`, `0xCCA9` and `0xC02C` by default.
-    pub cipher_suites: i64[] = [0xC02B, 0xCCA9, 0xC02C]
+    /// The cipher suites in order of preference, DTLS 1.3 and DTLS 1.2 codes in one list: `0x1301`, `0x1303` and `0x1302` for DTLS 1.3 and the ECDHE-ECDSA suites `0xC02B`, `0xCCA9` and `0xC02C` for DTLS 1.2 by default.
+    pub cipher_suites: i64[] = [0x1301, 0x1303, 0x1302, 0xC02B, 0xCCA9, 0xC02C]
+    /// The lowest protocol version to negotiate, `dtls12` or `dtls13`. The default is `dtls12`.
+    pub min_version: i64 = dtls12
+    /// The highest protocol version to negotiate, `dtls12` or `dtls13`. The default is `dtls13`.
+    pub max_version: i64 = dtls13
     /// The named groups in order of preference: X25519 and P-256 by default.
     pub groups: i64[] = [tls.group_x25519, tls.group_p256]
     /// The `use_srtp` profiles to offer or accept (RFC 5764). With none the extension is neither sent nor honoured.
@@ -84,6 +88,13 @@ enum Stage {
     ClientKeyExchange
     ClientVerify
     ClientFinished
+    Encrypted
+    ServerCertificate13
+    ServerVerify13
+    ServerFinished13
+    ClientCertificate13
+    ClientVerify13
+    ClientFinished13
     Established
     Closed
     Failed
@@ -95,6 +106,7 @@ struct Item {
     msg: i64
     seq: i64
     body: u8[]
+    acked: u8[]
 }
 
 struct Assembly {
@@ -106,7 +118,7 @@ struct Assembly {
     touched: bool
 }
 
-/// A DTLS 1.2 connection: the record layer, the handshake and its retransmission, without a socket or a clock.
+/// A DTLS 1.2 or DTLS 1.3 connection: the record layer, the handshake and its retransmission, without a socket or a clock.
 ///
 /// The caller feeds it received datagrams with `receive`, the time with `tick`, and sends what `poll_transmit` returns. The time is a count of milliseconds from any origin that never goes backwards.
 pub struct Conn {
@@ -146,6 +158,22 @@ pub struct Conn {
     outbox: u8[][]
     events: Event[]
     received: u8[][]
+    version: i64
+    hello: u8[]
+    retry_prefix: u8[]
+    retry_cookie: u8[]
+    retried: bool
+    schedule: *tls.KeySchedule?
+    client_app: u8[]
+    exporter: u8[]
+    request_context: u8[]
+    writers: *Sender[]
+    readers: *Reader[]
+    heard: RecordNumber[]
+    last_ack: RecordNumber[]
+    sent: Sent[]
+    updating: bool
+    flight_started: i64
 }
 
 /// Makes a connection from `config`. A client begins with `start`; a server waits for a ClientHello in `receive`.
@@ -187,6 +215,22 @@ pub fn conn(config: Config) -> *Conn {
         outbox: []
         events: []
         received: []
+        version: 0
+        hello: []
+        retry_prefix: []
+        retry_cookie: []
+        retried: false
+        schedule: none
+        client_app: []
+        exporter: []
+        request_context: []
+        writers: []
+        readers: []
+        heard: []
+        last_ack: []
+        sent: []
+        updating: false
+        flight_started: 0
     })
 }
 
@@ -205,6 +249,11 @@ pub fn state(c: *Conn) -> State {
 /// Returns the DER certificate the peer authenticated with, or an empty slice before the handshake has read it.
 pub fn peer_certificate(c: *Conn) -> u8[] {
     c.peer_certificate
+}
+
+/// Returns the negotiated protocol version, `dtls12` or `dtls13`, or 0 before it is known.
+pub fn version(c: *Conn) -> i64 {
+    c.version
 }
 
 /// Returns the negotiated cipher suite code, or 0 before the ServerHello.
@@ -273,6 +322,14 @@ pub fn write(c: *Conn, data: u8[]) ! io.Error {
     if c.stage != Stage.Established {
         fail NotConnected
     }
+    if c.version == dtls13 {
+        if data.len + sealed_overhead > c.config.mtu {
+            fail TooLarge
+        }
+        let sealed = seal_epoch(c, type_application, c.write_epoch, data) ?? fail NotConnected
+        c.outbox.push(sealed)
+        return
+    }
     let cipher = match c.write_cipher {
         some(k) => k
         none => fail NotConnected
@@ -282,6 +339,22 @@ pub fn write(c: *Conn, data: u8[]) ! io.Error {
     }
     let record = seal_plain(c, type_application, 1, data)
     c.outbox.push(record)
+}
+
+/// Updates the keys this side sends with (RFC 9147 section 8), and asks the peer to update its own when `request_peer` is set.
+///
+/// The KeyUpdate message is retransmitted until the peer acknowledges it, and the new keys are used from then on. Fails with `NotConnected` before the handshake finishes, with `Unsupported` on a DTLS 1.2 connection and with `WouldBlock` while a flight awaits its acknowledgement.
+pub fn update_keys(c: *Conn, request_peer: bool, now: i64) ! io.Error {
+    if c.stage != Stage.Established {
+        fail NotConnected
+    }
+    if c.version != dtls13 {
+        fail Unsupported
+    }
+    if c.flight.len > 0 {
+        fail WouldBlock
+    }
+    begin_update(c, request_peer, now)
 }
 
 /// Sends `close_notify` and closes the connection. Later `write` calls fail and later records are ignored.
@@ -306,6 +379,13 @@ fn export(c: *Conn, label: str, seed: u8[], length: i64) -> u8[] ! io.Error {
     tls.prf(h, c.master, label, seed, length)
 }
 
+fn export13(c: *Conn, label: str, context: u8[], length: i64) -> u8[] ! io.Error {
+    if c.stage != Stage.Established {
+        fail NotConnected
+    }
+    tls.export_secret(schedule13(c), c.exporter, label, context, length)
+}
+
 fn randoms(c: *Conn) -> u8[] {
     var seed: u8[] = []
     io.append(mut seed, c.client_random)
@@ -315,14 +395,20 @@ fn randoms(c: *Conn) -> u8[] {
 
 /// Returns `length` bytes of keying material for `label` (RFC 5705) bound to this connection and without a context.
 ///
-/// `"EXTRACTOR-dtls_srtp"` with twice the SRTP key and salt length gives the SRTP master keys (RFC 5764 section 4.2). Fails with `NotConnected` before the handshake finishes.
+/// `"EXTRACTOR-dtls_srtp"` with twice the SRTP key and salt length gives the SRTP master keys (RFC 5764 section 4.2). DTLS 1.3 uses the TLS 1.3 exporter with an empty context (RFC 8446 section 7.5). Fails with `NotConnected` before the handshake finishes.
 pub fn export_keying_material(c: *Conn, label: str, length: i64) -> u8[] ! io.Error {
+    if c.version == dtls13 {
+        return export13(c, label, [], length)
+    }
     let seed = randoms(c)
     export(c, label, seed, length)
 }
 
 /// Returns `length` bytes of keying material for `label` bound to this connection and to `context` (RFC 5705 section 4).
 pub fn export_keying_material_context(c: *Conn, label: str, context: u8[], length: i64) -> u8[] ! io.Error {
+    if c.version == dtls13 {
+        return export13(c, label, context, length)
+    }
     var seed = randoms(c)
     io.put_be16(mut seed, context.len)
     io.append(mut seed, context)
@@ -342,6 +428,11 @@ fn fatal(c: *Conn, description: i64, reason: str) {
 }
 
 fn send_alert(c: *Conn, level: i64, description: i64) {
+    if c.version == dtls13 {
+        let sealed = seal_epoch(c, type_alert, c.write_epoch, [u8(level), u8(description)]) ?? return
+        c.outbox.push(sealed)
+        return
+    }
     let record = seal_plain(c, type_alert, c.write_epoch, [u8(level), u8(description)])
     c.outbox.push(record)
 }
@@ -376,13 +467,13 @@ fn protection_overhead(c: *Conn, epoch: i64) -> i64 {
 fn queue_message(c: *Conn, kind: i64, body: u8[], epoch: i64) {
     let seq = c.send_seq
     c.send_seq += 1
-    c.flight.push(Item { kind: type_handshake, epoch, msg: kind, seq, body })
+    c.flight.push(Item { kind: type_handshake, epoch, msg: kind, seq, body, acked: [] })
     let whole = unfragmented(kind, seq, body)
     io.append(mut c.transcript, whole)
 }
 
 fn queue_change_cipher_spec(c: *Conn) {
-    c.flight.push(Item { kind: type_change_cipher_spec, epoch: 0, msg: 0, seq: 0, body: [1] })
+    c.flight.push(Item { kind: type_change_cipher_spec, epoch: 0, msg: 0, seq: 0, body: [1], acked: [] })
     c.write_epoch = 1
 }
 
@@ -395,7 +486,16 @@ fn start_flight(c: *Conn, now: i64) {
     c.timer = true
     c.rto = c.config.retransmit_initial
     c.deadline = now + c.rto
-    transmit_flight(c)
+    c.flight_started = now
+    send_flight(c)
+}
+
+fn send_flight(c: *Conn) {
+    if c.version == dtls13 {
+        transmit_flight13(c)
+    } else {
+        transmit_flight(c)
+    }
 }
 
 fn pack(c: *Conn, records: u8[][]) {
@@ -446,18 +546,28 @@ fn transmit_flight(c: *Conn) {
 }
 
 /// Retransmits the current flight when its timer has run out, and fails the handshake after `Config.handshake_timeout`.
+///
+/// A DTLS 1.3 flight sent after the handshake, the client's last flight or a KeyUpdate, is retransmitted until the peer acknowledges it and given up after `Config.handshake_timeout` without failing the connection.
 pub fn tick(c: *Conn, now: i64) {
     if !c.timer || now < c.deadline {
         return
     }
-    if now - c.started >= c.config.handshake_timeout {
+    if c.stage == Stage.Established {
+        if now - c.flight_started >= c.config.handshake_timeout {
+            c.timer = false
+            c.flight = []
+            c.sent = []
+            c.updating = false
+            return
+        }
+    } else if now - c.started >= c.config.handshake_timeout {
         emit_failed(c, "handshake timed out")
         return
     }
     let doubled = c.rto * 2
     c.rto = if doubled > c.config.retransmit_max { c.config.retransmit_max } else { doubled }
     c.deadline = now + c.rto
-    transmit_flight(c)
+    send_flight(c)
 }
 
 fn put_cipher(c: *Conn) ! io.Error {
@@ -553,6 +663,16 @@ fn offered_groups(exts: Extension[]) -> i64[] {
     u16_list(body) or []
 }
 
+fn offered_suites(c: *Conn) -> i64[] {
+    var out: i64[] = []
+    for code in c.config.cipher_suites {
+        if tls.suite13_of(code) != none && offers13(c) || tls.suite12_of(code) != none && offers12(c) {
+            out.push(code)
+        }
+    }
+    out
+}
+
 fn send_client_hello(c: *Conn, now: i64) {
     c.transcript = []
     c.flight = []
@@ -561,13 +681,15 @@ fn send_client_hello(c: *Conn, now: i64) {
     io.append(mut body, c.client_random)
     put_vector8(mut body, [])
     put_vector8(mut body, c.cookie)
-    put_u16_list(mut body, c.config.cipher_suites)
+    put_u16_list(mut body, offered_suites(c))
     put_vector8(mut body, [0])
     var exts: u8[] = []
     var groups: u8[] = []
     put_u16_list(mut groups, c.config.groups)
     put_extension(mut exts, ext_groups, groups)
-    put_extension(mut exts, ext_points, [1, 0])
+    if offers12(c) {
+        put_extension(mut exts, ext_points, [1, 0])
+    }
     var schemes: u8[] = []
     put_u16_list(mut schemes, offered_schemes())
     put_extension(mut exts, ext_schemes, schemes)
@@ -575,9 +697,18 @@ fn send_client_hello(c: *Conn, now: i64) {
         let srtp = srtp_extension(c.config.srtp_profiles)
         put_extension(mut exts, ext_srtp, srtp)
     }
-    put_extension(mut exts, ext_master, [])
-    put_extension(mut exts, ext_renegotiation, [0])
+    if offers12(c) {
+        put_extension(mut exts, ext_master, [])
+        put_extension(mut exts, ext_renegotiation, [0])
+    }
+    if offers13(c) {
+        client_hello13_extensions(c, mut exts) or {
+            fatal(c, alert_handshake_failure, "no DTLS 1.3 group")
+            return
+        }
+    }
     put_vector16(mut body, exts)
+    c.hello = body
     queue_message(c, msg_client_hello, body, 0)
     start_flight(c, now)
 }
@@ -635,6 +766,20 @@ fn on_hello_reply(c: *Conn, kind: i64, seq: i64, body: u8[], now: i64) {
         fatal(c, alert_decode_error, "malformed ServerHello")
         return
     }
+    if has_extension(hello.exts, ext_supported_versions) {
+        on_server_hello13(c, hello, body, now)
+        return
+    }
+    if !offers12(c) || c.retried {
+        fatal(c, alert_protocol_version, "the server offered DTLS 1.2")
+        return
+    }
+    let tail = hello.random[24..]
+    if offers13(c) && (hash.equal(tail, tls.downgrade_sentinel(1)) || hash.equal(tail, tls.downgrade_sentinel(0))) {
+        fatal(c, alert_illegal_parameter, "downgrade to DTLS 1.2 detected")
+        return
+    }
+    c.version = dtls12
     let found = tls.suite12_of(hello.suite)
     if found == none || !slices.contains(c.config.cipher_suites, hello.suite) || hello.compression != 0 {
         fatal(c, alert_illegal_parameter, "unoffered cipher suite")
@@ -842,6 +987,14 @@ fn on_client_hello(c: *Conn, kind: i64, seq: i64, body: u8[], now: i64) {
         return
     }
     let hello = parse_client_hello(body) or return
+    if offers13(c) && slices.contains(versions_offered(hello.exts), dtls13) {
+        on_client_hello13(c, seq, hello, body, now)
+        return
+    }
+    if !offers12(c) {
+        fatal(c, alert_protocol_version, "the client offered DTLS 1.2")
+        return
+    }
     if c.config.cookies {
         let expected = cookie_for(c.cookie_secret, hello)
         if !hash.equal(hello.cookie, expected) {
@@ -872,6 +1025,10 @@ fn on_client_hello(c: *Conn, kind: i64, seq: i64, body: u8[], now: i64) {
     c.group = group
     c.client_random = hello.random
     c.server_random = crypto.random(32)
+    if c.config.max_version == dtls13 {
+        io.copy(c.server_random[24..], tls.downgrade_sentinel(1))
+    }
+    c.version = dtls12
     c.srtp = pick_srtp(c, hello)
     c.transcript = []
     absorb(c, kind, seq, body)
@@ -1020,6 +1177,14 @@ fn on_message(c: *Conn, kind: i64, seq: i64, body: u8[], now: i64) {
         ClientKeyExchange => on_client_key_exchange(c, kind, seq, body)
         ClientVerify => on_client_verify(c, kind, seq, body)
         ClientFinished => on_client_finished(c, kind, seq, body)
+        Encrypted => on_encrypted_extensions(c, kind, body)
+        ServerCertificate13 => on_server_certificate13(c, kind, body)
+        ServerVerify13 => on_server_verify13(c, kind, body)
+        ServerFinished13 => on_server_finished13(c, kind, body, now)
+        ClientCertificate13 => on_client_certificate13(c, kind, body)
+        ClientVerify13 => on_client_verify13(c, kind, body)
+        ClientFinished13 => on_client_finished13(c, kind, body)
+        Established => on_post_handshake(c, kind, body)
         _ => {}
     }
 }
@@ -1068,6 +1233,10 @@ fn on_established(c: *Conn, kind: i64, seq: i64) {
 }
 
 fn on_fragment(c: *Conn, kind: i64, length: i64, seq: i64, offset: i64, fragment: u8[], epoch: i64, now: i64) {
+    if c.version == dtls13 {
+        on_fragment13(c, kind, length, seq, offset, fragment, epoch, now)
+        return
+    }
     if c.stage == Stage.Established {
         on_established(c, kind, seq)
         return
@@ -1084,6 +1253,10 @@ fn on_fragment(c: *Conn, kind: i64, length: i64, seq: i64, offset: i64, fragment
         }
         return
     }
+    assemble(c, kind, length, seq, offset, fragment, now)
+}
+
+fn assemble(c: *Conn, kind: i64, length: i64, seq: i64, offset: i64, fragment: u8[], now: i64) {
     if seq >= c.recv_next + 8 {
         return
     }
@@ -1147,23 +1320,31 @@ fn has_read_cipher(c: *Conn) -> bool {
 }
 
 fn on_record(c: *Conn, r: Raw, now: i64) {
-    var body = r.body
-    if r.epoch == 0 {
-        if r.kind == type_application || (r.kind == type_alert && has_read_cipher(c)) {
-            return
-        }
-    } else if r.epoch == 1 {
-        let cipher = match c.read_cipher {
-            some(k) => k
-            none => return
-        }
-        if !fresh(c.window, r.seq) {
-            return
-        }
-        body = open_record(cipher, r.kind, r.epoch, r.seq, r.body) or return
-        mark(c.window, r.seq)
-    } else {
+    if r.header.len > 0 {
+        on_unified(c, r, now)
         return
+    }
+    if c.version == dtls13 {
+        on_plain13(c, r, now)
+        return
+    }
+    let body = match r.epoch {
+        0 => {
+            if r.kind == type_application || (r.kind == type_alert && has_read_cipher(c)) {
+                return
+            }
+            r.body
+        }
+        1 => {
+            let cipher = c.read_cipher ?? return
+            if !fresh(c.window, r.seq) {
+                return
+            }
+            let opened = open_record(cipher, r.kind, r.epoch, r.seq, r.body) or return
+            mark(c.window, r.seq)
+            opened
+        }
+        _ => return
     }
     if r.kind == type_handshake {
         on_handshake(c, body, r.epoch, now)
@@ -1186,6 +1367,9 @@ pub fn receive(c: *Conn, datagram: u8[], now: i64) {
     }
     if c.replay_flight {
         c.replay_flight = false
-        transmit_flight(c)
+        send_flight(c)
+    }
+    if c.version == dtls13 && gap(c) {
+        send_ack(c, c.heard)
     }
 }
