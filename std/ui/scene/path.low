@@ -1,0 +1,260 @@
+import std/math
+import std/ui/geometry
+
+const miter_limit: f32 = 4.0
+const flatness: f32 = 0.1
+const max_segments: i64 = 1024
+const tiny: f32 = 0.0001
+
+/// A vertex of a `Path`: where it lands and the coordinates the path shader reads to decide how much of the triangle is inside a curve.
+pub extern struct PathVertex {
+    /// The position in device pixels.
+    pub position: geometry.Point
+    /// The curve coordinates. `(0, 1)` marks a corner of a solid triangle. The corners of a curve triangle carry `(0, 0)`, `(0.5, 0)` and `(1, 1)`, and the shader fills where `s * s - t` is negative.
+    pub st: geometry.Point
+}
+
+/// A filled shape made of triangles, as gpui builds a `Path`.
+///
+/// `path` starts one, `move_to`, `line_to` and `curve_to` extend it by fanning triangles from the start of the contour, and `push_triangle` adds one of any shape. A path fills only where its triangles do, so it is right for a shape that a fan from the contour's first point covers: a convex outline, an outline that is star-shaped about that point, and curves that bulge outward. No fill rule is applied to a concave or self-overlapping outline. A translucent colour blends once for every triangle covering a pixel, so a path whose triangles overlap is darker where they do.
+pub struct Path {
+    /// The triangles' vertices, three to a triangle.
+    pub vertices: PathVertex[] = []
+    /// The smallest rectangle that holds the start of the path and every vertex.
+    pub bounds: geometry.Rect
+    /// The visible area. `push_path` replaces it with the scene's current clip.
+    pub clip: geometry.Rect = geometry.Rect {}
+    /// The colour of every triangle; its alpha is the path's opacity.
+    pub color: geometry.Color
+    /// The draw order `push_path` assigns; `0` in a path that was not pushed.
+    pub order: i64 = 0
+    start: geometry.Point
+    current: geometry.Point
+    contours: i64 = 0
+}
+
+struct Pair {
+    plus: geometry.Point
+    minus: geometry.Point
+}
+
+struct Heading {
+    dir: geometry.Point
+    normal: geometry.Point
+    length: f32
+}
+
+struct Joint {
+    before: Pair
+    after: Pair
+}
+
+/// Returns a path of `color` that starts at `start` and has no triangles.
+pub fn path(start: geometry.Point, color: geometry.Color) -> Path {
+    Path { bounds: geometry.Rect { x: start.x, y: start.y }, color, start, current: start }
+}
+
+/// Starts a new contour at `to`. The next `line_to` or `curve_to` fans from it.
+pub fn move_to(mut p: Path, to: geometry.Point) {
+    p.contours += 1
+    p.start = to
+    p.current = to
+}
+
+/// Draws a straight edge from the current point to `to`, adding the triangle from the contour's start once the contour has two edges.
+pub fn line_to(mut p: Path, to: geometry.Point) {
+    p.contours += 1
+    if p.contours > 1 {
+        push_solid(mut p, p.start, p.current, to)
+    }
+    p.current = to
+}
+
+/// Draws a quadratic curve from the current point to `to` bending towards `ctrl`, adding the fan triangle as `line_to` does and a Loop-Blinn triangle whose curve coordinates make the shader fill the area between the chord and the curve.
+pub fn curve_to(mut p: Path, to: geometry.Point, ctrl: geometry.Point) {
+    p.contours += 1
+    if p.contours > 1 {
+        push_solid(mut p, p.start, p.current, to)
+    }
+    let first = PathVertex { position: p.current, st: geometry.point(0.0, 0.0) }
+    let second = PathVertex { position: ctrl, st: geometry.point(0.5, 0.0) }
+    let third = PathVertex { position: to, st: geometry.point(1.0, 1.0) }
+    push_triangle(mut p, first, second, third)
+    p.current = to
+}
+
+/// Adds the triangle `a`, `b`, `c` and grows the bounds to hold its corners.
+pub fn push_triangle(mut p: Path, a: PathVertex, b: PathVertex, c: PathVertex) {
+    p.bounds = geometry.union(p.bounds, geometry.Rect { x: a.position.x, y: a.position.y })
+    p.bounds = geometry.union(p.bounds, geometry.Rect { x: b.position.x, y: b.position.y })
+    p.bounds = geometry.union(p.bounds, geometry.Rect { x: c.position.x, y: c.position.y })
+    p.vertices.push(a)
+    p.vertices.push(b)
+    p.vertices.push(c)
+}
+
+fn push_solid(mut p: Path, a: geometry.Point, b: geometry.Point, c: geometry.Point) {
+    let st = geometry.point(0.0, 1.0)
+    push_triangle(mut p, PathVertex { position: a, st }, PathVertex { position: b, st }, PathVertex { position: c, st })
+}
+
+/// Returns the line of `width` device pixels along `points` as a path of `color`, with butt caps.
+///
+/// Each corner is mitred when the mitre is at most four half-widths long and bevelled otherwise, so a sharp turn never spikes. The triangles of a segment meet those of its neighbours at shared vertices without overlapping, except where a segment is shorter than the reach of its corner, which a sharp turn makes longer than the width, and there they overlap on the inside of the turn. Consecutive equal points are one point, and fewer than two points, or a width of zero or less, give a path with no triangles.
+pub fn stroke_polyline(points: geometry.Point[], width: f32, color: geometry.Color) -> Path {
+    let kept = distinct(points)
+    if kept.len < 2 || width <= 0.0 {
+        return path(if points.len > 0 { points[0] } else { geometry.Point {} }, color)
+    }
+    let half = width * 0.5
+    var out = path(kept[0], color)
+    var headings: Heading[] = []
+    for i in 0..kept.len - 1 {
+        headings.push(heading_between(kept[i], kept[i + 1]))
+    }
+    var starts: Pair[] = [side_pair(kept[0], headings[0], half)]
+    var ends: Pair[] = []
+    for i in 1..kept.len - 1 {
+        let joint = join_at(mut out, kept[i], headings[i - 1], headings[i], half)
+        ends.push(joint.before)
+        starts.push(joint.after)
+    }
+    ends.push(side_pair(kept[kept.len - 1], headings[headings.len - 1], half))
+    for i in 0..headings.len {
+        push_strip(mut out, starts[i], ends[i])
+    }
+    out
+}
+
+/// Returns the quadratic curve from `a` to `b` bending towards `ctrl` as a path of `color` that is `width` device pixels wide, drawn along its flattening with `stroke_polyline`.
+pub fn stroke_quad(a: geometry.Point, ctrl: geometry.Point, b: geometry.Point, width: f32, color: geometry.Color) -> Path {
+    stroke_polyline(flatten_quad(a, ctrl, b), width, color)
+}
+
+/// Returns the cubic curve from `a` to `b` with control points `c1` and `c2` as a path of `color` that is `width` device pixels wide, drawn along its flattening with `stroke_polyline`.
+pub fn stroke_cubic(a: geometry.Point, c1: geometry.Point, c2: geometry.Point, b: geometry.Point, width: f32, color: geometry.Color) -> Path {
+    stroke_polyline(flatten_cubic(a, c1, c2, b), width, color)
+}
+
+/// Returns the points of a polyline within a tenth of a device pixel of the quadratic curve from `a` to `b` bending towards `ctrl`, from `a` to `b` inclusive and evenly spaced in the curve's parameter.
+pub fn flatten_quad(a: geometry.Point, ctrl: geometry.Point, b: geometry.Point) -> geometry.Point[] {
+    let dx = a.x - 2.0 * ctrl.x + b.x
+    let dy = a.y - 2.0 * ctrl.y + b.y
+    let count = segment_count(sqrt(dx * dx + dy * dy) / (4.0 * flatness))
+    var out: geometry.Point[] = [a]
+    for i in 1..count {
+        let t = f32(i) / f32(count)
+        let u = 1.0 - t
+        let x = u * u * a.x + 2.0 * u * t * ctrl.x + t * t * b.x
+        let y = u * u * a.y + 2.0 * u * t * ctrl.y + t * t * b.y
+        out.push(geometry.point(x, y))
+    }
+    out.push(b)
+    out
+}
+
+/// Returns the points of a polyline within a tenth of a device pixel of the cubic curve from `a` to `b` with control points `c1` and `c2`, from `a` to `b` inclusive and evenly spaced in the curve's parameter.
+pub fn flatten_cubic(a: geometry.Point, c1: geometry.Point, c2: geometry.Point, b: geometry.Point) -> geometry.Point[] {
+    let first_x = a.x - 2.0 * c1.x + c2.x
+    let first_y = a.y - 2.0 * c1.y + c2.y
+    let second_x = c1.x - 2.0 * c2.x + b.x
+    let second_y = c1.y - 2.0 * c2.y + b.y
+    let bend = math.max(sqrt(first_x * first_x + first_y * first_y), sqrt(second_x * second_x + second_y * second_y))
+    let count = segment_count(0.75 * bend / flatness)
+    var out: geometry.Point[] = [a]
+    for i in 1..count {
+        let t = f32(i) / f32(count)
+        let u = 1.0 - t
+        let w0 = u * u * u
+        let w1 = 3.0 * u * u * t
+        let w2 = 3.0 * u * t * t
+        let w3 = t * t * t
+        let x = w0 * a.x + w1 * c1.x + w2 * c2.x + w3 * b.x
+        let y = w0 * a.y + w1 * c1.y + w2 * c2.y + w3 * b.y
+        out.push(geometry.point(x, y))
+    }
+    out.push(b)
+    out
+}
+
+fn segment_count(square: f32) -> i64 {
+    let n = i64(-floor(-sqrt(square)))
+    math.clamp(n, 1, max_segments)
+}
+
+fn distinct(points: geometry.Point[]) -> geometry.Point[] {
+    var kept: geometry.Point[] = []
+    for p in points {
+        if kept.len == 0 || separation(kept[kept.len - 1], p) > tiny {
+            kept.push(p)
+        }
+    }
+    kept
+}
+
+fn separation(a: geometry.Point, b: geometry.Point) -> f32 {
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    sqrt(dx * dx + dy * dy)
+}
+
+fn heading_between(a: geometry.Point, b: geometry.Point) -> Heading {
+    let length = separation(a, b)
+    let dir = geometry.point((b.x - a.x) / length, (b.y - a.y) / length)
+    Heading { dir, normal: geometry.point(-dir.y, dir.x), length }
+}
+
+fn moved(p: geometry.Point, d: geometry.Point, k: f32) -> geometry.Point {
+    geometry.point(p.x + d.x * k, p.y + d.y * k)
+}
+
+fn side_pair(p: geometry.Point, h: Heading, half: f32) -> Pair {
+    Pair { plus: moved(p, h.normal, half), minus: moved(p, h.normal, -half) }
+}
+
+fn push_strip(mut out: Path, start: Pair, end: Pair) {
+    push_solid(mut out, start.plus, start.minus, end.minus)
+    push_solid(mut out, start.plus, end.minus, end.plus)
+}
+
+fn join_at(mut out: Path, p: geometry.Point, a: Heading, b: Heading, half: f32) -> Joint {
+    let dot = a.dir.x * b.dir.x + a.dir.y * b.dir.y
+    let cross = a.dir.x * b.dir.y - a.dir.y * b.dir.x
+    if math.abs(cross) < tiny && dot > 0.0 {
+        return Joint { before: side_pair(p, a, half), after: side_pair(p, b, half) }
+    }
+    let outward: f32 = if cross > 0.0 { -1.0 } else { 1.0 }
+    let a_outer = moved(p, a.normal, outward * half)
+    let b_outer = moved(p, b.normal, outward * half)
+    let denominator = 1.0 + dot
+    let sum = geometry.point(a.normal.x + b.normal.x, a.normal.y + b.normal.y)
+    let reach = if denominator > tiny { outward * half / denominator } else { 0.0 }
+    let tip = moved(p, sum, reach)
+    let meet = moved(p, sum, -reach)
+    let inner_fits = denominator > tiny && math.abs(cross) * half / denominator * 2.0 <= math.min(a.length, b.length)
+    let mitred = denominator * miter_limit * miter_limit >= 2.0
+
+    var inner_before = moved(p, a.normal, -outward * half)
+    var inner_after = moved(p, b.normal, -outward * half)
+    var apex = p
+    if inner_fits {
+        inner_before = meet
+        inner_after = meet
+        apex = meet
+    }
+    var outer_before = a_outer
+    var outer_after = b_outer
+    if mitred && inner_fits {
+        outer_before = tip
+        outer_after = tip
+    } else if mitred {
+        push_solid(mut out, p, a_outer, tip)
+        push_solid(mut out, p, tip, b_outer)
+    } else {
+        push_solid(mut out, apex, a_outer, b_outer)
+    }
+    if outward > 0.0 {
+        return Joint { before: Pair { plus: outer_before, minus: inner_before }, after: Pair { plus: outer_after, minus: inner_after } }
+    }
+    Joint { before: Pair { plus: inner_before, minus: outer_before }, after: Pair { plus: inner_after, minus: outer_after } }
+}
