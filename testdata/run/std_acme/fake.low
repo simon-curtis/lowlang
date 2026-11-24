@@ -85,6 +85,9 @@ struct Fake {
     ari_retry: i64
     cert_seconds: i64
     records: [str: str]
+    persist_field: str
+    issuers: str[]
+    hash_prefix: str
     log: str[]
     ca_key: x509.PrivateKey
     ca_der: u8[]
@@ -125,7 +128,7 @@ fn fake(plain: *http.Client, clk: clock.Clock) -> *Fake ! io.Error {
         lock: sync.mutex(), plain, clock: clk, base: "", http_port: 0, tls_port: 0, accounts: [], orders: [], authzs: [], certs: [],
         nonces: [], nonce_count: 0, rejections_left: 0, posts: 0, ari: false, eab_keys: none_keys, eab_required: false,
         unauthorized: [], refused: [], authz_polls: 0, order_polls: 0, retry_after: "", window_start: 0, window_end: 0, ari_retry: 0,
-        cert_seconds: 7776000, records: records, log: [], ca_key: key, ca_der: ca, ca_subject: parsed.subject, alt_der: alt, aki,
+        cert_seconds: 7776000, records: records, persist_field: "", issuers: [], hash_prefix: "", log: [], ca_key: key, ca_der: ca, ca_subject: parsed.subject, alt_der: alt, aki,
     })
 }
 
@@ -278,11 +281,15 @@ fn directory(f: *Fake) -> http.Response {
         members.push(json.text_member("renewalInfo", "{f.base}/ari"))
     }
     let profiles: json.Member[] = [json.text_member("default", "the default profile"), json.text_member("shortlived", "a short lived profile")]
-    let meta: json.Member[] = [
+    var meta: json.Member[] = [
         json.text_member("termsOfService", "https://example.test/terms"), json.text_member("website", "https://example.test/"),
         json.array_member("caaIdentities", [json.text_value("example.test")]), json.bool_member("externalAccountRequired", f.eab_required),
         json.object_member("profiles", profiles),
     ]
+    if f.hash_prefix.len > 0 {
+        meta.push(json.text_member("accountHashPrefix", f.hash_prefix))
+        meta.push(json.array_member("issuerDomainNames", issuer_values(f)))
+    }
     members.push(json.object_member("meta", meta))
     json_reply(200, json.object_value(members))
 }
@@ -557,14 +564,23 @@ fn order_json(f: *Fake, index: i64) -> json.Value {
     json.object_value(members)
 }
 
-fn kinds_for(a: Az) -> str[] {
-    if a.wildcard {
-        return ["dns-01"]
+fn issuer_values(f: *Fake) -> json.Value[] {
+    var out: json.Value[] = []
+    for name in f.issuers {
+        out.push(json.text_value(name))
     }
+    out
+}
+
+fn kinds_for(f: *Fake, a: Az) -> str[] {
+    var kinds = if a.wildcard { ["dns-01"] } else { ["http-01", "dns-01", "tls-alpn-01"] }
     if a.kind == "ip" {
-        return ["http-01", "tls-alpn-01"]
+        kinds = ["http-01", "tls-alpn-01"]
     }
-    ["http-01", "dns-01", "tls-alpn-01"]
+    if f.persist_field.len > 0 {
+        kinds.push("dns-persist-01")
+    }
+    kinds
 }
 
 fn challenge_json(f: *Fake, index: i64, kind: str) -> json.Value {
@@ -574,9 +590,13 @@ fn challenge_json(f: *Fake, index: i64, kind: str) -> json.Value {
         status = if a.status == "pending" { "processing" } else { a.status }
     }
     var members: json.Member[] = [
-        json.text_member("type", kind), json.text_member("url", "{f.base}/chall/{index}/{kind}"), json.text_member("token", a.token),
-        json.text_member("status", status),
+        json.text_member("type", kind), json.text_member("url", "{f.base}/chall/{index}/{kind}"), json.text_member("status", status),
     ]
+    if kind == "dns-persist-01" {
+        members.push(json.array_member(f.persist_field, issuer_values(f)))
+    } else {
+        members.push(json.text_member("token", a.token))
+    }
     if a.responded == kind && a.status == "invalid" {
         members.push(json.object_member("error", [
             json.text_member("type", "urn:ietf:params:acme:error:unauthorized"), json.text_member("detail", a.detail), json.int_member("status", 403),
@@ -588,7 +608,7 @@ fn challenge_json(f: *Fake, index: i64, kind: str) -> json.Value {
 fn authz_json(f: *Fake, index: i64) -> json.Value {
     let a = f.authzs[index]
     var list: json.Value[] = []
-    for kind in kinds_for(a) {
+    for kind in kinds_for(f, a) {
         list.push(challenge_json(f, index, kind))
     }
     var members: json.Member[] = [
@@ -687,6 +707,40 @@ fn dns01_detail(f: *Fake, az: Az, ka: str) -> str {
     ""
 }
 
+fn account_uri_of(f: *Fake, az: Az) -> str {
+    let owner = f.accounts[f.orders[az.order].account]
+    if f.hash_prefix.len == 0 {
+        return owner.url
+    }
+    var input: u8[] = [u8(az.value.len)]
+    io.append(mut input, bytes(az.value))
+    io.append(mut input, bytes(jose.thumbprint(owner.jwk)))
+    io.append(mut input, bytes(owner.url))
+    "{f.hash_prefix}sha-256/{base64.encode_url(hash.sum(hash.sha256(), input))}"
+}
+
+fn dns_persist_detail(f: *Fake, az: Az) -> str {
+    let have = f.records["_validation-persist.{az.value}"] ?? ""
+    if have.len == 0 {
+        return "no TXT record"
+    }
+    let record = acme.parse_dns_persist(have) catch { _ => return "the TXT record is malformed" }
+    if !slices.contains(f.issuers, record.issuer) {
+        return "the TXT record names another issuer"
+    }
+    if record.account_uri != account_uri_of(f, az) {
+        return "the accounturi does not match"
+    }
+    if az.wildcard && !record.wildcard {
+        return "the TXT record lacks policy=wildcard"
+    }
+    let limit = record.persist_until ?? unix_now(f)
+    if unix_now(f) > limit {
+        return "the TXT record has expired"
+    }
+    ""
+}
+
 fn alpn_name(az: Az) -> str {
     if az.kind == "ip" {
         return acme.tls_alpn_server_name(acme.Identifier { kind: "ip", value: az.value })
@@ -726,6 +780,9 @@ fn validation_detail(f: *Fake, index: i64, kind: str) -> str {
     if slices.contains(f.unauthorized, az.value) {
         return "the server could not validate {az.value}"
     }
+    if kind == "dns-persist-01" {
+        return dns_persist_detail(f, az)
+    }
     let ka = key_authorization_of(f, az)
     match kind {
         "http-01" => http01_detail(f, az, ka)
@@ -738,7 +795,7 @@ fn challenge_handler(f: *Fake, call: Call, index: i64, kind: str) -> http.Respon
     if index < 0 || index >= f.authzs.len || f.orders[f.authzs[index].order].account != call.account {
         return plain_problem(404, "malformed", "no such challenge")
     }
-    if !slices.contains(kinds_for(f.authzs[index]), kind) {
+    if !slices.contains(kinds_for(f, f.authzs[index]), kind) {
         return plain_problem(404, "malformed", "no such challenge type")
     }
     if f.authzs[index].responded.len == 0 {

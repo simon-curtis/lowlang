@@ -1,7 +1,9 @@
 import std/base64
 import std/crypto/x509
+import std/io
 import std/json
 import std/net
+import std/slices
 import std/text
 import std/time/timestamp
 
@@ -9,10 +11,26 @@ import std/time/timestamp
 pub struct Solvers {
     /// The responses that the HTTP-01 and TLS-ALPN-01 solvers put in place, which a server of the caller serves through `http01_handler` and `tls_alpn_source`. `none` disables both.
     pub challenges: Challenges? = none
-    /// The DNS-01 solver, or `none` to disable it. It is the only way to prove a wildcard name.
+    /// The DNS-01 solver, or `none` to disable it. It proves a wildcard name.
     pub dns: DnsRecords? = none
-    /// The challenge types to try, most preferred first. Defaults to `http-01`, `tls-alpn-01` and `dns-01`. A type is used only when the matching solver is set.
-    pub methods: str[] = ["http-01", "tls-alpn-01", "dns-01"]
+    /// The DNS-PERSIST-01 solver, or `none` to disable it. It proves a wildcard name when its `wildcard` is set.
+    pub persistent: PersistentDns? = none
+    /// The challenge types to try, most preferred first. Defaults to `dns-persist-01`, `http-01`, `tls-alpn-01` and `dns-01`. A type is used only when the matching solver is set.
+    pub methods: str[] = ["dns-persist-01", "http-01", "tls-alpn-01", "dns-01"]
+}
+
+/// How DNS-PERSIST-01 keeps the standing TXT record that lets one account at one CA issue for a domain.
+///
+/// The record stays in the DNS between orders, so `publish` has no work once it exists, and whoever holds the account key can then issue without touching the DNS. `obtain` never removes it; deleting the record is how the domain's owner withdraws the authorization.
+pub struct PersistentDns {
+    /// Makes sure the TXT record `name` holds the text `value` and returns when the server's resolver can be expected to see it. The strings stay the same from order to order, so a record that is already there needs no work. A `value` of more than 255 bytes goes into the record as the character-strings of `dns_persist_strings`. A failure stops the order.
+    pub publish: fn(str, str) ! io.Error
+    /// Whether the record carries `policy=wildcard`. Without it the record proves only the domain it sits under, and a wildcard name is left to `dns-01`.
+    pub wildcard: bool = false
+    /// The `persistUntil` of the record, in Unix seconds, or `none` for a record that does not expire. `obtain` fails with `Unsupported` once this time has passed.
+    pub persist_until: i64? = none
+    /// The issuer domain name to write, which the challenge must offer, or the empty string to take the first one the challenge offers.
+    pub issuer: str = ""
 }
 
 /// A certificate that `obtain` issued.
@@ -25,9 +43,19 @@ pub struct Issued {
     pub key: x509.PrivateKey
 }
 
-fn available(solvers: Solvers, kind: str) -> bool {
+fn persists(solvers: Solvers, authz: Authorization) -> bool {
+    if authz.identifier.kind != "dns" {
+        return false
+    }
+    match solvers.persistent {
+        some(solver) => solver.wildcard || !authz.wildcard
+        none => false
+    }
+}
+
+fn available(solvers: Solvers, authz: Authorization, kind: str) -> bool {
     let served = match solvers.challenges {
-        some(_) => true
+        some(_) => !authz.wildcard
         none => false
     }
     let published = match solvers.dns {
@@ -38,13 +66,14 @@ fn available(solvers: Solvers, kind: str) -> bool {
         "http-01" => served
         "tls-alpn-01" => served
         "dns-01" => published
+        "dns-persist-01" => persists(solvers, authz)
         _ => false
     }
 }
 
 fn pick(solvers: Solvers, authz: Authorization) -> Challenge? {
     for kind in solvers.methods {
-        if !available(solvers, kind) || (authz.wildcard && kind != "dns-01") {
+        if !available(solvers, authz, kind) {
             continue
         }
         for ch in authz.challenges {
@@ -64,30 +93,69 @@ fn offered(authz: Authorization) -> str {
     text.join(kinds, ", ")
 }
 
-fn present(c: *Client, solvers: Solvers, authz: Authorization, ch: Challenge, authorization: str) ! Error {
+fn persist_issuer(solver: PersistentDns, ch: Challenge) -> str ! Error {
+    if ch.issuers.len == 0 || ch.issuers.len > 10 {
+        fail Protocol("the dns-persist-01 challenge offers {ch.issuers.len} issuer domain names, not 1 to 10")
+    }
+    if solver.issuer.len == 0 {
+        return ch.issuers[0]
+    }
+    if !slices.contains(ch.issuers, solver.issuer) {
+        fail Unsupported("the server does not accept the issuer domain name {solver.issuer}; it offers {text.join(ch.issuers, ", ")}")
+    }
+    solver.issuer
+}
+
+fn persist_record(c: *Client, a: Account, solver: PersistentDns, authz: Authorization, ch: Challenge) -> PersistRecord ! Error {
+    let issuer = persist_issuer(solver, ch)?
+    match solver.persist_until {
+        some(limit) => {
+            if timestamp.unix_seconds(c.options.clock.read()) > limit {
+                fail Unsupported("the persistUntil {limit} of the DNS-PERSIST-01 solver has passed")
+            }
+        }
+        none => {}
+    }
+    var account_uri = a.url
+    if c.directory.account_hash_prefix.len > 0 {
+        account_uri = account_hash_uri(c.directory.account_hash_prefix, authz.identifier.value, a.key, a.url)?
+    }
+    PersistRecord { issuer, account_uri, wildcard: solver.wildcard, persist_until: solver.persist_until }
+}
+
+fn present(c: *Client, a: Account, solvers: Solvers, authz: Authorization, ch: Challenge) ! Error {
     match ch.kind {
         "http-01" => {
             let store = solvers.challenges ?? challenges()
-            put_token(store, ch.token, authorization)
+            put_token(store, ch.token, key_authorization(ch, a.key))
         }
         "tls-alpn-01" => {
             let store = solvers.challenges ?? challenges()
             let now = timestamp.unix_seconds(c.options.clock.read())
-            let credentials = tls_alpn_credentials(authz.identifier, authorization, now)?
+            let credentials = tls_alpn_credentials(authz.identifier, key_authorization(ch, a.key), now)?
             put_certificate(store, tls_alpn_server_name(authz.identifier), credentials)
         }
-        _ => {
+        "dns-01" => {
             let records = match solvers.dns {
                 some(r) => r
                 none => fail Unsupported("no DNS solver")
             }
             let name = dns01_name(authz.identifier.value)
-            records.publish(name, dns01_value(authorization)) catch { e => fail Solver(e) }
+            records.publish(name, dns01_value(key_authorization(ch, a.key))) catch { e => fail Solver(e) }
         }
+        "dns-persist-01" => {
+            let solver = match solvers.persistent {
+                some(s) => s
+                none => fail Unsupported("no DNS-PERSIST-01 solver")
+            }
+            let value = dns_persist_value(persist_record(c, a, solver, authz, ch)?)?
+            solver.publish(dns_persist_name(authz.identifier.value), value) catch { e => fail Solver(e) }
+        }
+        _ => fail Unsupported("no solver for {ch.kind}")
     }
 }
 
-fn withdraw(solvers: Solvers, authz: Authorization, ch: Challenge, authorization: str) {
+fn withdraw(a: Account, solvers: Solvers, authz: Authorization, ch: Challenge) {
     match ch.kind {
         "http-01" => {
             match solvers.challenges {
@@ -101,15 +169,16 @@ fn withdraw(solvers: Solvers, authz: Authorization, ch: Challenge, authorization
                 none => {}
             }
         }
-        _ => {
+        "dns-01" => {
             match solvers.dns {
                 some(records) => {
                     let name = dns01_name(authz.identifier.value)
-                    records.remove(name, dns01_value(authorization)) catch { _ => {} }
+                    records.remove(name, dns01_value(key_authorization(ch, a.key))) catch { _ => {} }
                 }
                 none => {}
             }
         }
+        _ => {}
     }
 }
 
@@ -118,26 +187,25 @@ fn prove(c: *Client, a: Account, solvers: Solvers, authz: Authorization) ! Error
         some(found) => found
         none => fail Unsupported("no usable challenge for {authz.identifier.value}; the server offers {offered(authz)}")
     }
-    let authorization = key_authorization(ch, a.key)
-    present(c, solvers, authz, ch, authorization) catch {
+    present(c, a, solvers, authz, ch) catch {
         e => {
-            withdraw(solvers, authz, ch, authorization)
+            withdraw(a, solvers, authz, ch)
             fail e
         }
     }
     let _ = respond(c, a, ch) catch {
         e => {
-            withdraw(solvers, authz, ch, authorization)
+            withdraw(a, solvers, authz, ch)
             fail e
         }
     }
     let _ = wait_authorization(c, a, authz.url) catch {
         e => {
-            withdraw(solvers, authz, ch, authorization)
+            withdraw(a, solvers, authz, ch)
             fail e
         }
     }
-    withdraw(solvers, authz, ch, authorization)
+    withdraw(a, solvers, authz, ch)
 }
 
 struct Names {
@@ -176,7 +244,7 @@ pub fn csr_for(request: OrderRequest, key: x509.PrivateKey) -> u8[] ! Error {
 
 /// Orders a certificate for `request.identifiers`, proves control of each name with `solvers` and returns the issued certificate.
 ///
-/// `key` is the private key of the certificate, as `x509.generate_private_key` makes one; it is not the account key. For each authorization that is not already `valid` it picks the first of `solvers.methods` that the server offers and a solver exists for, puts the response in place, tells the server, waits for the validation and takes the response away again, also when the validation fails. It then finalizes with a request for `key`, waits for the order to become `valid` and downloads the chain.
+/// `key` is the private key of the certificate, as `x509.generate_private_key` makes one; it is not the account key. For each authorization that is not already `valid` it picks the first of `solvers.methods` that the server offers and a solver exists for, puts the response in place, tells the server, waits for the validation and takes the response away again, also when the validation fails; the TXT record of `dns-persist-01` stays. It then finalizes with a request for `key`, waits for the order to become `valid` and downloads the chain.
 ///
 /// Fails with `Unsupported` when no offered challenge has a solver, with `Rejected` or `OrderFailed` when the server refuses, with `Solver` when a DNS function fails, with `Timeout` when a wait exceeds `Options.poll_timeout` and with the other variants of `Error` for transport and protocol failures.
 pub fn obtain(c: *Client, a: Account, request: OrderRequest, key: x509.PrivateKey, solvers: Solvers) -> Issued ! Error {

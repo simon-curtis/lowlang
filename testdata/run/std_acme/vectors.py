@@ -27,3 +27,12 @@ authorization = f"{TOKEN}.{thumbprint}"
 print("thumbprint", thumbprint)
 print("key authorization", authorization)
 print("dns01 value", b64(hashlib.sha256(authorization.encode()).digest()))
+
+
+def account_hash(domain: str, account_url: str) -> str:
+    data = bytes([len(domain)]) + domain.encode() + thumbprint.encode() + account_url.encode()
+    return b64(hashlib.sha256(data).digest())
+
+
+print("account hash", account_hash("example.org", "https://ca.example/acct/123"))
+print("account hash of any domain", account_hash("*", "https://ca.example/acct/123"))
