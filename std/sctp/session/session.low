@@ -1,0 +1,295 @@
+import std/io
+import std/sctp
+import std/time
+
+/// The datagram path a session runs over: a function that sends one packet and a channel the received packets arrive on.
+///
+/// The path can lose, reorder and duplicate packets. A send that fails is a lost packet.
+pub struct Transport {
+    /// Sends one SCTP packet to the peer.
+    pub send: fn(u8[])
+    /// The packets that arrive from the peer. A closed channel ends the session.
+    pub incoming: chan[u8[]]
+}
+
+enum Command {
+    Send(stream: i64, ppid: i64, data: u8[], delivery: sctp.Delivery, reply: chan[io.Error?])
+    Reset(stream: i64, reply: chan[bool])
+    Buffered(reply: chan[i64])
+    Shutdown
+    Close
+}
+
+enum Step {
+    Command(command: Command)
+    Arrived(packet: u8[])
+    Drained
+    Elapsed
+    Ended
+}
+
+struct Core {
+    assoc: *sctp.Assoc
+    transport: Transport
+    commands: chan[Command]
+    messages: chan[sctp.Message]
+    events: chan[sctp.Event]
+    gone: chan[bool]
+    backlog: sctp.Message[]
+}
+
+const backlog_limit = 256
+
+/// A session that can be copied into a green thread or a closure, and used with every function of this module.
+///
+/// `messages` carries the messages the peer sent and `events` the association's events. Both close when the session ends, and `events` must be read: the session drops an event when 64 wait.
+pub struct Handle {
+    /// The messages the peer sent. The session stops reading packets while 256 of them wait.
+    pub messages: chan[sctp.Message]
+    /// The association's events.
+    pub events: chan[sctp.Event]
+    core: *Core
+}
+
+/// An SCTP association with the green thread that drives it, and the owner that closes it when dropped.
+pub struct Session {
+    /// The copyable view that every function of the module takes.
+    pub handle: Handle
+    drop stop(handle.core)
+}
+
+fn clock() -> i64 {
+    time.monotonic() / 1000000
+}
+
+/// Creates the association and starts the green thread that runs it over `transport`.
+///
+/// A client sends its INIT at once. Read `events` for `Connected` or `Failed`, or call `wait_connected`.
+pub fn open(config: sctp.Config, transport: Transport) -> Session {
+    let core = new(Core {
+        assoc: sctp.assoc(config)
+        transport
+        commands: chan[Command](16)
+        messages: chan[sctp.Message](256)
+        events: chan[sctp.Event](64)
+        gone: chan[bool]()
+        backlog: []
+    })
+    spawn run(core)
+    Session { handle: Handle { messages: core.messages, events: core.events, core } }
+}
+
+fn flush(c: *Core) {
+    for {
+        let p = sctp.poll_transmit(c.assoc) ?? break
+        c.transport.send(p)
+    }
+    for {
+        let e = sctp.poll_event(c.assoc) ?? break
+        select {
+            c.events <- e => {}
+            else => {}
+        }
+    }
+    for {
+        let m = sctp.read(c.assoc) ?? break
+        c.backlog.push(m)
+    }
+    for {
+        if c.backlog.len == 0 {
+            break
+        }
+        var delivered = false
+        select {
+            c.messages <- c.backlog[0] => {
+                delivered = true
+            }
+            else => {}
+        }
+        if !delivered {
+            break
+        }
+        c.backlog = c.backlog[1..]
+    }
+}
+
+fn handle(c: *Core, command: Command, now: i64) -> bool {
+    match command {
+        Send(stream, ppid, data, delivery, reply) => {
+            var failure: io.Error? = none
+            sctp.send(c.assoc, now, stream, ppid, data, delivery) catch {
+                e => {
+                    failure = e
+                }
+            }
+            reply <- failure
+        }
+        Reset(stream, reply) => {
+            sctp.reset_stream(c.assoc, now, stream)
+            reply <- true
+        }
+        Buffered(reply) => {
+            reply <- sctp.buffered_amount(c.assoc)
+        }
+        Shutdown => {
+            sctp.shutdown(c.assoc, now)
+        }
+        Close => return false
+    }
+    true
+}
+
+fn wait_for(c: *Core, now: i64) -> i64 {
+    let t = sctp.next_timeout(c.assoc)
+    if t < 0 {
+        return 60000
+    }
+    let left = t - now
+    if left < 1 { 1 } else { left }
+}
+
+fn next_step(c: *Core, wait: i64) -> Step {
+    if c.backlog.len >= backlog_limit {
+        return select {
+            command = <-c.commands => match command {
+                some(x) => Step.Command(x)
+                none => Step.Ended
+            }
+            c.messages <- c.backlog[0] => Step.Drained
+            after(wait) => Step.Elapsed
+        }
+    }
+    select {
+        command = <-c.commands => match command {
+            some(x) => Step.Command(x)
+            none => Step.Ended
+        }
+        packet = <-c.transport.incoming => match packet {
+            some(x) => Step.Arrived(x)
+            none => Step.Ended
+        }
+        after(wait) => Step.Elapsed
+    }
+}
+
+fn run(c: *Core) {
+    sctp.connect(c.assoc, clock())
+    flush(c)
+    for {
+        let now = clock()
+        let step = next_step(c, wait_for(c, now))
+        var running = true
+        match step {
+            Command(command) => {
+                running = handle(c, command, clock())
+            }
+            Arrived(packet) => {
+                sctp.receive(c.assoc, packet, clock())
+            }
+            Drained => {
+                c.backlog = c.backlog[1..]
+            }
+            Elapsed => {}
+            Ended => {
+                running = false
+            }
+        }
+        if !running {
+            break
+        }
+        sctp.tick(c.assoc, clock())
+        flush(c)
+    }
+    sctp.abort(c.assoc)
+    flush(c)
+    close(c.messages)
+    close(c.events)
+    close(c.gone)
+}
+
+fn stop(c: *Core) {
+    select {
+        c.commands <- Command.Close => {}
+        <-c.gone => {}
+    }
+}
+
+fn ask[T](s: Handle, command: Command, reply: chan[T]) -> T ! io.Error {
+    select {
+        s.core.commands <- command => {}
+        <-s.core.gone => fail NotConnected
+    }
+    select {
+        answer = <-reply => match answer {
+            some(v) => v
+            none => fail NotConnected
+        }
+        <-s.core.gone => fail NotConnected
+    }
+}
+
+/// Waits until the handshake finishes.
+///
+/// Fails with `Refused` when the handshake fails and with `NotConnected` when the session ends first. Events that arrive before the result are consumed.
+pub fn wait_connected(s: Handle) ! io.Error {
+    for {
+        let event = <-s.events
+        match event {
+            some(e) => match e {
+                Connected => return
+                Failed(_) => fail Refused
+                Closed => fail NotConnected
+                StreamReset(_) => {}
+            }
+            none => fail NotConnected
+        }
+    }
+}
+
+/// Sends `data` as one message on `stream` with the protocol identifier `ppid`.
+///
+/// Fails as `sctp.send` does and with `NotConnected` after the session ends.
+pub fn send(s: Handle, stream: i64, ppid: i64, data: u8[], delivery: sctp.Delivery) ! io.Error {
+    let reply = chan[io.Error?](1)
+    let result = ask(s, Command.Send(stream, ppid, data, delivery, reply), reply)?
+    match result {
+        some(e) => fail e
+        none => {}
+    }
+}
+
+/// Waits for the next message from the peer.
+///
+/// Fails with `NotConnected` when the session ends.
+pub fn receive(s: Handle) -> sctp.Message ! io.Error {
+    let item = <-s.messages
+    match item {
+        some(m) => m
+        none => fail NotConnected
+    }
+}
+
+/// Asks the peer to reset `stream` once everything queued on it was sent. The peer's answer arrives as a `StreamReset` event on its side.
+pub fn reset_stream(s: Handle, stream: i64) ! io.Error {
+    let reply = chan[bool](1)
+    ask(s, Command.Reset(stream, reply), reply)?
+}
+
+/// Returns the bytes sent that the peer has not acknowledged.
+pub fn buffered_amount(s: Handle) -> i64 ! io.Error {
+    let reply = chan[i64](1)
+    ask(s, Command.Buffered(reply), reply)?
+}
+
+/// Begins an orderly shutdown. `events` reports `Closed` when the peer acknowledged.
+pub fn shutdown_session(s: Handle) {
+    select {
+        s.core.commands <- Command.Shutdown => {}
+        <-s.core.gone => {}
+    }
+}
+
+/// Aborts the association and ends the session.
+pub fn close_session(s: Handle) {
+    stop(s.core)
+}

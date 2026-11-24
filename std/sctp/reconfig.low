@@ -1,0 +1,166 @@
+import std/io
+
+const result_nothing_to_do = 0
+const result_performed = 1
+const result_in_progress = 4
+const result_bad_sequence = 5
+
+fn serial_next(n: i64) -> i64 {
+    wrap(n + 1)
+}
+
+/// Asks the peer to reset the outgoing direction of `stream` once everything queued on it has been sent (RFC 6525), so the next message on it starts at sequence number 0.
+///
+/// The request waits for the data queued before it. The peer answers by resetting its own outgoing direction, which `poll_event` reports as `StreamReset`.
+pub fn reset_stream(a: *Assoc, now: i64, stream: i64) {
+    if a.stage != Stage.Established || !a.peer_reconfig {
+        return
+    }
+    a.reset_queue.push(stream)
+    try_send_reset(a, now)
+    flush_packet(a)
+}
+
+fn reconfig_chunk(params: Param[]) -> Chunk {
+    var body: u8[] = []
+    encode_params(mut body, params)
+    Chunk { kind: chunk_reconfig, flags: 0, body }
+}
+
+fn outgoing_request(a: *Assoc, r: Reset) -> Param {
+    var value: u8[] = []
+    io.put_be32(mut value, r.sequence)
+    io.put_be32(mut value, wrap(a.peer_reset_sequence - 1))
+    io.put_be32(mut value, wrap(a.next_tsn - 1))
+    for s in r.streams {
+        io.put_be16(mut value, s)
+    }
+    Param { kind: param_outgoing_reset, value }
+}
+
+fn try_send_reset(a: *Assoc, now: i64) {
+    if a.reset != none || a.reset_queue.len == 0 || a.queue.len > 0 {
+        return
+    }
+    let r = Reset { sequence: a.reset_sequence, streams: a.reset_queue, deadline: now + a.rto }
+    a.reset_sequence = serial_next(a.reset_sequence)
+    a.reset_queue = []
+    a.reset = r
+    add_chunk(a, reconfig_chunk([outgoing_request(a, r)]))
+}
+
+fn tick_reset(a: *Assoc, now: i64) {
+    let r = a.reset ?? return
+    if now < r.deadline {
+        return
+    }
+    a.errors += 1
+    if a.errors > a.config.max_retransmissions {
+        fail_with(a, "the peer stopped answering a stream reset")
+        return
+    }
+    backoff(a)
+    a.reset = Reset { sequence: r.sequence, streams: r.streams, deadline: now + a.rto }
+    add_chunk(a, reconfig_chunk([outgoing_request(a, r)]))
+}
+
+fn respond(a: *Assoc, sequence: i64, result: i64) {
+    var value: u8[] = []
+    io.put_be32(mut value, sequence)
+    io.put_be32(mut value, result)
+    add_chunk(a, reconfig_chunk([Param { kind: param_reconfig_response, value }]))
+}
+
+fn stream_ids(value: u8[], from: i64) -> i64[] {
+    var out: i64[] = []
+    var at = from
+    for {
+        if at + 2 > value.len {
+            break
+        }
+        out.push(io.be16(value, at))
+        at += 2
+    }
+    out
+}
+
+fn reset_inbound(a: *Assoc, stream: i64) {
+    let st = inbound_of(a, stream)
+    for k, m in st.ready {
+        a.buffered -= m.data.len
+    }
+    st.ready = [:]
+    st.next_ssn = 0
+    a.events.push(Event.StreamReset(stream))
+}
+
+fn on_outgoing_reset(a: *Assoc, value: u8[]) {
+    if value.len < 12 {
+        return
+    }
+    let sequence = io.be32(value, 0)
+    if sequence == a.peer_reset_sequence {
+        if a.cum < unwrap(io.be32(value, 8), a.cum) {
+            respond(a, sequence, result_in_progress)
+            return
+        }
+        for s in stream_ids(value, 12) {
+            reset_inbound(a, s)
+        }
+        a.peer_reset_sequence = serial_next(sequence)
+        respond(a, sequence, result_performed)
+    } else if sequence == wrap(a.peer_reset_sequence - 1) {
+        respond(a, sequence, result_nothing_to_do)
+    } else {
+        respond(a, sequence, result_bad_sequence)
+    }
+}
+
+fn on_incoming_reset(a: *Assoc, value: u8[], now: i64) {
+    if value.len < 4 {
+        return
+    }
+    let sequence = io.be32(value, 0)
+    if sequence != a.peer_reset_sequence {
+        respond(a, sequence, result_bad_sequence)
+        return
+    }
+    a.peer_reset_sequence = serial_next(sequence)
+    for s in stream_ids(value, 4) {
+        a.reset_queue.push(s)
+    }
+    respond(a, sequence, result_performed)
+}
+
+fn on_reset_response(a: *Assoc, value: u8[]) {
+    if value.len < 8 {
+        return
+    }
+    let r = a.reset ?? return
+    if io.be32(value, 0) != r.sequence {
+        return
+    }
+    let result = io.be32(value, 4)
+    if result == result_in_progress {
+        return
+    }
+    if result == result_nothing_to_do || result == result_performed {
+        for s in r.streams {
+            outbound_of(a, s).next_ssn = 0
+        }
+    }
+    a.reset = none
+    a.errors = 0
+}
+
+fn on_reconfig(a: *Assoc, c: Chunk, now: i64) {
+    let params = parse_params(c.body) or return
+    for p in params {
+        match p.kind {
+            13 => on_outgoing_reset(a, p.value)
+            14 => on_incoming_reset(a, p.value, now)
+            16 => on_reset_response(a, p.value)
+            _ => {}
+        }
+    }
+}

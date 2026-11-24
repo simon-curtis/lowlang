@@ -1,0 +1,757 @@
+import std/crypto
+import std/crypto/hash
+import std/io
+
+/// What an association reports through `poll_event`.
+pub enum Event {
+    /// The four-way handshake finished and messages can flow.
+    Connected
+    /// The peer shut the association down or `shutdown` completed.
+    Closed
+    /// The peer aborted, the handshake did not finish or the peer stopped answering.
+    Failed(reason: str)
+    /// The peer reset the outgoing direction of a stream (RFC 6525): its next message on `stream` starts at sequence number 0.
+    StreamReset(stream: i64)
+}
+
+/// The phase of an association.
+pub enum State {
+    /// Nothing has been exchanged.
+    Idle = 0
+    /// An INIT or a COOKIE ECHO is waiting for an answer.
+    Connecting = 1
+    /// Messages can flow.
+    Established = 2
+    /// A shutdown is in progress.
+    ShuttingDown = 3
+    /// The association closed.
+    Closed = 4
+    /// The association failed.
+    Failed = 5
+}
+
+/// A message the peer sent.
+pub struct Message {
+    /// The stream the message arrived on.
+    pub stream: i64
+    /// The payload protocol identifier, which data channels use to tell strings, binary data and control messages apart.
+    pub ppid: i64
+    /// The payload.
+    pub data: u8[]
+}
+
+/// How a message is delivered (RFC 3758).
+pub struct Delivery {
+    /// Whether messages on the stream arrive in the order they were sent.
+    pub ordered: bool = true
+    /// The most times a fragment of the message is retransmitted before the message is abandoned, or -1 for no limit.
+    pub max_retransmits: i64 = -1
+    /// The milliseconds after which an unacknowledged message is abandoned, or -1 for no limit.
+    pub lifetime: i64 = -1
+}
+
+/// The settings of an association.
+pub struct Config {
+    /// Whether the association sends the INIT. WebRTC makes the DTLS client the initiator.
+    pub client: bool
+    /// The SCTP port of this side, 5000 by default.
+    pub local_port: i64 = 5000
+    /// The SCTP port of the peer, 5000 by default.
+    pub remote_port: i64 = 5000
+    /// The largest SCTP packet sent, in bytes. The default is 1200.
+    pub mtu: i64 = 1200
+    /// The bytes of received data the association buffers, which it advertises as its receiver window. The default is 1048576.
+    pub window: i64 = 1048576
+    /// The largest message `send` accepts. The default is 262144.
+    pub max_message_size: i64 = 262144
+    /// The first retransmission timeout in milliseconds. The default is 3000.
+    pub rto_initial: i64 = 3000
+    /// The shortest retransmission timeout. The default is 1000.
+    pub rto_min: i64 = 1000
+    /// The longest retransmission timeout. The default is 60000.
+    pub rto_max: i64 = 60000
+    /// The consecutive timeouts after which the association fails. The default is 10.
+    pub max_retransmissions: i64 = 10
+    /// The idle milliseconds between heartbeats. The default is 30000.
+    pub heartbeat_interval: i64 = 30000
+    /// The milliseconds a SACK may wait for a second packet. The default is 200.
+    pub sack_delay: i64 = 200
+    /// The streams the association accepts and uses, at most 65535, which is the default.
+    pub streams: i64 = 65535
+}
+
+enum Stage {
+    Idle
+    CookieWait
+    CookieEchoed
+    Established
+    ShutdownPending
+    ShutdownSent
+    ShutdownReceived
+    ShutdownAckSent
+    Closed
+    Failed
+}
+
+struct Outgoing {
+    stream: i64
+    unordered: bool
+    ssn: i64
+    max_retransmits: i64
+    expires: i64
+    abandoned: bool
+}
+
+struct Sent {
+    tsn: i64
+    stream: i64
+    ssn: i64
+    ppid: i64
+    flags: i64
+    payload: u8[]
+    message: *Outgoing
+    sent_at: i64
+    retransmits: i64
+    acked: bool
+    abandoned: bool
+    retransmit: bool
+    in_flight: bool
+    misses: i64
+}
+
+struct Inbound {
+    next_ssn: i64
+    ready: [i64: Message]
+}
+
+struct Outbound {
+    next_ssn: i64
+}
+
+struct Reset {
+    sequence: i64
+    streams: i64[]
+    deadline: i64
+}
+
+/// An SCTP association (RFC 4960) with the extensions data channels need: partial reliability (RFC 3758) and stream reset (RFC 6525). It has no socket and no clock.
+///
+/// The caller feeds it received packets with `receive`, the time with `tick`, and sends what `poll_transmit` returns. The time is a count of milliseconds from any origin that never goes backwards.
+pub struct Assoc {
+    config: Config
+    stage: Stage
+    secret: u8[]
+    tag: i64
+    peer_tag: i64
+    peer_forward: bool
+    peer_reconfig: bool
+    peer_streams: i64
+    init_tsn: i64
+    next_tsn: i64
+    acked_cum: i64
+    advanced: i64
+    forward_due: bool
+    outstanding: *Sent[]
+    queue: *Sent[]
+    flight: i64
+    rwnd: i64
+    cwnd: i64
+    ssthresh: i64
+    partial_acked: i64
+    recovery: i64
+    rto: i64
+    srtt: i64
+    rttvar: i64
+    rtx_at: i64
+    errors: i64
+    outbound: [i64: *Outbound]
+    cum: i64
+    seen: [i64: bool]
+    frags: [i64: Fragment]
+    buffered: i64
+    duplicates: i64[]
+    inbound: [i64: *Inbound]
+    sack_due: bool
+    sack_packets: i64
+    sack_at: i64
+    heartbeat_at: i64
+    heartbeat_sent: i64
+    init_attempts: i64
+    init_at: i64
+    init_chunk: Chunk
+    echo: u8[]
+    shutdown_at: i64
+    reset_queue: i64[]
+    reset: Reset?
+    reset_sequence: i64
+    peer_reset_sequence: i64
+    pending: Chunk[]
+    pending_size: i64
+    outbox: u8[][]
+    events: Event[]
+    received: Message[]
+}
+
+const initial_cwnd_packets = 4
+const cookie_fields = 28
+
+fn tag_of(random: u8[]) -> i64 {
+    let v = io.be32(random, 0)
+    if v == 0 { 1 } else { v }
+}
+
+/// Makes an association from `config`. A client begins with `connect`; a server waits for an INIT in `receive`.
+pub fn assoc(config: Config) -> *Assoc {
+    let first = io.be32(crypto.random(4), 0)
+    new(Assoc {
+        config
+        stage: Stage.Idle
+        secret: crypto.random(32)
+        tag: tag_of(crypto.random(4))
+        peer_tag: 0
+        peer_forward: false
+        peer_reconfig: false
+        peer_streams: 0
+        init_tsn: first
+        next_tsn: first
+        acked_cum: first - 1
+        advanced: first - 1
+        forward_due: false
+        outstanding: []
+        queue: []
+        flight: 0
+        rwnd: 0
+        cwnd: initial_cwnd_packets * config.mtu
+        ssthresh: config.window
+        partial_acked: 0
+        recovery: first - 1
+        rto: config.rto_initial
+        srtt: 0
+        rttvar: 0
+        rtx_at: -1
+        errors: 0
+        outbound: [:]
+        cum: 0
+        seen: [:]
+        frags: [:]
+        buffered: 0
+        duplicates: []
+        inbound: [:]
+        sack_due: false
+        sack_packets: 0
+        sack_at: -1
+        heartbeat_at: -1
+        heartbeat_sent: -1
+        init_attempts: 0
+        init_at: -1
+        init_chunk: Chunk { kind: 0, flags: 0, body: [] }
+        echo: []
+        shutdown_at: -1
+        reset_queue: []
+        reset: none
+        reset_sequence: first
+        peer_reset_sequence: 0
+        pending: []
+        pending_size: 0
+        outbox: []
+        events: []
+        received: []
+    })
+}
+
+/// Returns the phase of the association.
+pub fn state(a: *Assoc) -> State {
+    match a.stage {
+        Idle => State.Idle
+        CookieWait => State.Connecting
+        CookieEchoed => State.Connecting
+        Established => State.Established
+        ShutdownPending => State.ShuttingDown
+        ShutdownSent => State.ShuttingDown
+        ShutdownReceived => State.ShuttingDown
+        ShutdownAckSent => State.ShuttingDown
+        Closed => State.Closed
+        Failed => State.Failed
+    }
+}
+
+/// Returns the next packet to send to the peer, or `none`.
+pub fn poll_transmit(a: *Assoc) -> u8[]? {
+    if a.outbox.len == 0 {
+        return none
+    }
+    let p = a.outbox[0]
+    a.outbox = a.outbox[1..]
+    p
+}
+
+/// Returns the next event, or `none`.
+pub fn poll_event(a: *Assoc) -> Event? {
+    if a.events.len == 0 {
+        return none
+    }
+    let e = a.events[0]
+    a.events = a.events[1..]
+    e
+}
+
+/// Returns the next complete message the peer sent, or `none`.
+pub fn read(a: *Assoc) -> Message? {
+    if a.received.len == 0 {
+        return none
+    }
+    let m = a.received[0]
+    a.received = a.received[1..]
+    m
+}
+
+/// Returns the bytes `send` accepted that the peer has not acknowledged, which a caller uses to pace what it queues.
+pub fn buffered_amount(a: *Assoc) -> i64 {
+    var n = 0
+    for s in a.queue {
+        n += s.payload.len
+    }
+    for s in a.outstanding {
+        if !s.acked && !s.abandoned {
+            n += s.payload.len
+        }
+    }
+    n
+}
+
+fn next_deadline(current: i64, candidate: i64) -> i64 {
+    if candidate < 0 {
+        return current
+    }
+    if current < 0 || candidate < current { candidate } else { current }
+}
+
+/// Returns the time at which `tick` next has work to do, or -1 when no timer runs.
+pub fn next_timeout(a: *Assoc) -> i64 {
+    var t = -1
+    for d in [a.rtx_at, a.sack_at, a.heartbeat_at, a.init_at, a.shutdown_at] {
+        t = next_deadline(t, d)
+    }
+    match a.reset {
+        some(r) => {
+            t = next_deadline(t, r.deadline)
+        }
+        none => {}
+    }
+    t
+}
+
+fn fail_with(a: *Assoc, reason: str) {
+    if a.stage == Stage.Failed || a.stage == Stage.Closed {
+        return
+    }
+    a.stage = Stage.Failed
+    clear_timers(a)
+    a.events.push(Event.Failed(reason))
+}
+
+fn clear_timers(a: *Assoc) {
+    a.rtx_at = -1
+    a.sack_at = -1
+    a.heartbeat_at = -1
+    a.init_at = -1
+    a.shutdown_at = -1
+    a.reset = none
+}
+
+fn close_with_event(a: *Assoc) {
+    if a.stage == Stage.Failed || a.stage == Stage.Closed {
+        return
+    }
+    a.stage = Stage.Closed
+    clear_timers(a)
+    a.events.push(Event.Closed)
+}
+
+fn flush_packet(a: *Assoc) {
+    if a.pending.len == 0 {
+        return
+    }
+    a.outbox.push(encode_packet(Packet { source: a.config.local_port, destination: a.config.remote_port, tag: a.peer_tag, chunks: a.pending }))
+    a.pending = []
+    a.pending_size = 0
+}
+
+fn add_chunk(a: *Assoc, c: Chunk) {
+    let n = pad4(chunk_header + c.body.len)
+    if a.pending.len > 0 && a.pending_size + n > a.config.mtu - header_size {
+        flush_packet(a)
+    }
+    a.pending.push(c)
+    a.pending_size += n
+}
+
+fn send_alone(a: *Assoc, tag: i64, c: Chunk) {
+    flush_packet(a)
+    a.outbox.push(encode_packet(Packet { source: a.config.local_port, destination: a.config.remote_port, tag, chunks: [c] }))
+}
+
+fn init_params(a: *Assoc) -> Param[] {
+    [
+        Param { kind: param_supported_extensions, value: [u8(chunk_reconfig), u8(chunk_forward_tsn)] }
+        Param { kind: param_forward_tsn_supported, value: [] }
+    ]
+}
+
+fn init_body(a: *Assoc, extra: Param[]) -> u8[] {
+    var params = init_params(a)
+    for p in extra {
+        params.push(p)
+    }
+    encode_init(Init { tag: a.tag, window: a.config.window, outbound: a.config.streams, inbound: a.config.streams, tsn: a.init_tsn, params })
+}
+
+/// Sends the INIT that begins the handshake. Only a client calls it.
+pub fn connect(a: *Assoc, now: i64) {
+    if !a.config.client || a.stage != Stage.Idle {
+        return
+    }
+    a.stage = Stage.CookieWait
+    a.init_chunk = Chunk { kind: chunk_init, flags: 0, body: init_body(a, []) }
+    a.init_attempts = 1
+    a.rto = a.config.rto_initial
+    a.init_at = now + a.rto
+    send_alone(a, 0, a.init_chunk)
+}
+
+fn peer_supports(params: Param[]) -> bool {
+    match find_param(params, param_forward_tsn_supported) {
+        some(_) => true
+        none => false
+    }
+}
+
+fn peer_extension(params: Param[], chunk: i64) -> bool {
+    let list = find_param(params, param_supported_extensions) ?? return false
+    for b in list {
+        if i64(b) == chunk {
+            return true
+        }
+    }
+    false
+}
+
+fn adopt_peer(a: *Assoc, i: Init) {
+    a.peer_tag = i.tag
+    a.rwnd = i.window
+    a.peer_streams = i.outbound
+    a.peer_forward = peer_supports(i.params) || peer_extension(i.params, chunk_forward_tsn)
+    a.peer_reconfig = peer_extension(i.params, chunk_reconfig)
+    a.cum = i.tsn - 1
+    a.peer_reset_sequence = wrap(i.tsn)
+}
+
+fn cookie_mac(a: *Assoc, fields: u8[]) -> u8[] {
+    hash.hmac(hash.sha256(), a.secret, fields)
+}
+
+fn make_cookie(a: *Assoc, i: Init) -> u8[] {
+    var fields: u8[] = []
+    io.put_be32(mut fields, a.tag)
+    io.put_be32(mut fields, a.init_tsn)
+    io.put_be32(mut fields, i.tag)
+    io.put_be32(mut fields, i.tsn)
+    io.put_be32(mut fields, i.window)
+    io.put_be16(mut fields, i.outbound)
+    io.put_be16(mut fields, 0)
+    io.put_be32(mut fields, (if peer_supports(i.params) || peer_extension(i.params, chunk_forward_tsn) { 1 } else { 0 }) | (if peer_extension(i.params, chunk_reconfig) { 2 } else { 0 }))
+    io.append(mut fields, cookie_mac(a, fields))
+    fields
+}
+
+fn on_init(a: *Assoc, p: Packet, c: Chunk) {
+    if a.config.client || p.tag != 0 {
+        return
+    }
+    let i = parse_init(c.body) or return
+    if i.tag == 0 || i.window < 1500 || i.outbound == 0 || i.inbound == 0 {
+        return
+    }
+    if a.stage != Stage.Idle {
+        return
+    }
+    var reply = init_body(a, [Param { kind: param_state_cookie, value: make_cookie(a, i) }])
+    send_alone(a, i.tag, Chunk { kind: chunk_init_ack, flags: 0, body: reply })
+}
+
+fn on_init_ack(a: *Assoc, p: Packet, c: Chunk, now: i64) {
+    if !a.config.client || a.stage != Stage.CookieWait || p.tag != a.tag {
+        return
+    }
+    let i = parse_init(c.body) or return
+    let cookie = find_param(i.params, param_state_cookie) ?? return
+    if i.tag == 0 {
+        return
+    }
+    adopt_peer(a, i)
+    a.echo = cookie
+    a.stage = Stage.CookieEchoed
+    a.init_attempts = 1
+    a.init_chunk = Chunk { kind: chunk_cookie_echo, flags: 0, body: cookie }
+    a.init_at = now + a.rto
+    send_alone(a, a.peer_tag, a.init_chunk)
+}
+
+fn on_cookie_echo(a: *Assoc, c: Chunk, now: i64) {
+    if a.config.client || c.body.len != cookie_fields + 32 {
+        return
+    }
+    let fields = c.body[..cookie_fields]
+    if !hash.equal(c.body[cookie_fields..], cookie_mac(a, fields)) {
+        return
+    }
+    if io.be32(fields, 0) != a.tag || io.be32(fields, 4) != a.init_tsn {
+        return
+    }
+    if a.stage == Stage.Idle {
+        a.peer_tag = io.be32(fields, 8)
+        a.cum = io.be32(fields, 12) - 1
+        a.peer_reset_sequence = io.be32(fields, 12)
+        a.rwnd = io.be32(fields, 16)
+        a.peer_streams = io.be16(fields, 20)
+        let flags = io.be32(fields, 24)
+        a.peer_forward = (flags & 1) != 0
+        a.peer_reconfig = (flags & 2) != 0
+        a.ssthresh = a.rwnd
+        establish(a, now)
+    }
+    if a.peer_tag == io.be32(fields, 8) {
+        send_alone(a, a.peer_tag, Chunk { kind: chunk_cookie_ack, flags: 0, body: [] })
+    }
+}
+
+fn establish(a: *Assoc, now: i64) {
+    a.stage = Stage.Established
+    a.init_at = -1
+    a.errors = 0
+    a.rto = a.config.rto_initial
+    a.heartbeat_at = now + a.config.heartbeat_interval
+    a.events.push(Event.Connected)
+}
+
+fn on_cookie_ack(a: *Assoc, now: i64) {
+    if a.stage != Stage.CookieEchoed {
+        return
+    }
+    establish(a, now)
+}
+
+fn on_heartbeat(a: *Assoc, c: Chunk) {
+    add_chunk(a, Chunk { kind: chunk_heartbeat_ack, flags: 0, body: c.body })
+}
+
+fn on_heartbeat_ack(a: *Assoc, now: i64) {
+    a.heartbeat_sent = -1
+    a.errors = 0
+    a.heartbeat_at = now + a.config.heartbeat_interval
+}
+
+fn on_abort(a: *Assoc) {
+    fail_with(a, "aborted by the peer")
+}
+
+/// Sends an ABORT and fails the association.
+pub fn abort(a: *Assoc) {
+    if a.stage == Stage.Idle || a.stage == Stage.Closed || a.stage == Stage.Failed {
+        return
+    }
+    if a.peer_tag != 0 {
+        send_alone(a, a.peer_tag, Chunk { kind: chunk_abort, flags: 0, body: [] })
+    }
+    fail_with(a, "aborted locally")
+}
+
+/// Begins an orderly shutdown: the association sends what it holds, then SHUTDOWN, and reports `Closed` once the peer acknowledges.
+pub fn shutdown(a: *Assoc, now: i64) {
+    if a.stage != Stage.Established {
+        return
+    }
+    a.stage = Stage.ShutdownPending
+    progress_shutdown(a, now)
+    flush_output(a, now)
+}
+
+fn progress_shutdown(a: *Assoc, now: i64) {
+    if a.stage == Stage.ShutdownPending && a.queue.len == 0 && a.outstanding.len == 0 {
+        a.stage = Stage.ShutdownSent
+        a.shutdown_at = now + a.rto
+        send_shutdown(a)
+    } else if a.stage == Stage.ShutdownReceived && a.queue.len == 0 && a.outstanding.len == 0 {
+        a.stage = Stage.ShutdownAckSent
+        a.shutdown_at = now + a.rto
+        send_alone(a, a.peer_tag, Chunk { kind: chunk_shutdown_ack, flags: 0, body: [] })
+    }
+}
+
+fn send_shutdown(a: *Assoc) {
+    var body: u8[] = []
+    io.put_be32(mut body, wrap(a.cum))
+    send_alone(a, a.peer_tag, Chunk { kind: chunk_shutdown, flags: 0, body })
+}
+
+fn on_shutdown(a: *Assoc, now: i64) {
+    if a.stage == Stage.Established || a.stage == Stage.ShutdownPending {
+        a.stage = Stage.ShutdownReceived
+        progress_shutdown(a, now)
+    }
+}
+
+fn on_shutdown_ack(a: *Assoc) {
+    if a.stage == Stage.ShutdownSent {
+        send_alone(a, a.peer_tag, Chunk { kind: chunk_shutdown_complete, flags: 0, body: [] })
+        close_with_event(a)
+    }
+}
+
+fn on_shutdown_complete(a: *Assoc) {
+    if a.stage == Stage.ShutdownAckSent {
+        close_with_event(a)
+    }
+}
+
+fn live(a: *Assoc) -> bool {
+    a.stage == Stage.Established || a.stage == Stage.ShutdownPending || a.stage == Stage.ShutdownReceived || a.stage == Stage.ShutdownSent || a.stage == Stage.ShutdownAckSent
+}
+
+fn on_chunk(a: *Assoc, p: Packet, c: Chunk, now: i64) {
+    match c.kind {
+        0 => if live(a) {
+            on_data(a, c, now)
+        }
+        1 => on_init(a, p, c)
+        2 => on_init_ack(a, p, c, now)
+        3 => if live(a) {
+            on_sack(a, c, now)
+        }
+        4 => if live(a) {
+            on_heartbeat(a, c)
+        }
+        5 => on_heartbeat_ack(a, now)
+        6 => on_abort(a)
+        7 => on_shutdown(a, now)
+        8 => on_shutdown_ack(a)
+        10 => on_cookie_echo(a, c, now)
+        11 => on_cookie_ack(a, now)
+        14 => on_shutdown_complete(a)
+        130 => if live(a) {
+            on_reconfig(a, c, now)
+        }
+        192 => if live(a) {
+            on_forward(a, c, now)
+        }
+        _ => {}
+    }
+}
+
+/// Feeds the association one packet from the peer.
+///
+/// A packet that does not parse, fails its checksum or carries another verification tag is dropped without a reply.
+pub fn receive(a: *Assoc, packet: u8[], now: i64) {
+    if a.stage == Stage.Failed || a.stage == Stage.Closed {
+        return
+    }
+    let p = parse_packet(packet) or return
+    if p.destination != a.config.local_port {
+        return
+    }
+    let initial = p.chunks[0].kind == chunk_init
+    if !initial && p.tag != a.tag {
+        return
+    }
+    for c in p.chunks {
+        on_chunk(a, p, c, now)
+        if a.stage == Stage.Failed || a.stage == Stage.Closed {
+            return
+        }
+    }
+    flush_output(a, now)
+}
+
+fn flush_output(a: *Assoc, now: i64) {
+    if live(a) {
+        send_pending(a, now)
+        progress_shutdown(a, now)
+    }
+    flush_packet(a)
+}
+
+fn backoff(a: *Assoc) {
+    a.rto = if a.rto * 2 > a.config.rto_max { a.config.rto_max } else { a.rto * 2 }
+}
+
+fn tick_handshake(a: *Assoc, now: i64) {
+    if a.init_at < 0 || now < a.init_at {
+        return
+    }
+    if a.init_attempts >= 8 {
+        fail_with(a, "the handshake timed out")
+        return
+    }
+    a.init_attempts += 1
+    backoff(a)
+    a.init_at = now + a.rto
+    let tag = if a.init_chunk.kind == chunk_init { 0 } else { a.peer_tag }
+    send_alone(a, tag, a.init_chunk)
+}
+
+fn tick_shutdown(a: *Assoc, now: i64) {
+    if a.shutdown_at < 0 || now < a.shutdown_at {
+        return
+    }
+    a.errors += 1
+    if a.errors > a.config.max_retransmissions {
+        fail_with(a, "the shutdown timed out")
+        return
+    }
+    backoff(a)
+    a.shutdown_at = now + a.rto
+    if a.stage == Stage.ShutdownSent {
+        send_shutdown(a)
+    } else if a.stage == Stage.ShutdownAckSent {
+        send_alone(a, a.peer_tag, Chunk { kind: chunk_shutdown_ack, flags: 0, body: [] })
+    }
+}
+
+fn tick_heartbeat(a: *Assoc, now: i64) {
+    if a.heartbeat_at < 0 || now < a.heartbeat_at {
+        return
+    }
+    if a.heartbeat_sent >= 0 {
+        a.errors += 1
+        if a.errors > a.config.max_retransmissions {
+            fail_with(a, "the peer stopped answering heartbeats")
+            return
+        }
+    }
+    var info: u8[] = []
+    io.put_be64(mut info, now)
+    var body: u8[] = []
+    io.put_be16(mut body, param_heartbeat_info)
+    io.put_be16(mut body, 4 + info.len)
+    io.append(mut body, info)
+    add_chunk(a, Chunk { kind: chunk_heartbeat, flags: 0, body })
+    a.heartbeat_sent = now
+    a.heartbeat_at = now + a.rto
+}
+
+/// Runs the timers that are due at `now`: handshake and shutdown retransmission, the retransmission timeout of data, delayed acknowledgements, heartbeats and stream reset retransmission.
+pub fn tick(a: *Assoc, now: i64) {
+    if a.stage == Stage.Failed || a.stage == Stage.Closed {
+        return
+    }
+    tick_handshake(a, now)
+    tick_shutdown(a, now)
+    if live(a) {
+        tick_retransmission(a, now)
+        tick_sack(a, now)
+        tick_heartbeat(a, now)
+        tick_reset(a, now)
+        expire_messages(a, now)
+    }
+    flush_output(a, now)
+}

@@ -1,0 +1,136 @@
+import std/sctp
+import std/sctp/session
+import std/slices
+
+struct Path {
+    seen: i64
+    every: i64
+}
+
+fn check(name: str, ok: bool) {
+    if ok {
+        print("{name}: ok")
+    } else {
+        print("{name}: FAIL")
+    }
+}
+
+fn lossy(path: *Path, to: chan[u8[]], incoming: chan[u8[]]) -> session.Transport {
+    session.Transport {
+        send: fn(packet) {
+            path.seen += 1
+            if path.every > 0 && path.seen % path.every == 0 {
+                return
+            }
+            select {
+                to <- packet => {}
+                else => {}
+            }
+        }
+        incoming
+    }
+}
+
+fn config(client: bool) -> sctp.Config {
+    sctp.Config { client, rto_initial: 40, rto_min: 20, rto_max: 160, sack_delay: 10 }
+}
+
+fn pattern(n: i64) -> u8[] {
+    var data: u8[] = []
+    for i in 0..n {
+        data.push(u8((i * 7 + 3) & 255))
+    }
+    data
+}
+
+fn next_message(h: session.Handle) -> sctp.Message? {
+    select {
+        m = <-h.messages => m
+        after(10000) => none
+    }
+}
+
+fn next_event(h: session.Handle) -> sctp.Event? {
+    select {
+        e = <-h.events => e
+        after(10000) => none
+    }
+}
+
+fn run(every: i64) {
+    let to_client = chan[u8[]](256)
+    let to_server = chan[u8[]](256)
+    let path = new(Path { seen: 0, every })
+    using client = session.open(config(true), lossy(path, to_server, to_client))
+    using server = session.open(config(false), lossy(path, to_client, to_server))
+    session.wait_connected(client.handle) or {
+        print("connect: FAIL")
+        return
+    }
+    session.wait_connected(server.handle) or {
+        print("accept: FAIL")
+        return
+    }
+    check("both sides connect", true)
+    let big = pattern(30000)
+    session.send(client.handle, 1, 53, big, sctp.Delivery {}) or return
+    session.send(client.handle, 3, 51, bytes("hello"), sctp.Delivery { ordered: false }) or return
+    session.send(client.handle, 1, 53, bytes("tail"), sctp.Delivery {}) or return
+    var got: sctp.Message[] = []
+    for i in 0..3 {
+        let m = next_message(server.handle) ?? break
+        got.push(m)
+    }
+    check("three messages arrive", got.len == 3)
+    var ordered: sctp.Message[] = []
+    var unordered = 0
+    for m in got {
+        if m.stream == 1 {
+            ordered.push(m)
+        } else {
+            unordered += 1
+        }
+    }
+    check("the ordered stream keeps its order", ordered.len == 2 && slices.equal(ordered[0].data, big) && str(ordered[1].data) == "tail")
+    check("the unordered message arrives", unordered == 1)
+    check("the protocol identifier survives", ordered.len == 2 && ordered[0].ppid == 53)
+    session.send(server.handle, 2, 51, bytes("reply"), sctp.Delivery {}) or return
+    let reply = next_message(client.handle) ?? sctp.Message { stream: -1, ppid: 0, data: [] }
+    check("the server answers", reply.stream == 2 && str(reply.data) == "reply")
+    session.reset_stream(client.handle, 1) or return
+    var reset = false
+    for {
+        let e = next_event(server.handle) ?? break
+        match e {
+            StreamReset(s) => {
+                reset = s == 1
+                break
+            }
+            _ => {}
+        }
+    }
+    check("the peer sees the stream reset", reset)
+    session.shutdown_session(client.handle)
+    var closed = false
+    for {
+        let e = next_event(client.handle) ?? break
+        match e {
+            Closed => {
+                closed = true
+                break
+            }
+            _ => {}
+        }
+    }
+    check("shutdown completes", closed)
+    session.send(client.handle, 1, 51, bytes("late"), sctp.Delivery {}) catch {
+        _ => check("send after shutdown fails", true)
+    }
+}
+
+fn main() {
+    print("clean path")
+    run(0)
+    print("every third packet lost")
+    run(3)
+}
