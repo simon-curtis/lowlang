@@ -3,6 +3,8 @@ import std/dtls
 import std/ice
 import icesession = std/ice/session
 import std/io
+import std/mdns
+import std/net
 import std/rtp
 import std/sdp
 import std/text
@@ -56,8 +58,77 @@ fn random_ssrc() -> i64 {
     if value == 0 { 1 } else { value }
 }
 
-fn candidate_value(c: ice.Candidate) -> str {
-    text.trim_prefix(ice.format(c), "candidate:")
+fn host_name(c: *Core, ip: u8[]) -> str {
+    let key = net.format_ip(ip)
+    match c.names[key] {
+        some(name) => return name
+        none => {}
+    }
+    let name = mdns.random_name()
+    c.names[key] = name
+    match c.responder {
+        some(r) => mdns.publish(r, mdns.Host { name, ip })
+        none => {}
+    }
+    name
+}
+
+fn unspecified(ip: u8[]) -> u8[] {
+    io.buffer(ip.len)
+}
+
+fn candidate_value(c: *Core, candidate: ice.Candidate) -> str {
+    if !c.config.mdns {
+        return text.trim_prefix(ice.format(candidate), "candidate:")
+    }
+    var shown = candidate
+    match candidate.related {
+        some(r) => {
+            shown.related = net.Addr { ip: unspecified(r.ip), port: 0 }
+        }
+        none => {}
+    }
+    var fields = text.fields(text.trim_prefix(ice.format(shown), "candidate:"))
+    if candidate.kind == ice.Kind.Host {
+        fields[4] = host_name(c, candidate.addr.ip)
+    }
+    text.join(fields, " ")
+}
+
+fn resolve_candidate(fields: str[], commands: chan[Command], gone: chan[bool]) {
+    var value: str? = none
+    let ip = mdns.resolve(fields[4], resolve_wait) catch {
+        _ => []
+    }
+    if ip.len > 0 {
+        var named = fields
+        named[4] = net.format_ip(ip)
+        value = text.join(named, " ")
+    }
+    select {
+        commands <- Command.Resolved(value) => {}
+        <-gone => {}
+    }
+}
+
+fn resolve_later(c: *Core, key: str) {
+    let fields = text.fields(key)
+    if fields.len < 8 || text.lower(fields[2]) != "udp" || fields[1] != "1" || !mdns.is_local(fields[4]) {
+        return
+    }
+    c.resolving += 1
+    spawn resolve_candidate(fields, c.commands, c.gone)
+}
+
+fn end_remote(c: *Core, link: icesession.Handle) {
+    if c.resolving > 0 {
+        c.remote_ended = true
+        return
+    }
+    c.remote_ended = false
+    icesession.end_of_remote_candidates(link) catch {
+        _ => {}
+    }
 }
 
 fn transport_attributes(c: *Core, setup: sdp.Setup) -> sdp.Attribute[] {
@@ -128,7 +199,7 @@ fn described_session(c: *Core, media: sdp.Media[], mids: str[]) -> sdp.Session !
     for at, m in all {
         if m.port != 0 {
             for candidate in gathered {
-                all[at].attributes.push(sdp.attribute("candidate", candidate_value(candidate)))
+                all[at].attributes.push(sdp.attribute("candidate", candidate_value(c, candidate)))
             }
             break
         }
@@ -203,7 +274,10 @@ fn add_remote(c: *Core, link: icesession.Handle, value: str) -> Error? {
     }
     c.remote_candidates[key] = true
     let candidate = ice.parse(key) catch {
-        Unsupported => return none
+        Unsupported => {
+            resolve_later(c, key)
+            return none
+        }
         _ => return Error.Invalid("candidate {key}")
     }
     if candidate.component != 1 {
@@ -225,7 +299,7 @@ fn apply_transport(c: *Core, s: sdp.Session, m: sdp.Media) ! Error {
         }
     }
     if sdp.end_of_candidates(s, m) {
-        icesession.end_of_remote_candidates(link) or fail Closed
+        end_remote(c, link)
     }
 }
 

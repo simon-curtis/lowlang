@@ -1,0 +1,155 @@
+import std/crypto
+import std/net
+import std/net/dns
+import std/text
+
+/// The UDP port of multicast DNS.
+pub const port = 5353
+
+const cache_flush = 0x8000
+const unicast_response = 0x8000
+const shared_ttl = 120
+const one_shot_ttl = 10
+
+/// A name the responder answers for and its address.
+pub struct Host {
+    /// The name, ending in `.local`.
+    pub name: str
+    /// The IPv4 address of 4 bytes or the IPv6 address of 16 bytes.
+    pub ip: u8[]
+}
+
+/// A response and where it goes.
+pub struct Reply {
+    /// The encoded DNS message.
+    pub data: u8[]
+    /// The querier for a unicast response, or the multicast group.
+    pub to: net.Addr
+}
+
+/// Returns the IPv4 multicast group of mDNS, 224.0.0.251 port 5353.
+pub fn group() -> net.Addr {
+    net.Addr { ip: [224, 0, 0, 251], port }
+}
+
+/// Reports whether `name` is in the `.local` domain, ignoring ASCII case and one trailing dot.
+pub fn is_local(name: str) -> bool {
+    var n = text.lower(name)
+    if text.ends_with(n, ".") {
+        n = n[..n.len - 1]
+    }
+    n.len > 6 && text.ends_with(n, ".local")
+}
+
+/// Returns a random name in the `.local` domain: a version 4 UUID, as browsers name their host candidates.
+pub fn random_name() -> str {
+    var raw = crypto.random(16)
+    raw[6] = (raw[6] & 0x0F) | 0x40
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    let h = text.encode_hex(raw)
+    "{h[0..8]}-{h[8..12]}-{h[12..16]}-{h[16..20]}-{h[20..32]}.local"
+}
+
+/// Returns a one-shot query (RFC 6762 section 5.1) for the records of `kind` of `name`, `dns.type_a` or `dns.type_aaaa`: ID 0, no recursion and one question asking for a multicast response.
+///
+/// Each kind goes in its own query because Chromium's responder ignores a query with more than one question.
+pub fn query(name: str, kind: i64) -> u8[] {
+    var m = dns.query(0, name, kind, 0)
+    m.recursion_desired = false
+    dns.encode(m) or []
+}
+
+fn record_ip(r: dns.Record, name: str) -> u8[]? {
+    if !dns.same_name(r.name, name) || (r.class & 0x7FFF) != dns.class_in {
+        return none
+    }
+    match r.data {
+        A(ip) => ip
+        Aaaa(ip) => ip
+        _ => none
+    }
+}
+
+/// Returns the first address a response gives for `name` in its answer or additional records, or `none` when `datagram` is not a response or names no address for it.
+///
+/// The cache-flush bit of a record's class is ignored.
+pub fn answer(datagram: u8[], name: str) -> u8[]? {
+    let m = dns.decode(datagram) or return none
+    if !m.response || m.opcode != 0 || m.rcode != 0 {
+        return none
+    }
+    for r in m.answers {
+        match record_ip(r, name) {
+            some(ip) => return ip
+            none => {}
+        }
+    }
+    for r in m.additional {
+        match record_ip(r, name) {
+            some(ip) => return ip
+            none => {}
+        }
+    }
+    none
+}
+
+fn wanted(q: dns.Question, h: Host) -> bool {
+    if (q.class & 0x7FFF) != dns.class_in || !dns.same_name(q.name, h.name) {
+        return false
+    }
+    q.kind == dns.type_any || (q.kind == dns.type_a && h.ip.len == 4) || (q.kind == dns.type_aaaa && h.ip.len == 16)
+}
+
+fn address_data(ip: u8[]) -> dns.Data {
+    if ip.len == 4 { dns.Data.A(ip) } else { dns.Data.Aaaa(ip) }
+}
+
+/// Answers the query `datagram` from `from` for the names of `hosts`, or returns `none` when it asks about none of them.
+///
+/// A query from a port other than 5353 is a one-shot query (RFC 6762 section 6.7): the response goes back to `from` with the query's ID and questions, a time to live of 10 seconds and no cache-flush bit. A query from port 5353 gets a response with ID 0, the cache-flush bit and a time to live of 120 seconds, sent to the multicast group unless every question asked for a unicast response. A response or a query with another opcode gets nothing. A truncated query and one listing known answers are answered like any other, without comparing the known answers.
+pub fn respond(hosts: Host[], datagram: u8[], from: net.Addr) -> Reply? {
+    let m = dns.decode(datagram) or return none
+    if m.response || m.opcode != 0 {
+        return none
+    }
+    let one_shot = from.port != port
+    var answers: dns.Record[] = []
+    var unicast = true
+    for q in m.questions {
+        if (q.class & unicast_response) == 0 {
+            unicast = false
+        }
+        for h in hosts {
+            if wanted(q, h) {
+                answers.push(dns.Record { name: h.name, class: if one_shot { dns.class_in } else { dns.class_in | cache_flush }, ttl: if one_shot { one_shot_ttl } else { shared_ttl }, data: address_data(h.ip) })
+            }
+        }
+    }
+    if answers.len == 0 {
+        return none
+    }
+    var questions: dns.Question[] = []
+    if one_shot {
+        for q in m.questions {
+            questions.push(dns.Question { name: q.name, kind: q.kind, class: q.class & 0x7FFF })
+        }
+    }
+    let response = dns.Message {
+        id: if one_shot { m.id } else { 0 }
+        response: true
+        opcode: 0
+        authoritative: true
+        truncated: false
+        recursion_desired: false
+        recursion_available: false
+        authentic: false
+        checking_disabled: false
+        rcode: 0
+        questions
+        answers
+        authority: []
+        additional: []
+    }
+    let data = dns.encode(response) or return none
+    Reply { data, to: if one_shot || unicast { from } else { group() } }
+}

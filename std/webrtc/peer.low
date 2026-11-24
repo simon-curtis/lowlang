@@ -4,6 +4,7 @@ import dtlssession = std/dtls/session
 import std/ice
 import icesession = std/ice/session
 import std/io
+import std/mdns
 import std/net
 import std/rtp
 import std/sctp
@@ -94,6 +95,8 @@ pub struct Config {
     pub max_message_size: i64 = 262144
     /// The ICE settings: consent and keepalive, and `turn_servers` and `relay_only` for relayed candidates; `controlling`, `hosts` and `stun_servers` are set by the peer.
     pub ice: ice.Config = ice.Config { controlling: false }
+    /// Whether host candidates are announced under random `.local` names that an mDNS responder on port 5353 answers for, as browsers announce theirs, so no description or `Event.Candidate` carries a local address.
+    pub mdns: bool = false
 }
 
 /// A local track: a media section this peer sends RTP on, made by `add_track`.
@@ -144,6 +147,7 @@ enum Command {
     Answer(offer: sdp.Session, reply: chan[Described])
     Accept(answer: sdp.Session, reply: chan[Error?])
     AddCandidate(value: str, reply: chan[Error?])
+    Resolved(value: str?)
     EndCandidates(reply: chan[Error?])
     OpenChannel(options: datachannel.Options, reply: chan[Opened])
     SendRtp(ssrc: i64, packet: rtp.Packet, reply: chan[io.Error?])
@@ -194,6 +198,10 @@ struct Core {
     dtls_client: bool
     remote_fingerprints: dtls.Fingerprint[]
     remote_candidates: [str: bool]
+    resolving: i64
+    remote_ended: bool
+    responder: mdns.Handle?
+    names: [str: str]
     data: bool
     remote_sctp_port: i64
     remote_max_message: i64
@@ -231,6 +239,7 @@ pub struct Peer {
 const record_overhead = 37
 const unlimited_message = 1073741823
 const default_remote_message = 65536
+const resolve_wait = 5000
 
 /// Creates a peer with a new self-signed certificate and starts its green thread.
 ///
@@ -262,6 +271,10 @@ pub fn open(config: Config) -> Peer ! io.Error {
         dtls_client: false
         remote_fingerprints: []
         remote_candidates: [:]
+        resolving: 0
+        remote_ended: false
+        responder: none
+        names: [:]
         data: false
         remote_sctp_port: 5000
         remote_max_message: default_remote_message
@@ -311,7 +324,31 @@ fn hold_ice(options: icesession.Options, reply: chan[icesession.Handle?], failur
     <-stop
 }
 
+fn hold_responder(reply: chan[mdns.Handle], failure: chan[io.Error], stop: chan[bool]) {
+    using r = mdns.responder() catch {
+        e => {
+            failure <- e
+            return
+        }
+    }
+    reply <- r.handle
+    <-stop
+}
+
+fn open_responder(c: *Core) ! Error {
+    let reply = chan[mdns.Handle](1)
+    let failure = chan[io.Error](1)
+    spawn hold_responder(reply, failure, c.stop)
+    c.responder = select {
+        r = <-reply => r ?? fail Closed
+        e = <-failure => fail Unavailable(e ?? io.Error.NotConnected)
+    }
+}
+
 fn open_ice(c: *Core, controlling: bool) ! Error {
+    if c.config.mdns {
+        open_responder(c)?
+    }
     var config = c.config.ice
     config.controlling = controlling
     config.stun_servers = c.config.stun_servers
@@ -428,7 +465,7 @@ fn on_dtls_connected(c: *Core, link: dtlssession.Handle) {
 
 fn on_ice(c: *Core, e: ice.Event) {
     match e {
-        LocalCandidate(candidate) => publish(c, Event.Candidate(candidate_value(candidate)))
+        LocalCandidate(candidate) => publish(c, Event.Candidate(candidate_value(c, candidate)))
         GatheringComplete => publish(c, Event.GatheringComplete)
         Selected(_, _) => {
             if c.dtls == none {
@@ -603,10 +640,22 @@ fn add_candidate_now(c: *Core, value: str) -> Error? {
 
 fn end_candidates_now(c: *Core) -> Error? {
     let link = c.ice ?? return Error.WrongState
-    icesession.end_of_remote_candidates(link) catch {
-        _ => {}
-    }
+    end_remote(c, link)
     none
+}
+
+fn resolved_now(c: *Core, value: str?) {
+    c.resolving -= 1
+    let link = c.ice ?? return
+    match value {
+        some(v) => {
+            add_remote(c, link, v)
+        }
+        none => {}
+    }
+    if c.resolving == 0 && c.remote_ended {
+        end_remote(c, link)
+    }
 }
 
 fn handle(c: *Core, command: Command) -> bool {
@@ -629,6 +678,7 @@ fn handle(c: *Core, command: Command) -> bool {
         EndCandidates(reply) => {
             reply <- end_candidates_now(c)
         }
+        Resolved(value) => resolved_now(c, value)
         OpenChannel(options, reply) => {
             reply <- open_channel_now(c, options)
         }
@@ -807,13 +857,15 @@ pub fn apply_answer(h: Handle, answer: sdp.Session) ! Error {
 
 /// Adds a remote candidate that arrived by trickle, the value of an `a=candidate` attribute with or without the `candidate:` prefix.
 ///
-/// A TCP candidate, a host name candidate and a candidate of component 2 are skipped. Fails with `WrongState` before the remote description is applied and with `Invalid` for a value that is not a candidate.
+/// A candidate whose address is a `.local` name is added once mDNS resolves the name, and dropped when no answer comes within 5 seconds; a TCP candidate, another host name and a candidate of component 2 are skipped. Fails with `WrongState` before the remote description is applied and with `Invalid` for a value that is not a candidate.
 pub fn add_remote_candidate(h: Handle, value: str) ! Error {
     let reply = chan[Error?](1)
     applied(h, Command.AddCandidate(value, reply), reply)?
 }
 
 /// Tells the peer the remote peer has no more candidates.
+///
+/// ICE hears of it once every `.local` name still being resolved has an answer or has timed out.
 ///
 /// Fails with `WrongState` before the ICE sockets are open.
 pub fn end_of_remote_candidates(h: Handle) ! Error {

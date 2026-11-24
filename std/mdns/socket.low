@@ -1,0 +1,186 @@
+import std/io
+import std/net
+import std/net/dns
+import std/time
+
+struct Datagram {
+    data: u8[]
+    from: net.Addr
+}
+
+/// The copyable view of a `Responder`.
+pub struct Handle {
+    /// The address the responder's socket is bound to.
+    pub addr: net.Addr
+    names: chan[Host]
+}
+
+/// An mDNS responder: a socket on port 5353 in the multicast group and a green thread that answers queries for the published names. Dropping it closes the socket and ends the thread.
+pub struct Responder {
+    /// The view `publish` takes.
+    pub handle: Handle
+    socket: net.SocketHandle
+    drop net.close_socket_on(socket)
+}
+
+const resend_after = 1000
+
+fn read_into(s: net.SocketHandle, inbox: chan[Datagram]) {
+    let buf = io.buffer(9000)
+    for {
+        let packet = net.receive_from_on(s, buf) catch {
+            _ => break
+        }
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        select {
+            inbox <- Datagram { data, from: packet.from } => {}
+            else => {}
+        }
+    }
+    close(inbox)
+}
+
+fn has_ipv4(i: net.Interface) -> bool {
+    for a in i.addresses {
+        if a.ip.len == 4 {
+            return true
+        }
+    }
+    false
+}
+
+fn multicast_interfaces() -> str[] {
+    var out: str[] = []
+    for i in net.interfaces() or [] {
+        if i.up && i.multicast && !i.loopback && has_ipv4(i) {
+            out.push(i.name)
+        }
+    }
+    out
+}
+
+fn shared_socket(interfaces: str[]) -> net.Socket ! io.Error {
+    using var s = net.bind_udp_with("0.0.0.0", port, net.ListenOptions { reuse_addr: true, reuse_port: true })?
+    net.join_group(s, group().ip, "")?
+    for name in interfaces {
+        net.join_group(s, group().ip, name) catch {
+            _ => {}
+        }
+    }
+    s
+}
+
+fn send_reply(s: net.SocketHandle, interfaces: str[], reply: Reply) {
+    if reply.to.port != port || reply.to.ip[0] != 224 || interfaces.len == 0 {
+        net.send_to_on(s, reply.data, reply.to) catch {
+            _ => 0
+        }
+        return
+    }
+    for name in interfaces {
+        using var owner = net.adopt_socket(s)
+        net.set_multicast_interface(owner, name) catch {
+            _ => {}
+        }
+        net.detach_socket(mut owner)
+        net.send_to_on(s, reply.data, reply.to) catch {
+            _ => 0
+        }
+    }
+}
+
+fn serve(s: net.SocketHandle, interfaces: str[], inbox: chan[Datagram], names: chan[Host]) {
+    var hosts: Host[] = []
+    for {
+        select {
+            d = <-inbox => {
+                let datagram = d ?? break
+                match respond(hosts, datagram.data, datagram.from) {
+                    some(reply) => send_reply(s, interfaces, reply)
+                    none => {}
+                }
+            }
+            h = <-names => {
+                match h {
+                    some(host) => hosts.push(host)
+                    none => {}
+                }
+            }
+        }
+    }
+}
+
+fn start(mut s: net.Socket, interfaces: str[]) -> Responder {
+    let h = net.detach_socket(mut s)
+    let inbox = chan[Datagram](64)
+    let names = chan[Host](64)
+    spawn read_into(h, inbox)
+    spawn serve(h, interfaces, inbox, names)
+    Responder { handle: Handle { addr: h.addr, names }, socket: h }
+}
+
+/// Binds port 5353 on every IPv4 address, shared with other mDNS sockets of the host, joins the group and starts answering queries.
+///
+/// The socket joins the group on the system's default multicast interface and on every interface that is up, multicast capable, not a loopback and has an IPv4 address, and a multicast response leaves through each of those interfaces, or through the default one when there are none. Fails with the error of `net.bind_udp_with` or `net.join_group`.
+pub fn responder() -> Responder ! io.Error {
+    let interfaces = multicast_interfaces()
+    using var s = shared_socket(interfaces)?
+    start(mut s, interfaces)
+}
+
+/// Makes the responder of `h` answer for `host` from now on.
+pub fn publish(h: Handle, host: Host) {
+    h.names <- host
+}
+
+fn now() -> i64 {
+    time.monotonic() / 1000000
+}
+
+fn ask(s: net.SocketHandle, inbox: chan[Datagram], to: net.Addr, name: str, wait: i64) -> u8[] ! io.Error {
+    let wires = [query(name, dns.type_a), query(name, dns.type_aaaa)]
+    let deadline = now() + wait
+    for {
+        for wire in wires {
+            net.send_to_on(s, wire, to)?
+        }
+        let resend = now() + resend_after
+        for {
+            let left = (if resend < deadline { resend } else { deadline }) - now()
+            if left <= 0 {
+                break
+            }
+            let arrived: Datagram? = select {
+                d = <-inbox => d ?? fail NotConnected
+                after(left) => none
+            }
+            match arrived {
+                some(d) => match answer(d.data, name) {
+                    some(ip) => return ip
+                    none => {}
+                }
+                none => {}
+            }
+        }
+        if now() >= deadline {
+            fail TimedOut
+        }
+    }
+}
+
+fn querier() -> net.Socket ! io.Error {
+    shared_socket([]) catch {
+        _ => net.bind_udp("0.0.0.0", 0)?
+    }
+}
+
+/// Resolves the `.local` name `name` to an address with one-shot multicast queries (RFC 6762 section 5.1), one for `A` and one for `AAAA` records, sent again every second, and returns the first address a response gives.
+///
+/// The query leaves from port 5353 in the multicast group, so a responder that answers only to the group is heard, as Chromium's is; when the port cannot be shared it leaves from a free port and only the unicast responses to a one-shot query arrive. Fails with `TimedOut` when no response names an address within `wait` milliseconds, and with the error of the socket.
+pub fn resolve(name: str, wait: i64) -> u8[] ! io.Error {
+    using var s = querier()?
+    let inbox = chan[Datagram](64)
+    spawn read_into(s.handle, inbox)
+    ask(s.handle, inbox, group(), name, wait)?
+}
