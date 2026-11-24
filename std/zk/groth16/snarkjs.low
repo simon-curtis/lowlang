@@ -1,0 +1,272 @@
+import std/big
+import std/crypto/limb
+import std/crypto/nistec
+import std/crypto/pairing
+import std/json
+
+fn curve_name(c: *pairing.Curve) -> str {
+    if c.l == 4 { "bn128" } else { "bls12381" }
+}
+
+fn digits_only(text: str) -> bool {
+    if text.len == 0 {
+        return false
+    }
+    for b in text {
+        if b < '0' || b > '9' {
+            return false
+        }
+    }
+    true
+}
+
+fn decimal(data: u8[]) -> str {
+    big.to_str(big.from_bytes(data), 10)
+}
+
+fn decimal_limbs(text: str, limbs: i64) -> u64[] ! Error {
+    if !digits_only(text) {
+        fail Malformed
+    }
+    let n = big.parse(text, 10) or fail Malformed
+    let data = big.to_bytes_sized(n, 8 * limbs) or fail Malformed
+    limb.from_bytes(data, limbs)
+}
+
+fn base_element(c: *pairing.Curve, text: str) -> u64[] ! Error {
+    let raw = decimal_limbs(text, c.l)?
+    if !nistec.below(raw, c.fp.m) {
+        fail Malformed
+    }
+    let out = nistec.element(c.fp)
+    nistec.to_mont(c.fp, out, raw)
+    out
+}
+
+fn base_text(c: *pairing.Curve, a: u64[]) -> str {
+    let plain = nistec.element(c.fp)
+    nistec.from_mont(c.fp, plain, a)
+    decimal(nistec.encode(plain))
+}
+
+fn string_at(v: json.Value, index: i64) -> str ! Error {
+    match json.at(v, index) ?? fail Malformed {
+        Str(s) => s
+        _ => fail Malformed
+    }
+}
+
+fn member(v: json.Value, name: str) -> json.Value ! Error {
+    json.get(v, name) ?? fail Malformed
+}
+
+fn write_strings(w: *json.Writer, items: str[]) {
+    json.start_array(w)
+    for item in items {
+        json.string_value(w, item)
+    }
+    json.end_array(w)
+}
+
+fn write_g1(w: *json.Writer, c: *pairing.Curve, p: pairing.Point) {
+    let a = pairing.affine(c, p) ?? return write_strings(w, ["0", "1", "0"])
+    write_strings(w, [base_text(c, a.x), base_text(c, a.y), "1"])
+}
+
+fn g2_rows(c: *pairing.Curve, p: pairing.Point) -> str[][] {
+    let a = pairing.affine(c, p) ?? return [["0", "0"], ["1", "0"], ["0", "0"]]
+    [[base_text(c, a.x[..c.l]), base_text(c, a.x[c.l..])], [base_text(c, a.y[..c.l]), base_text(c, a.y[c.l..])], ["1", "0"]]
+}
+
+fn write_g2(w: *json.Writer, c: *pairing.Curve, p: pairing.Point) {
+    json.start_array(w)
+    for row in g2_rows(c, p) {
+        write_strings(w, row)
+    }
+    json.end_array(w)
+}
+
+fn checked(c: *pairing.Curve, p: pairing.Point) -> pairing.Point ! Error {
+    if !pairing.in_subgroup(c, p) {
+        fail Point
+    }
+    p
+}
+
+fn read_g1(c: *pairing.Curve, v: json.Value) -> pairing.Point ! Error {
+    let x = string_at(v, 0)?
+    let y = string_at(v, 1)?
+    let z = string_at(v, 2)?
+    if z == "0" {
+        if x != "0" || y != "1" {
+            fail Malformed
+        }
+        return pairing.g1_infinity(c)
+    }
+    if z != "1" {
+        fail Malformed
+    }
+    checked(c, pairing.from_affine(c, base_element(c, x)?, base_element(c, y)?))?
+}
+
+fn fp2_element(c: *pairing.Curve, v: json.Value) -> u64[] ! Error {
+    let out: u64[] = __make(2 * c.l)
+    __memmove(out, base_element(c, string_at(v, 0)?)?)
+    __memmove(out[c.l..], base_element(c, string_at(v, 1)?)?)
+    out
+}
+
+fn read_g2(c: *pairing.Curve, v: json.Value) -> pairing.Point ! Error {
+    let x = json.at(v, 0) ?? fail Malformed
+    let y = json.at(v, 1) ?? fail Malformed
+    let z = json.at(v, 2) ?? fail Malformed
+    if string_at(z, 0)? == "0" && string_at(z, 1)? == "0" {
+        if string_at(x, 0)? != "0" || string_at(x, 1)? != "0" || string_at(y, 0)? != "1" || string_at(y, 1)? != "0" {
+            fail Malformed
+        }
+        return pairing.g2_infinity(c)
+    }
+    if string_at(z, 0)? != "1" || string_at(z, 1)? != "0" {
+        fail Malformed
+    }
+    checked(c, pairing.from_affine(c, fp2_element(c, x)?, fp2_element(c, y)?))?
+}
+
+fn parsed(text: str) -> json.Value ! Error {
+    json.parse(bytes(text)) or fail Malformed
+}
+
+fn check_header(c: *pairing.Curve, v: json.Value) ! Error {
+    match member(v, "protocol")? {
+        Str(p) => {
+            if p != "groth16" {
+                fail Malformed
+            }
+        }
+        _ => fail Malformed
+    }
+    match member(v, "curve")? {
+        Str(name) => {
+            if name != curve_name(c) {
+                fail Curve
+            }
+        }
+        _ => fail Malformed
+    }
+}
+
+fn write_header(w: *json.Writer, c: *pairing.Curve) {
+    json.property(w, "protocol")
+    json.string_value(w, "groth16")
+    json.property(w, "curve")
+    json.string_value(w, curve_name(c))
+}
+
+/// Returns the snarkjs `proof.json` of `proof`: `pi_a`, `pi_b` and `pi_c` as decimal strings in projective form with `z = 1`, the coordinates of `pi_b` as `[real, imaginary]`, `protocol` `"groth16"` and `curve` `"bn128"` or `"bls12381"`.
+pub fn proof_to_json(c: *pairing.Curve, proof: Proof) -> str {
+    let w = json.writer(1)
+    json.start_object(w)
+    json.property(w, "pi_a")
+    write_g1(w, c, proof.a)
+    json.property(w, "pi_b")
+    write_g2(w, c, proof.b)
+    json.property(w, "pi_c")
+    write_g1(w, c, proof.c)
+    write_header(w, c)
+    json.end_object(w)
+    json.written_text(w)
+}
+
+/// Returns the proof of the snarkjs `proof.json` in `text` for the curve `c`.
+///
+/// Fails with `Malformed` when a member is missing or mistyped, a number is not a decimal below the field prime or the protocol is not `"groth16"`, with `Curve` when the curve name is not that of `c`, and with `Point` when a point is not on its curve and in the subgroup of order `r`.
+pub fn proof_from_json(c: *pairing.Curve, text: str) -> Proof ! Error {
+    let v = parsed(text)?
+    check_header(c, v)?
+    Proof {
+        a: read_g1(c, member(v, "pi_a")?)?
+        b: read_g2(c, member(v, "pi_b")?)?
+        c: read_g1(c, member(v, "pi_c")?)?
+    }
+}
+
+/// Returns the snarkjs `verification_key.json` of `vk`: `protocol`, `curve`, `nPublic`, `vk_alpha_1`, `vk_beta_2`, `vk_gamma_2`, `vk_delta_2` and `IC`, without the `vk_alphabeta_12` member snarkjs caches.
+pub fn verifying_key_to_json(c: *pairing.Curve, vk: VerifyingKey) -> str {
+    let w = json.writer(1)
+    json.start_object(w)
+    write_header(w, c)
+    json.property(w, "nPublic")
+    json.integer(w, vk.ic.len - 1)
+    json.property(w, "vk_alpha_1")
+    write_g1(w, c, vk.alpha)
+    json.property(w, "vk_beta_2")
+    write_g2(w, c, vk.beta)
+    json.property(w, "vk_gamma_2")
+    write_g2(w, c, vk.gamma)
+    json.property(w, "vk_delta_2")
+    write_g2(w, c, vk.delta)
+    json.property(w, "IC")
+    json.start_array(w)
+    for p in vk.ic {
+        write_g1(w, c, p)
+    }
+    json.end_array(w)
+    json.end_object(w)
+    json.written_text(w)
+}
+
+/// Returns the verifying key of the snarkjs `verification_key.json` in `text` for the curve `c`, failing as `proof_from_json` does. `nPublic` must be one less than the length of `IC`; `vk_alphabeta_12` is ignored.
+pub fn verifying_key_from_json(c: *pairing.Curve, text: str) -> VerifyingKey ! Error {
+    let v = parsed(text)?
+    check_header(c, v)?
+    var ic: pairing.Point[] = []
+    let list = member(v, "IC")?
+    for {
+        let item = json.at(list, ic.len) ?? break
+        ic.push(read_g1(c, item)?)
+    }
+    match member(v, "nPublic")? {
+        Int(n) => {
+            if n + 1 != ic.len {
+                fail Malformed
+            }
+        }
+        _ => fail Malformed
+    }
+    VerifyingKey {
+        alpha: read_g1(c, member(v, "vk_alpha_1")?)?
+        beta: read_g2(c, member(v, "vk_beta_2")?)?
+        gamma: read_g2(c, member(v, "vk_gamma_2")?)?
+        delta: read_g2(c, member(v, "vk_delta_2")?)?
+        ic
+    }
+}
+
+/// Returns the snarkjs `public.json` of the public inputs `inputs`, plain integers least significant limb first: an array of decimal strings.
+pub fn public_to_json(inputs: u64[][]) -> str {
+    let w = json.writer(1)
+    json.start_array(w)
+    for x in inputs {
+        json.string_value(w, decimal(limb.to_bytes(x, 8 * x.len)))
+    }
+    json.end_array(w)
+    json.written_text(w)
+}
+
+/// Returns the public inputs of the snarkjs `public.json` in `text` as plain integers of `c`'s scalar field, least significant limb first, as `verify` takes them. Fails with `Malformed` for anything but an array of decimal strings below `r`.
+pub fn public_from_json(c: *pairing.Curve, text: str) -> u64[][] ! Error {
+    let v = parsed(text)?
+    var out: u64[][] = []
+    for {
+        let item = json.at(v, out.len) ?? break
+        let x = match item {
+            Str(s) => decimal_limbs(s, c.fr.m.len)?
+            _ => fail Malformed
+        }
+        if !nistec.below(x, c.fr.m) {
+            fail Malformed
+        }
+        out.push(x)
+    }
+    out
+}
