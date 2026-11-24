@@ -594,15 +594,23 @@ fn send_shutdown(a: *Assoc) {
     send_alone(a, a.peer_tag, Chunk { kind: chunk_shutdown, flags: 0, body })
 }
 
-fn on_shutdown(a: *Assoc, now: i64) {
+fn on_shutdown(a: *Assoc, c: Chunk, now: i64) {
+    if c.body.len < 4 || !live(a) {
+        return
+    }
+    acknowledge(a, Sack { cumulative: io.be32(c.body, 0), window: a.rwnd + a.flight, gaps: [], duplicates: [] }, now)
     if a.stage == Stage.Established || a.stage == Stage.ShutdownPending {
         a.stage = Stage.ShutdownReceived
         progress_shutdown(a, now)
+    } else if a.stage == Stage.ShutdownSent {
+        a.stage = Stage.ShutdownAckSent
+        a.shutdown_at = now + a.rto
+        send_alone(a, a.peer_tag, Chunk { kind: chunk_shutdown_ack, flags: 0, body: [] })
     }
 }
 
 fn on_shutdown_ack(a: *Assoc) {
-    if a.stage == Stage.ShutdownSent {
+    if a.stage == Stage.ShutdownSent || a.stage == Stage.ShutdownAckSent {
         send_alone(a, a.peer_tag, Chunk { kind: chunk_shutdown_complete, flags: 0, body: [] })
         close_with_event(a)
     }
@@ -612,6 +620,22 @@ fn on_shutdown_complete(a: *Assoc) {
     if a.stage == Stage.ShutdownAckSent {
         close_with_event(a)
     }
+}
+
+fn answer_closed(a: *Assoc, p: Packet) {
+    if p.tag != a.tag {
+        return
+    }
+    for c in p.chunks {
+        if c.kind == chunk_shutdown_ack {
+            send_alone(a, a.tag, Chunk { kind: chunk_shutdown_complete, flags: flag_reflected, body: [] })
+            return
+        }
+    }
+}
+
+fn reflected(a: *Assoc, p: Packet) -> bool {
+    p.tag == a.peer_tag && p.chunks.len == 1 && p.chunks[0].kind == chunk_shutdown_complete && (p.chunks[0].flags & flag_reflected) != 0
 }
 
 fn live(a: *Assoc) -> bool {
@@ -633,7 +657,7 @@ fn on_chunk(a: *Assoc, p: Packet, c: Chunk, now: i64) {
         }
         5 => on_heartbeat_ack(a, now)
         6 => on_abort(a)
-        7 => on_shutdown(a, now)
+        7 => on_shutdown(a, c, now)
         8 => on_shutdown_ack(a)
         10 => on_cookie_echo(a, c, now)
         11 => on_cookie_ack(a, now)
@@ -652,24 +676,34 @@ fn on_chunk(a: *Assoc, p: Packet, c: Chunk, now: i64) {
 ///
 /// A packet that does not parse, fails its checksum or carries another verification tag is dropped without a reply.
 pub fn receive(a: *Assoc, packet: u8[], now: i64) {
-    if a.stage == Stage.Failed || a.stage == Stage.Closed {
+    if a.stage == Stage.Failed {
         return
     }
     let p = parse_packet(packet) or return
     if p.destination != a.config.local_port {
         return
     }
-    let initial = p.chunks[0].kind == chunk_init
-    if !initial && p.tag != a.tag {
+    if a.stage == Stage.Closed {
+        answer_closed(a, p)
         return
     }
+    let initial = p.chunks[0].kind == chunk_init
+    if !initial && p.tag != a.tag && !reflected(a, p) {
+        return
+    }
+    var carried_data = false
     for c in p.chunks {
         on_chunk(a, p, c, now)
         if a.stage == Stage.Failed || a.stage == Stage.Closed {
             return
         }
+        carried_data = carried_data || c.kind == chunk_data
     }
     flush_output(a, now)
+    if carried_data && a.stage == Stage.ShutdownSent {
+        a.shutdown_at = now + a.rto
+        send_shutdown(a)
+    }
 }
 
 fn flush_output(a: *Assoc, now: i64) {

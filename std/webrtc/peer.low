@@ -198,6 +198,7 @@ enum Command {
     Transceivers(reply: chan[Transceiver[]])
     GetSignaling(reply: chan[Signaling])
     WaitConnected(reply: chan[State])
+    ShutdownExpired(round: i64)
     Close
 }
 
@@ -268,6 +269,8 @@ struct Core {
     srtp: srtp.Pair?
     channel_peer: datachannel.Handle?
     sctp_up: bool
+    closing_peer: datachannel.Handle?
+    closings: i64
     opening: Opening[]
     sctp_events: chan[datachannel.Event]
     tracks: Local[]
@@ -299,6 +302,7 @@ const record_overhead = 37
 const unlimited_message = 1073741823
 const default_remote_message = 65536
 const resolve_wait = 5000
+const shutdown_wait = 5000
 
 /// Creates a peer with a new self-signed certificate and starts its green thread.
 ///
@@ -351,6 +355,8 @@ pub fn open(config: Config) -> Peer ! io.Error {
         srtp: none
         channel_peer: none
         sctp_up: false
+        closing_peer: none
+        closings: 0
         opening: []
         sctp_events: chan[datachannel.Event]()
         tracks: []
@@ -490,6 +496,7 @@ fn forward_sctp_events(from: chan[datachannel.Event], to: chan[datachannel.Event
 }
 
 fn open_channels(c: *Core, link: dtlssession.Handle) {
+    abort_closing(c)
     let config = sctp.Config {
         client: c.dtls_client
         remote_port: c.remote_sctp_port
@@ -515,10 +522,39 @@ fn open_channels(c: *Core, link: dtlssession.Handle) {
 
 fn stop_channels(c: *Core) {
     c.data = false
-    end_channels(c)
+    if !c.sctp_up {
+        end_channels(c)
+        return
+    }
+    let h = c.channel_peer ?? return
+    c.channel_peer = none
+    c.sctp_up = false
+    flush_opening(c)
+    datachannel.shutdown_peer(h)
+    c.closing_peer = h
+    c.closings += 1
+    spawn expire_shutdown(c, c.closings)
+}
+
+fn expire_shutdown(c: *Core, round: i64) {
+    select {
+        after(shutdown_wait) => {}
+        <-c.gone => return
+    }
+    select {
+        c.commands <- Command.ShutdownExpired(round) => {}
+        <-c.gone => {}
+    }
+}
+
+fn abort_closing(c: *Core) {
+    let h = c.closing_peer ?? return
+    datachannel.close_peer(h)
+    c.closing_peer = none
 }
 
 fn end_channels(c: *Core) {
+    abort_closing(c)
     let h = c.channel_peer ?? return
     datachannel.close_peer(h)
     c.channel_peer = none
@@ -896,6 +932,9 @@ fn handle(c: *Core, command: Command) -> bool {
                 c.waiters.push(reply)
             }
         }
+        ShutdownExpired(round) => if round == c.closings {
+            abort_closing(c)
+        }
         Close => return false
     }
     true
@@ -961,10 +1000,7 @@ fn run(c: *Core) {
 }
 
 fn finish(c: *Core) {
-    match c.channel_peer {
-        some(h) => datachannel.close_peer(h)
-        none => {}
-    }
+    end_channels(c)
     match c.dtls {
         some(h) => dtlssession.close_session(h)
         none => {}
@@ -1145,7 +1181,7 @@ pub fn set_direction(h: Handle, mid: str, direction: sdp.Direction) ! Error {
     applied(h, Command.SetDirection(mid, direction, reply), reply)?
 }
 
-/// Stops the section `mid`: the next offer or answer rejects it with port 0, after which its remote track ends, a data channel section closes its association, and the section keeps its place.
+/// Stops the section `mid`: the next offer or answer rejects it with port 0, after which its remote track ends, a data channel section shuts its association down, delivering what its channels queued before they end, and the section keeps its place.
 ///
 /// Fails with `Invalid` for a `mid` no section has and with `Closed` once the peer has closed.
 pub fn stop_section(h: Handle, mid: str) ! Error {
