@@ -1,0 +1,150 @@
+import std/atspi
+import std/dbus
+import std/file
+import std/io
+import std/process
+import std/testing
+import std/text
+
+struct Daemon {
+    address: str
+    handle: *process.ChildHandle
+}
+
+fn bus_config(dir: str) -> str {
+    "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n<busconfig>\n  <type>session</type>\n  <listen>unix:path={dir}/bus</listen>\n  <auth>EXTERNAL</auth>\n  <policy context=\"default\">\n    <allow send_destination=\"*\" eavesdrop=\"true\"/>\n    <allow eavesdrop=\"true\"/>\n    <allow own=\"*\"/>\n  </policy>\n</busconfig>\n"
+}
+
+fn first_line(s: io.Stream) -> str ! io.Error {
+    var collected: u8[] = []
+    let buf = io.buffer(512)
+    for {
+        let n = s.read(buf)?
+        if n == 0 {
+            break
+        }
+        io.append(mut collected, buf[..n])
+        if text.index_byte(str(collected), '\n') >= 0 {
+            break
+        }
+    }
+    text.trim(str(collected))
+}
+
+fn start_daemon(dir: str) -> Daemon ! io.Error {
+    let config = "{dir}/bus.conf"
+    file.write_text(config, bus_config(dir))?
+    var command = process.command("dbus-daemon", ["--config-file={config}", "--nofork", "--nopidfile", "--print-address=1"])
+    command.stdout = process.Stdio.Piped
+    let handle = process.start_handle(command)?
+    let stdout = match handle.stdout {
+        some(s) => s
+        none => fail Invalid
+    }
+    let address = first_line(stdout)?
+    if address.len == 0 {
+        fail Invalid
+    }
+    Daemon { address, handle }
+}
+
+fn serve_registry(t: *testing.T, address: str) -> *dbus.ConnectionHandle {
+    let addresses = dbus.parse_addresses(address) catch {
+        e => {
+            t.fatal("address {address}: {e}")
+            panic("unreachable")
+        }
+    }
+    using var c = dbus.connect_addresses(addresses) catch {
+        e => {
+            t.fatal("connect: {e}")
+            panic("unreachable")
+        }
+    }
+    let h = dbus.detach(mut c)
+    let owner = dbus.request_name_on(h, "org.a11y.atspi.Registry", 0) catch {
+        e => {
+            t.fatal("request_name: {e}")
+            return h
+        }
+    }
+    t.equal(owner, dbus.NameReply.PrimaryOwner)
+    let desktop = dbus.unique_name_on(h)
+    let spec = dbus.InterfaceSpec {
+        name: "org.a11y.atspi.Socket",
+        methods: [dbus.MethodSpec { name: "Embed", in_signature: "(so)", out_signature: "(so)", handler: fn(c: dbus.Call) -> dbus.Value[] ! dbus.Error {
+            [dbus.Value.Struct([dbus.Value.String(desktop), dbus.Value.ObjectPath("/org/a11y/atspi/accessible/root")])]
+        } }],
+    }
+    dbus.export(dbus.serve_on(h), "/org/a11y/atspi/accessible/root", spec) catch {
+        e => t.fatal("export: {e}")
+    }
+    h
+}
+
+fn read(t: *testing.T, address: str, dest: str, path: str, method: str, args: str[]) -> str {
+    var arguments = ["call", "--address", address, "--dest", dest, "--object-path", path, "--method", method]
+    for a in args {
+        arguments.push(a)
+    }
+    let out = process.run(process.command("gdbus", arguments), []) catch {
+        e => {
+            t.error("gdbus {method}: {e}")
+            return ""
+        }
+    }
+    if !process.success(out.status) {
+        t.error("gdbus {method} failed: {str(out.stderr)}")
+    }
+    text.trim(str(out.stdout))
+}
+
+fn test_gdbus_reads_the_tree_of_an_application_registered_on_a_private_bus(t: *testing.T) {
+    if (process.find("dbus-daemon") ?? "").len == 0 || (process.find("gdbus") ?? "").len == 0 {
+        t.skip("dbus-daemon or gdbus is not installed")
+    }
+    let dir = file.temp_dir("lowatspi") catch {
+        e => {
+            t.error("temporary directory: {e}")
+            return
+        }
+    }
+    defer file.remove_all(dir) or {}
+    let daemon = start_daemon(dir) catch {
+        e => {
+            t.error("starting dbus-daemon: {e}")
+            return
+        }
+    }
+    using child = process.adopt(daemon.handle)
+    let registry = serve_registry(t, daemon.address)
+    defer dbus.shutdown_on(registry)
+    let bridge = connect_to(daemon.address, "lowtest", fn() {}, true) or {
+        t.fatal("connect")
+        return
+    }
+    defer atspi.close(bridge)
+    let nodes = [
+        atspi.Node { key: "save", name: "Save", role: atspi.Role.Button, width: 60.0, height: 24.0, focusable: true, actionable: true },
+        atspi.Node { key: "title", name: "Settings", role: atspi.Role.Heading, y: 30.0, width: 60.0, height: 24.0, text: some("Settings") },
+    ]
+    atspi.update(bridge, "Private bus", true, nodes) or {
+        t.fatal("update")
+        return
+    }
+    let me = atspi.bus_name(bridge)
+    let application = read(t, daemon.address, me, "/org/a11y/atspi/accessible/root", "org.freedesktop.DBus.Properties.Get", ["org.a11y.atspi.Accessible", "Name"])
+    testing.equal(t, application, "(<'lowtest'>,)")
+    let parent = read(t, daemon.address, me, "/org/a11y/atspi/accessible/root", "org.freedesktop.DBus.Properties.Get", ["org.a11y.atspi.Accessible", "Parent"])
+    testing.contains(t, parent, "'/org/a11y/atspi/accessible/root'")
+    let window = read(t, daemon.address, me, "/org/a11y/atspi/accessible/window", "org.a11y.atspi.Accessible.GetChildren", [])
+    testing.contains(t, window, "'/org/a11y/atspi/accessible/e0'")
+    testing.contains(t, window, "'/org/a11y/atspi/accessible/e1'")
+    let role = read(t, daemon.address, me, atspi.element_path(bridge, "save"), "org.a11y.atspi.Accessible.GetRole", [])
+    testing.equal(t, role, "(uint32 43,)")
+    let said = read(t, daemon.address, me, atspi.element_path(bridge, "title"), "org.a11y.atspi.Text.GetText", ["0", "8"])
+    testing.equal(t, said, "('Settings',)")
+    let pressed = read(t, daemon.address, me, atspi.element_path(bridge, "save"), "org.a11y.atspi.Action.DoAction", ["0"])
+    testing.equal(t, pressed, "(true,)")
+    testing.equal(t, atspi.take_actions(bridge).len, 1)
+}

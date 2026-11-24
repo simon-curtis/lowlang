@@ -1,0 +1,415 @@
+import std/atspi
+import std/dbus
+import std/net
+import std/sync
+import std/testing
+import std/text
+
+const peer_guid = "0123456789abcdef0123456789abcdef"
+const accessible_api = "org.a11y.atspi.Accessible"
+const component_api = "org.a11y.atspi.Component"
+const action_api = "org.a11y.atspi.Action"
+const text_api = "org.a11y.atspi.Text"
+const root_object = "/org/a11y/atspi/accessible/root"
+const window_object = "/org/a11y/atspi/accessible/window"
+const registry_api = "org.a11y.atspi.Registry"
+const object_prefix = "/org/a11y/atspi/accessible/"
+
+struct Log {
+    lock: sync.Mutex
+    lines: str[]
+    wakes: i64
+}
+
+struct Rig {
+    client: *dbus.ConnectionHandle
+    log: *Log
+}
+
+fn short(path: str) -> str {
+    text.trim_prefix(path, object_prefix)
+}
+
+fn record(log: *Log, m: dbus.Message) {
+    if m.kind != dbus.MessageType.Signal {
+        return
+    }
+    let detail = match m.body[0] {
+        String(s) => s
+        _ => "?"
+    }
+    let first = dbus.int_of(m.body[1]) or -1
+    let last = text.last_index_byte(m.interface, '.')
+    sync.lock(log.lock)
+    log.lines.push("{short(m.path)} {m.interface[last + 1..]}.{m.member} {detail} {first}")
+    sync.unlock(log.lock)
+}
+
+fn accept_side(h: net.ConnHandle, ready: chan[*dbus.ConnectionHandle]) {
+    ready <- dbus.accept_over_handle(h, dbus.ServerAuth { guid: peer_guid }) or panic("accept")
+}
+
+fn with_rig(t: *testing.T, body: fn(*testing.T, atspi.Bridge, Rig)) {
+    using var pair = net.socketpair() or {
+        t.fatal("socket pair")
+        return
+    }
+    let near = net.detach(mut pair.first)
+    let far = net.detach(mut pair.second)
+    let ready = chan[*dbus.ConnectionHandle](1)
+    spawn accept_side(far, ready)
+    let client = dbus.connect_over_handle(near, false) or {
+        t.fatal("connect")
+        return
+    }
+    let server = match <-ready {
+        some(h) => h
+        none => {
+            t.fatal("the peer did not accept")
+            return
+        }
+    }
+    let log = new(Log { lock: sync.mutex(), lines: [], wakes: 0 })
+    dbus.add_filter_on(client, fn(m) { record(log, m)
+        false })
+    let bridge = atspi.serve(server, "demo", fn() { sync.lock(log.lock)
+        log.wakes += 1
+        sync.unlock(log.lock) }) or {
+        t.fatal("serve")
+        return
+    }
+    body(t, bridge, Rig { client, log })
+    dbus.shutdown_on(client)
+    dbus.shutdown_on(server)
+}
+
+fn ask(t: *testing.T, r: Rig, path: str, interface: str, member: str, args: dbus.Value[]) -> dbus.Value[] {
+    let reply = dbus.call_on(r.client, dbus.method_call("", path, interface, member, args)) catch {
+        e => {
+            t.error("{member} on {path}: {e}")
+            return []
+        }
+    }
+    reply.body
+}
+
+fn refused(r: Rig, path: str, interface: str, member: str, args: dbus.Value[]) -> str {
+    dbus.call_on(r.client, dbus.method_call("", path, interface, member, args)) catch {
+        e => return match e {
+            Remote(name, message) => name
+            _ => "{e}"
+        }
+    }
+    ""
+}
+
+fn read_property(t: *testing.T, r: Rig, path: str, interface: str, name: str) -> dbus.Value {
+    dbus.get_property_on(r.client, "", path, interface, name) catch {
+        e => {
+            t.error("{name} of {path}: {e}")
+            return dbus.Value.String("")
+        }
+    }
+}
+
+fn name_of(t: *testing.T, r: Rig, path: str) -> str {
+    dbus.string_of(read_property(t, r, path, accessible_api, "Name")) or "?"
+}
+
+fn show(v: dbus.Value) -> str {
+    match v {
+        Struct(fields) => {
+            let path = dbus.string_of(fields[1]) or "?"
+            short(path)
+        }
+        _ => "?"
+    }
+}
+
+fn children_of(t: *testing.T, r: Rig, path: str) -> str[] {
+    var paths: str[] = []
+    let body = ask(t, r, path, accessible_api, "GetChildren", [])
+    if body.len != 1 {
+        return paths
+    }
+    for item in dbus.array_of(body[0]) or [] {
+        let fields = dbus.fields_of(item) or []
+        paths.push(dbus.string_of(fields[1]) or "?")
+    }
+    paths
+}
+
+fn states_of(t: *testing.T, r: Rig, path: str) -> i64 {
+    let body = ask(t, r, path, accessible_api, "GetState", [])
+    if body.len != 1 {
+        return 0
+    }
+    let words = dbus.array_of(body[0]) or []
+    var bits = 0
+    for i, w in words {
+        bits |= i64(dbus.uint_of(w) or 0) << (i * 32)
+    }
+    bits
+}
+
+fn role_of(t: *testing.T, r: Rig, path: str) -> i64 {
+    let body = ask(t, r, path, accessible_api, "GetRole", [])
+    if body.len != 1 {
+        return -1
+    }
+    i64(dbus.uint_of(body[0]) or 0)
+}
+
+fn extents_of(t: *testing.T, r: Rig, path: str) -> str {
+    let body = ask(t, r, path, component_api, "GetExtents", [dbus.Value.UInt32(0)])
+    if body.len != 1 {
+        return "?"
+    }
+    let parts = dbus.fields_of(body[0]) or []
+    var out: str[] = []
+    for p in parts {
+        out.push("{dbus.int_of(p) or -1}")
+    }
+    text.join(out, ",")
+}
+
+fn sample() -> atspi.Node[] {
+    [
+        atspi.Node { key: "title", name: "Settings", role: atspi.Role.Heading, x: 10.0, y: 4.0, width: 80.4, height: 20.0, text: some("Settings") },
+        atspi.Node { key: "save", name: "Save", role: atspi.Role.Button, x: 10.0, y: 30.0, width: 60.0, height: 24.0, focusable: true, actionable: true },
+        atspi.Node { key: "name", name: "Name", role: atspi.Role.Entry, x: 10.0, y: 60.0, width: 120.0, height: 24.0, focusable: true, editable: true, text: some("héllo") },
+    ]
+}
+
+fn test_tree_is_walkable_by_an_assistive_technology(t: *testing.T) {
+    with_rig(t, fn(t: *testing.T, b: atspi.Bridge, r: Rig) {
+        atspi.update(b, "Settings window", true, sample()) or {
+            t.fatal("update")
+            return
+        }
+        testing.equal(t, name_of(t, r, root_object), "demo")
+        testing.equal(t, role_of(t, r, root_object), 75)
+        testing.equal_slice(t, children_of(t, r, root_object), ["/org/a11y/atspi/accessible/window"])
+        testing.equal(t, name_of(t, r, window_object), "Settings window")
+        testing.equal(t, role_of(t, r, window_object), 23)
+        let items = children_of(t, r, window_object)
+        testing.equal(t, items.len, 3)
+        testing.equal(t, name_of(t, r, items[0]), "Settings")
+        testing.equal(t, role_of(t, r, items[0]), 83)
+        testing.equal(t, name_of(t, r, items[1]), "Save")
+        testing.equal(t, role_of(t, r, items[1]), 43)
+        testing.equal(t, role_of(t, r, items[2]), 79)
+        testing.equal(t, extents_of(t, r, items[0]), "10,4,81,20")
+        testing.equal(t, extents_of(t, r, window_object), "0,0,130,84")
+        testing.equal(t, dbus.int_of(read_property(t, r, window_object, accessible_api, "ChildCount")) or -1, 3)
+        let parent = read_property(t, r, items[1], accessible_api, "Parent")
+        testing.equal(t, show(parent), "window")
+        let index = ask(t, r, items[2], accessible_api, "GetIndexInParent", [])
+        testing.equal(t, dbus.int_of(index[0]) or -1, 2)
+    })
+}
+
+fn test_interfaces_follow_what_each_element_can_do(t: *testing.T) {
+    with_rig(t, fn(t: *testing.T, b: atspi.Bridge, r: Rig) {
+        atspi.update(b, "Settings window", true, sample()) or {
+            t.fatal("update")
+            return
+        }
+        let items = children_of(t, r, window_object)
+        var seen: str[] = []
+        for p in items {
+            let body = ask(t, r, p, accessible_api, "GetInterfaces", [])
+            var names: str[] = []
+            for v in dbus.array_of(body[0]) or [] {
+                names.push(text.trim_prefix(dbus.string_of(v) or "?", "org.a11y.atspi."))
+            }
+            seen.push(text.join(names, "+"))
+        }
+        testing.equal_slice(t, seen, ["Accessible+Component+Text", "Accessible+Component+Action", "Accessible+Component+Text"])
+        testing.equal(t, refused(r, items[0], action_api, "DoAction", [dbus.Value.Int32(0)]), "org.freedesktop.DBus.Error.UnknownInterface")
+    })
+}
+
+fn test_states_report_focus_and_editability(t: *testing.T) {
+    with_rig(t, fn(t: *testing.T, b: atspi.Bridge, r: Rig) {
+        var nodes = sample()
+        nodes[2].focused = true
+        atspi.update(b, "Settings window", true, nodes) or {
+            t.fatal("update")
+            return
+        }
+        let items = children_of(t, r, window_object)
+        let focusable = 1 << 11
+        let focused = 1 << 12
+        let editable = 1 << 7
+        let showing = 1 << 25
+        testing.equal(t, states_of(t, r, items[1]) & (focusable | focused | editable | showing), focusable | showing)
+        testing.equal(t, states_of(t, r, items[2]) & (focusable | focused | editable | showing), focusable | focused | editable | showing)
+        testing.equal(t, states_of(t, r, window_object) & (1 << 1), 1 << 1)
+    })
+}
+
+fn test_text_serves_characters_not_bytes(t: *testing.T) {
+    with_rig(t, fn(t: *testing.T, b: atspi.Bridge, r: Rig) {
+        atspi.update(b, "Settings window", true, sample()) or {
+            t.fatal("update")
+            return
+        }
+        let entry = children_of(t, r, window_object)[2]
+        testing.equal(t, dbus.int_of(read_property(t, r, entry, text_api, "CharacterCount")) or -1, 5)
+        let body = ask(t, r, entry, text_api, "GetText", [dbus.Value.Int32(1), dbus.Value.Int32(3)])
+        testing.equal(t, dbus.string_of(body[0]) or "?", "él")
+        let whole = ask(t, r, entry, text_api, "GetText", [dbus.Value.Int32(0), dbus.Value.Int32(-1)])
+        testing.equal(t, dbus.string_of(whole[0]) or "?", "héllo")
+        let letter = ask(t, r, entry, text_api, "GetCharacterAtOffset", [dbus.Value.Int32(1)])
+        testing.equal(t, dbus.int_of(letter[0]) or -1, 233)
+        testing.equal(t, refused(r, entry, text_api, "GetText", [dbus.Value.Int32(2), dbus.Value.Int32(9)]), "org.freedesktop.DBus.Error.InvalidArgs")
+    })
+}
+
+fn test_hit_testing_finds_the_topmost_element(t: *testing.T) {
+    with_rig(t, fn(t: *testing.T, b: atspi.Bridge, r: Rig) {
+        atspi.update(b, "Settings window", true, sample()) or {
+            t.fatal("update")
+            return
+        }
+        let hit = ask(t, r, window_object, component_api, "GetAccessibleAtPoint", [dbus.Value.Int32(20), dbus.Value.Int32(40), dbus.Value.UInt32(0)])
+        testing.equal(t, show(hit[0]), "e1")
+        let miss = ask(t, r, window_object, component_api, "GetAccessibleAtPoint", [dbus.Value.Int32(300), dbus.Value.Int32(40), dbus.Value.UInt32(0)])
+        testing.equal(t, show(miss[0]), "/org/a11y/atspi/null")
+        let inside = ask(t, r, children_of(t, r, window_object)[1], component_api, "Contains", [dbus.Value.Int32(11), dbus.Value.Int32(31), dbus.Value.UInt32(0)])
+        testing.equal(t, dbus.bool_of(inside[0]) or false, true)
+    })
+}
+
+fn test_actions_wait_for_the_application_thread(t: *testing.T) {
+    with_rig(t, fn(t: *testing.T, b: atspi.Bridge, r: Rig) {
+        atspi.update(b, "Settings window", true, sample()) or {
+            t.fatal("update")
+            return
+        }
+        let items = children_of(t, r, window_object)
+        let done = ask(t, r, items[1], action_api, "DoAction", [dbus.Value.Int32(0)])
+        testing.equal(t, dbus.bool_of(done[0]) or false, true)
+        let wrong = ask(t, r, items[1], action_api, "DoAction", [dbus.Value.Int32(1)])
+        testing.equal(t, dbus.bool_of(wrong[0]) or true, false)
+        let grabbed = ask(t, r, items[2], component_api, "GrabFocus", [])
+        testing.equal(t, dbus.bool_of(grabbed[0]) or false, true)
+        let heading = ask(t, r, items[0], component_api, "GrabFocus", [])
+        testing.equal(t, dbus.bool_of(heading[0]) or true, false)
+        let taken = atspi.take_actions(b)
+        testing.equal(t, taken.len, 2)
+        match taken[0] {
+            Click(key) => testing.equal(t, key, "save")
+            _ => t.error("the first action_api is not a click")
+        }
+        match taken[1] {
+            Focus(key) => testing.equal(t, key, "name")
+            _ => t.error("the second action_api is not a focus")
+        }
+        testing.equal(t, atspi.take_actions(b).len, 0)
+        sync.lock(r.log.lock)
+        testing.equal(t, r.log.wakes, 2)
+        sync.unlock(r.log.lock)
+    })
+}
+
+fn test_updates_emit_the_events_orca_follows(t: *testing.T) {
+    with_rig(t, fn(t: *testing.T, b: atspi.Bridge, r: Rig) {
+        atspi.update(b, "Settings window", false, sample()) or {
+            t.fatal("update")
+            return
+        }
+        var next = sample()
+        next[1].focused = true
+        next.push(atspi.Node { key: "help", name: "Help", role: atspi.Role.Link, x: 10.0, y: 90.0, width: 30.0, height: 12.0 })
+        atspi.update(b, "Settings window", true, next) or {
+            t.fatal("update")
+            return
+        }
+        next[1].focused = false
+        next[2].focused = true
+        next[1].name = "Save as"
+        atspi.update(b, "Settings window", true, next[1..]) or {
+            t.fatal("update")
+            return
+        }
+        atspi.update(b, "Settings window", true, next[1..]) or {
+            t.fatal("update")
+            return
+        }
+        name_of(t, r, root_object)
+        testing.equal_slice(t, r.log.lines, [
+            "window Object.ChildrenChanged add 0",
+            "e0 Object.StateChanged showing 1",
+            "e0 Object.StateChanged visible 1",
+            "window Object.ChildrenChanged add 1",
+            "e1 Object.StateChanged showing 1",
+            "e1 Object.StateChanged visible 1",
+            "window Object.ChildrenChanged add 2",
+            "e2 Object.StateChanged showing 1",
+            "e2 Object.StateChanged visible 1",
+            "window Object.PropertyChange accessible-name 0",
+            "e1 Object.StateChanged focused 1",
+            "e1 Focus.Focus  0",
+            "window Object.ChildrenChanged add 3",
+            "e3 Object.StateChanged showing 1",
+            "e3 Object.StateChanged visible 1",
+            "window Object.StateChanged active 1",
+            "window Window.Activate  0",
+            "e1 Object.StateChanged focused 0",
+            "e1 Object.PropertyChange accessible-name 0",
+            "e2 Object.StateChanged focused 1",
+            "e2 Focus.Focus  0",
+            "window Object.ChildrenChanged remove 0",
+        ])
+    })
+}
+
+fn test_a_key_keeps_its_path_and_a_gone_key_is_unknown(t: *testing.T) {
+    with_rig(t, fn(t: *testing.T, b: atspi.Bridge, r: Rig) {
+        atspi.update(b, "Settings window", true, sample()) or {
+            t.fatal("update")
+            return
+        }
+        let before = atspi.element_path(b, "name")
+        atspi.update(b, "Settings window", true, sample()[1..]) or {
+            t.fatal("update")
+            return
+        }
+        testing.equal(t, atspi.element_path(b, "name"), before)
+        testing.equal(t, atspi.element_path(b, "title"), "")
+        testing.equal(t, refused(r, atspi.element_path(b, "name"), accessible_api, "GetRole", []), "")
+        testing.equal(t, refused(r, "/org/a11y/atspi/accessible/e0", accessible_api, "GetRole", []), "org.freedesktop.DBus.Error.UnknownObject")
+    })
+}
+
+fn test_registration_keeps_the_registrys_answer_as_the_parent(t: *testing.T) {
+    with_rig(t, fn(t: *testing.T, b: atspi.Bridge, r: Rig) {
+        let seen = chan[str](1)
+        let service = dbus.serve_on(r.client)
+        dbus.export(service, root_object, dbus.InterfaceSpec {
+            name: "org.a11y.atspi.Socket",
+            methods: [dbus.MethodSpec {
+                name: "Embed",
+                in_signature: "(so)",
+                out_signature: "(so)",
+                handler: fn(c: dbus.Call) -> dbus.Value[] ! dbus.Error {
+                    let fields = dbus.fields_of(c.message.body[0])?
+                    seen <- "{dbus.string_of(fields[1])?} {c.message.destination}"
+                    [dbus.Value.Struct([dbus.Value.String(":1.1"), dbus.Value.ObjectPath("/org/a11y/atspi/accessible/root")])]
+                },
+            }],
+        }) or {
+            t.fatal("export")
+            return
+        }
+        atspi.register(b) or {
+            t.fatal("register")
+            return
+        }
+        testing.equal(t, (<-seen) ?? "no call", "{root_object} {registry_api}")
+        let parent = dbus.fields_of(read_property(t, r, root_object, accessible_api, "Parent")) or []
+        testing.equal(t, dbus.string_of(parent[0]) or "?", ":1.1")
+    })
+}
