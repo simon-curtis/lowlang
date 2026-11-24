@@ -1,3 +1,4 @@
+import std/crypto/drbg
 import std/crypto/falcon
 import std/slices
 import std/text
@@ -98,22 +99,167 @@ fn corrupted(lv: falcon.Level, pk: u8[], message: u8[], sig: u8[]) {
     print("{name} public key single-bit corruptions accepted: {accepted} of {pk.len * 8}")
 }
 
-fn main() {
-    var n = 0
-    var first: [str: bool] = [:]
-    for line in text.lines(embed("std_falcon_vectors.txt")) {
-        let f = text.fields(line)
-        n += 1
-        let lv = level_of(f[1])
-        let pk = unhex(f[3])
-        let message = unhex(f[4])
-        let sig = unhex(f[5])
-        verdict("kat {f[1]} {f[2]}", falcon.verify(lv, pk, message, sig))
-        if !(first[f[1]] ?? false) {
-            first[f[1]] = true
-            shapes(lv, pk, message, sig)
-            corrupted(lv, pk, message, sig)
+struct Kat {
+    level: falcon.Level
+    label: str
+    public: u8[]
+    private: u8[]
+    message: u8[]
+    sm: u8[]
+}
+
+fn header(lv: falcon.Level) -> u8 {
+    match lv {
+        Falcon512 => 0x39
+        Falcon1024 => 0x3a
+    }
+}
+
+fn signature_of(k: Kat) -> u8[] {
+    slices.flatten([[header(k.level)], k.sm[2..42], k.sm[2 + 40 + k.message.len + 1..]])
+}
+
+fn wrapped(k: Kat, sig: u8[]) -> u8[] {
+    let length = sig.len - 40
+    slices.flatten([[u8(length >> 8), u8(length & 0xff)], sig[1..41], k.message, [sig[0] - 0x10], sig[41..]])
+}
+
+fn known_answer(k: Kat, seed: u8[]) ! drbg.Error {
+    let d = drbg.instantiate_without_df(seed, [])?
+    let key_seed = drbg.generate(d, 48, [])?
+    generated(k, key_seed)
+    let nonce = drbg.generate(d, 40, [])?
+    let sampler_seed = drbg.generate(d, 48, [])?
+    let signed = falcon.sign_internal(k.level, k.private, k.message, nonce, sampler_seed) catch {
+        _ => {
+            print("{k.label} sign: failed")
+            return
         }
     }
-    print("sizes {falcon.public_key_size(Falcon512)} {falcon.signature_size(Falcon512)} {falcon.public_key_size(Falcon1024)} {falcon.signature_size(Falcon1024)}")
+    verdict("{k.label} sign, sm of {k.sm.len} bytes", slices.equal(wrapped(k, signed), k.sm))
+    verdict("{k.label} signature verifies", falcon.verify(k.level, k.public, k.message, signed))
+}
+
+fn generated(k: Kat, seed: u8[]) {
+    let keys = falcon.generate_seeded(k.level, seed) catch {
+        _ => {
+            print("{k.label} keygen: failed")
+            return
+        }
+    }
+    verdict("{k.label} keygen public key", slices.equal(keys.public, k.public))
+    verdict("{k.label} keygen private key", slices.equal(keys.private, k.private))
+}
+
+fn fresh_keys(lv: falcon.Level) {
+    let name = name_of(lv)
+    let a = falcon.generate(lv)
+    let b = falcon.generate(lv)
+    verdict("{name} generated key pairs differ", !slices.equal(a.private, b.private) && !slices.equal(a.public, b.public))
+    let message = bytes("generated key pair")
+    let signature = falcon.sign(lv, a.private, message, Hedged) or []
+    verdict("{name} generated key pair signs and verifies", falcon.verify(lv, a.public, message, signature))
+    let again = falcon.generate_seeded(lv, a.seed) or falcon.Keys { seed: [], public: [], private: [] }
+    verdict("{name} seed regenerates the key pair", slices.equal(again.private, a.private) && slices.equal(again.public, a.public))
+    let short = falcon.generate_seeded(lv, a.seed[..47]) catch {
+        e => {
+            print("{name} keygen seed of 47 bytes: {e}")
+            return
+        }
+    }
+    print("{name} keygen seed of 47 bytes: generated {short.public.len} bytes")
+}
+
+fn padded_answer(k: Kat, label: str, seed: u8[], expected: u8[]) {
+    let signed = falcon.sign(k.level, k.private, k.message, Given(seed)) catch {
+        _ => {
+            print("{label}: failed")
+            return
+        }
+    }
+    verdict("{label}, {signed.len} bytes", slices.equal(signed, expected))
+    verdict("{label} verifies", falcon.verify(k.level, k.public, k.message, signed))
+}
+
+fn hedged(k: Kat) {
+    let name = name_of(k.level)
+    let a = falcon.sign(k.level, k.private, k.message, Hedged) or []
+    let b = falcon.sign(k.level, k.private, k.message, Hedged) or []
+    verdict("{name} hedged signatures verify", falcon.verify(k.level, k.public, k.message, a) && falcon.verify(k.level, k.public, k.message, b))
+    verdict("{name} hedged signatures differ", !slices.equal(a, b))
+}
+
+fn rejected(label: str, lv: falcon.Level, private: u8[], message: u8[], randomness: falcon.Randomness) {
+    let signed = falcon.sign(lv, private, message, randomness) catch {
+        e => {
+            print("{label}: {e}")
+            return
+        }
+    }
+    print("{label}: signed {signed.len} bytes")
+}
+
+fn f_bytes(lv: falcon.Level) -> i64 {
+    match lv {
+        Falcon512 => 384
+        Falcon1024 => 640
+    }
+}
+
+fn rejections(k: Kat) {
+    let name = name_of(k.level)
+    let seed = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f")
+    rejected("{name} truncated private key", k.level, k.private[..k.private.len - 1], k.message, Given(seed))
+    var extended = slices.clone(k.private)
+    extended.push(0)
+    rejected("{name} extended private key", k.level, extended, k.message, Given(seed))
+    var wrong_header = slices.clone(k.private)
+    wrong_header[0] = k.private[0] + 0x10
+    rejected("{name} private key header", k.level, wrong_header, k.message, Given(seed))
+    var zero_f = slices.clone(k.private)
+    for i in 1..1 + f_bytes(k.level) {
+        zero_f[i] = 0
+    }
+    rejected("{name} f of zero", k.level, zero_f, k.message, Given(seed))
+    var other_big_f = slices.clone(k.private)
+    other_big_f[other_big_f.len - 1] ^= 0x01
+    rejected("{name} F that makes G leave -127..127", k.level, other_big_f, k.message, Given(seed))
+    rejected("{name} seed of 47 bytes", k.level, k.private, k.message, Given(seed[..47]))
+    let signed = falcon.sign_internal(k.level, k.private, k.message, seed[..39], seed) catch {
+        e => {
+            print("{name} nonce of 39 bytes: {e}")
+            return
+        }
+    }
+    print("{name} nonce of 39 bytes: signed {signed.len} bytes")
+}
+
+fn main() {
+    var first: [str: bool] = [:]
+    var kats: [str: Kat] = [:]
+    for line in text.lines(embed("std_falcon_vectors.txt")) {
+        let f = text.fields(line)
+        let lv = level_of(f[1])
+        let key = "{f[1]} {f[2]}"
+        if f[0] == "padded" {
+            padded_answer(kats[key] ?? continue, "padded {key} with seed {f[3][..8]}", unhex(f[3]), unhex(f[4]))
+            continue
+        }
+        let k = Kat { level: lv, label: "kat {key}", public: unhex(f[4]), private: unhex(f[5]), message: unhex(f[6]), sm: unhex(f[7]) }
+        kats[key] = k
+        let sig = signature_of(k)
+        verdict("kat {key} verify", falcon.verify(lv, k.public, k.message, sig))
+        known_answer(k, unhex(f[3])) catch {
+            _ => print("kat {key}: generator failed")
+        }
+        if !(first[f[1]] ?? false) {
+            first[f[1]] = true
+            shapes(lv, k.public, k.message, sig)
+            corrupted(lv, k.public, k.message, sig)
+            hedged(k)
+            rejections(k)
+            fresh_keys(lv)
+        }
+    }
+    print("sizes {falcon.public_key_size(Falcon512)} {falcon.signature_size(Falcon512)} {falcon.private_key_size(Falcon512)} {falcon.public_key_size(Falcon1024)} {falcon.signature_size(Falcon1024)} {falcon.private_key_size(Falcon1024)}")
 }
