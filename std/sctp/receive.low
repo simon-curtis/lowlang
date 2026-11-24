@@ -1,0 +1,203 @@
+import std/io
+import std/slices
+
+fn inbound_of(a: *Assoc, id: i64) -> *Inbound {
+    match a.inbound[id] {
+        some(s) => return s
+        none => {}
+    }
+    let s = new(Inbound { next_ssn: 0, ready: [:] })
+    a.inbound[id] = s
+    s
+}
+
+fn ssn_distance(from: i64, to: i64) -> i64 {
+    (to - from) & 0xFFFF
+}
+
+fn deliver_ready(a: *Assoc, st: *Inbound) {
+    for {
+        let m = st.ready[st.next_ssn] ?? break
+        st.ready.delete(st.next_ssn)
+        st.next_ssn = (st.next_ssn + 1) & 0xFFFF
+        a.buffered -= m.data.len
+        a.received.push(m)
+    }
+}
+
+fn assemble(a: *Assoc, t: i64) {
+    var start = t
+    for {
+        let f = a.frags[start] ?? return
+        if (f.flags & flag_begin) != 0 {
+            break
+        }
+        start -= 1
+    }
+    var end = t
+    for {
+        let f = a.frags[end] ?? return
+        if (f.flags & flag_end) != 0 {
+            break
+        }
+        end += 1
+    }
+    let first = a.frags[start] ?? return
+    var data: u8[] = []
+    for k in start..end + 1 {
+        let f = a.frags[k] ?? return
+        io.append(mut data, f.payload)
+        a.frags.delete(k)
+    }
+    let m = Message { stream: first.stream, ppid: first.ppid, data }
+    if (first.flags & flag_unordered) != 0 {
+        a.buffered -= data.len
+        a.received.push(m)
+        return
+    }
+    let st = inbound_of(a, first.stream)
+    if ssn_distance(st.next_ssn, first.ssn) >= 32768 {
+        a.buffered -= data.len
+        return
+    }
+    st.ready[first.ssn] = m
+    deliver_ready(a, st)
+}
+
+fn advance_cumulative(a: *Assoc) {
+    for {
+        if (a.seen[a.cum + 1] ?? false) == false {
+            break
+        }
+        a.seen.delete(a.cum + 1)
+        a.cum += 1
+    }
+}
+
+fn on_data(a: *Assoc, c: Chunk, now: i64) {
+    let f = parse_data(c) or return
+    let t = unwrap(f.tsn, a.cum)
+    if t <= a.cum || (a.seen[t] ?? false) {
+        if a.duplicates.len < 16 {
+            a.duplicates.push(wrap(t))
+        }
+        a.sack_due = true
+        return
+    }
+    if f.stream >= a.config.streams || a.buffered + f.payload.len > a.config.window {
+        return
+    }
+    a.seen[t] = true
+    a.frags[t] = Fragment { tsn: t, stream: f.stream, ssn: f.ssn, ppid: f.ppid, flags: f.flags, payload: f.payload }
+    a.buffered += f.payload.len
+    advance_cumulative(a)
+    assemble(a, t)
+    a.sack_packets += 1
+    if a.seen.len > 0 || a.sack_packets >= 2 {
+        a.sack_due = true
+    } else if a.sack_at < 0 {
+        a.sack_at = now + a.config.sack_delay
+    }
+}
+
+fn build_sack(a: *Assoc) -> Chunk {
+    var offsets: i64[] = []
+    for t in a.seen {
+        offsets.push(t - a.cum)
+    }
+    slices.sort(mut offsets)
+    var gaps: i64[] = []
+    var i = 0
+    for {
+        if i >= offsets.len || offsets[i] > 65535 {
+            break
+        }
+        let start = offsets[i]
+        var end = start
+        for {
+            if i + 1 >= offsets.len || offsets[i + 1] != end + 1 || end + 1 > 65535 {
+                break
+            }
+            i += 1
+            end += 1
+        }
+        gaps.push(start)
+        gaps.push(end)
+        i += 1
+    }
+    let room = a.config.window - a.buffered
+    let sack = Sack { cumulative: wrap(a.cum), window: if room < 0 { 0 } else { room }, gaps, duplicates: a.duplicates }
+    a.duplicates = []
+    encode_sack(sack)
+}
+
+fn send_sack(a: *Assoc) {
+    add_chunk(a, build_sack(a))
+    a.sack_due = false
+    a.sack_packets = 0
+    a.sack_at = -1
+}
+
+fn tick_sack(a: *Assoc, now: i64) {
+    if a.sack_at >= 0 && now >= a.sack_at {
+        a.sack_due = true
+    }
+}
+
+fn drop_fragments_through(a: *Assoc, t: i64) {
+    var gone: i64[] = []
+    for k in a.frags {
+        if k <= t {
+            gone.push(k)
+        }
+    }
+    for k in gone {
+        let f = a.frags[k] ?? continue
+        a.buffered -= f.payload.len
+        a.frags.delete(k)
+    }
+    var passed: i64[] = []
+    for k in a.seen {
+        if k <= t {
+            passed.push(k)
+        }
+    }
+    for k in passed {
+        a.seen.delete(k)
+    }
+}
+
+fn skip_stream(a: *Assoc, id: i64, ssn: i64) {
+    let st = inbound_of(a, id)
+    if ssn_distance(st.next_ssn, ssn) >= 32768 {
+        return
+    }
+    let reach = ssn_distance(st.next_ssn, ssn)
+    var stale: i64[] = []
+    for k in st.ready {
+        if ssn_distance(st.next_ssn, k) <= reach {
+            stale.push(k)
+        }
+    }
+    for k in stale {
+        let m = st.ready[k] ?? continue
+        a.buffered -= m.data.len
+        st.ready.delete(k)
+    }
+    st.next_ssn = (ssn + 1) & 0xFFFF
+    deliver_ready(a, st)
+}
+
+fn on_forward(a: *Assoc, c: Chunk, now: i64) {
+    let f = parse_forward(c) or return
+    let t = unwrap(f.tsn, a.cum)
+    if t > a.cum {
+        drop_fragments_through(a, t)
+        a.cum = t
+        advance_cumulative(a)
+    }
+    for entry in f.streams {
+        skip_stream(a, entry >> 16, entry & 0xFFFF)
+    }
+    a.sack_due = true
+}

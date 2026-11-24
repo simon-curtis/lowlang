@@ -1,0 +1,509 @@
+import std/io
+import std/rand
+import std/slices
+import std/testing
+import checksum = std/hash
+
+struct Flying {
+    due: i64
+    to_second: bool
+    data: u8[]
+}
+
+struct Wire {
+    rng: rand.Rng
+    loss: i64
+    duplicate: i64
+    jitter: i64
+    queue: Flying[]
+    now: i64
+    packets: i64
+    largest: i64
+    muted: bool
+}
+
+struct Pair {
+    a: *Assoc
+    b: *Assoc
+}
+
+fn wire(seed: u64, loss: i64, duplicate: i64, jitter: i64) -> *Wire {
+    new(Wire { rng: rand.seeded(seed), loss, duplicate, jitter, queue: [], now: 0, packets: 0, largest: 0, muted: false })
+}
+
+fn inject(w: *Wire, to_second: bool, d: u8[]) {
+    w.packets += 1
+    if d.len > w.largest {
+        w.largest = d.len
+    }
+    if w.muted || rand.below(mut w.rng, 100) < w.loss {
+        return
+    }
+    var copies = 1
+    if rand.below(mut w.rng, 100) < w.duplicate {
+        copies = 2
+    }
+    for _ in 0..copies {
+        let delay = 1 + rand.below(mut w.rng, w.jitter + 1)
+        w.queue.push(Flying { due: w.now + delay, to_second, data: d })
+    }
+}
+
+fn collect(w: *Wire, c: *Assoc, to_second: bool) {
+    for {
+        let d = poll_transmit(c) ?? break
+        inject(w, to_second, d)
+    }
+}
+
+fn advance(w: *Wire, p: Pair) {
+    w.now += 5
+    collect(w, p.a, true)
+    collect(w, p.b, false)
+    var ready: Flying[] = []
+    var rest: Flying[] = []
+    for f in w.queue {
+        if f.due <= w.now {
+            ready.push(f)
+        } else {
+            rest.push(f)
+        }
+    }
+    w.queue = rest
+    for f in ready {
+        if f.to_second {
+            receive(p.b, f.data, w.now)
+        } else {
+            receive(p.a, f.data, w.now)
+        }
+    }
+    tick(p.a, w.now)
+    tick(p.b, w.now)
+}
+
+fn pair(a: Config, b: Config) -> Pair {
+    Pair { a: assoc(a), b: assoc(b) }
+}
+
+fn default_pair() -> Pair {
+    pair(Config { client: true }, Config { client: false })
+}
+
+fn connected(p: Pair) -> bool {
+    state(p.a) == State.Established && state(p.b) == State.Established
+}
+
+fn settle(w: *Wire, p: Pair, limit: i64) -> bool {
+    connect(p.a, w.now)
+    for w.now < limit {
+        advance(w, p)
+        if connected(p) {
+            break
+        }
+    }
+    connected(p)
+}
+
+fn drain(w: *Wire, p: Pair, steps: i64) {
+    for _ in 0..steps {
+        advance(w, p)
+    }
+}
+
+fn payload(seed: i64, n: i64) -> u8[] {
+    var out: u8[] = []
+    for i in 0..n {
+        out.push(u8(seed * 31 + i * 7 + i / 251))
+    }
+    out
+}
+
+fn read_all(a: *Assoc) -> Message[] {
+    var out: Message[] = []
+    for {
+        let m = read(a) ?? break
+        out.push(m)
+    }
+    out
+}
+
+fn events_of(a: *Assoc) -> Event[] {
+    var out: Event[] = []
+    for {
+        let e = poll_event(a) ?? break
+        out.push(e)
+    }
+    out
+}
+
+fn crc32c_of(data: u8[]) -> i64 {
+    let c = checksum.crc32c_new()
+    checksum.crc32_update(c, data)
+    i64(checksum.crc32_sum(c))
+}
+
+fn test_crc32c_matches_the_iscsi_vector(t: *testing.T) {
+    let zeros: u8[] = io.buffer(32)
+    testing.error_if(t, crc32c_of(zeros) != 0x8A9136AA, "crc32c of 32 zero bytes")
+    var ones: u8[] = []
+    for _ in 0..32 {
+        ones.push(0xFF)
+    }
+    testing.error_if(t, crc32c_of(ones) != 0x62A8AB43, "crc32c of 32 0xFF bytes")
+}
+
+fn parses(data: u8[]) -> bool {
+    let p = parse_packet(data) or return false
+    p.chunks.len > 0
+}
+
+fn test_a_packet_round_trips_and_a_flipped_bit_is_dropped(t: *testing.T) {
+    let p = Packet { source: 5000, destination: 5001, tag: 0xDEADBEEF, chunks: [Chunk { kind: chunk_data, flags: 3, body: payload(1, 33) }, Chunk { kind: chunk_heartbeat, flags: 0, body: [1, 2, 3] }] }
+    let wire_form = encode_packet(p)
+    testing.error_if(t, wire_form.len % 4 != 0, "packet is not padded to 4 bytes")
+    let back = parse_packet(wire_form) or {
+        testing.fatal(t, "packet did not parse")
+        return
+    }
+    testing.error_if(t, back.tag != 0xDEADBEEF || back.chunks.len != 2 || back.chunks[1].body.len != 3, "fields changed")
+    var bad = wire_form
+    bad[20] = bad[20] ^ 1
+    testing.error_if(t, parses(bad), "a flipped bit passed the checksum")
+}
+
+fn test_the_four_way_handshake_connects_both_sides(t: *testing.T) {
+    let w = wire(1, 0, 0, 0)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 5000))
+    testing.error_if(t, events_of(p.a).len != 1 || events_of(p.b).len != 1, "each side reports Connected once")
+}
+
+fn test_a_lost_init_is_retransmitted(t: *testing.T) {
+    let w = wire(2, 50, 0, 2)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 120000))
+}
+
+fn test_a_forged_cookie_is_ignored(t: *testing.T) {
+    let server = assoc(Config { client: false })
+    let client = assoc(Config { client: true })
+    connect(client, 0)
+    receive(server, poll_transmit(client) ?? [], 0)
+    let ack = parse_packet(poll_transmit(server) ?? []) or {
+        testing.fatal(t, "no INIT ACK")
+        return
+    }
+    let init = parse_init(ack.chunks[0].body) or {
+        testing.fatal(t, "INIT ACK did not parse")
+        return
+    }
+    var cookie = find_param(init.params, param_state_cookie) ?? []
+    cookie[3] = cookie[3] ^ 0x40
+    let echo = encode_packet(Packet { source: 5000, destination: 5000, tag: init.tag, chunks: [Chunk { kind: chunk_cookie_echo, flags: 0, body: cookie }] })
+    receive(server, echo, 1)
+    testing.error_if(t, state(server) != State.Idle, "a forged cookie established the association")
+    testing.error_if(t, poll_transmit(server) != none, "a forged cookie got an answer")
+}
+
+fn exchange(t: *testing.T, w: *Wire, p: Pair, sizes: i64[], delivery: Delivery, steps: i64) -> Message[] {
+    var sent: Message[] = []
+    for i, n in sizes {
+        let data = payload(i, n)
+        send(p.a, w.now, i % 3, 51 + i, data, delivery) or {
+            testing.fatal(t, "send failed")
+            return []
+        }
+        sent.push(Message { stream: i % 3, ppid: 51 + i, data })
+    }
+    var got: Message[] = []
+    for _ in 0..steps {
+        advance(w, p)
+        for m in read_all(p.b) {
+            got.push(m)
+        }
+        if got.len == sent.len {
+            break
+        }
+    }
+    got
+}
+
+fn same(a: Message, b: Message) -> bool {
+    a.stream == b.stream && a.ppid == b.ppid && slices.equal(a.data, b.data)
+}
+
+fn test_ordered_messages_arrive_intact_and_in_order_on_a_lossy_path(t: *testing.T) {
+    for seed in 1..6 {
+        let w = wire(u64(seed), 15, 10, 30)
+        let p = default_pair()
+        testing.require(t, settle(w, p, 120000))
+        let sizes: i64[] = [1, 1100, 1400, 5000, 20000, 3, 70000, 1170, 1171, 1172, 64]
+        var sent: Message[] = []
+        for i, n in sizes {
+            let data = payload(i, n)
+            send(p.a, w.now, 0, 51, data, Delivery {}) or {
+                testing.fatal(t, "send failed")
+                return
+            }
+            sent.push(Message { stream: 0, ppid: 51, data })
+        }
+        var got: Message[] = []
+        for _ in 0..40000 {
+            advance(w, p)
+            for m in read_all(p.b) {
+                got.push(m)
+            }
+            if got.len == sent.len {
+                break
+            }
+        }
+        testing.error_if(t, got.len != sent.len, "seed {seed}: {got.len} of {sent.len} messages arrived")
+        for i in 0..got.len {
+            testing.error_if(t, i < sent.len && !same(got[i], sent[i]), "seed {seed}: message {i} differs")
+        }
+        testing.error_if(t, w.largest > 1200, "a packet of {w.largest} bytes exceeds the mtu")
+    }
+}
+
+fn test_unordered_messages_all_arrive(t: *testing.T) {
+    let w = wire(7, 20, 5, 40)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 120000))
+    let got = exchange(t, w, p, [100, 3000, 100, 2500, 7, 9000], Delivery { ordered: false }, 40000)
+    testing.error_if(t, got.len != 6, "{got.len} of 6 unordered messages arrived")
+    var total = 0
+    for m in got {
+        total += m.data.len
+    }
+    testing.error_if(t, total != 100 + 3000 + 100 + 2500 + 7 + 9000, "the payload bytes changed")
+}
+
+fn test_streams_keep_their_own_order(t: *testing.T) {
+    let w = wire(9, 10, 0, 20)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 120000))
+    for i in 0..30 {
+        send(p.a, w.now, i % 3, 51, payload(i, 200 + i), Delivery {}) or return
+    }
+    var per: [i64: i64[]] = [:]
+    var count = 0
+    for _ in 0..40000 {
+        advance(w, p)
+        for m in read_all(p.b) {
+            var seen = per[m.stream] ?? []
+            seen.push(m.data.len)
+            per[m.stream] = seen
+            count += 1
+        }
+        if count == 30 {
+            break
+        }
+    }
+    testing.error_if(t, count != 30, "{count} of 30 arrived")
+    for stream, lens in per {
+        testing.error_if(t, !slices.sorted(lens), "stream {stream} delivered out of order")
+    }
+}
+
+fn test_a_message_with_no_retransmits_is_abandoned_and_later_messages_still_arrive(t: *testing.T) {
+    let w = wire(11, 40, 0, 10)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 120000))
+    for i in 0..40 {
+        send(p.a, w.now, 0, 51, payload(i, 300), Delivery { max_retransmits: 0 }) or return
+        drain(w, p, 4)
+    }
+    w.loss = 0
+    send(p.a, w.now, 0, 99, payload(99, 50), Delivery {}) or return
+    var seen_last = false
+    var count = 0
+    for _ in 0..4000 {
+        advance(w, p)
+        for m in read_all(p.b) {
+            count += 1
+            if m.ppid == 99 {
+                seen_last = true
+            }
+        }
+        if seen_last {
+            break
+        }
+    }
+    testing.error_if(t, !seen_last, "the reliable message behind abandoned ones never arrived")
+    testing.error_if(t, count > 41 || count < 2, "{count} messages arrived")
+    testing.error_if(t, buffered_amount(p.a) != 0, "the sender still holds {buffered_amount(p.a)} bytes")
+}
+
+fn test_a_message_past_its_lifetime_is_abandoned(t: *testing.T) {
+    let w = wire(12, 0, 0, 0)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 120000))
+    w.muted = true
+    send(p.a, w.now, 0, 51, payload(1, 100), Delivery { lifetime: 500 }) or return
+    drain(w, p, 400)
+    w.muted = false
+    send(p.a, w.now, 0, 52, payload(2, 100), Delivery {}) or return
+    var got: Message[] = []
+    for _ in 0..4000 {
+        advance(w, p)
+        for m in read_all(p.b) {
+            got.push(m)
+        }
+        if got.len > 0 {
+            break
+        }
+    }
+    testing.error_if(t, got.len != 1 || got[0].ppid != 52, "the later message must arrive without the expired one")
+}
+
+fn test_resetting_a_stream_restarts_its_sequence_numbers(t: *testing.T) {
+    let w = wire(13, 5, 0, 5)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 120000))
+    events_of(p.a)
+    events_of(p.b)
+    for i in 0..3 {
+        send(p.a, w.now, 4, 51, payload(i, 80), Delivery {}) or return
+    }
+    reset_stream(p.a, w.now, 4)
+    var got = 0
+    var reset = false
+    var resent = false
+    for _ in 0..40000 {
+        advance(w, p)
+        if !resent && p.a.reset == none {
+            send(p.a, w.now, 4, 51, payload(9, 80), Delivery {}) or return
+            resent = true
+        }
+        got += read_all(p.b).len
+        for e in events_of(p.b) {
+            match e {
+                StreamReset(s) => {
+                    reset = reset || s == 4
+                }
+                _ => {}
+            }
+        }
+        if got == 4 && reset {
+            break
+        }
+    }
+    testing.error_if(t, got != 4, "{got} of 4 messages arrived")
+    testing.error_if(t, !reset, "the peer did not report the reset")
+}
+
+fn delivered_after_reset(seed: u64) -> str {
+    let w = wire(seed, 0, 0, 5)
+    let p = default_pair()
+    if !settle(w, p, 120000) {
+        return "no handshake"
+    }
+    w.loss = 15
+    send(p.a, w.now, 4, 51, payload(1, 80), Delivery {}) or return "send failed"
+    reset_stream(p.a, w.now, 4)
+    send(p.a, w.now, 4, 51, payload(2, 80), Delivery {}) or return "second send failed"
+    var got: Message[] = []
+    for _ in 0..120000 {
+        advance(w, p)
+        for m in read_all(p.b) {
+            got.push(m)
+        }
+        if got.len == 2 {
+            break
+        }
+    }
+    if got.len != 2 {
+        return "{got.len} of 2 messages arrived"
+    }
+    if !slices.equal(got[0].data, payload(1, 80)) || !slices.equal(got[1].data, payload(2, 80)) {
+        return "the messages arrived changed or out of order"
+    }
+    ""
+}
+
+fn test_a_message_sent_while_a_reset_is_pending_follows_the_reset_on_a_lossy_path(t: *testing.T) {
+    for seed in 1..13 {
+        let why = delivered_after_reset(u64(seed))
+        testing.error_if(t, why != "", "seed {seed}: {why}")
+    }
+}
+
+fn test_a_shutdown_closes_both_sides(t: *testing.T) {
+    let w = wire(14, 0, 0, 2)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 120000))
+    send(p.a, w.now, 0, 51, payload(1, 4000), Delivery {}) or return
+    shutdown(p.a, w.now)
+    drain(w, p, 600)
+    testing.error_if(t, state(p.a) != State.Closed || state(p.b) != State.Closed, "a is {state(p.a)} and b is {state(p.b)}")
+    testing.error_if(t, read_all(p.b).len != 1, "the message queued before the shutdown must arrive")
+}
+
+fn test_an_abort_fails_the_peer(t: *testing.T) {
+    let w = wire(15, 0, 0, 0)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 120000))
+    abort(p.a)
+    drain(w, p, 20)
+    testing.error_if(t, state(p.b) != State.Failed, "the peer is {state(p.b)}")
+}
+
+fn test_a_silent_peer_fails_the_association_after_the_retransmission_limit(t: *testing.T) {
+    let w = wire(16, 0, 0, 0)
+    let p = pair(Config { client: true, max_retransmissions: 4, rto_initial: 100, rto_min: 100, rto_max: 400 }, Config { client: false })
+    testing.require(t, settle(w, p, 120000))
+    w.muted = true
+    send(p.a, w.now, 0, 51, payload(1, 100), Delivery {}) or return
+    drain(w, p, 2000)
+    testing.error_if(t, state(p.a) != State.Failed, "a is {state(p.a)}")
+}
+
+fn test_the_congestion_window_opens_during_a_large_transfer(t: *testing.T) {
+    let w = wire(17, 0, 0, 10)
+    let p = default_pair()
+    testing.require(t, settle(w, p, 120000))
+    let before = p.a.cwnd
+    for i in 0..4 {
+        send(p.a, w.now, 0, 51, payload(i, 200000), Delivery {}) or return
+    }
+    var got = 0
+    var peak = 0
+    for _ in 0..100000 {
+        advance(w, p)
+        got += read_all(p.b).len
+        if p.a.cwnd > peak {
+            peak = p.a.cwnd
+        }
+        if got == 4 {
+            break
+        }
+    }
+    testing.error_if(t, got != 4, "{got} of 4 large messages arrived")
+    testing.error_if(t, peak <= before * 4, "cwnd stayed at {peak} from {before}")
+}
+
+fn test_a_receiver_window_smaller_than_the_message_is_respected(t: *testing.T) {
+    let w = wire(18, 0, 0, 5)
+    let p = pair(Config { client: true }, Config { client: false, window: 20000 })
+    testing.require(t, settle(w, p, 120000))
+    send(p.a, w.now, 0, 51, payload(1, 15000), Delivery {}) or return
+    var got = 0
+    for _ in 0..20000 {
+        advance(w, p)
+        got += read_all(p.b).len
+        if got == 1 {
+            break
+        }
+    }
+    testing.error_if(t, got != 1, "the 15000-byte message did not arrive through a 20000-byte window")
+}
+
+fn test_heartbeats_keep_an_idle_association_alive(t: *testing.T) {
+    let w = wire(19, 0, 0, 0)
+    let p = pair(Config { client: true, heartbeat_interval: 1000, rto_initial: 500, rto_min: 500 }, Config { client: false, heartbeat_interval: 1000 })
+    testing.require(t, settle(w, p, 120000))
+    let before = w.packets
+    drain(w, p, 2000)
+    testing.error_if(t, w.packets - before < 4, "no heartbeats flowed")
+    testing.error_if(t, !connected(p), "the association did not survive idling")
+}
