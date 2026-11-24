@@ -1,0 +1,842 @@
+import std/io
+import std/testing
+import std/text
+
+struct Capture {
+    from: str
+    label: str
+    hex: str
+}
+
+fn decode_frame(data: u8[]) -> Frame ! Error {
+    let r = io.bytes_reader(data)
+    let f = read_frame(r, 0) catch {
+        Closed => fail Malformed
+        e => fail e
+    }
+    if io.buffered(r) > 0 {
+        fail Malformed
+    }
+    f
+}
+
+fn nibble(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        return i64(c) - 48
+    }
+    if c >= 'A' && c <= 'F' {
+        return i64(c) - 55
+    }
+    i64(c) - 87
+}
+
+fn hex(s: str) -> u8[] {
+    var out: u8[] = []
+    var i = 0
+    for i < s.len {
+        if s[i] == ' ' {
+            i += 1
+            continue
+        }
+        out.push(u8(nibble(s[i]) * 16 + nibble(s[i + 1])))
+        i += 2
+    }
+    out
+}
+
+fn label(e: Error) -> str {
+    match e {
+        Malformed => "Malformed"
+        Closed => "Closed"
+        TooLarge => "TooLarge"
+        Argument => "Argument"
+        Timeout => "Timeout"
+        _ => "other"
+    }
+}
+
+fn show(v: Value) -> str {
+    match v {
+        Void => "void"
+        Bool(b) => "bool {b}"
+        Int(n) => "int {n}"
+        Float(f) => "float {f}"
+        Decimal(scale, n) => "decimal {n}e-{scale}"
+        Str(s) => "str {s}"
+        Bytes(b) => "bytes {b.len}"
+        Array(items) => {
+            var parts: str[] = []
+            for item in items {
+                parts.push(show(item))
+            }
+            "[{text.join(parts, ", ")}]"
+        }
+        Time(s) => "time {s}"
+        Table(fields) => "{{{fields_text(fields)}}}"
+    }
+}
+
+fn fields_text(fields: Field[]) -> str {
+    var parts: str[] = []
+    for f in fields {
+        parts.push("{f.name}={show(f.value)}")
+    }
+    text.join(parts, ", ")
+}
+
+fn encoded(t: *testing.T, m: Method) -> u8[] {
+    let empty: u8[] = []
+    encode_method(m) catch {
+        e => testing.must(t, e, empty)
+    }
+}
+
+fn decoded(t: *testing.T, data: u8[]) -> Method {
+    decode_method(data) catch {
+        e => testing.must(t, e, Method.ConnectionOpenOk)
+    }
+}
+
+fn frame_of(t: *testing.T, data: u8[]) -> Frame {
+    decode_frame(data) catch {
+        e => testing.must(t, e, Frame { kind: 0, channel: 0, payload: [] })
+    }
+}
+
+fn header_of(t: *testing.T, data: u8[]) -> Header {
+    decode_header(data) catch {
+        e => testing.must(t, e, Header { class_id: 0, size: 0, properties: Properties {} })
+    }
+}
+
+fn captured_method(t: *testing.T, which: str, from: str) -> Method {
+    for c in captured() {
+        if c.label == which && c.from == from {
+            return decoded(t, frame_of(t, hex(c.hex)).payload)
+        }
+    }
+    t.fatal("no capture {from} {which}")
+    Method.ConnectionOpenOk
+}
+
+fn captured_header(t: *testing.T, from: str) -> Header {
+    for c in captured() {
+        if c.label == "content header" && c.from == from {
+            return header_of(t, frame_of(t, hex(c.hex)).payload)
+        }
+    }
+    t.fatal("no capture {from} content header")
+    Header { class_id: 0, size: 0, properties: Properties {} }
+}
+
+/// Frames the RabbitMQ 3.13.7 broker and pika 1.5.0 exchanged for one session, recorded through a TCP proxy: connection setup, an exchange and a queue declared with arguments, a binding, confirm mode, qos, one persistent message with properties published, fetched with basic.get and acknowledged, and teardown. Every frame decodes and encodes back to its bytes, except pika's connection.open, which sets the reserved insist bit that the client leaves clear.
+fn test_captured_frames_round_trip(t: *testing.T) {
+    for c in captured() {
+        let wire = hex(c.hex)
+        let f = frame_of(t, wire)
+        t.equal_slice(encode_frame(f), wire)
+        if f.kind == frame_method && c.label != "10.40" {
+            let m = decoded(t, f.payload)
+            t.equal_slice(encoded(t, m), f.payload)
+        }
+        if f.kind == frame_header {
+            let h = header_of(t, f.payload)
+            let again = encode_header(h.class_id, h.size, h.properties) or []
+            t.equal_slice(again, f.payload)
+        }
+    }
+}
+
+fn test_captured_connection_start(t: *testing.T) {
+    let m = captured_method(t, "10.10", "broker")
+    match m {
+        ConnectionStart(major, minor, properties, mechanisms, locales) => {
+            t.equal(major, 0)
+            t.equal(minor, 9)
+            t.equal(mechanisms, "AMQPLAIN PLAIN")
+            t.equal(locales, "en_US")
+            t.equal(show(find(properties, "product") ?? Value.Void), "str RabbitMQ")
+            t.equal(show(find(properties, "version") ?? Value.Void), "str 3.13.7")
+            let caps = find(properties, "capabilities") ?? Value.Void
+            match caps {
+                Table(fields) => {
+                    t.equal(show(find(fields, "publisher_confirms") ?? Value.Void), "bool true")
+                    t.equal(show(find(fields, "basic.nack") ?? Value.Void), "bool true")
+                    t.equal(show(find(fields, "connection.blocked") ?? Value.Void), "bool true")
+                    t.equal(show(find(fields, "consumer_cancel_notify") ?? Value.Void), "bool true")
+                    t.equal(fields.len, 9)
+                }
+                _ => t.error("capabilities is not a table")
+            }
+        }
+        _ => t.error("not connection.start")
+    }
+}
+
+fn test_captured_connection_start_ok(t: *testing.T) {
+    let m = captured_method(t, "10.11", "client")
+    match m {
+        ConnectionStartOk(properties, mechanism, response, locale) => {
+            t.equal(mechanism, "PLAIN")
+            t.equal(locale, "en_US")
+            t.equal_slice(response, hex("00 67 75 65 73 74 00 67 75 65 73 74"))
+            t.equal(show(find(properties, "connection_name") ?? Value.Void), "str capture")
+        }
+        _ => t.error("not connection.start-ok")
+    }
+}
+
+fn test_captured_tune_and_open(t: *testing.T) {
+    match captured_method(t, "10.30", "broker") {
+        ConnectionTune(channel_max, frame_max, heartbeat) => {
+            t.equal(channel_max, 2047)
+            t.equal(frame_max, 131072)
+            t.equal(heartbeat, 60)
+        }
+        _ => t.error("not connection.tune")
+    }
+    match captured_method(t, "10.31", "client") {
+        ConnectionTuneOk(channel_max, frame_max, heartbeat) => {
+            t.equal(channel_max, 2047)
+            t.equal(frame_max, 131072)
+            t.equal(heartbeat, 30)
+        }
+        _ => t.error("not connection.tune-ok")
+    }
+    match captured_method(t, "10.40", "client") {
+        ConnectionOpen(host) => t.equal(host, "/")
+        _ => t.error("not connection.open")
+    }
+}
+
+fn test_captured_declares_with_arguments(t: *testing.T) {
+    match captured_method(t, "40.10", "client") {
+        ExchangeDeclare(exchange, kind, passive, durable, auto_delete, internal, arguments) => {
+            t.equal(exchange, "amqp.cap.x")
+            t.equal(kind, "direct")
+            t.is_false(passive)
+            t.is_true(durable)
+            t.is_false(auto_delete)
+            t.is_false(internal)
+            t.equal(fields_text(arguments), "alternate-exchange=str amqp.cap.alt")
+        }
+        _ => t.error("not exchange.declare")
+    }
+    match captured_method(t, "50.10", "client") {
+        QueueDeclare(queue, passive, durable, exclusive, auto_delete, arguments) => {
+            t.equal(queue, "amqp.cap.q")
+            t.is_true(durable)
+            t.is_false(exclusive)
+            t.equal(fields_text(arguments), "x-message-ttl=int 60000, x-max-length=int 5000000000")
+        }
+        _ => t.error("not queue.declare")
+    }
+    match captured_method(t, "50.11", "broker") {
+        QueueDeclareOk(queue, messages, consumers) => {
+            t.equal(queue, "amqp.cap.q")
+            t.equal(messages, 0)
+            t.equal(consumers, 0)
+        }
+        _ => t.error("not queue.declare-ok")
+    }
+    match captured_method(t, "50.20", "client") {
+        QueueBind(queue, exchange, key, arguments) => {
+            t.equal(queue, "amqp.cap.q")
+            t.equal(exchange, "amqp.cap.x")
+            t.equal(key, "rk")
+            t.equal(arguments.len, 0)
+        }
+        _ => t.error("not queue.bind")
+    }
+}
+
+fn test_captured_publish_and_get(t: *testing.T) {
+    match captured_method(t, "60.40", "client") {
+        BasicPublish(exchange, key, mandatory, immediate) => {
+            t.equal(exchange, "amqp.cap.x")
+            t.equal(key, "rk")
+            t.is_false(mandatory)
+            t.is_false(immediate)
+        }
+        _ => t.error("not basic.publish")
+    }
+    match captured_method(t, "60.71", "broker") {
+        BasicGetOk(delivery_tag, redelivered, exchange, key, messages) => {
+            t.equal(delivery_tag, 1)
+            t.is_false(redelivered)
+            t.equal(exchange, "amqp.cap.x")
+            t.equal(key, "rk")
+            t.equal(messages, 0)
+        }
+        _ => t.error("not basic.get-ok")
+    }
+    match captured_method(t, "60.80", "client") {
+        BasicAck(tag, multiple) => {
+            t.equal(tag, 1)
+            t.is_false(multiple)
+        }
+        _ => t.error("not basic.ack")
+    }
+    match captured_method(t, "60.80", "broker") {
+        BasicAck(tag, multiple) => {
+            t.equal(tag, 1)
+            t.is_false(multiple)
+        }
+        _ => t.error("not the confirm basic.ack")
+    }
+}
+
+fn test_captured_content_header(t: *testing.T) {
+    for who in ["client", "broker"] {
+        let h = captured_header(t, who)
+        t.equal(h.class_id, 60)
+        t.equal(h.size, 5)
+        let p = h.properties
+        t.equal(p.content_type, "text/plain")
+        t.equal(p.content_encoding, "")
+        t.equal(p.delivery_mode, 2)
+        t.equal(p.priority, 0)
+        t.equal(p.correlation_id, "c1")
+        t.equal(p.reply_to, "rq")
+        t.equal(p.message_id, "m1")
+        t.equal(p.timestamp, 1700000000)
+        t.equal(p.kind, "t")
+        t.equal(p.app_id, "capture")
+        t.equal(fields_text(p.headers).len > 0, true)
+        t.contains(fields_text(p.headers), "k=str v")
+        t.contains(fields_text(p.headers), "n=int 7")
+        t.contains(fields_text(p.headers), "flag=bool true")
+    }
+}
+
+fn test_captured_closes(t: *testing.T) {
+    match captured_method(t, "20.40", "client") {
+        ChannelClose(code, reply, class_id, method_id) => {
+            t.equal(code, 200)
+            t.equal(reply, "Normal shutdown")
+            t.equal(class_id, 0)
+            t.equal(method_id, 0)
+        }
+        _ => t.error("not channel.close")
+    }
+    match captured_method(t, "10.50", "client") {
+        ConnectionClose(code, reply, class_id, method_id) => {
+            t.equal(code, 200)
+            t.equal(reply, "Normal shutdown")
+        }
+        _ => t.error("not connection.close")
+    }
+}
+
+/// The protocol header and the heartbeat frame are the byte strings of sections 4.2.2 and 4.2.3 of the AMQP 0-9-1 specification.
+fn test_specification_frames(t: *testing.T) {
+    let heartbeat = frame_of(t, hex("08 00 00 00 00 00 00 CE"))
+    t.equal(heartbeat.kind, frame_heartbeat)
+    t.equal(heartbeat.channel, 0)
+    t.equal(heartbeat.payload.len, 0)
+    t.equal_slice(encode_frame(Frame { kind: frame_heartbeat, channel: 0, payload: [] }), hex("08 00 00 00 00 00 00 CE"))
+    t.equal_slice(bytes("AMQP\x00\x00\x09\x01"), hex("41 4D 51 50 00 00 09 01"))
+}
+
+fn test_frame_layout(t: *testing.T) {
+    let f = Frame { kind: frame_body, channel: 0x0102, payload: [1, 2, 3] }
+    t.equal_slice(encode_frame(f), hex("03 01 02 00 00 00 03 01 02 03 CE"))
+}
+
+fn field_bytes(t: *testing.T, v: Value) -> u8[] {
+    let empty: u8[] = []
+    encode_fields([Field { name: "a", value: v }]) catch {
+        e => testing.must(t, e, empty)
+    }
+}
+
+fn field_value(t: *testing.T, data: u8[]) -> str {
+    let none: Field[] = []
+    let fields = decode_fields(data) catch {
+        e => testing.must(t, e, none)
+    }
+    show(fields[0].value)
+}
+
+fn test_value_encodings(t: *testing.T) {
+    let cases: [str: Value] = [
+        "01 61 56": Value.Void
+        "01 61 74 01": Value.Bool(true)
+        "01 61 74 00": Value.Bool(false)
+        "01 61 49 00 00 00 07": Value.Int(7)
+        "01 61 49 FF FF FF FF": Value.Int(-1)
+        "01 61 49 7F FF FF FF": Value.Int(2147483647)
+        "01 61 6C 00 00 00 00 80 00 00 00": Value.Int(2147483648)
+        "01 61 6C 00 00 00 01 2A 05 F2 00": Value.Int(5000000000)
+        "01 61 49 80 00 00 00": Value.Int(-2147483648)
+        "01 61 6C FF FF FF FF 7F FF FF FF": Value.Int(-2147483649)
+        "01 61 64 3F F8 00 00 00 00 00 00": Value.Float(1.5)
+        "01 61 44 02 00 00 01 3A": Value.Decimal(2, 314)
+        "01 61 53 00 00 00 02 61 62": Value.Str("ab")
+        "01 61 53 00 00 00 00": Value.Str("")
+        "01 61 78 00 00 00 02 01 02": Value.Bytes([1, 2])
+        "01 61 54 00 00 00 00 65 53 F1 00": Value.Time(1700000000)
+        "01 61 41 00 00 00 0B 49 00 00 00 01 53 00 00 00 01 61": Value.Array([Value.Int(1), Value.Str("a")])
+        "01 61 41 00 00 00 00": Value.Array([])
+        "01 61 46 00 00 00 04 01 6B 74 01": Value.Table([Field { name: "k", value: Value.Bool(true) }])
+    ]
+    for h, v in cases {
+        t.equal_slice(field_bytes(t, v), hex(h))
+        t.equal(field_value(t, hex(h)), show(v))
+    }
+}
+
+fn test_value_decoding_of_other_widths(t: *testing.T) {
+    let cases: [str: str] = [
+        "01 61 62 FF": "int -1"
+        "01 61 62 7F": "int 127"
+        "01 61 42 FF": "int 255"
+        "01 61 73 FF FE": "int -2"
+        "01 61 55 80 00": "int -32768"
+        "01 61 75 FF FE": "int 65534"
+        "01 61 69 FF FF FF FF": "int 4294967295"
+        "01 61 49 80 00 00 00": "int -2147483648"
+        "01 61 4C 00 00 00 01 00 00 00 00": "int 4294967296"
+        "01 61 6C FF FF FF FF FF FF FF FF": "int -1"
+        "01 61 66 3F C0 00 00": "float 1.5"
+        "01 61 44 00 FF FF FF FF": "decimal -1e-0"
+    ]
+    for h, want in cases {
+        t.equal(field_value(t, hex(h)), want)
+    }
+}
+
+fn test_nested_table_round_trip(t: *testing.T) {
+    let inner = Value.Table([Field { name: "list", value: Value.Array([Value.Table([Field { name: "x", value: Value.Int(1) }]), Value.Void]) }])
+    let fields = [Field { name: "outer", value: inner }, Field { name: "after", value: Value.Str("s") }]
+    let data = encode_fields(fields) or []
+    let back = decode_fields(data) or []
+    t.equal(fields_text(back), fields_text(fields))
+    t.equal_slice(encode_fields(back) or [], data)
+}
+
+fn deep(n: i64) -> Value {
+    var v = Value.Bool(true)
+    for i in 0..n {
+        v = Value.Table([Field { name: "d", value: v }])
+    }
+    v
+}
+
+fn test_nesting_limit(t: *testing.T) {
+    let ok = encode_fields([Field { name: "a", value: deep(15) }]) or []
+    t.equal(decode_outcome(ok), "ok")
+    let deeper = encode_fields([Field { name: "a", value: deep(40) }]) or []
+    t.equal(decode_outcome(deeper), "Malformed")
+}
+
+fn decode_outcome(data: u8[]) -> str {
+    decode_fields(data) catch {
+        e => return label(e)
+    }
+    "ok"
+}
+
+fn test_malformed_tables(t: *testing.T) {
+    let cases = [
+        "01 61 53 00 00 00 05 61"
+        "01 61 5A"
+        "01 61 49 00 00 00"
+        "01 61"
+        "05 61 62"
+        "01 61 41 00 00 00 02 49"
+        "01 61 46 00 00 00 05 01 6B 74 01"
+        "01 61 74"
+        "01 61 44 02 00 00 01"
+    ]
+    for h in cases {
+        t.equal(decode_outcome(hex(h)), "Malformed")
+    }
+}
+
+fn test_encoding_limits(t: *testing.T) {
+    let long = text.repeat("a", 256)
+    t.equal(encode_outcome(Method.QueueDeclare(long, false, false, false, false, [])), "TooLarge")
+    t.equal(encode_outcome(Method.QueueDeclare(text.repeat("a", 255), false, false, false, false, [])), "ok")
+    t.equal(encode_outcome(Method.ConnectionTuneOk(70000, 131072, 60)), "Argument")
+    t.equal(encode_outcome(Method.ConnectionTuneOk(2047, -1, 60)), "Argument")
+    t.equal(encode_outcome(Method.ConnectionTuneOk(2047, 4294967296, 60)), "Argument")
+    encode_fields([Field { name: long, value: Value.Void }]) catch {
+        e => {
+            t.equal(label(e), "TooLarge")
+            return
+        }
+    }
+    t.error("name of 256 bytes encoded")
+}
+
+fn encode_outcome(m: Method) -> str {
+    encode_method(m) catch {
+        e => return label(e)
+    }
+    "ok"
+}
+
+fn all_methods() -> Method[] {
+    let args = [Field { name: "x-expires", value: Value.Int(60000) }]
+    [
+        Method.ConnectionStart(0, 9, args, "PLAIN AMQPLAIN", "en_US")
+        Method.ConnectionStartOk(args, "PLAIN", [0, 97, 0, 98], "en_US")
+        Method.ConnectionSecure([1, 2, 3])
+        Method.ConnectionSecureOk([4, 5])
+        Method.ConnectionTune(2047, 131072, 60)
+        Method.ConnectionTuneOk(2047, 131072, 30)
+        Method.ConnectionOpen("/vhost")
+        Method.ConnectionOpenOk
+        Method.ConnectionClose(320, "CONNECTION_FORCED - broker forced connection closure with reason 'shutdown'", 0, 0)
+        Method.ConnectionCloseOk
+        Method.ConnectionBlocked("low on memory")
+        Method.ConnectionUnblocked
+        Method.ChannelOpen
+        Method.ChannelOpenOk
+        Method.ChannelFlow(true)
+        Method.ChannelFlowOk(false)
+        Method.ChannelClose(404, "NOT_FOUND - no queue 'q' in vhost '/'", 50, 10)
+        Method.ChannelCloseOk
+        Method.ExchangeDeclare("x", "topic", true, true, false, true, args)
+        Method.ExchangeDeclareOk
+        Method.ExchangeDelete("x", true)
+        Method.ExchangeDeleteOk
+        Method.ExchangeBind("dst", "src", "k", args)
+        Method.ExchangeBindOk
+        Method.ExchangeUnbind("dst", "src", "k", args)
+        Method.ExchangeUnbindOk
+        Method.QueueDeclare("q", false, true, true, true, args)
+        Method.QueueDeclareOk("q", 7, 2)
+        Method.QueueBind("q", "x", "k", args)
+        Method.QueueBindOk
+        Method.QueueUnbind("q", "x", "k", args)
+        Method.QueueUnbindOk
+        Method.QueuePurge("q")
+        Method.QueuePurgeOk(12)
+        Method.QueueDelete("q", true, true)
+        Method.QueueDeleteOk(3)
+        Method.BasicQos(1048576, 100, true)
+        Method.BasicQosOk
+        Method.BasicConsume("q", "ctag", true, false, true, args)
+        Method.BasicConsumeOk("ctag")
+        Method.BasicCancel("ctag", true)
+        Method.BasicCancelOk("ctag")
+        Method.BasicPublish("x", "k", true, true)
+        Method.BasicReturn(312, "NO_ROUTE", "x", "k")
+        Method.BasicDeliver("ctag", 9007199254740993, true, "x", "k")
+        Method.BasicGet("q", true)
+        Method.BasicGetOk(5, false, "x", "k", 4)
+        Method.BasicGetEmpty
+        Method.BasicAck(6, true)
+        Method.BasicReject(7, true)
+        Method.BasicNack(8, true, false)
+        Method.BasicRecover(true)
+        Method.BasicRecoverOk
+        Method.ConfirmSelect
+        Method.ConfirmSelectOk
+        Method.TxSelect
+        Method.TxSelectOk
+        Method.TxCommit
+        Method.TxCommitOk
+        Method.TxRollback
+        Method.TxRollbackOk
+    ]
+}
+
+fn test_every_method_round_trips(t: *testing.T) {
+    var seen: [str: bool] = [:]
+    for m in all_methods() {
+        let data = encoded(t, m)
+        let again = encoded(t, decoded(t, data))
+        t.equal_slice(again, data)
+        let key = "{io.be16(data, 0)}.{io.be16(data, 2)}"
+        t.is_false(seen[key] ?? false)
+        seen[key] = true
+    }
+    t.equal(seen.len, 61)
+}
+
+fn test_method_wire_layout(t: *testing.T) {
+    t.equal_slice(encoded(t, Method.BasicAck(1, false)), hex("00 3C 00 50 00 00 00 00 00 00 00 01 00"))
+    t.equal_slice(encoded(t, Method.BasicAck(300, true)), hex("00 3C 00 50 00 00 00 00 00 00 01 2C 01"))
+    t.equal_slice(encoded(t, Method.BasicNack(2, true, true)), hex("00 3C 00 78 00 00 00 00 00 00 00 02 03"))
+    t.equal_slice(encoded(t, Method.BasicQos(0, 10, false)), hex("00 3C 00 0A 00 00 00 00 00 0A 00"))
+    t.equal_slice(encoded(t, Method.BasicPublish("x", "k", true, false)), hex("00 3C 00 28 00 00 01 78 01 6B 01"))
+    t.equal_slice(encoded(t, Method.ConnectionOpen("/")), hex("00 0A 00 28 01 2F 00 00"))
+    t.equal_slice(encoded(t, Method.ChannelOpenOk), hex("00 14 00 0B 00 00 00 00"))
+    t.equal_slice(encoded(t, Method.QueueDeclareOk("q", 1, 2)), hex("00 32 00 0B 01 71 00 00 00 01 00 00 00 02"))
+    t.equal_slice(encoded(t, Method.ExchangeDeclare("x", "fanout", false, true, true, false, [])), hex("00 28 00 0A 00 00 01 78 06 66 61 6E 6F 75 74 06 00 00 00 00"))
+}
+
+fn test_flag_bits_are_independent(t: *testing.T) {
+    let base = Method.QueueDeclare("q", false, false, false, false, [])
+    let toggles = [
+        Method.QueueDeclare("q", true, false, false, false, [])
+        Method.QueueDeclare("q", false, true, false, false, [])
+        Method.QueueDeclare("q", false, false, true, false, [])
+        Method.QueueDeclare("q", false, false, false, true, [])
+    ]
+    let flags_at = 4 + 2 + 2
+    var want = 1
+    for m in toggles {
+        let data = encoded(t, m)
+        t.equal(i64(data[flags_at]), want)
+        want = want * 2
+    }
+    t.equal(i64(encoded(t, base)[flags_at]), 0)
+}
+
+fn test_malformed_methods(t: *testing.T) {
+    let cases = [
+        ""
+        "00"
+        "00 0A"
+        "00 63 00 01"
+        "00 0A 00 63"
+        "00 0A 00 1E 07 FF 00 02 00 00 00"
+        "00 0A 00 1E 07 FF 00 02 00 00 00 3C 00"
+        "00 3C 00 50 00 00 00 00 00 00 00"
+        "00 3C 00 50 00 00 00 00 00 00 00 01 00 00"
+        "00 32 00 0B 05 71"
+        "00 3C 00 3C 01 63 00 00 00 00 00 00 00 01 00 01 78"
+    ]
+    for h in cases {
+        t.equal(method_outcome(hex(h)), "Malformed")
+    }
+}
+
+fn method_outcome(data: u8[]) -> str {
+    decode_method(data) catch {
+        e => return label(e)
+    }
+    "ok"
+}
+
+fn test_malformed_frames(t: *testing.T) {
+    let cases: [str: str] = [
+        "": "Malformed"
+        "01 00": "Malformed"
+        "01 00 00 00 00 00 04 00 0A": "Malformed"
+        "08 00 00 00 00 00 00 CF": "Malformed"
+        "09 00 00 00 00 00 00 CE": "Malformed"
+        "00 00 00 00 00 00 00 CE": "Malformed"
+        "08 00 00 00 00 00 00 CE 00": "Malformed"
+        "41 4D 51 50 00 00 09 01": "Malformed"
+    ]
+    for h, want in cases {
+        decode_frame(hex(h)) catch {
+            e => {
+                t.equal(label(e), want)
+                continue
+            }
+        }
+        t.error("frame decoded: {h}")
+    }
+}
+
+fn test_frame_size_limit(t: *testing.T) {
+    let data = hex("03 00 01 00 00 00 0A 00 01 02 03 04 05 06 07 08 09 CE")
+    let r = io.bytes_reader(data)
+    let ok = read_frame(r, 18) or Frame { kind: 0, channel: 0, payload: [] }
+    t.equal(ok.payload.len, 10)
+    let limited = io.bytes_reader(data)
+    read_frame(limited, 17) catch {
+        e => {
+            t.equal(label(e), "TooLarge")
+            return
+        }
+    }
+    t.error("a frame over the limit was read")
+}
+
+fn test_frames_read_back_to_back(t: *testing.T) {
+    var data: u8[] = []
+    for i in 0..3 {
+        io.append(mut data, encode_frame(Frame { kind: frame_body, channel: i + 1, payload: [u8(i), u8(i)] }))
+    }
+    let r = io.bytes_reader(data)
+    for i in 0..3 {
+        let f = read_frame(r, 0) or Frame { kind: 0, channel: 0, payload: [] }
+        t.equal(f.channel, i + 1)
+        t.equal_slice(f.payload, [u8(i), u8(i)])
+    }
+}
+
+fn test_large_frame_is_read_in_chunks(t: *testing.T) {
+    var body: u8[] = []
+    for i in 0..200000 {
+        body.push(u8(i % 251))
+    }
+    let data = encode_frame(Frame { kind: frame_body, channel: 3, payload: body })
+    let r = io.bytes_reader(data)
+    let f = read_frame(r, 0) or Frame { kind: 0, channel: 0, payload: [] }
+    t.equal(f.payload.len, 200000)
+    t.equal_slice(f.payload, body)
+}
+
+fn full_properties() -> Properties {
+    Properties {
+        content_type: "application/json"
+        content_encoding: "gzip"
+        headers: [Field { name: "h", value: Value.Int(1) }]
+        delivery_mode: 2
+        priority: 9
+        correlation_id: "corr"
+        reply_to: "reply"
+        expiration: "60000"
+        message_id: "id"
+        timestamp: 1700000000
+        kind: "kind"
+        user_id: "guest"
+        app_id: "app"
+    }
+}
+
+fn test_header_flags(t: *testing.T) {
+    let none = encode_header(60, 0, Properties {}) or []
+    t.equal_slice(none, hex("00 3C 00 00 00 00 00 00 00 00 00 00 00 00"))
+    let some_props = encode_header(60, 5, Properties { content_type: "a", delivery_mode: 2 }) or []
+    t.equal_slice(some_props, hex("00 3C 00 00 00 00 00 00 00 00 00 05 90 00 01 61 02"))
+    let all = encode_header(60, 1, full_properties()) or []
+    t.equal(io.be16(all, 12), 0xFFF8)
+}
+
+fn test_header_round_trips_every_property(t: *testing.T) {
+    let data = encode_header(60, 123456789012, full_properties()) or []
+    let h = header_of(t, data)
+    t.equal(h.size, 123456789012)
+    t.equal(h.properties.content_type, "application/json")
+    t.equal(h.properties.content_encoding, "gzip")
+    t.equal(fields_text(h.properties.headers), "h=int 1")
+    t.equal(h.properties.delivery_mode, 2)
+    t.equal(h.properties.priority, 9)
+    t.equal(h.properties.correlation_id, "corr")
+    t.equal(h.properties.reply_to, "reply")
+    t.equal(h.properties.expiration, "60000")
+    t.equal(h.properties.message_id, "id")
+    t.equal(h.properties.timestamp, 1700000000)
+    t.equal(h.properties.kind, "kind")
+    t.equal(h.properties.user_id, "guest")
+    t.equal(h.properties.app_id, "app")
+    t.equal_slice(encode_header(h.class_id, h.size, h.properties) or [], data)
+}
+
+fn header_outcome(data: u8[]) -> str {
+    decode_header(data) catch {
+        e => return label(e)
+    }
+    "ok"
+}
+
+fn test_malformed_headers(t: *testing.T) {
+    let cases = [
+        ""
+        "00 3C"
+        "00 3C 00 01 00 00 00 00 00 00 00 05 00 00"
+        "00 3C 00 00 80 00 00 00 00 00 00 05 00 00"
+        "00 3C 00 00 00 00 00 00 00 00 00 05 00 01"
+        "00 3C 00 00 00 00 00 00 00 00 00 05 80 00"
+        "00 3C 00 00 00 00 00 00 00 00 00 05 80 00 05 61"
+        "00 3C 00 00 00 00 00 00 00 00 00 05 00 00 00"
+        "00 3C 00 00 00 00 00 00 00 00 00 05 20 00 00 00 00 05 5A"
+    ]
+    for h in cases {
+        t.equal(header_outcome(hex(h)), "Malformed")
+    }
+}
+
+fn test_header_encoding_limits(t: *testing.T) {
+    let cases = [
+        Properties { delivery_mode: 256 }
+        Properties { priority: -1 }
+        Properties { timestamp: -1 }
+    ]
+    for p in cases {
+        encode_header(60, 0, p) catch {
+            e => {
+                t.equal(label(e), "Argument")
+                continue
+            }
+        }
+        t.error("properties out of range were encoded")
+    }
+    encode_header(60, 0, Properties { content_type: text.repeat("a", 256) }) catch {
+        e => {
+            t.equal(label(e), "TooLarge")
+            return
+        }
+    }
+    t.error("a string property over 255 bytes was encoded")
+}
+
+fn test_body_frames_split(t: *testing.T) {
+    var body: u8[] = []
+    for i in 0..10 {
+        body.push(u8(i))
+    }
+    let data = body_frames(5, body, 4)
+    let r = io.bytes_reader(data)
+    var sizes: i64[] = []
+    var joined: u8[] = []
+    for io.buffered(r) > 0 || sizes.len < 3 {
+        let f = read_frame(r, 0) or break
+        t.equal(f.kind, frame_body)
+        t.equal(f.channel, 5)
+        sizes.push(f.payload.len)
+        io.append(mut joined, f.payload)
+    }
+    t.equal_slice(sizes, [4, 4, 2])
+    t.equal_slice(joined, body)
+    t.equal(body_frames(5, [], 4).len, 0)
+    t.equal(body_frames(5, body[..8], 4).len, 2 * (8 + 4))
+    t.equal(body_frames(5, body[..4], 4).len, 12)
+}
+
+fn test_find(t: *testing.T) {
+    let fields = [Field { name: "a", value: Value.Int(1) }, Field { name: "b", value: Value.Int(2) }, Field { name: "a", value: Value.Int(3) }]
+    t.equal(show(find(fields, "a") ?? Value.Void), "int 1")
+    t.equal(show(find(fields, "b") ?? Value.Void), "int 2")
+    t.is_none(find(fields, "c"))
+}
+
+
+fn captured() -> Capture[] {
+    [
+        Capture { from: "client", label: "10.11", hex: "01000000000163000a000b0000013f0770726f64756374530000001a50696b6120507974686f6e20436c69656e74204c69627261727908706c6174666f726d530000000d507974686f6e20332e31342e390c6361706162696c6974696573460000008c1c61757468656e7469636174696f6e5f6661696c7572655f636c6f736574010a62617369632e6e61636b740112636f6e6e656374696f6e2e626c6f636b6564740116636f6e73756d65725f63616e63656c5f6e6f7469667974011a65786368616e67655f65786368616e67655f62696e64696e67737401127075626c69736865725f636f6e6669726d7374010b696e666f726d6174696f6e53000000205365652068747470733a2f2f70696b612e6769746875622e696f2f70696b612f0776657273696f6e5300000005312e352e300f636f6e6e656374696f6e5f6e616d6553000000076361707475726505504c41494e0000000c00677565737400677565737405656e5f5553ce" }
+        Capture { from: "client", label: "10.31", hex: "0100000000000c000a001f07ff00020000001ece" }
+        Capture { from: "client", label: "10.40", hex: "01000000000008000a0028012f0001ce" }
+        Capture { from: "client", label: "20.10", hex: "010001000000050014000a00ce" }
+        Capture { from: "client", label: "40.10", hex: "010001000000410028000a00000a616d71702e6361702e7806646972656374020000002412616c7465726e6174652d65786368616e6765530000000c616d71702e6361702e616c74ce" }
+        Capture { from: "client", label: "50.10", hex: "0100010000003f0032000a00000a616d71702e6361702e7102000000290d782d6d6573736167652d74746c490000ea600c782d6d61782d6c656e6774686c000000012a05f200ce" }
+        Capture { from: "client", label: "50.20", hex: "010001000000240032001400000a616d71702e6361702e710a616d71702e6361702e7802726b0000000000ce" }
+        Capture { from: "client", label: "85.10", hex: "010001000000050055000a00ce" }
+        Capture { from: "client", label: "60.10", hex: "0100010000000b003c000a00000000000a00ce" }
+        Capture { from: "client", label: "60.40", hex: "01000100000015003c002800000a616d71702e6361702e7802726b00ce" }
+        Capture { from: "client", label: "content header", hex: "0200010000004f003c00000000000000000005b6e80a746578742f706c61696e00000016016b530000000176016e490000000704666c6167740102026331027271026d31000000006553f10001740763617074757265ce" }
+        Capture { from: "client", label: "content body", hex: "0300010000000568656c6c6fce" }
+        Capture { from: "client", label: "60.70", hex: "01000100000012003c004600000a616d71702e6361702e7100ce" }
+        Capture { from: "client", label: "60.80", hex: "0100010000000d003c0050000000000000000100ce" }
+        Capture { from: "client", label: "50.40", hex: "010001000000120032002800000a616d71702e6361702e7100ce" }
+        Capture { from: "client", label: "40.20", hex: "010001000000120028001400000a616d71702e6361702e7800ce" }
+        Capture { from: "client", label: "20.40", hex: "0100010000001a0014002800c80f4e6f726d616c2073687574646f776e00000000ce" }
+        Capture { from: "client", label: "10.50", hex: "0100000000001a000a003200c80f4e6f726d616c2073687574646f776e00000000ce" }
+        Capture { from: "broker", label: "10.10", hex: "01000000000202000a000a0009000001dd0c6361706162696c697469657346000000c7127075626c69736865725f636f6e6669726d7374011a65786368616e67655f65786368616e67655f62696e64696e677374010a62617369632e6e61636b740116636f6e73756d65725f63616e63656c5f6e6f74696679740112636f6e6e656374696f6e2e626c6f636b6564740113636f6e73756d65725f7072696f72697469657374011c61757468656e7469636174696f6e5f6661696c7572655f636c6f73657401107065725f636f6e73756d65725f716f7374010f6469726563745f7265706c795f746f74010c636c75737465725f6e616d6553000000137261626269744036653236366563323135666309636f70797269676874530000003c436f707972696768742028632920323030372d323032342042726f6164636f6d20496e6320616e642f6f7220697473207375627369646961726965730b696e666f726d6174696f6e53000000394c6963656e73656420756e64657220746865204d504c20322e302e20576562736974653a2068747470733a2f2f7261626269746d712e636f6d08706c6174666f726d530000001445726c616e672f4f54502032362e322e352e31360770726f6475637453000000085261626269744d510776657273696f6e5300000006332e31332e370000000e414d51504c41494e20504c41494e00000005656e5f5553ce" }
+        Capture { from: "broker", label: "10.30", hex: "0100000000000c000a001e07ff00020000003cce" }
+        Capture { from: "broker", label: "10.41", hex: "01000000000005000a002900ce" }
+        Capture { from: "broker", label: "20.11", hex: "010001000000080014000b00000000ce" }
+        Capture { from: "broker", label: "40.11", hex: "010001000000040028000bce" }
+        Capture { from: "broker", label: "50.11", hex: "010001000000170032000b0a616d71702e6361702e710000000000000000ce" }
+        Capture { from: "broker", label: "50.21", hex: "0100010000000400320015ce" }
+        Capture { from: "broker", label: "85.11", hex: "010001000000040055000bce" }
+        Capture { from: "broker", label: "60.11", hex: "01000100000004003c000bce" }
+        Capture { from: "broker", label: "60.80", hex: "0100010000000d003c0050000000000000000100ce" }
+        Capture { from: "broker", label: "60.71", hex: "0100010000001f003c00470000000000000001000a616d71702e6361702e7802726b00000000ce" }
+        Capture { from: "broker", label: "content header", hex: "0200010000004f003c00000000000000000005b6e80a746578742f706c61696e0000001604666c61677401016b530000000176016e490000000702026331027271026d31000000006553f10001740763617074757265ce" }
+        Capture { from: "broker", label: "content body", hex: "0300010000000568656c6c6fce" }
+        Capture { from: "broker", label: "50.41", hex: "010001000000080032002900000000ce" }
+        Capture { from: "broker", label: "40.21", hex: "0100010000000400280015ce" }
+        Capture { from: "broker", label: "20.41", hex: "0100010000000400140029ce" }
+        Capture { from: "broker", label: "10.51", hex: "01000000000004000a0033ce" }
+    ]
+}

@@ -1,0 +1,129 @@
+import std/amqp
+import std/io
+import std/net
+
+struct Stored {
+    key: str
+    body: u8[]
+}
+
+struct Broker {
+    stream: io.Stream
+    reader: *io.Reader
+    stored: Stored[]
+    tag: str
+    channel: i64
+    next_tag: i64
+}
+
+fn wire(e: amqp.Error) -> io.Error {
+    io.Error.Malformed
+}
+
+fn put(b: *Broker, channel: i64, m: amqp.Method) ! io.Error {
+    let payload = amqp.encode_method(m) catch wire
+    io.write_all(b.stream, amqp.encode_frame(amqp.Frame { kind: amqp.frame_method, channel, payload }))?
+}
+
+fn take(b: *Broker) -> amqp.Frame ! io.Error {
+    amqp.read_frame(b.reader, 0) catch wire
+}
+
+fn take_method(b: *Broker) -> amqp.Method ! io.Error {
+    let f = take(b)?
+    amqp.decode_method(f.payload) catch wire
+}
+
+fn handshake(b: *Broker) ! io.Error {
+    io.read_exact(b.reader, 8)?
+    put(b, 0, amqp.Method.ConnectionStart(0, 9, [], "PLAIN", "en_US"))?
+    take_method(b)?
+    put(b, 0, amqp.Method.ConnectionTune(2047, 131072, 0))?
+    take_method(b)?
+    take_method(b)?
+    put(b, 0, amqp.Method.ConnectionOpenOk)?
+}
+
+fn read_body(b: *Broker) -> u8[] ! io.Error {
+    let header = take(b)?
+    let h = amqp.decode_header(header.payload) catch wire
+    var body: u8[] = []
+    for body.len < h.size {
+        io.append(mut body, take(b)?.payload)
+    }
+    body
+}
+
+fn deliver(b: *Broker) ! io.Error {
+    for m in b.stored {
+        b.next_tag += 1
+        let method = amqp.encode_method(amqp.Method.BasicDeliver(b.tag, b.next_tag, false, "", m.key)) catch wire
+        io.write_all(b.stream, amqp.encode_frame(amqp.Frame { kind: amqp.frame_method, channel: b.channel, payload: method }))?
+        let header = amqp.encode_header(amqp.class_basic, m.body.len, amqp.Properties { content_type: "text/plain" }) catch wire
+        io.write_all(b.stream, amqp.encode_frame(amqp.Frame { kind: amqp.frame_header, channel: b.channel, payload: header }))?
+        io.write_all(b.stream, amqp.encode_frame(amqp.Frame { kind: amqp.frame_body, channel: b.channel, payload: m.body }))?
+    }
+    b.stored = []
+}
+
+fn serve_methods(b: *Broker) ! io.Error {
+    for {
+        let m = take_method(b)?
+        match m {
+            ChannelOpen => put(b, 1, amqp.Method.ChannelOpenOk)?
+            QueueDeclare(queue, passive, durable, exclusive, auto_delete, arguments) => put(b, 1, amqp.Method.QueueDeclareOk(queue, b.stored.len, 0))?
+            BasicPublish(exchange, key, mandatory, immediate) => {
+                let body = read_body(b)?
+                b.stored.push(Stored { key, body })
+            }
+            BasicConsume(queue, tag, no_local, no_ack, exclusive, arguments) => {
+                b.tag = tag
+                b.channel = 1
+                put(b, 1, amqp.Method.BasicConsumeOk(tag))?
+                deliver(b)?
+            }
+            BasicAck(tag, multiple) => {}
+            BasicCancel(tag, no_wait) => put(b, 1, amqp.Method.BasicCancelOk(tag))?
+            ChannelClose(code, text, class_id, method_id) => put(b, 1, amqp.Method.ChannelCloseOk)?
+            ConnectionClose(code, text, class_id, method_id) => {
+                put(b, 0, amqp.Method.ConnectionCloseOk)?
+                return
+            }
+            _ => fail io.Error.Malformed
+        }
+    }
+}
+
+fn serve(l: net.ListenerHandle) {
+    let h = net.accept_handle(l) or return
+    using c = net.adopt(h)
+    let stream = net.stream(c)
+    let b = new(Broker { stream, reader: io.reader(stream), stored: [], tag: "", channel: 0, next_tag: 0 })
+    handshake(b) or return
+    serve_methods(b) or {}
+}
+
+fn work(port: i64) ! amqp.Error {
+    using c = amqp.connect(amqp.Options { port })?
+    let ch = amqp.open_channel(c)?
+    amqp.declare_queue(ch, "orders", amqp.QueueOptions { durable: true })?
+    for n in 1..4 {
+        amqp.publish(ch, "", "orders", bytes("order {n}"), amqp.PublishOptions {})?
+    }
+    let consumer = amqp.consume(ch, "orders", amqp.ConsumeOptions {})?
+    for i in 0..3 {
+        let d = <-consumer.deliveries ?? break
+        print("{d.routing_key}: {str(d.body)}")
+        amqp.ack(d)?
+    }
+    amqp.cancel(consumer)?
+    amqp.close_channel(ch)?
+}
+
+fn main() {
+    using l = net.listen("127.0.0.1", 0) or return
+    spawn serve(l.handle)
+    work(l.handle.addr.port) catch {
+        e => print("failed")
+    }
+}

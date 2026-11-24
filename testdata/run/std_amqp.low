@@ -1,0 +1,1448 @@
+import std/amqp
+import std/crypto/x509
+import std/io
+import std/net
+import std/sync
+import std/text
+import std/tls
+
+struct Greeting {
+    mechanism: str
+    response: u8[]
+    properties: amqp.Field[]
+    channel_max: i64
+    frame_max: i64
+    heartbeat: i64
+    virtual_host: str
+}
+
+struct Offer {
+    mechanisms: str
+    channel_max: i64
+    frame_max: i64
+    heartbeat: i64
+    version: i64
+    bare: bool
+}
+
+struct Request {
+    channel: i64
+    method: amqp.Method
+}
+
+struct Content {
+    properties: amqp.Properties
+    size: i64
+    frames: i64
+    largest: i64
+    body: u8[]
+}
+
+struct Session {
+    stub: *Stub
+    stream: io.Stream
+    reader: *io.Reader
+    gate: sync.Mutex
+    greeting: Greeting
+    published: i64
+    deliveries: i64
+}
+
+struct Stub {
+    offer: Offer
+    secure: bool
+    script: fn(*Session) ! io.Error
+    log: chan[str]
+    greeted: chan[Greeting]
+    config: tls.Config
+}
+
+fn default_offer() -> Offer {
+    Offer { mechanisms: "PLAIN AMQPLAIN", channel_max: 2047, frame_max: 131072, heartbeat: 60, version: 9, bare: false }
+}
+
+fn describe(e: amqp.Error) -> str {
+    match e {
+        Connect => "Connect"
+        Closed => "Closed"
+        Timeout => "Timeout"
+        Protocol => "Protocol"
+        Malformed => "Malformed"
+        TooLarge => "TooLarge"
+        Tls => "Tls"
+        Unsupported => "Unsupported"
+        Argument => "Argument"
+        Auth(m) => "Auth({m})"
+        ConnectionClosed(code, m) => "ConnectionClosed({code}, {m})"
+        ChannelClosed(code, m) => "ChannelClosed({code}, {m})"
+        Nacked => "Nacked"
+        Exhausted => "Exhausted"
+    }
+}
+
+fn wire(e: amqp.Error) -> io.Error {
+    io.Error.Malformed
+}
+
+fn method_bytes(channel: i64, m: amqp.Method) -> u8[] {
+    let payload = amqp.encode_method(m) or []
+    amqp.encode_frame(amqp.Frame { kind: amqp.frame_method, channel, payload })
+}
+
+fn header_bytes(channel: i64, size: i64, p: amqp.Properties) -> u8[] {
+    let payload = amqp.encode_header(amqp.class_basic, size, p) or []
+    amqp.encode_frame(amqp.Frame { kind: amqp.frame_header, channel, payload })
+}
+
+fn body_bytes(channel: i64, body: u8[], step: i64) -> u8[] {
+    var out: u8[] = []
+    var at = 0
+    for at < body.len {
+        let end = if at + step < body.len { at + step } else { body.len }
+        io.append(mut out, amqp.encode_frame(amqp.Frame { kind: amqp.frame_body, channel, payload: body[at..end] }))
+        at = end
+    }
+    out
+}
+
+fn put_raw(s: *Session, data: u8[]) ! io.Error {
+    sync.lock(s.gate)
+    defer sync.unlock(s.gate)
+    io.write_all(s.stream, data)?
+}
+
+fn put_method(s: *Session, channel: i64, m: amqp.Method) ! io.Error {
+    put_raw(s, method_bytes(channel, m))?
+}
+
+fn put_message(s: *Session, channel: i64, m: amqp.Method, p: amqp.Properties, body: u8[]) ! io.Error {
+    var out = method_bytes(channel, m)
+    io.append(mut out, header_bytes(channel, body.len, p))
+    io.append(mut out, body_bytes(channel, body, frame_step(s)))
+    put_raw(s, out)?
+}
+
+fn frame_step(s: *Session) -> i64 {
+    s.stub.offer.frame_max - 8
+}
+
+fn read_any(s: *Session) -> amqp.Frame ! io.Error {
+    for {
+        let f = amqp.read_frame(s.reader, 0) catch wire
+        if f.kind != amqp.frame_heartbeat {
+            return f
+        }
+    }
+}
+
+fn read_request(s: *Session) -> Request ! io.Error {
+    let f = read_any(s)?
+    if f.kind != amqp.frame_method {
+        fail io.Error.Malformed
+    }
+    let m = amqp.decode_method(f.payload) catch wire
+    Request { channel: f.channel, method: m }
+}
+
+fn read_content(s: *Session, channel: i64) -> Content ! io.Error {
+    let h = read_any(s)?
+    if h.kind != amqp.frame_header || h.channel != channel {
+        fail io.Error.Malformed
+    }
+    let header = amqp.decode_header(h.payload) catch wire
+    var content = Content { properties: header.properties, size: header.size, frames: 0, largest: 0, body: [] }
+    for content.body.len < header.size {
+        let f = read_any(s)?
+        if f.kind != amqp.frame_body {
+            fail io.Error.Malformed
+        }
+        content.frames += 1
+        if f.payload.len > content.largest {
+            content.largest = f.payload.len
+        }
+        io.append(mut content.body, f.payload)
+    }
+    content
+}
+
+fn note(s: *Session, text: str) {
+    select {
+        s.stub.log <- text => {}
+        else => {}
+    }
+}
+
+fn wait_note(stub: *Stub) -> str {
+    var out: str? = none
+    select {
+        v = <-stub.log => {
+            out = v
+        }
+        after(3000) => {}
+    }
+    out ?? "no note"
+}
+
+fn greet(stub: *Stub, session: *Session) ! io.Error {
+    let header = io.read_exact(session.reader, 8)?
+    if str(header) != "AMQP\x00\x00\x09\x01" {
+        fail io.Error.Malformed
+    }
+    let offer = stub.offer
+    if offer.version != 9 {
+        put_raw(session, bytes("AMQP\x00\x00\x08\x00"))?
+        fail io.Error.Eof
+    }
+    let props = [amqp.Field { name: "product", value: amqp.Value.Str("stub") }]
+    put_method(session, 0, amqp.Method.ConnectionStart(0, offer.version, props, offer.mechanisms, "en_US"))?
+    var greeting = session.greeting
+    let started = read_request(session)?
+    match started.method {
+        ConnectionStartOk(properties, mechanism, response, locale) => {
+            greeting.properties = properties
+            greeting.mechanism = mechanism
+            greeting.response = response
+        }
+        _ => fail io.Error.Malformed
+    }
+    session.greeting = greeting
+    if offer.bare {
+        return
+    }
+    put_method(session, 0, amqp.Method.ConnectionTune(offer.channel_max, offer.frame_max, offer.heartbeat))?
+    let tuned = read_request(session)?
+    match tuned.method {
+        ConnectionTuneOk(channel_max, frame_max, heartbeat) => {
+            greeting.channel_max = channel_max
+            greeting.frame_max = frame_max
+            greeting.heartbeat = heartbeat
+        }
+        _ => fail io.Error.Malformed
+    }
+    let opened = read_request(session)?
+    match opened.method {
+        ConnectionOpen(host) => {
+            greeting.virtual_host = host
+        }
+        _ => fail io.Error.Malformed
+    }
+    session.greeting = greeting
+    put_method(session, 0, amqp.Method.ConnectionOpenOk)?
+}
+
+fn serve_stream(stub: *Stub, stream: io.Stream) {
+    let blank = Greeting { mechanism: "", response: [], properties: [], channel_max: 0, frame_max: 0, heartbeat: 0, virtual_host: "" }
+    let session = new(Session { stub, stream, reader: io.reader(stream), gate: sync.mutex(), greeting: blank, published: 0, deliveries: 0 })
+    greet(stub, session) catch {
+        e => return
+    }
+    select {
+        stub.greeted <- session.greeting => {}
+        else => {}
+    }
+    stub.script(session) catch {
+        e => return
+    }
+}
+
+fn serve(l: net.ListenerHandle, stub: *Stub) {
+    let h = net.accept_handle(l) or return
+    using c = net.adopt(h)
+    let plain = net.stream(c)
+    if stub.secure {
+        using t = tls.server(plain, stub.config) or return
+        serve_stream(stub, tls.stream(t))
+        return
+    }
+    serve_stream(stub, plain)
+}
+
+fn new_stub(script: fn(*Session) ! io.Error) -> *Stub {
+    new(Stub { offer: default_offer(), secure: false, script, log: chan[str](256), greeted: chan[Greeting](1), config: tls.Config {} })
+}
+
+fn idle(s: *Session) ! io.Error {
+    for {
+        read_request(s)?
+    }
+}
+
+fn options(l: net.Listener) -> amqp.Options {
+    amqp.Options { port: l.handle.addr.port, call_timeout: 5000 }
+}
+
+fn with_stub(name: str, stub: *Stub, body: fn(*Stub, amqp.Options) ! amqp.Error) {
+    print("== {name}")
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    spawn serve(l.handle, stub)
+    body(stub, options(l)) catch {
+        e => print("scenario failed: {describe(e)}")
+    }
+}
+
+fn expect_failure(label: str, attempt: fn() ! amqp.Error) {
+    attempt() catch {
+        e => {
+            print("{label}: {describe(e)}")
+            return
+        }
+    }
+    print("{label}: no error")
+}
+
+fn open_failure(label: str, c: amqp.Connection) {
+    amqp.open_channel(c) catch {
+        e => {
+            print("{label}: {describe(e)}")
+            return
+        }
+    }
+    print("{label}: no error")
+}
+
+fn shows(g: Greeting) -> str {
+    "mechanism {g.mechanism} channel_max {g.channel_max} frame_max {g.frame_max} heartbeat {g.heartbeat} vhost {g.virtual_host}"
+}
+
+fn field_text(fields: amqp.Field[], name: str) -> str {
+    let v = amqp.find(fields, name) ?? amqp.Value.Void
+    match v {
+        Str(s) => s
+        Bool(b) => "{b}"
+        Int(n) => "{n}"
+        Table(inner) => "table of {inner.len}"
+        _ => "other"
+    }
+}
+
+fn greeting_of(stub: *Stub) -> Greeting {
+    var out: Greeting? = none
+    select {
+        g = <-stub.greeted => {
+            out = g
+        }
+        after(3000) => {}
+    }
+    out ?? panic("no greeting")
+}
+
+fn standard(s: *Session, r: Request) ! io.Error {
+    match r.method {
+        ChannelOpen => {
+            put_method(s, r.channel, amqp.Method.ChannelOpenOk)?
+        }
+        ChannelClose(code, text, class_id, method_id) => {
+            put_method(s, r.channel, amqp.Method.ChannelCloseOk)?
+        }
+        ExchangeDeclare(exchange, kind, passive, durable, auto_delete, internal, arguments) => {
+            put_method(s, r.channel, amqp.Method.ExchangeDeclareOk)?
+        }
+        QueueDeclare(queue, passive, durable, exclusive, auto_delete, arguments) => {
+            let name = if queue == "" { "amq.gen-7" } else { queue }
+            put_method(s, r.channel, amqp.Method.QueueDeclareOk(name, 3, 1))?
+        }
+        QueueBind(queue, exchange, key, arguments) => {
+            put_method(s, r.channel, amqp.Method.QueueBindOk)?
+        }
+        ConfirmSelect => {
+            put_method(s, r.channel, amqp.Method.ConfirmSelectOk)?
+        }
+        BasicQos(size, count, global) => {
+            put_method(s, r.channel, amqp.Method.BasicQosOk)?
+        }
+        BasicConsume(queue, tag, no_local, no_ack, exclusive, arguments) => {
+            put_method(s, r.channel, amqp.Method.BasicConsumeOk(tag))?
+        }
+        BasicCancel(tag, no_wait) => {
+            put_method(s, r.channel, amqp.Method.BasicCancelOk(tag))?
+        }
+        BasicAck(tag, multiple) => {
+            note(s, "ack {tag} multiple={multiple}")
+        }
+        BasicNack(tag, multiple, requeue) => {
+            note(s, "nack {tag} multiple={multiple} requeue={requeue}")
+        }
+        BasicReject(tag, requeue) => {
+            note(s, "reject {tag} requeue={requeue}")
+        }
+        ConnectionClose(code, text, class_id, method_id) => {
+            note(s, "connection.close {code}")
+            put_method(s, 0, amqp.Method.ConnectionCloseOk)?
+            fail io.Error.Eof
+        }
+        ConnectionCloseOk => {
+            note(s, "connection.close-ok")
+            fail io.Error.Eof
+        }
+        _ => {
+            note(s, "unhandled method")
+        }
+    }
+}
+
+fn serve_standard(s: *Session) ! io.Error {
+    for {
+        standard(s, read_request(s)?)?
+    }
+}
+
+fn negotiated(stub: *Stub, o: amqp.Options) ! amqp.Error {
+    using c = amqp.connect(o)?
+    let g = greeting_of(stub)
+    print("client asked: {shows(g)}")
+    print("connection: channels {amqp.channel_limit(c)} frame {amqp.frame_limit(c)} heartbeat {amqp.heartbeat_interval(c)}")
+    print("server product: {field_text(amqp.server_properties(c), "product")}")
+    print("blocked: {amqp.blocked(c) ?? "no"}")
+}
+
+fn handshake_scenarios() {
+    with_stub("handshake with the defaults", new_stub(idle), negotiated)
+
+    let narrow = new_stub(idle)
+    narrow.offer.frame_max = 8192
+    narrow.offer.channel_max = 10
+    narrow.offer.heartbeat = 30
+    with_stub("handshake takes the smaller limits", narrow, fn(stub, o) {
+        var asked = o
+        asked.heartbeat = 20
+        negotiated(stub, asked)
+    })
+
+    let wide = new_stub(idle)
+    wide.offer.frame_max = 0
+    wide.offer.channel_max = 0
+    wide.offer.heartbeat = 0
+    with_stub("handshake when the broker sets no limits", wide, fn(stub, o) {
+        var asked = o
+        asked.heartbeat = 15
+        asked.channel_max = 0
+        asked.frame_max = 0
+        negotiated(stub, asked)
+    })
+
+    with_stub("handshake with heartbeats off and a virtual host", new_stub(idle), fn(stub, o) {
+        var asked = o
+        asked.heartbeat = 0
+        asked.virtual_host = "/tenant"
+        negotiated(stub, asked)
+    })
+}
+
+fn mechanism_scenarios() {
+    with_stub("PLAIN response and client properties", new_stub(idle), fn(stub, o) {
+        var asked = o
+        asked.username = "alice"
+        asked.password = "s3cret"
+        asked.name = "named"
+        asked.properties = [amqp.Field { name: "tag", value: amqp.Value.Str("extra") }]
+        using c = amqp.connect(asked)?
+        let g = greeting_of(stub)
+        print("mechanism {g.mechanism}, response {g.response.len} bytes")
+        print("credentials {text.replace(str(g.response), "\x00", "|")}")
+        print("connection_name {field_text(g.properties, "connection_name")}")
+        print("product {field_text(g.properties, "product")}")
+        print("extra tag {field_text(g.properties, "tag")}")
+        let caps = amqp.find(g.properties, "capabilities") ?? amqp.Value.Void
+        match caps {
+            Table(fields) => {
+                for name in ["publisher_confirms", "basic.nack", "consumer_cancel_notify", "connection.blocked", "authentication_failure_close", "exchange_exchange_bindings"] {
+                    print("capability {name}: {field_text(fields, name)}")
+                }
+            }
+            _ => print("no capabilities")
+        }
+    })
+
+    with_stub("AMQPLAIN response", new_stub(idle), fn(stub, o) {
+        var asked = o
+        asked.mechanism = amqp.Mechanism.AmqPlain
+        asked.username = "bob"
+        asked.password = "pw"
+        using c = amqp.connect(asked)?
+        let g = greeting_of(stub)
+        let fields = amqp.decode_fields(g.response)?
+        print("mechanism {g.mechanism}: LOGIN {field_text(fields, "LOGIN")} PASSWORD {field_text(fields, "PASSWORD")}")
+    })
+
+    let external = new_stub(idle)
+    external.offer.mechanisms = "EXTERNAL PLAIN"
+    with_stub("EXTERNAL response", external, fn(stub, o) {
+        var asked = o
+        asked.mechanism = amqp.Mechanism.External
+        using c = amqp.connect(asked)?
+        let g = greeting_of(stub)
+        print("mechanism {g.mechanism}: response {g.response.len} bytes")
+    })
+}
+
+fn refuse_after_start_ok(code: i64, reply: str) -> fn(*Session) ! io.Error {
+    fn(s) {
+        put_method(s, 0, amqp.Method.ConnectionClose(code, reply, 10, 11))?
+        let closing = read_request(s)?
+        match closing.method {
+            ConnectionCloseOk => note(s, "close-ok")
+            _ => note(s, "something else")
+        }
+    }
+}
+
+fn refused(name: str, stub: *Stub, setup: fn(*amqp.Options)) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    spawn serve(l.handle, stub)
+    let o = new(options(l))
+    setup(o)
+    using c = amqp.connect(*o) catch {
+        e => {
+            print("{name}: {describe(e)}")
+            return
+        }
+    }
+    print("{name}: connected")
+}
+
+fn refused_with_note(name: str, stub: *Stub) {
+    refused(name, stub, fn(o) {})
+    print("  broker: {wait_note(stub)}")
+}
+
+fn handshake_failures() {
+    print("== handshake failures")
+    let old = new_stub(idle)
+    old.offer.version = 8
+    refused("protocol 0-8", old, fn(o) {})
+
+    let minor = new_stub(idle)
+    minor.offer.version = 10
+    refused("protocol 0-10", minor, fn(o) {})
+
+    let nothing = new_stub(idle)
+    nothing.offer.mechanisms = "SCRAM-SHA-256"
+    refused("no common mechanism", nothing, fn(o) {})
+
+    let tiny = new_stub(idle)
+    tiny.offer.frame_max = 1000
+    refused("broker frame_max below 4096", tiny, fn(o) {})
+
+    refused("option frame_max below 4096", new_stub(idle), fn(o) { o.frame_max = 100 })
+    refused("option channel_max above 65535", new_stub(idle), fn(o) { o.channel_max = 70000 })
+    refused("option heartbeat negative", new_stub(idle), fn(o) { o.heartbeat = -1 })
+    refused("option buffer zero", new_stub(idle), fn(o) { o.buffer = 0 })
+
+    let challenge = new_stub(fn(s) {
+        put_method(s, 0, amqp.Method.ConnectionSecure(bytes("challenge")))?
+        idle(s)?
+    })
+    challenge.offer.bare = true
+    refused("authentication challenge", challenge, fn(o) {})
+
+    let hangup = new_stub(fn(s) {})
+    hangup.offer.bare = true
+    refused("broker hangs up after start-ok", hangup, fn(o) {})
+
+    for code in [403, 530, 402] {
+        let stub = new_stub(refuse_after_start_ok(code, "ACCESS_REFUSED - Login was refused"))
+        stub.offer.bare = true
+        refused_with_note("connection.close {code} after start-ok", stub)
+    }
+}
+
+fn raw_server(l: net.ListenerHandle, reply: u8[]) {
+    let h = net.accept_handle(l) or return
+    using c = net.adopt(h)
+    let stream = net.stream(c)
+    let reader = io.reader(stream)
+    io.read_exact(reader, 8) or return
+    if reply.len == 0 {
+        return
+    }
+    io.write_all(stream, reply) or return
+    io.read_all(io.reader_stream(reader)) or []
+}
+
+fn try_raw(name: str, reply: u8[]) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    spawn raw_server(l.handle, reply)
+    var o = options(l)
+    o.timeout = 400
+    using c = amqp.connect(o) catch {
+        e => {
+            print("{name}: {describe(e)}")
+            return
+        }
+    }
+    print("{name}: connected")
+}
+
+fn garbage_handshakes() {
+    print("== garbage during the handshake")
+    let open_ok = method_bytes(0, amqp.Method.ConnectionOpenOk)
+    try_raw("http reply", bytes("HTTP/1.1 400 Bad Request\r\n\r\n"))
+    try_raw("heartbeat then silence", amqp.encode_frame(amqp.Frame { kind: amqp.frame_heartbeat, channel: 0, payload: [] }))
+    try_raw("method on channel 1", method_bytes(1, amqp.Method.ConnectionOpenOk))
+    try_raw("unknown method", amqp.encode_frame(amqp.Frame { kind: amqp.frame_method, channel: 0, payload: [0, 99, 0, 1] }))
+    try_raw("open-ok instead of start", open_ok)
+    try_raw("bad end marker", [1, 0, 0, 0, 0, 0, 0, 0xCF])
+    try_raw("unknown frame type", [9, 0, 0, 0, 0, 0, 0, 0xCE])
+    try_raw("oversize frame", [1, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF])
+    try_raw("connection closed after the protocol header", [])
+}
+
+fn next_notice(c: amqp.Connection, ms: i64) -> str {
+    var got: amqp.Notice? = none
+    var expired = false
+    select {
+        n = <-c.notices => {
+            got = n
+        }
+        after(ms) => {
+            expired = true
+        }
+    }
+    if expired {
+        return "nothing within {ms} ms"
+    }
+    match got {
+        some(n) => match n {
+            Blocked(reason) => "blocked: {reason}"
+            Unblocked => "unblocked"
+        }
+        none => "closed"
+    }
+}
+
+fn blocked_script(s: *Session) ! io.Error {
+    put_method(s, 0, amqp.Method.ConnectionBlocked("low on memory"))?
+    for {
+        let r = read_request(s)?
+        match r.method {
+            ChannelOpen => {
+                put_method(s, 0, amqp.Method.ConnectionUnblocked)?
+            }
+            _ => {}
+        }
+        standard(s, r)?
+    }
+}
+
+fn forced_close_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            QueueDeclare(queue, passive, durable, exclusive, auto_delete, arguments) => {
+                put_method(s, 0, amqp.Method.ConnectionClose(320, "CONNECTION_FORCED - shutdown", 50, 10))?
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn count_heartbeats(s: *Session) ! io.Error {
+    var beats = 0
+    for {
+        let f = amqp.read_frame(s.reader, 0) catch {
+            e => {
+                note(s, "client sent at least two heartbeats: {beats >= 2}")
+                return
+            }
+        }
+        if f.kind == amqp.frame_heartbeat {
+            beats += 1
+        }
+    }
+}
+
+fn connection_scenarios() {
+    with_stub("connection.blocked and unblocked", new_stub(blocked_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        print("notice: {next_notice(c, 3000)}")
+        print("blocked: {amqp.blocked(c) ?? "no"}")
+        let ch = amqp.open_channel(c)?
+        print("notice: {next_notice(c, 3000)}")
+        print("blocked: {amqp.blocked(c) ?? "no"}")
+    })
+
+    with_stub("connection.close from the broker", new_stub(forced_close_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        expect_failure("declare", fn() ! amqp.Error { amqp.declare_queue(ch, "jobs", amqp.QueueOptions {})? })
+        print("broker: {wait_note(stub)}")
+        expect_failure("publish", fn() ! amqp.Error { amqp.publish(ch, "", "jobs", bytes("x"), amqp.PublishOptions {})? })
+        open_failure("open_channel", c)
+        print("notice: {next_notice(c, 3000)}")
+    })
+
+    let silent = new_stub(count_heartbeats)
+    silent.offer.heartbeat = 1
+    with_stub("heartbeats: broker goes silent", silent, fn(stub, o) {
+        var asked = o
+        asked.heartbeat = 1
+        using c = amqp.connect(asked)?
+        print("heartbeat interval {amqp.heartbeat_interval(c)}")
+        print("notice: {next_notice(c, 8000)}")
+        open_failure("open_channel", c)
+        print("broker: {wait_note(stub)}")
+    })
+
+    with_stub("close_connection", new_stub(serve_standard), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        amqp.close_connection(c)
+        print("broker: {wait_note(stub)}")
+        amqp.close_connection(c)
+        open_failure("open_channel", c)
+        expect_failure("declare", fn() ! amqp.Error { amqp.declare_queue(ch, "q", amqp.QueueOptions {})? })
+        print("notice: {next_notice(c, 3000)}")
+    })
+
+    let deaf = new_stub(idle)
+    with_stub("close_connection when the broker never answers", deaf, fn(stub, o) {
+        using c = amqp.connect(o)?
+        amqp.close_connection(c)
+        print("returned")
+    })
+}
+
+fn broken_connection(name: str, data: u8[]) {
+    let stub = new_stub(fn(s) {
+        read_request(s)?
+        put_raw(s, data)?
+        idle(s)?
+    })
+    with_stub(name, stub, fn(stub, o) {
+        using c = amqp.connect(o)?
+        open_failure("open_channel", c)
+        print("notice: {next_notice(c, 3000)}")
+        open_failure("open_channel again", c)
+    })
+}
+
+fn broken_connections() {
+    broken_connection("bad frame end marker", [1, 0, 0, 0, 0, 0, 0, 0xCF])
+    broken_connection("unknown frame type", [9, 0, 0, 0, 0, 0, 0, 0xCE])
+    broken_connection("frame over the agreed size", [1, 0, 0, 0, 2, 0, 0])
+    broken_connection("content header on channel 0", header_bytes(0, 0, amqp.Properties {}))
+    broken_connection("body on channel 0", amqp.encode_frame(amqp.Frame { kind: amqp.frame_body, channel: 0, payload: [1] }))
+    broken_connection("connection.start after the handshake", method_bytes(0, amqp.Method.ConnectionStart(0, 9, [], "PLAIN", "en_US")))
+    broken_connection("undecodable method", amqp.encode_frame(amqp.Frame { kind: amqp.frame_method, channel: 0, payload: [0, 99, 0, 1] }))
+    broken_connection("truncated method", amqp.encode_frame(amqp.Frame { kind: amqp.frame_method, channel: 0, payload: [0, 10] }))
+}
+
+fn tls_server_config() -> tls.Config {
+    let pem = embed("std_tls_ec.pem")
+    let key = x509.pem_private_key(pem) or return tls.Config {}
+    tls.Config { certificates: x509.pem_certificates(pem), key }
+}
+
+fn tls_roots() -> x509.Certificate[] {
+    var out: x509.Certificate[] = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        out.push(x509.parse(der) or return out)
+    }
+    out
+}
+
+fn tls_scenarios() {
+    let secure = new_stub(serve_standard)
+    secure.secure = true
+    secure.config = tls_server_config()
+    with_stub("TLS with the right server name", secure, fn(stub, o) {
+        using c = amqp.connect_tls(o, tls.Config { server_name: "localhost", roots: tls_roots() })?
+        let ch = amqp.open_channel(c)?
+        let q = amqp.declare_queue(ch, "", amqp.QueueOptions {})?
+        print("declared {q.name}: {q.messages} messages, {q.consumers} consumers")
+    })
+
+    let wrong = new_stub(serve_standard)
+    wrong.secure = true
+    wrong.config = tls_server_config()
+    with_stub("TLS with the wrong server name", wrong, fn(stub, o) {
+        using c = amqp.connect_tls(o, tls.Config { server_name: "other.example", roots: tls_roots() }) catch {
+            e => {
+                print("connect_tls: {describe(e)}")
+                return
+            }
+        }
+        print("connected")
+    })
+
+    let untrusted = new_stub(serve_standard)
+    untrusted.secure = true
+    untrusted.config = tls_server_config()
+    with_stub("TLS without the root", untrusted, fn(stub, o) {
+        using c = amqp.connect_tls(o, tls.Config { server_name: "localhost" }) catch {
+            e => {
+                print("connect_tls: {describe(e)}")
+                return
+            }
+        }
+        print("connected")
+    })
+
+    with_stub("TLS against a plain broker", new_stub(serve_standard), fn(stub, o) {
+        var asked = o
+        asked.timeout = 500
+        using c = amqp.connect_tls(asked, tls.Config { server_name: "localhost", roots: tls_roots() }) catch {
+            e => {
+                print("connect_tls: {describe(e)}")
+                return
+            }
+        }
+        print("connected")
+    })
+}
+
+fn broker_closes_channel_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            QueueDeclare(queue, passive, durable, exclusive, auto_delete, arguments) => {
+                if queue == "missing" {
+                    put_method(s, r.channel, amqp.Method.ChannelClose(404, "NOT_FOUND - no queue '{queue}'", 50, 10))?
+                } else {
+                    standard(s, r)?
+                }
+            }
+            ChannelCloseOk => {
+                note(s, "channel.close-ok on {r.channel}")
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn ignoring_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            QueueDeclare(queue, passive, durable, exclusive, auto_delete, arguments) => {}
+            ChannelClose(code, text, class_id, method_id) => {
+                note(s, "channel.close on {r.channel} with {code}")
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn flow_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            ChannelOpen => {
+                standard(s, r)?
+                put_method(s, r.channel, amqp.Method.ChannelFlow(false))?
+            }
+            ChannelFlowOk(active) => {
+                note(s, "flow-ok active={active}")
+            }
+            BasicQos(size, count, global) => {
+                put_method(s, r.channel, amqp.Method.ChannelFlow(true))?
+                standard(s, r)?
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn channel_scenarios() {
+    with_stub("channel.close from the broker", new_stub(broker_closes_channel_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        print("channel {ch.id}")
+        expect_failure("declare", fn() ! amqp.Error { amqp.declare_queue(ch, "missing", amqp.QueueOptions {})? })
+        print("broker: {wait_note(stub)}")
+        expect_failure("declare again", fn() ! amqp.Error { amqp.declare_queue(ch, "missing", amqp.QueueOptions {})? })
+        amqp.close_channel(ch) catch {
+            e => print("close_channel: {describe(e)}")
+        }
+        let next = amqp.open_channel(c)?
+        print("next channel {next.id}")
+        let q = amqp.declare_queue(next, "present", amqp.QueueOptions {})?
+        print("channel {next.id} declared {q.name}")
+    })
+
+    with_stub("a call the broker never answers", new_stub(ignoring_script), fn(stub, o) {
+        var asked = o
+        asked.call_timeout = 300
+        using c = amqp.connect(asked)?
+        let ch = amqp.open_channel(c)?
+        expect_failure("declare", fn() ! amqp.Error { amqp.declare_queue(ch, "slow", amqp.QueueOptions {})? })
+        expect_failure("declare again", fn() ! amqp.Error { amqp.declare_queue(ch, "slow", amqp.QueueOptions {})? })
+        print("broker: {wait_note(stub)}")
+        let other = amqp.open_channel(c)?
+        print("another channel {other.id} opens while the number of the first is reserved")
+    })
+
+    let narrow = new_stub(serve_standard)
+    narrow.offer.channel_max = 2
+    with_stub("channel numbers run out", narrow, fn(stub, o) {
+        using c = amqp.connect(o)?
+        let a = amqp.open_channel(c)?
+        let b = amqp.open_channel(c)?
+        print("channels {a.id} and {b.id}")
+        open_failure("third", c)
+        amqp.close_channel(a)?
+        amqp.close_channel(a)?
+        let again = amqp.open_channel(c)?
+        print("reopened as {again.id}")
+    })
+
+    with_stub("channel.flow", new_stub(flow_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        var waited = 0
+        for amqp.flowing(ch) && waited < 600 {
+            sleep(5)
+            waited += 1
+        }
+        print("flowing {amqp.flowing(ch)}")
+        print("broker: {wait_note(stub)}")
+        amqp.qos(ch, 10, 0, false)?
+        print("flowing {amqp.flowing(ch)}")
+        print("broker: {wait_note(stub)}")
+    })
+
+    with_stub("argument checks", new_stub(serve_standard), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        amqp.qos(ch, 70000, 0, false) catch {
+            e => print("qos 70000: {describe(e)}")
+        }
+        amqp.qos(ch, -1, 0, false) catch {
+            e => print("qos -1: {describe(e)}")
+        }
+        expect_failure("wait_confirm without confirm mode", fn() ! amqp.Error { amqp.wait_confirm(ch, 1, 10)? })
+        amqp.publish_confirmed(ch, "", "q", bytes("x"), amqp.PublishOptions {}, 10) catch {
+            e => print("publish_confirmed without confirm mode: {describe(e)}")
+        }
+        var tall = amqp.Properties {}
+        tall.priority = 300
+        expect_failure("priority 300", fn() ! amqp.Error { amqp.publish(ch, "", "q", bytes("x"), amqp.PublishOptions { properties: tall })? })
+        var long = amqp.Properties {}
+        long.message_id = text.repeat("m", 256)
+        expect_failure("message_id of 256 bytes", fn() ! amqp.Error { amqp.publish(ch, "", "q", bytes("x"), amqp.PublishOptions { properties: long })? })
+        expect_failure("valid publish", fn() ! amqp.Error { amqp.publish(ch, "", "q", bytes("x"), amqp.PublishOptions {})? })
+        print("channel flowing: {amqp.flowing(ch)}")
+    })
+}
+
+fn publish_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            ConfirmSelect => {
+                s.published = 0
+                standard(s, r)?
+            }
+            BasicPublish(exchange, key, mandatory, immediate) => {
+                let content = read_content(s, r.channel)?
+                s.published += 1
+                answer_publish(s, r.channel, exchange, key, mandatory, content)?
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn answer_publish(s: *Session, channel: i64, exchange: str, key: str, mandatory: bool, content: Content) ! io.Error {
+    let verdict = str(content.body)
+    match verdict {
+        "ack" => put_method(s, channel, amqp.Method.BasicAck(s.published, false))?
+        "nack" => put_method(s, channel, amqp.Method.BasicNack(s.published, false, false))?
+        "ack-through" => put_method(s, channel, amqp.Method.BasicAck(s.published, true))?
+        "nack-through" => put_method(s, channel, amqp.Method.BasicNack(s.published, true, false))?
+        "hold" => {}
+        "return" => {
+            var p = content.properties
+            p.message_id = "returned"
+            put_message(s, channel, amqp.Method.BasicReturn(312, "NO_ROUTE", exchange, key), p, content.body)?
+            put_method(s, channel, amqp.Method.BasicAck(s.published, false))?
+        }
+        _ => {
+            let p = content.properties
+            note(s, "publish {s.published} {exchange}/{key} mandatory={mandatory} size {content.size} in {content.frames} body frames, largest {content.largest}")
+            note(s, "properties type={p.content_type} encoding={p.content_encoding} mode={p.delivery_mode} priority={p.priority} correlation={p.correlation_id} reply_to={p.reply_to} expiration={p.expiration} id={p.message_id} timestamp={p.timestamp} kind={p.kind} user={p.user_id} app={p.app_id} headers={p.headers.len}")
+        }
+    }
+}
+
+fn publish_scenarios() {
+    let small = new_stub(publish_script)
+    small.offer.frame_max = 4096
+    with_stub("publish splits the body to the frame size", small, fn(stub, o) {
+        using c = amqp.connect(o)?
+        print("frame limit {amqp.frame_limit(c)}")
+        let ch = amqp.open_channel(c)?
+        let body = bytes(text.repeat("x", 10000))
+        let p = amqp.Properties {
+            content_type: "text/plain"
+            content_encoding: "identity"
+            headers: [amqp.Field { name: "n", value: amqp.Value.Int(7) }]
+            delivery_mode: 2
+            priority: 5
+            correlation_id: "corr"
+            reply_to: "back"
+            expiration: "60000"
+            message_id: "m-1"
+            timestamp: 1700000000
+            kind: "order"
+            user_id: "guest"
+            app_id: "fixture"
+        }
+        let seq = amqp.publish(ch, "ex", "key", body, amqp.PublishOptions { properties: p, mandatory: true })?
+        print("sequence {seq}")
+        print("broker: {wait_note(stub)}")
+        print("broker: {wait_note(stub)}")
+        amqp.publish(ch, "", "q", [], amqp.PublishOptions {})?
+        print("broker: {wait_note(stub)}")
+        print("broker: {wait_note(stub)}")
+        amqp.publish(ch, "", "q", bytes(text.repeat("x", 4088)), amqp.PublishOptions {})?
+        print("broker: {wait_note(stub)}")
+        print("broker: {wait_note(stub)}")
+        amqp.publish(ch, "", "q", bytes(text.repeat("x", 4089)), amqp.PublishOptions {})?
+        print("broker: {wait_note(stub)}")
+        print("broker: {wait_note(stub)}")
+    })
+
+    with_stub("publish over max_message", new_stub(publish_script), fn(stub, o) {
+        var asked = o
+        asked.max_message = 100
+        using c = amqp.connect(asked)?
+        let ch = amqp.open_channel(c)?
+        expect_failure("101 bytes", fn() ! amqp.Error { amqp.publish(ch, "", "q", bytes(text.repeat("x", 101)), amqp.PublishOptions {})? })
+        amqp.publish(ch, "", "q", bytes(text.repeat("x", 100)), amqp.PublishOptions {})?
+        print("broker: {wait_note(stub)}")
+    })
+
+    with_stub("publisher confirms", new_stub(publish_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        let plain = amqp.publish(ch, "", "q", bytes("plain"), amqp.PublishOptions {})?
+        print("sequence outside confirm mode {plain}")
+        amqp.confirm_mode(ch)?
+        let a = amqp.publish(ch, "", "q", bytes("ack"), amqp.PublishOptions {})?
+        let b = amqp.publish(ch, "", "q", bytes("nack"), amqp.PublishOptions {})?
+        let d = amqp.publish(ch, "", "q", bytes("ack-through"), amqp.PublishOptions {})?
+        print("sequences {a} {b} {d}")
+        print("seq {a} acked {amqp.wait_confirm(ch, a, 3000)?}")
+        print("seq {b} acked {amqp.wait_confirm(ch, b, 3000)?}")
+        print("seq {d} acked {amqp.wait_confirm(ch, d, 3000)?}")
+        expect_failure("seq {a} again", fn() ! amqp.Error { amqp.wait_confirm(ch, a, 100)? })
+        expect_failure("seq 99", fn() ! amqp.Error { amqp.wait_confirm(ch, 99, 100)? })
+        amqp.publish_confirmed(ch, "", "q", bytes("ack"), amqp.PublishOptions {}, 3000)?
+        print("publish_confirmed acked")
+        amqp.publish_confirmed(ch, "", "q", bytes("nack"), amqp.PublishOptions {}, 3000) catch {
+            e => print("publish_confirmed nacked: {describe(e)}")
+        }
+        amqp.publish_confirmed(ch, "", "q", bytes("hold"), amqp.PublishOptions {}, 200) catch {
+            e => print("publish_confirmed unanswered: {describe(e)}")
+        }
+    })
+
+    with_stub("confirms resolved by multiple", new_stub(publish_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        amqp.confirm_mode(ch)?
+        for body in ["hold", "hold", "ack-through"] {
+            amqp.publish(ch, "", "q", bytes(body), amqp.PublishOptions {})?
+        }
+        print("all acked {amqp.wait_confirms(ch, 3000)?}")
+        for body in ["hold", "hold", "ack", "nack-through"] {
+            amqp.publish(ch, "", "q", bytes(body), amqp.PublishOptions {})?
+        }
+        print("all acked {amqp.wait_confirms(ch, 3000)?}")
+        print("nothing left {amqp.wait_confirms(ch, 3000)?}")
+    })
+
+    with_stub("a confirm pending when the connection ends", new_stub(publish_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        amqp.confirm_mode(ch)?
+        let seq = amqp.publish(ch, "", "q", bytes("hold"), amqp.PublishOptions {})?
+        amqp.close_connection(c)
+        expect_failure("wait_confirm after close", fn() ! amqp.Error { amqp.wait_confirm(ch, seq, 3000)? })
+    })
+
+    with_stub("mandatory publish returned", new_stub(publish_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        amqp.confirm_mode(ch)?
+        let props = amqp.Properties { content_type: "text/plain" }
+        amqp.publish_confirmed(ch, "ex", "nowhere", bytes("return"), amqp.PublishOptions { mandatory: true, properties: props }, 3000)?
+        var got: amqp.Return? = none
+        select {
+            r = <-ch.returns => {
+                got = r
+            }
+            after(3000) => {}
+        }
+        match got {
+            some(r) => print("returned {r.code} {r.text} {r.exchange}/{r.routing_key} {str(r.body)} type={r.properties.content_type} id={r.properties.message_id}")
+            none => print("no return")
+        }
+    })
+}
+
+fn consume_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            BasicConsume(queue, tag, no_local, no_ack, exclusive, arguments) => {
+                standard(s, r)?
+                note(s, "consume {queue} no_ack={no_ack} exclusive={exclusive} no_local={no_local}")
+                deliver_all(s, r.channel, tag)?
+            }
+            BasicGet(queue, no_ack) => {
+                answer_get(s, r.channel, queue, no_ack)?
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn answer_get(s: *Session, channel: i64, queue: str, no_ack: bool) ! io.Error {
+    s.deliveries += 1
+    if s.deliveries > 2 {
+        put_method(s, channel, amqp.Method.BasicGetEmpty)?
+        return
+    }
+    let left = 2 - s.deliveries
+    let props = amqp.Properties { content_type: "text/plain" }
+    put_message(s, channel, amqp.Method.BasicGetOk(40 + s.deliveries, s.deliveries == 2, "ex", queue, left), props, bytes("got {s.deliveries} no_ack={no_ack}"))?
+}
+
+fn deliver_all(s: *Session, channel: i64, tag: str) ! io.Error {
+    put_message(s, channel, amqp.Method.BasicDeliver("ghost", 90, false, "ex", "key"), amqp.Properties {}, bytes("nobody"))?
+    let props = amqp.Properties {
+        content_type: "text/plain"
+        delivery_mode: 2
+        headers: [amqp.Field { name: "n", value: amqp.Value.Int(7) }]
+        message_id: "m-1"
+    }
+    put_message(s, channel, amqp.Method.BasicDeliver(tag, 1, false, "ex", "key"), props, bytes("hello"))?
+    put_message(s, channel, amqp.Method.BasicDeliver(tag, 2, true, "ex", "key"), amqp.Properties {}, bytes(text.repeat("y", 9000)))?
+    put_message(s, channel, amqp.Method.BasicDeliver(tag, 3, false, "", "key"), amqp.Properties {}, [])?
+    put_message(s, channel, amqp.Method.BasicDeliver(tag, 4, false, "ex", "key"), amqp.Properties {}, bytes("four"))?
+    put_message(s, channel, amqp.Method.BasicDeliver(tag, 5, false, "ex", "key"), amqp.Properties {}, bytes("five"))?
+}
+
+fn show_delivery(d: amqp.Delivery) {
+    let p = d.properties
+    print("delivery {d.delivery_tag} redelivered={d.redelivered} {d.exchange}/{d.routing_key} {d.body.len} bytes consumer={d.consumer_tag.len > 0} type={p.content_type} mode={p.delivery_mode} id={p.message_id} headers={p.headers.len}")
+}
+
+fn next_delivery(cn: amqp.Consumer) -> amqp.Delivery? {
+    var got: amqp.Delivery? = none
+    select {
+        d = <-cn.deliveries => {
+            got = d
+        }
+        after(3000) => {}
+    }
+    got
+}
+
+fn cancel_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            BasicCancel(tag, no_wait) => {
+                put_message(s, r.channel, amqp.Method.BasicDeliver(tag, 7, false, "ex", "key"), amqp.Properties {}, bytes("late"))?
+                put_method(s, r.channel, amqp.Method.BasicCancelOk(tag))?
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn broker_cancel_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            BasicConsume(queue, tag, no_local, no_ack, exclusive, arguments) => {
+                standard(s, r)?
+                if tag == "t" {
+                    put_message(s, r.channel, amqp.Method.BasicDeliver(tag, 1, false, "ex", "key"), amqp.Properties {}, bytes("one"))?
+                    put_method(s, r.channel, amqp.Method.BasicCancel(tag, false))?
+                } else {
+                    put_method(s, r.channel, amqp.Method.BasicCancel(tag, true))?
+                }
+            }
+            BasicCancelOk(tag) => {
+                note(s, "cancel-ok {tag}")
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn consumer_close_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            BasicConsume(queue, tag, no_local, no_ack, exclusive, arguments) => {
+                standard(s, r)?
+                put_method(s, r.channel, amqp.Method.ChannelClose(406, "PRECONDITION_FAILED", 60, 20))?
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn flood_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            BasicConsume(queue, tag, no_local, no_ack, exclusive, arguments) => {
+                standard(s, r)?
+                for i in 0..8 {
+                    put_message(s, r.channel, amqp.Method.BasicDeliver(tag, i + 1, false, "ex", "key"), amqp.Properties {}, bytes("m{i}"))?
+                }
+                note(s, "sent eight deliveries")
+            }
+            BasicNack(tag, multiple, requeue) => {}
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn consume_scenarios() {
+    let small = new_stub(consume_script)
+    small.offer.frame_max = 4096
+    with_stub("consume, deliveries and settling", small, fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        let cn = amqp.consume(ch, "jobs", amqp.ConsumeOptions { tag: "worker", exclusive: true })?
+        print("consumer {cn.tag}")
+        print("broker: {wait_note(stub)}")
+        var all: amqp.Delivery[] = []
+        for i in 0..5 {
+            let d = next_delivery(cn) ?? panic("delivery {i} missing")
+            show_delivery(d)
+            all.push(d)
+        }
+        print("body 2 intact: {str(all[1].body) == text.repeat("y", 9000)}")
+        amqp.ack(all[0])?
+        amqp.nack(all[1], true)?
+        amqp.reject(all[2], false)?
+        amqp.ack_through(all[3])?
+        amqp.nack_through(all[4], false)?
+        amqp.reject(all[4], true)?
+        for i in 0..6 {
+            print("broker: {wait_note(stub)}")
+        }
+    })
+
+    with_stub("consume with a generated tag", new_stub(consume_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        let cn = amqp.consume(ch, "jobs", amqp.ConsumeOptions { no_ack: true })?
+        print("tag generated: {cn.tag.len > 0}")
+        print("broker: {wait_note(stub)}")
+        expect_failure("same tag twice", fn() ! amqp.Error { amqp.consume(ch, "jobs", amqp.ConsumeOptions { tag: cn.tag })? })
+    })
+
+    with_stub("basic.get", new_stub(consume_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        for i in 0..3 {
+            let got = amqp.get(ch, "jobs", i == 1)?
+            match got {
+                some(d) => print("get {d.delivery_tag} redelivered={d.redelivered} remaining={d.remaining} {d.exchange}/{d.routing_key} {str(d.body)}")
+                none => print("get: empty")
+            }
+        }
+    })
+
+    with_stub("cancel from the client", new_stub(cancel_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        let cn = amqp.consume(ch, "jobs", amqp.ConsumeOptions { tag: "t" })?
+        amqp.cancel(cn)?
+        print("broker: {wait_note(stub)}")
+        let late = next_delivery(cn)
+        print("deliveries closed: {late == none}")
+        amqp.cancel(cn)?
+        print("cancel twice ok")
+    })
+
+    with_stub("cancel from the broker", new_stub(broker_cancel_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        let cn = amqp.consume(ch, "jobs", amqp.ConsumeOptions { tag: "t" })?
+        let first = next_delivery(cn)
+        print("first delivery {first != none}")
+        let last = next_delivery(cn)
+        print("deliveries closed: {last == none}")
+        print("broker: {wait_note(stub)}")
+        amqp.cancel(cn)?
+        print("cancel after the broker's cancel ok")
+        let quiet = amqp.consume(ch, "jobs", amqp.ConsumeOptions { tag: "quiet" })?
+        let gone = next_delivery(quiet)
+        print("no_wait cancel closed deliveries: {gone == none}")
+    })
+
+    with_stub("channel.close ends consumers and returns", new_stub(consumer_close_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        let cn = amqp.consume(ch, "jobs", amqp.ConsumeOptions { tag: "t" })?
+        let last = next_delivery(cn)
+        print("deliveries closed: {last == none}")
+        var ended = false
+        select {
+            r = <-ch.returns => {
+                ended = true
+            }
+            after(3000) => {}
+        }
+        print("returns closed: {ended}")
+    })
+
+    with_stub("a slow consumer holds back the connection", new_stub(flood_script), fn(stub, o) {
+        var asked = o
+        asked.buffer = 2
+        asked.call_timeout = 300
+        using c = amqp.connect(asked)?
+        let ch = amqp.open_channel(c)?
+        let cn = amqp.consume(ch, "jobs", amqp.ConsumeOptions { tag: "t" })?
+        print("broker: {wait_note(stub)}")
+        sleep(100)
+        open_failure("open_channel while the consumer is full", c)
+        amqp.cancel(cn)?
+        let other = amqp.open_channel(c)?
+        print("open_channel after the cancel: ok")
+        print("cancelled while full")
+        amqp.close_channel(ch)?
+        print("closed while full")
+    })
+}
+
+fn after_open(frames: fn(*Session, i64) ! io.Error) -> fn(*Session) ! io.Error {
+    fn(s) {
+        for {
+            let r = read_request(s)?
+            standard(s, r)?
+            match r.method {
+                ChannelOpen => {
+                    frames(s, r.channel)?
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn broken_channel(name: str, frames: fn(*Session, i64) ! io.Error, limit: i64, wait: i64) {
+    with_stub(name, new_stub(after_open(frames)), fn(stub, o) {
+        var asked = o
+        if limit > 0 {
+            asked.max_message = limit
+        }
+        using c = amqp.connect(asked)?
+        let ch = amqp.open_channel(c)?
+        print("notice: {next_notice(c, wait)}")
+        expect_failure("declare", fn() ! amqp.Error { amqp.declare_queue(ch, "q", amqp.QueueOptions {})? })
+    })
+}
+
+fn broken_channels() {
+    let deliver = amqp.Method.BasicDeliver("t", 1, false, "ex", "key")
+    broken_channel("content header without a method", fn(s, ch) { put_raw(s, header_bytes(ch, 3, amqp.Properties {}))? }, 0, 3000)
+    broken_channel("content body without a method", fn(s, ch) { put_raw(s, amqp.encode_frame(amqp.Frame { kind: amqp.frame_body, channel: ch, payload: [1] }))? }, 0, 3000)
+    broken_channel("content body before the header", fn(s, ch) {
+        put_method(s, ch, deliver)?
+        put_raw(s, amqp.encode_frame(amqp.Frame { kind: amqp.frame_body, channel: ch, payload: [1] }))?
+    }, 0, 3000)
+    broken_channel("content header twice", fn(s, ch) {
+        put_method(s, ch, deliver)?
+        put_raw(s, header_bytes(ch, 3, amqp.Properties {}))?
+        put_raw(s, header_bytes(ch, 3, amqp.Properties {}))?
+    }, 0, 3000)
+    broken_channel("more body than the header declares", fn(s, ch) {
+        put_method(s, ch, deliver)?
+        put_raw(s, header_bytes(ch, 2, amqp.Properties {}))?
+        put_raw(s, amqp.encode_frame(amqp.Frame { kind: amqp.frame_body, channel: ch, payload: [1, 2, 3] }))?
+    }, 0, 3000)
+    broken_channel("a method in the middle of a message", fn(s, ch) {
+        put_method(s, ch, deliver)?
+        put_method(s, ch, deliver)?
+    }, 0, 3000)
+    broken_channel("message over max_message", fn(s, ch) {
+        put_method(s, ch, deliver)?
+        put_raw(s, header_bytes(ch, 101, amqp.Properties {}))?
+    }, 100, 3000)
+    broken_channel("undecodable content header", fn(s, ch) {
+        put_method(s, ch, deliver)?
+        put_raw(s, amqp.encode_frame(amqp.Frame { kind: amqp.frame_header, channel: ch, payload: [0, 60] }))?
+    }, 0, 3000)
+    broken_channel("frames for a channel that is not open", fn(s, ch) {
+        put_method(s, 9, deliver)?
+        put_raw(s, header_bytes(9, 0, amqp.Properties {}))?
+    }, 0, 200)
+}
+
+fn replies_script(s: *Session) ! io.Error {
+    for {
+        let r = read_request(s)?
+        match r.method {
+            ExchangeDeclare(exchange, kind, passive, durable, auto_delete, internal, arguments) => {
+                put_method(s, r.channel, amqp.Method.QueueBindOk)?
+            }
+            QueuePurge(queue) => {
+                put_method(s, r.channel, amqp.Method.QueuePurgeOk(12))?
+            }
+            QueueDelete(queue, if_unused, if_empty) => {
+                put_method(s, r.channel, amqp.Method.QueueDeleteOk(5))?
+            }
+            _ => {
+                standard(s, r)?
+            }
+        }
+    }
+}
+
+fn unexpected_replies() {
+    with_stub("replies", new_stub(replies_script), fn(stub, o) {
+        using c = amqp.connect(o)?
+        let ch = amqp.open_channel(c)?
+        amqp.declare_exchange(ch, "ex", "topic", amqp.ExchangeOptions {}) catch {
+            e => print("wrong reply: {describe(e)}")
+        }
+        print("purged {amqp.purge_queue(ch, "q")?}")
+        print("deleted {amqp.delete_queue(ch, "q", false, false)?}")
+    })
+}
+
+fn main() {
+    handshake_scenarios()
+    mechanism_scenarios()
+    handshake_failures()
+    garbage_handshakes()
+    connection_scenarios()
+    broken_connections()
+    tls_scenarios()
+    channel_scenarios()
+    publish_scenarios()
+    consume_scenarios()
+    broken_channels()
+    unexpected_replies()
+}

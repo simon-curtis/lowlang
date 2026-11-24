@@ -1,0 +1,540 @@
+import std/io
+import std/sync
+
+fn register_channel(l: *Link) -> *ChanState ! Error {
+    sync.lock(l.sgate)
+    defer sync.unlock(l.sgate)
+    if l.closed {
+        fail l.failure ?? Closed
+    }
+    var id = 1
+    for id <= l.channel_max {
+        if l.channels[id] == none {
+            let c = new(ChanState {
+                id
+                link: l
+                cgate: sync.mutex()
+                replies: chan[Reply](1)
+                consumers: [:]
+                confirms: [:]
+                next_seq: 0
+                confirming: false
+                pending: none
+                returns: chan[Return](16)
+                closed: false
+                ended: false
+                failure: none
+                active: true
+            })
+            l.channels[id] = c
+            return c
+        }
+        id += 1
+    }
+    fail Exhausted
+}
+
+/// Opens a channel on `c`, using the lowest free channel number.
+///
+/// Fails with `Exhausted` when every channel number up to the agreed limit is in use, `Timeout` when the broker does not answer within `Options.call_timeout`, and with the error that closed the connection when it is closed.
+pub fn open_channel(c: Connection) -> Channel ! Error {
+    let state = register_channel(c.link)?
+    let m = call(state, Method.ChannelOpen) catch {
+        e => {
+            expire_channel(c.link, state, e)
+            fail e
+        }
+    }
+    match m {
+        ChannelOpenOk => {}
+        _ => {
+            expire_channel(c.link, state, Protocol)
+            fail Protocol
+        }
+    }
+    Channel { id: state.id, returns: state.returns, state }
+}
+
+fn channel_error(c: *ChanState) -> Error {
+    sync.lock(c.link.sgate)
+    let cause = c.failure ?? Closed
+    sync.unlock(c.link.sgate)
+    cause
+}
+
+fn check_open(c: *ChanState) ! Error {
+    sync.lock(c.link.sgate)
+    let closed = c.closed
+    let cause = c.failure ?? Closed
+    sync.unlock(c.link.sgate)
+    if closed {
+        fail cause
+    }
+}
+
+fn send_method(c: *ChanState, m: Method) ! Error {
+    check_open(c)?
+    send(c.link, method_frame(c.id, m)?)?
+}
+
+fn await_reply(c: *ChanState) -> Reply ! Error {
+    var got: Reply? = none
+    var expired = false
+    if c.link.call_timeout > 0 {
+        select {
+            r = <-c.replies => {
+                got = r
+            }
+            after(c.link.call_timeout) => {
+                expired = true
+            }
+        }
+    } else {
+        got = <-c.replies
+    }
+    if expired {
+        expire_channel(c.link, c, Timeout)
+        fail Timeout
+    }
+    match got {
+        some(r) => r
+        none => fail channel_error(c)
+    }
+}
+
+fn call_reply(c: *ChanState, m: Method) -> Reply ! Error {
+    sync.lock(c.cgate)
+    defer sync.unlock(c.cgate)
+    send_method(c, m)?
+    await_reply(c)?
+}
+
+fn call(c: *ChanState, m: Method) -> Method ! Error {
+    let r = call_reply(c, m)?
+    match r {
+        Answer(answer) => answer
+        Got(d) => fail Protocol
+    }
+}
+
+fn call_empty(c: *ChanState, m: Method, expected: Method) ! Error {
+    let answer = call(c, m)?
+    if !same_method(answer, expected) {
+        fail Protocol
+    }
+}
+
+fn same_method(a: Method, b: Method) -> bool {
+    let left = encode_method(a) catch {
+        e => return false
+    }
+    let right = encode_method(b) catch {
+        e => return false
+    }
+    str(left) == str(right)
+}
+
+/// Closes the channel.
+///
+/// Sends `channel.close` and waits for the broker's answer. Messages not yet acknowledged on the channel return to their queues, the `deliveries` channel of each of its consumers and its `returns` are closed, and later calls on it fail with `Closed`. Closing a channel that is already closed does nothing.
+pub fn close_channel(ch: Channel) ! Error {
+    let c = ch.state
+    check_open(c) catch {
+        e => return
+    }
+    for cs in consumers_of(c) {
+        stop_consumer(c, cs)
+    }
+    call(c, Method.ChannelClose(200, "", 0, 0)) catch {
+        Closed => return
+        ChannelClosed(code, text) => return
+        e => fail e
+    }
+}
+
+fn consumers_of(c: *ChanState) -> *ConsumerState[] {
+    sync.lock(c.link.sgate)
+    var out: *ConsumerState[] = []
+    for tag, cs in c.consumers {
+        out.push(cs)
+    }
+    sync.unlock(c.link.sgate)
+    out
+}
+
+/// Sets the prefetch limit of the channel, or of every consumer on it.
+///
+/// The broker sends a consumer no more than `prefetch_count` unacknowledged messages, or `prefetch_size` bytes of them, `0` for no limit. With `global` the limits apply to the whole channel, as RabbitMQ defines it, and otherwise to each consumer started afterwards on it.
+pub fn qos(ch: Channel, prefetch_count: i64, prefetch_size: i64, global: bool) ! Error {
+    if prefetch_count < 0 || prefetch_count > 65535 || prefetch_size < 0 {
+        fail Argument
+    }
+    call_empty(ch.state, Method.BasicQos(prefetch_size, prefetch_count, global), Method.BasicQosOk)?
+}
+
+/// Declares an exchange named `name` of type `kind`, such as `"direct"`, `"fanout"`, `"topic"` or `"headers"`.
+///
+/// Fails with `ChannelClosed` when the broker refuses, such as code `406` for an exchange that exists with other settings, which closes the channel.
+pub fn declare_exchange(ch: Channel, name: str, kind: str, o: ExchangeOptions) ! Error {
+    call_empty(ch.state, Method.ExchangeDeclare(name, kind, o.passive, o.durable, o.auto_delete, o.internal, o.arguments), Method.ExchangeDeclareOk)?
+}
+
+/// Deletes the exchange `name`. With `if_unused` the broker refuses while the exchange has bindings.
+pub fn delete_exchange(ch: Channel, name: str, if_unused: bool) ! Error {
+    call_empty(ch.state, Method.ExchangeDelete(name, if_unused), Method.ExchangeDeleteOk)?
+}
+
+/// Binds the exchange `destination` to the exchange `source`, so messages published to `source` with `routing_key` also reach `destination`. This is a RabbitMQ extension.
+pub fn bind_exchange(ch: Channel, destination: str, source: str, routing_key: str, arguments: Field[]) ! Error {
+    call_empty(ch.state, Method.ExchangeBind(destination, source, routing_key, arguments), Method.ExchangeBindOk)?
+}
+
+/// Removes the binding that `bind_exchange` made.
+pub fn unbind_exchange(ch: Channel, destination: str, source: str, routing_key: str, arguments: Field[]) ! Error {
+    call_empty(ch.state, Method.ExchangeUnbind(destination, source, routing_key, arguments), Method.ExchangeUnbindOk)?
+}
+
+/// Declares the queue `name`, or with an empty `name` a queue the broker names, and returns its name and its message and consumer counts.
+///
+/// Fails with `ChannelClosed` when the broker refuses, such as code `405` for an exclusive queue of another connection or `406` for a queue that exists with other settings, which closes the channel.
+pub fn declare_queue(ch: Channel, name: str, o: QueueOptions) -> QueueInfo ! Error {
+    let answer = call(ch.state, Method.QueueDeclare(name, o.passive, o.durable, o.exclusive, o.auto_delete, o.arguments))?
+    match answer {
+        QueueDeclareOk(queue, messages, consumers) => QueueInfo { name: queue, messages, consumers }
+        _ => fail Protocol
+    }
+}
+
+/// Binds `queue` to `exchange` with `routing_key`, and `arguments` for a headers exchange.
+pub fn bind_queue(ch: Channel, queue: str, exchange: str, routing_key: str, arguments: Field[]) ! Error {
+    call_empty(ch.state, Method.QueueBind(queue, exchange, routing_key, arguments), Method.QueueBindOk)?
+}
+
+/// Removes the binding of `queue` to `exchange` with `routing_key`.
+pub fn unbind_queue(ch: Channel, queue: str, exchange: str, routing_key: str, arguments: Field[]) ! Error {
+    call_empty(ch.state, Method.QueueUnbind(queue, exchange, routing_key, arguments), Method.QueueUnbindOk)?
+}
+
+/// Removes every ready message from `queue` and returns how many there were.
+pub fn purge_queue(ch: Channel, queue: str) -> i64 ! Error {
+    let answer = call(ch.state, Method.QueuePurge(queue))?
+    match answer {
+        QueuePurgeOk(messages) => messages
+        _ => fail Protocol
+    }
+}
+
+/// Deletes `queue` and returns how many messages it held. With `if_unused` the broker refuses while the queue has consumers, and with `if_empty` while it has messages.
+pub fn delete_queue(ch: Channel, queue: str, if_unused: bool, if_empty: bool) -> i64 ! Error {
+    let answer = call(ch.state, Method.QueueDelete(queue, if_unused, if_empty))?
+    match answer {
+        QueueDeleteOk(messages) => messages
+        _ => fail Protocol
+    }
+}
+
+fn body_frames(channel: i64, body: u8[], step: i64) -> u8[] {
+    var out: u8[] = []
+    var at = 0
+    for at < body.len {
+        let end = if at + step < body.len { at + step } else { body.len }
+        io.append(mut out, encode_frame(Frame { kind: frame_body, channel, payload: body[at..end] }))
+        at = end
+    }
+    out
+}
+
+fn publish_bytes(l: *Link, channel: i64, exchange: str, key: str, body: u8[], o: PublishOptions) -> u8[] ! Error {
+    if body.len > l.max_message {
+        fail TooLarge
+    }
+    var out = method_frame(channel, Method.BasicPublish(exchange, key, o.mandatory, o.immediate))?
+    let header = encode_header(class_basic, body.len, o.properties)?
+    io.append(mut out, encode_frame(Frame { kind: frame_header, channel, payload: header }))
+    io.append(mut out, body_frames(channel, body, l.frame_max - 8))
+    out
+}
+
+fn register_confirm(c: *ChanState) -> i64 ! Error {
+    sync.lock(c.link.sgate)
+    defer sync.unlock(c.link.sgate)
+    if c.closed {
+        fail c.failure ?? Closed
+    }
+    c.next_seq += 1
+    c.confirms[c.next_seq] = new(Confirm { done: chan[bool](1), resolved: false })
+    c.next_seq
+}
+
+fn confirming(c: *ChanState) -> bool {
+    sync.lock(c.link.sgate)
+    let on = c.confirming
+    sync.unlock(c.link.sgate)
+    on
+}
+
+/// Publishes `body` to `exchange` with `routing_key`, and returns the sequence number that `wait_confirm` takes.
+///
+/// The message is written to the connection before the call returns, which does not mean the broker has taken it. On a channel in confirm mode (`confirm_mode`) the number counts the channel's publishes from `1`, the broker answers each with an acknowledgement or a negative one, and the outcome stays on the channel until `wait_confirm` claims it, so a publisher that never waits uses `publish_confirmed` or publishes on a channel that is not in confirm mode, where the number is `0`. The body is split into frames of the agreed size. Fails with `TooLarge` when the body is over `Options.max_message`, `Argument` for a property out of range, `ChannelClosed` or `Closed` when the channel is closed, and with `Timeout` or `Closed` when the write fails, which also closes the connection. A publish the broker cannot route is dropped without an error unless `o.mandatory` is set, which returns it on `Channel.returns`; one to an exchange that does not exist closes the channel with `ChannelClosed` code `404`, seen by the next call.
+pub fn publish(ch: Channel, exchange: str, routing_key: str, body: u8[], o: PublishOptions) -> i64 ! Error {
+    let c = ch.state
+    let l = c.link
+    let wire = publish_bytes(l, c.id, exchange, routing_key, body, o)?
+    sync.lock(l.wgate)
+    defer sync.unlock(l.wgate)
+    check_open(c)?
+    var seq = 0
+    if confirming(c) {
+        seq = register_confirm(c)?
+    }
+    write_frame(l, wire)?
+    seq
+}
+
+/// Puts the channel in publisher confirm mode, in which the broker answers each publish with an acknowledgement or a negative one. See `publish` and `wait_confirm`.
+pub fn confirm_mode(ch: Channel) ! Error {
+    let c = ch.state
+    call_empty(c, Method.ConfirmSelect, Method.ConfirmSelectOk)?
+    sync.lock(c.link.sgate)
+    c.confirming = true
+    sync.unlock(c.link.sgate)
+}
+
+fn confirm_of(c: *ChanState, seq: i64) -> *Confirm ! Error {
+    sync.lock(c.link.sgate)
+    let found = c.confirms[seq]
+    sync.unlock(c.link.sgate)
+    found ?? fail Argument
+}
+
+fn forget_confirm(c: *ChanState, seq: i64) {
+    sync.lock(c.link.sgate)
+    c.confirms.delete(seq)
+    sync.unlock(c.link.sgate)
+}
+
+fn await_confirm(c: *ChanState, cf: *Confirm, timeout: i64) -> bool ! Error {
+    var got: bool? = none
+    var expired = false
+    if timeout > 0 {
+        select {
+            v = <-cf.done => {
+                got = v
+            }
+            after(timeout) => {
+                expired = true
+            }
+        }
+    } else {
+        got = <-cf.done
+    }
+    if expired {
+        fail Timeout
+    }
+    match got {
+        some(acked) => acked
+        none => fail channel_error(c)
+    }
+}
+
+/// Waits for the broker's answer to the publish numbered `seq` and returns whether it acknowledged it.
+///
+/// `timeout` is in milliseconds, and `0` or less waits indefinitely. A `false` means the broker sent `basic.nack`: it could not take the message. The outcome is claimed by the call, so a second call for the same number fails with `Argument`, as does a number that was never issued or the call on a channel that is not in confirm mode. Fails with `Timeout` when no answer arrives in time, in which case the outcome stays claimable, and with the error that closed the channel when it ends first.
+pub fn wait_confirm(ch: Channel, seq: i64, timeout: i64) -> bool ! Error {
+    let c = ch.state
+    let cf = confirm_of(c, seq)?
+    let acked = await_confirm(c, cf, timeout)?
+    forget_confirm(c, seq)
+    acked
+}
+
+/// Waits for the broker's answer to every publish whose outcome has not been claimed, and returns whether all were acknowledged.
+///
+/// `timeout` applies to each wait, as for `wait_confirm`. Every outcome it waited for is claimed.
+pub fn wait_confirms(ch: Channel, timeout: i64) -> bool ! Error {
+    let c = ch.state
+    sync.lock(c.link.sgate)
+    var seqs: i64[] = []
+    for seq, cf in c.confirms {
+        seqs.push(seq)
+    }
+    sync.unlock(c.link.sgate)
+    var all = true
+    for seq in seqs {
+        let acked = wait_confirm(ch, seq, timeout)?
+        if !acked {
+            all = false
+        }
+    }
+    all
+}
+
+/// Publishes as `publish` does and waits up to `timeout` milliseconds for the broker's answer.
+///
+/// Fails with `Argument` when the channel is not in confirm mode, `Nacked` when the broker sends `basic.nack`, `Timeout` when no answer arrives in time, and as `publish` does.
+pub fn publish_confirmed(ch: Channel, exchange: str, routing_key: str, body: u8[], o: PublishOptions, timeout: i64) ! Error {
+    let seq = publish(ch, exchange, routing_key, body, o)?
+    if seq == 0 {
+        fail Argument
+    }
+    let acked = wait_confirm(ch, seq, timeout)?
+    if !acked {
+        fail Nacked
+    }
+}
+
+fn generated_tag(o: ConsumeOptions) -> str {
+    if o.tag.len > 0 {
+        return o.tag
+    }
+    random_tag()
+}
+
+fn enlist(c: *ChanState, cs: *ConsumerState) ! Error {
+    sync.lock(c.link.sgate)
+    defer sync.unlock(c.link.sgate)
+    if c.closed {
+        fail c.failure ?? Closed
+    }
+    if c.consumers[cs.tag] != none {
+        fail Argument
+    }
+    c.consumers[cs.tag] = cs
+}
+
+/// Starts a consumer of `queue` and returns it.
+///
+/// The broker may deliver as soon as the call returns. Unless `o.no_ack` is set each message must be settled with `ack`, `nack` or `reject`; set `qos` first to bound how many are unsettled at once. Fails with `Argument` when `o.tag` is already a consumer of the channel, `ChannelClosed` code `404` when the queue does not exist, and `Closed` when the channel is closed.
+///
+/// ```low
+/// import std/amqp
+///
+/// fn print_orders(ch: amqp.Channel) ! amqp.Error {
+///     let consumer = amqp.consume(ch, "orders", amqp.ConsumeOptions {})?
+///     for {
+///         let d = <-consumer.deliveries ?? break
+///         print("{d.routing_key}: {str(d.body)}")
+///         amqp.ack(d)?
+///     }
+/// }
+/// ```
+pub fn consume(ch: Channel, queue: str, o: ConsumeOptions) -> Consumer ! Error {
+    let c = ch.state
+    let tag = generated_tag(o)
+    let cs = new(ConsumerState { tag, no_ack: o.no_ack, cancelling: false, quit: chan[bool](), deliveries: chan[Delivery](c.link.buffer) })
+    enlist(c, cs)?
+    let answer = call(c, Method.BasicConsume(queue, tag, o.no_local, o.no_ack, o.exclusive, o.arguments)) catch {
+        e => {
+            drop_consumer(c, tag)
+            fail e
+        }
+    }
+    match answer {
+        BasicConsumeOk(confirmed) => {
+            if confirmed != tag {
+                drop_consumer(c, tag)
+                fail Protocol
+            }
+        }
+        _ => {
+            drop_consumer(c, tag)
+            fail Protocol
+        }
+    }
+    Consumer { tag, deliveries: cs.deliveries, channel: c, state: cs }
+}
+
+/// Ends the consumer.
+///
+/// Sends `basic.cancel` and closes `deliveries` when the broker answers. Messages the broker sent meanwhile that were not yet in the channel are returned to their queue unless the consumer has `no_ack`, in which case they are lost. Cancelling a consumer that has ended does nothing. Fails with `Timeout` and the errors that close the channel.
+pub fn cancel(cn: Consumer) ! Error {
+    let c = cn.channel
+    sync.lock(c.link.sgate)
+    let live = c.consumers[cn.tag] != none
+    sync.unlock(c.link.sgate)
+    if !live {
+        return
+    }
+    stop_consumer(c, cn.state)
+    let answer = call(c, Method.BasicCancel(cn.tag, false)) catch {
+        e => {
+            match channel_error(c) {
+                Closed => return
+                _ => fail e
+            }
+        }
+    }
+    match answer {
+        BasicCancelOk(tag) => {}
+        _ => fail Protocol
+    }
+}
+
+/// Fetches one message from `queue` with `basic.get`, or returns `none` when the queue is empty.
+///
+/// With `no_ack` the broker counts the message settled when it sends it; otherwise settle it with `ack`, `nack` or `reject`. `Delivery.remaining` is the number of messages left. Polling with `get` is slower than a consumer.
+pub fn get(ch: Channel, queue: str, no_ack: bool) -> Delivery? ! Error {
+    let r = call_reply(ch.state, Method.BasicGet(queue, no_ack))?
+    match r {
+        Got(d) => some(d)
+        Answer(m) => match m {
+            BasicGetEmpty => none
+            _ => fail Protocol
+        }
+    }
+}
+
+/// Acknowledges the delivery `d`.
+///
+/// The call returns when the frame is written. Fails with the error that closed the channel.
+pub fn ack(d: Delivery) ! Error {
+    send_method(d.channel, Method.BasicAck(d.delivery_tag, false))?
+}
+
+/// Acknowledges the delivery `d` and every earlier unacknowledged delivery on its channel.
+pub fn ack_through(d: Delivery) ! Error {
+    send_method(d.channel, Method.BasicAck(d.delivery_tag, true))?
+}
+
+/// Refuses the delivery `d`. With `requeue` the broker puts it back on its queue, and otherwise drops it or dead-letters it.
+pub fn nack(d: Delivery, requeue: bool) ! Error {
+    send_method(d.channel, Method.BasicNack(d.delivery_tag, false, requeue))?
+}
+
+/// Refuses the delivery `d` and every earlier unacknowledged delivery on its channel, as `nack` does.
+pub fn nack_through(d: Delivery, requeue: bool) ! Error {
+    send_method(d.channel, Method.BasicNack(d.delivery_tag, true, requeue))?
+}
+
+/// Refuses the delivery `d` with `basic.reject`, which the AMQP specification defines and RabbitMQ treats as `nack` for one message.
+pub fn reject(d: Delivery, requeue: bool) ! Error {
+    send_method(d.channel, Method.BasicReject(d.delivery_tag, requeue))?
+}
+
+/// Asks the broker to redeliver every unacknowledged message of the channel. With `requeue` the broker may deliver them to another consumer, and otherwise to the same one.
+pub fn recover(ch: Channel, requeue: bool) ! Error {
+    call_empty(ch.state, Method.BasicRecover(requeue), Method.BasicRecoverOk)?
+}
+
+/// Puts the channel in transaction mode: publishes and acknowledgements take effect at `commit` and are undone by `rollback`.
+pub fn tx_select(ch: Channel) ! Error {
+    call_empty(ch.state, Method.TxSelect, Method.TxSelectOk)?
+}
+
+/// Commits the transaction of the channel.
+pub fn tx_commit(ch: Channel) ! Error {
+    call_empty(ch.state, Method.TxCommit, Method.TxCommitOk)?
+}
+
+/// Rolls back the transaction of the channel.
+pub fn tx_rollback(ch: Channel) ! Error {
+    call_empty(ch.state, Method.TxRollback, Method.TxRollbackOk)?
+}
+
+/// Returns whether the broker has the channel flowing: `false` between a `channel.flow` that pauses it and the one that resumes it.
+pub fn flowing(ch: Channel) -> bool {
+    sync.lock(ch.state.link.sgate)
+    let on = ch.state.active
+    sync.unlock(ch.state.link.sgate)
+    on
+}
