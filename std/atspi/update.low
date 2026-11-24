@@ -1,0 +1,212 @@
+import std/dbus
+import std/sync
+
+const object_events = "org.a11y.atspi.Event.Object"
+const focus_events = "org.a11y.atspi.Event.Focus"
+const window_events = "org.a11y.atspi.Event.Window"
+
+struct Event {
+    path: str
+    interface: str
+    member: str
+    detail: str
+    first: i64
+    second: i64
+    payload: dbus.Value
+}
+
+fn export_application(st: *State) ! dbus.Error {
+    dbus.export(st.service, root_path, accessible_spec(st, Target.Root))?
+    dbus.export(st.service, root_path, application_spec(st))?
+    dbus.export(st.service, window_path, accessible_spec(st, Target.Window))?
+    dbus.export(st.service, window_path, component_spec(st, Target.Window))?
+}
+
+fn export_element(st: *State, key: str, path: str, n: Node) ! dbus.Error {
+    let t = Target.Element(key)
+    dbus.export(st.service, path, accessible_spec(st, t))?
+    dbus.export(st.service, path, component_spec(st, t))?
+    if n.actionable {
+        dbus.export(st.service, path, action_spec(st, t))?
+    }
+    if n.text != none {
+        dbus.export(st.service, path, text_spec(st, t))?
+    }
+}
+
+fn zero_payload() -> dbus.Value {
+    dbus.Value.Int32(0)
+}
+
+fn state_event(path: str, name: str, on: bool) -> Event {
+    Event { path, interface: object_events, member: "StateChanged", detail: name, first: if on { 1 } else { 0 }, second: 0, payload: zero_payload() }
+}
+
+fn event_message(e: Event) -> dbus.Message {
+    dbus.signal(e.path, e.interface, e.member, [
+        dbus.Value.String(e.detail),
+        dbus.Value.Int32(i32(e.first)),
+        dbus.Value.Int32(i32(e.second)),
+        dbus.variant(e.payload),
+        dbus.Value.Array("{{sv}}", []),
+    ])
+}
+
+fn keyed(nodes: Node[]) -> [str: i64] {
+    var found: [str: i64] = [:]
+    for i, n in nodes {
+        found[n.key] = i
+    }
+    found
+}
+
+fn unique(nodes: Node[]) -> Node[] {
+    var seen: [str: bool] = [:]
+    var kept: Node[] = []
+    for n in nodes {
+        if seen[n.key] == none {
+            seen[n.key] = true
+            kept.push(n)
+        }
+    }
+    kept
+}
+
+fn same_nodes(a: Node[], b: Node[]) -> bool {
+    for i, n in a {
+        if n != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn node_events(path: str, before: Node?, n: Node) -> Event[] {
+    var events: Event[] = []
+    let was_visible = match before {
+        some(b) => b.visible
+        none => false
+    }
+    let was_focused = match before {
+        some(b) => b.focused
+        none => false
+    }
+    let was_named = match before {
+        some(b) => b.name
+        none => ""
+    }
+    if n.visible != was_visible {
+        events.push(state_event(path, "showing", n.visible))
+        events.push(state_event(path, "visible", n.visible))
+    }
+    if n.focused != was_focused {
+        events.push(state_event(path, "focused", n.focused))
+        if n.focused {
+            events.push(Event { path, interface: focus_events, member: "Focus", detail: "", first: 0, second: 0, payload: zero_payload() })
+        }
+    }
+    if before != none && n.name != was_named {
+        events.push(Event { path, interface: object_events, member: "PropertyChange", detail: "accessible-name", first: 0, second: 0, payload: dbus.Value.String(n.name) })
+    }
+    events
+}
+
+fn window_events_for(title: str, active: bool, was_title: str, was_active: bool) -> Event[] {
+    var events: Event[] = []
+    if active != was_active {
+        events.push(state_event(window_path, "active", active))
+        events.push(Event {
+            path: window_path,
+            interface: window_events,
+            member: if active { "Activate" } else { "Deactivate" },
+            detail: "",
+            first: 0,
+            second: 0,
+            payload: zero_payload(),
+        })
+    }
+    if title != was_title {
+        events.push(Event { path: window_path, interface: object_events, member: "PropertyChange", detail: "accessible-name", first: 0, second: 0, payload: dbus.Value.String(title) })
+    }
+    events
+}
+
+fn children_event(st: *State, detail: str, index: i64, path: str) -> Event {
+    Event { path: window_path, interface: object_events, member: "ChildrenChanged", detail, first: index, second: 0, payload: reference(st, path) }
+}
+
+/// Replaces the exported tree with the window `title`, whether it is `active`, and `nodes`, in reading order.
+///
+/// Objects appear for keys that are new and go away for keys that are not listed. The signals an assistive technology follows go out as the tree changes: `ChildrenChanged` on the window, `StateChanged` for `focused`, `showing`, `visible` and `active`, `Focus` for an element that gains the keyboard focus, `Activate` and `Deactivate` for the window, and `PropertyChange` for a new name. A later node with the key of an earlier one is dropped. Fails as `dbus.export` and `dbus.send_on` do.
+pub fn update(b: Bridge, title: str, active: bool, nodes: Node[]) ! dbus.Error {
+    let st = b.state
+    let next = unique(nodes)
+    sync.lock(st.lock)
+    let unchanged = st.nodes.len == next.len && title == st.title && active == st.active && same_nodes(st.nodes, next)
+    sync.unlock(st.lock)
+    if unchanged {
+        return
+    }
+    var events: Event[] = []
+    var removed: Node[] = []
+    sync.lock(st.lock)
+    let before = st.nodes
+    let was_title = st.title
+    let was_active = st.active
+    let old_index = keyed(before)
+    let new_index = keyed(next)
+    for n in next {
+        if st.numbers[n.key] == none {
+            st.numbers[n.key] = st.next_number
+            st.next_number += 1
+        }
+    }
+    st.nodes = next
+    st.title = title
+    st.active = active
+    for n in before {
+        if new_index[n.key] == none {
+            removed.push(n)
+        }
+    }
+    sync.unlock(st.lock)
+    var paths: [str: str] = [:]
+    for n in next {
+        paths[n.key] = path_of(st, n.key)
+    }
+    for i, n in next {
+        let path = paths[n.key] ?? ""
+        match old_index[n.key] {
+            some(at) => {
+                let old = before[at]
+                if old.actionable != n.actionable || (old.text != none) != (n.text != none) {
+                    dbus.unexport(st.service, path)
+                    export_element(st, n.key, path, n)?
+                }
+                for e in node_events(path, some(old), n) {
+                    events.push(e)
+                }
+            }
+            none => {
+                export_element(st, n.key, path, n)?
+                events.push(children_event(st, "add", i, path))
+                for e in node_events(path, none, n) {
+                    events.push(e)
+                }
+            }
+        }
+    }
+    for n in removed {
+        let path = path_of(st, n.key)
+        events.push(children_event(st, "remove", old_index[n.key] ?? 0, path))
+    }
+    for e in window_events_for(title, active, was_title, was_active) {
+        events.push(e)
+    }
+    for n in removed {
+        dbus.unexport(st.service, path_of(st, n.key))
+    }
+    for e in events {
+        dbus.send_on(st.handle, event_message(e))?
+    }
+}
