@@ -91,9 +91,17 @@ fn serve_connection(h: net.ConnHandle, secure: tls.Config?, behaviour: Behaviour
         })
         none => net.stream_on(h)
     }
-    let a = new(Allocation { events: chan[Happening](256), out: chan[u8[]](256), key: stun.long_term_key("alice", realm, "secret"), relay: none, permissions: [], channels: [:], first: true, behaviour })
+    let a = allocation(behaviour)
     spawn write_split(stream, a.out, closed)
     spawn read_client(stream, a.events)
+    serve(a)
+}
+
+fn allocation(behaviour: Behaviour) -> *Allocation {
+    new(Allocation { events: chan[Happening](256), out: chan[u8[]](256), key: stun.long_term_key("alice", realm, "secret"), relay: none, permissions: [], channels: [:], first: true, behaviour })
+}
+
+fn serve(a: *Allocation) {
     for {
         let happening = (<-a.events) ?? break
         match happening {
@@ -107,6 +115,41 @@ fn serve_connection(h: net.ConnHandle, secure: tls.Config?, behaviour: Behaviour
         none => {}
     }
     close(a.out)
+}
+
+fn start_udp_server() -> net.SocketHandle {
+    using var socket = net.bind_udp("127.0.0.1", 0) or panic("bind the server")
+    let h = net.detach_socket(mut socket)
+    spawn serve_datagrams(h)
+    h
+}
+
+fn serve_datagrams(h: net.SocketHandle) {
+    var clients: [str: *Allocation] = [:]
+    let buf = io.buffer(65536)
+    for {
+        let packet = net.receive_from_on(h, buf) or return
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        let key = net.format(packet.from)
+        let a = clients[key] ?? {
+            let fresh = allocation(Behaviour {})
+            clients[key] = fresh
+            spawn write_datagrams(h, packet.from, fresh.out)
+            spawn serve(fresh)
+            fresh
+        }
+        a.events <- Happening.FromClient(data)
+    }
+}
+
+fn write_datagrams(h: net.SocketHandle, to: net.Addr, out: chan[u8[]]) {
+    for {
+        let m = (<-out) ?? break
+        if m.len > 0 {
+            net.send_to_on(h, m, to) or 0
+        }
+    }
 }
 
 fn read_client(stream: io.Stream, events: chan[Happening]) {
@@ -320,7 +363,9 @@ fn exchange_through(t: *testing.T, a: Handle, b: Handle) {
 }
 
 /// Connects an agent with `relay_only` through `server` to an agent with host candidates, sends data both ways over the relayed pair and checks the agent gathered one candidate.
-fn connect_through(t: *testing.T, server: turn.Config, settings: tls.Config) {
+///
+/// With `restarting`, the relay-only agent then restarts ICE and gathers again, data flows both ways over the old pair before the new credentials reach it, and once both sides select the new pair it uses the same relayed address and still carries data.
+fn connect_through(t: *testing.T, server: turn.Config, settings: tls.Config, restarting: bool) {
     using a = open(Options { config: ice.Config { controlling: true, turn_servers: [server], relay_only: true }, bind: ["127.0.0.1"], tls: settings }) or panic("open a")
     using b = open(Options { config: ice.Config { controlling: false }, bind: ["127.0.0.1"] }) or panic("open b")
     let ca = credentials(a.handle) or panic("credentials")
@@ -338,6 +383,25 @@ fn connect_through(t: *testing.T, server: turn.Config, settings: tls.Config) {
         return
     }
     exchange_through(t, a.handle, b.handle)
+    if restarting {
+        let before = (selected(a.handle) or panic("selected")) ?? panic("none")
+        let fresh = restart(a.handle) or panic("restart")
+        set_remote_credentials(b.handle, fresh.ufrag, fresh.pwd) or panic("set")
+        gather(a.handle) or panic("gather again")
+        pause(300)
+        exchange_through(t, a.handle, b.handle)
+        set_remote_credentials(a.handle, cb.ufrag, cb.pwd) or panic("set")
+        for c in candidates(b.handle) or [] {
+            add_remote_candidate(a.handle, c) or panic("add")
+        }
+        if !waited(a_selected, 15000) || !waited(b_selected, 15000) {
+            testing.fatal(t, "no pair selected after the restart")
+            return
+        }
+        exchange_through(t, a.handle, b.handle)
+        let after = (selected(a.handle) or panic("selected")) ?? panic("none")
+        testing.error_if(t, net.format(after.local.addr) != net.format(before.local.addr), "the restart moved the relayed address to {net.format(after.local.addr)}")
+    }
     let gathered = (candidates(a.handle) or []).len
     testing.error_if(t, gathered != 1, "{gathered} local candidates")
 }
@@ -371,7 +435,7 @@ fn stream_server(s: Server, transport: turn.Transport, name: str) -> turn.Config
 fn test_a_relay_only_agent_connects_through_a_tcp_server(t: *testing.T) {
     let s = start_server(none, Behaviour {})
     defer net.close_listener_on(s.listener)
-    connect_through(t, stream_server(s, turn.Transport.Tcp, ""), tls.Config {})
+    connect_through(t, stream_server(s, turn.Transport.Tcp, ""), tls.Config {}, false)
 }
 
 fn test_a_relay_only_agent_connects_through_a_tls_server_named_by_ip_or_host(t: *testing.T) {
@@ -379,8 +443,21 @@ fn test_a_relay_only_agent_connects_through_a_tls_server_named_by_ip_or_host(t: 
     let s = start_server(certificate, Behaviour {})
     defer net.close_listener_on(s.listener)
     let trusting = tls.Config { roots: [root_of(certificate)] }
-    connect_through(t, stream_server(s, turn.Transport.Tls, ""), trusting)
-    connect_through(t, stream_server(s, turn.Transport.Tls, "turn.test"), trusting)
+    connect_through(t, stream_server(s, turn.Transport.Tls, ""), trusting, false)
+    connect_through(t, stream_server(s, turn.Transport.Tls, "turn.test"), trusting, false)
+}
+
+fn test_a_relayed_pair_carries_data_through_an_ice_restart_over_udp_tcp_and_tls(t: *testing.T) {
+    let datagrams = start_udp_server()
+    defer net.close_socket_on(datagrams)
+    connect_through(t, turn.Config { server: datagrams.addr, username: "alice", password: "secret" }, tls.Config {}, true)
+    let plain = start_server(none, Behaviour {})
+    defer net.close_listener_on(plain.listener)
+    connect_through(t, stream_server(plain, turn.Transport.Tcp, ""), tls.Config {}, true)
+    let certificate = identity(["turn.test"], [[127, 0, 0, 1]])
+    let secure = start_server(certificate, Behaviour {})
+    defer net.close_listener_on(secure.listener)
+    connect_through(t, stream_server(secure, turn.Transport.Tls, "turn.test"), tls.Config { roots: [root_of(certificate)] }, true)
 }
 
 fn test_a_tls_server_with_the_wrong_name_or_an_untrusted_certificate_gives_no_candidate(t: *testing.T) {
