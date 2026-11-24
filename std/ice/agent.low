@@ -1,0 +1,1230 @@
+import std/crypto
+import std/crypto/hash
+import std/io
+import std/net
+import std/rand
+import std/stun
+
+/// The connection state of an agent (RFC 8445 and the W3C ICE connection states).
+pub enum State {
+    /// No remote credentials have arrived.
+    New = 0
+    /// Connectivity checks are running and no pair is valid.
+    Checking = 1
+    /// A pair is valid and none is nominated yet.
+    Connected = 2
+    /// A pair is nominated and the agent is using it.
+    Completed = 3
+    /// The consent of the remote peer has gone stale but not for as long as `consent_timeout`.
+    Disconnected = 4
+    /// Every pair failed or the consent expired.
+    Failed = 5
+    /// `close` was called.
+    Closed = 6
+}
+
+/// What an agent reports through `poll_event`.
+pub enum Event {
+    /// The state changed.
+    StateChanged(state: State)
+    /// A local candidate was gathered and is ready to be signalled to the peer.
+    LocalCandidate(candidate: Candidate)
+    /// Gathering finished: every STUN server answered or gave up.
+    GatheringComplete
+    /// A pair was selected: packets go from the socket bound to `local.addr`'s base to `remote.addr`.
+    Selected(local: Candidate, remote: Candidate)
+}
+
+/// A datagram the agent wants sent from the socket bound to `local` to the address `to`.
+pub struct Transmit {
+    /// The bound address of the socket to send from.
+    pub local: net.Addr
+    /// The destination.
+    pub to: net.Addr
+    /// The datagram.
+    pub data: u8[]
+}
+
+/// The pair an agent carries data on.
+pub struct Selection {
+    /// The local candidate.
+    pub local: Candidate
+    /// The address of the socket that sends for `local`.
+    pub base: net.Addr
+    /// The remote candidate.
+    pub remote: Candidate
+}
+
+/// The settings of an agent.
+pub struct Config {
+    /// Whether the agent starts in the controlling role, which picks the pair.
+    pub controlling: bool
+    /// Whether the agent is ICE-lite: it gathers only host candidates, never sends checks and answers the checks it receives.
+    pub lite: bool = false
+    /// The local username fragment. A random one is made when empty.
+    pub ufrag: str = ""
+    /// The local password. A random one is made when empty.
+    pub pwd: str = ""
+    /// The bound addresses of the agent's UDP sockets, one host candidate each.
+    pub hosts: net.Addr[] = []
+    /// The STUN servers each host candidate asks for its server-reflexive address.
+    pub stun_servers: net.Addr[] = []
+    /// The milliseconds between connectivity checks (Ta). The default is 50.
+    pub pacing: i64 = 50
+    /// The initial retransmission timeout of a check in milliseconds. The default is 500.
+    pub rto: i64 = 500
+    /// The number of times a check is sent, the first included. The default is 7.
+    pub transmissions: i64 = 7
+    /// Whether the selected pair is kept alive with consent checks (RFC 7675). Without it Binding indications are sent instead.
+    pub consent: bool = true
+    /// The milliseconds between consent checks, randomised between 80 and 120 percent. The default is 5000.
+    pub consent_interval: i64 = 5000
+    /// The milliseconds without a consent response after which the state becomes `Disconnected`. The default is 10000.
+    pub disconnected_after: i64 = 10000
+    /// The milliseconds without a consent response after which the state becomes `Failed`. The default is 30000.
+    pub consent_timeout: i64 = 30000
+    /// The milliseconds of silence after which a Binding indication is sent when `consent` is off. The default is 15000.
+    pub keepalive_interval: i64 = 15000
+    /// The milliseconds after remote credentials arrive within which a pair must be nominated before the state becomes `Failed`. The default is 30000.
+    pub failure_timeout: i64 = 30000
+    /// The tie-breaker for role conflicts, random when 0.
+    pub tie_breaker: u64 = 0
+}
+
+enum PairState {
+    Frozen
+    Waiting
+    InProgress
+    Succeeded
+    Failed
+}
+
+struct Pair {
+    local: i64
+    remote: i64
+    priority: i64
+    state: PairState
+    valid: bool = false
+    nominated: bool = false
+    nominate_on_success: bool = false
+    pending: bool = false
+    nominating: bool = false
+    sent_controlling: bool = false
+    valid_pair: i64 = -1
+    transaction: u8[] = []
+    wire: u8[] = []
+    sends: i64 = 0
+    deadline: i64 = 0
+}
+
+struct Local {
+    cand: Candidate
+    base: net.Addr
+}
+
+struct Gather {
+    base: net.Addr
+    server: net.Addr
+    transaction: u8[]
+    wire: u8[]
+    sends: i64
+    deadline: i64
+    done: bool
+}
+
+/// An ICE agent: the checklist, the connectivity checks and the state machine of RFC 8445, without a socket or a clock.
+///
+/// The caller feeds it received datagrams with `receive`, the time with `tick`, and sends what `poll_transmit` returns. The time is a count of milliseconds from any origin that never goes backwards.
+pub struct Agent {
+    /// The role: `true` for controlling.
+    pub controlling: bool
+    /// The connection state.
+    pub state: State
+    /// The local username fragment.
+    pub local_ufrag: str
+    /// The local password.
+    pub local_pwd: str
+    /// The remote username fragment, empty until `set_remote_credentials`.
+    pub remote_ufrag: str
+    /// The remote password.
+    pub remote_pwd: str
+    config: Config
+    tie_breaker: u64
+
+    locals: Local[]
+    remotes: Candidate[]
+    pairs: Pair[]
+    triggered: i64[]
+    gathers: Gather[]
+    gathered: bool
+    gathering: bool
+    remote_ended: bool
+    nominating: bool
+    renominate: bool
+    checking_since: i64
+    selection: Selection?
+    consent_ufrag: str
+    consent_pwd: str
+    consent_local_ufrag: str
+    consent_at: i64
+    consent_transaction: u8[]
+    consent_wire: u8[]
+    consent_sends: i64
+    consent_deadline: i64
+    last_consent: i64
+    last_sent: i64
+    next_check: i64
+    outbox: Transmit[]
+    events: Event[]
+    rng: rand.Rng
+}
+
+fn random_text(n: i64) -> str {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    let raw = crypto.random(n)
+    let out = io.buffer(n)
+    for i in 0..n {
+        out[i] = alphabet[i64(raw[i]) & 63]
+    }
+    str(out)
+}
+
+/// Makes an agent from `config`.
+///
+/// Generates the credentials and tie-breaker that `config` leaves empty.
+pub fn agent(config: Config) -> *Agent {
+    var tie = config.tie_breaker
+    if tie == 0 {
+        tie = random_u64()
+    }
+    new(Agent {
+        controlling: config.controlling && !config.lite
+        state: State.New
+        local_ufrag: if config.ufrag.len > 0 { config.ufrag } else { random_text(8) }
+        local_pwd: if config.pwd.len > 0 { config.pwd } else { random_text(24) }
+        remote_ufrag: ""
+        remote_pwd: ""
+        config
+        tie_breaker: tie
+
+        locals: []
+        remotes: []
+        pairs: []
+        triggered: []
+        gathers: []
+        gathered: false
+        gathering: false
+        remote_ended: false
+        nominating: false
+        renominate: false
+        checking_since: 0
+        selection: none
+        consent_ufrag: ""
+        consent_pwd: ""
+        consent_local_ufrag: ""
+        consent_at: -1
+        consent_transaction: []
+        consent_wire: []
+        consent_sends: 0
+        consent_deadline: -1
+        last_consent: 0
+        last_sent: 0
+        next_check: 0
+        outbox: []
+        events: []
+        rng: rand.seeded(random_u64())
+    })
+}
+
+fn same_addr(a: net.Addr, b: net.Addr) -> bool {
+    a.port == b.port && hash.equal(a.ip, b.ip)
+}
+
+fn wait_after(a: *Agent, sends: i64) -> i64 {
+    let timing = stun.Config { rto: a.config.rto, transmissions: a.config.transmissions }
+    let schedule = stun.waits(timing)
+    schedule[sends - 1]
+}
+
+fn random_u64() -> u64 {
+    let raw = crypto.random(8)
+    io.u64_be(raw, 0)
+}
+
+fn has_selection(a: *Agent) -> bool {
+    match a.selection {
+        some(_) => true
+        none => false
+    }
+}
+
+fn has_attribute(m: stun.Message, kind: i64) -> bool {
+    match stun.find(m, kind) {
+        some(_) => true
+        none => false
+    }
+}
+
+fn integrity_holds(m: stun.Message, key: u8[]) -> bool {
+    stun.check_integrity(m, key, stun.Integrity.Sha1) catch {
+        _ => return false
+    }
+    true
+}
+
+fn local_pref_of(c: Candidate) -> i64 {
+    (c.priority >> 8) & 0xffff
+}
+
+fn emit(a: *Agent, e: Event) {
+    a.events.push(e)
+}
+
+fn send(a: *Agent, local: net.Addr, to: net.Addr, data: u8[], now: i64) {
+    a.outbox.push(Transmit { local, to, data })
+    a.last_sent = now
+}
+
+fn set_state(a: *Agent, s: State) {
+    if a.state.index == s.index || a.state.index == State.Closed.index {
+        return
+    }
+    a.state = s
+    emit(a, Event.StateChanged(s))
+}
+
+fn family_matches(a: net.Addr, b: net.Addr) -> bool {
+    a.ip.len == b.ip.len
+}
+
+/// Returns the local candidates gathered so far, in the order they were reported.
+pub fn local_candidates(a: *Agent) -> Candidate[] {
+    var out: Candidate[] = []
+    for l in a.locals {
+        if l.cand.kind != Kind.PeerReflexive {
+            out.push(l.cand)
+        }
+    }
+    out
+}
+
+fn find_local(a: *Agent, addr: net.Addr) -> i64 {
+    for i, l in a.locals {
+        if same_addr(l.cand.addr, addr) {
+            return i
+        }
+    }
+    -1
+}
+
+fn local_for_base(a: *Agent, base: net.Addr) -> i64 {
+    var found = -1
+    for i, l in a.locals {
+        if same_addr(l.base, base) && (found < 0 || l.cand.kind == Kind.Host) {
+            found = i
+        }
+    }
+    found
+}
+
+fn find_remote(a: *Agent, addr: net.Addr) -> i64 {
+    for i, r in a.remotes {
+        if same_addr(r.addr, addr) {
+            return i
+        }
+    }
+    -1
+}
+
+fn pair_value(a: *Agent, local: Candidate, remote: Candidate) -> i64 {
+    if a.controlling {
+        pair_priority(local.priority, remote.priority)
+    } else {
+        pair_priority(remote.priority, local.priority)
+    }
+}
+
+fn find_pair(a: *Agent, li: i64, ri: i64) -> i64 {
+    for i, p in a.pairs {
+        if p.local == li && p.remote == ri {
+            return i
+        }
+    }
+    -1
+}
+
+fn foundation_busy(a: *Agent, li: i64, ri: i64) -> bool {
+    for p in a.pairs {
+        let same = a.locals[p.local].cand.foundation == a.locals[li].cand.foundation && a.remotes[p.remote].foundation == a.remotes[ri].foundation
+        let live = match p.state {
+            Frozen => true
+            Waiting => true
+            InProgress => true
+            _ => false
+        }
+        if same && live {
+            return true
+        }
+    }
+    false
+}
+
+fn add_pair(a: *Agent, li: i64, ri: i64) -> i64 {
+    let local = a.locals[li]
+    let remote = a.remotes[ri]
+    if local.cand.component != remote.component || !family_matches(local.cand.addr, remote.addr) {
+        return -1
+    }
+    let existing = find_pair(a, li, ri)
+    if existing >= 0 {
+        return existing
+    }
+    for p in a.pairs {
+        if p.remote == ri && same_addr(a.locals[p.local].base, local.base) {
+            return -1
+        }
+    }
+    let state = if foundation_busy(a, li, ri) { PairState.Frozen } else { PairState.Waiting }
+    let value = pair_value(a, local.cand, remote)
+    a.pairs.push(Pair { local: li, remote: ri, priority: value, state })
+    a.pairs.len - 1
+}
+
+fn add_local(a: *Agent, c: Candidate, base: net.Addr, announce: bool) -> i64 {
+    let known = find_local(a, c.addr)
+    if known >= 0 {
+        if announce {
+            emit(a, Event.LocalCandidate(a.locals[known].cand))
+        }
+        return known
+    }
+    a.locals.push(Local { cand: c, base })
+    let li = a.locals.len - 1
+    if announce {
+        emit(a, Event.LocalCandidate(c))
+    }
+    for ri in 0..a.remotes.len {
+        add_pair(a, li, ri)
+    }
+    li
+}
+
+fn start_gather(a: *Agent, base: net.Addr, server: net.Addr, now: i64) {
+    let m = stun.message(stun.Class.Request, stun.binding)
+    let wire = stun.encode(m)
+    let deadline = now + wait_after(a, 1)
+    a.gathers.push(Gather { base, server, transaction: m.transaction, wire, sends: 1, deadline, done: false })
+    send(a, base, server, wire, now)
+}
+
+fn finish_gathering(a: *Agent) {
+    if a.gathered || !a.gathering {
+        return
+    }
+    for g in a.gathers {
+        if !g.done {
+            return
+        }
+    }
+    a.gathered = true
+    emit(a, Event.GatheringComplete)
+}
+
+/// Gathers the host candidates of `config.hosts` and starts asking each `config.stun_servers` entry of the same family for a server-reflexive candidate.
+///
+/// Each candidate arrives as an `Event.LocalCandidate`, and `Event.GatheringComplete` follows the last STUN answer or timeout. A second call, after `restart`, reports the candidates again.
+pub fn gather(a: *Agent, now: i64) {
+    a.gathered = false
+    a.gathering = true
+    a.gathers = []
+    var rank = 0
+    for h in a.config.hosts {
+        let preference = local_preference(h.ip, rank)
+        let c = Candidate {
+            foundation: foundation(Kind.Host, h.ip, [], "udp")
+            priority: priority(Kind.Host, preference, 1)
+            addr: h
+            kind: Kind.Host
+        }
+        add_local(a, c, h, true)
+        rank += 1
+        if !a.config.lite {
+            for s in a.config.stun_servers {
+                if family_matches(h, s) {
+                    start_gather(a, h, s, now)
+                }
+            }
+        }
+    }
+    finish_gathering(a)
+}
+
+fn gather_answer(a: *Agent, g: i64, m: stun.Message, now: i64) {
+    let found = a.gathers[g]
+    a.gathers[g].done = true
+    if m.class == stun.Class.Success {
+        let mapped = stun.reflexive_address(m) or {
+            finish_gathering(a)
+            return
+        }
+        if !same_addr(mapped, found.base) {
+            let host = a.locals[local_for_base(a, found.base)].cand
+            let preference = local_pref_of(host)
+            let c = Candidate {
+                foundation: foundation(Kind.ServerReflexive, found.base.ip, found.server.ip, "udp")
+                priority: priority(Kind.ServerReflexive, preference, 1)
+                addr: mapped
+                kind: Kind.ServerReflexive
+                related: found.base
+            }
+            add_local(a, c, found.base, true)
+        }
+    }
+    finish_gathering(a)
+}
+
+fn recompute(a: *Agent) {
+    for i in 0..a.pairs.len {
+        let p = a.pairs[i]
+        a.pairs[i].priority = pair_value(a, a.locals[p.local].cand, a.remotes[p.remote])
+    }
+}
+
+fn switch_role(a: *Agent) {
+    a.controlling = !a.controlling
+    a.nominating = false
+    recompute(a)
+}
+
+/// Sets the remote username fragment and password.
+///
+/// A different username fragment than the one set before is a remote ICE restart: the remote candidates and the checklist are dropped and checking starts over, while the selected pair stays in use until a new one is nominated.
+pub fn set_remote_credentials(a: *Agent, ufrag: str, pwd: str, now: i64) {
+    let restarted = a.remote_ufrag.len > 0 && a.remote_ufrag != ufrag
+    if restarted {
+        clear_checklist(a)
+        a.renominate = true
+    }
+    if a.remote_ufrag != ufrag {
+        a.checking_since = now
+    }
+    a.remote_ufrag = ufrag
+    a.remote_pwd = pwd
+    if a.config.lite {
+        return
+    }
+    if a.state == State.New || restarted {
+        a.next_check = now
+        if a.state != State.Completed && a.state != State.Disconnected {
+            set_state(a, State.Checking)
+        }
+    }
+}
+
+fn clear_checklist(a: *Agent) {
+    a.remotes = []
+    a.pairs = []
+    a.triggered = []
+    a.remote_ended = false
+    a.nominating = false
+    var kept: Local[] = []
+    for l in a.locals {
+        if l.cand.kind != Kind.PeerReflexive {
+            kept.push(l)
+        }
+    }
+    a.locals = kept
+}
+
+/// Marks the remote peer as ICE-lite, which makes the agent controlling.
+pub fn set_remote_lite(a: *Agent, lite: bool) {
+
+    if lite && !a.config.lite && !a.controlling {
+        switch_role(a)
+    }
+}
+
+/// Adds a remote candidate and forms its pairs with the local candidates.
+///
+/// A candidate that is not UDP component 1 is ignored, as is one already known.
+pub fn add_remote_candidate(a: *Agent, c: Candidate, now: i64) {
+    if c.component != 1 || c.transport != "udp" || find_remote(a, c.addr) >= 0 {
+        return
+    }
+    a.remotes.push(c)
+    let ri = a.remotes.len - 1
+    if a.config.lite {
+        return
+    }
+    for li in 0..a.locals.len {
+        add_pair(a, li, ri)
+    }
+    evaluate(a, now)
+}
+
+/// Tells the agent no more remote candidates will arrive, so that failing every pair fails the agent.
+pub fn end_of_remote_candidates(a: *Agent, now: i64) {
+    a.remote_ended = true
+    evaluate(a, now)
+}
+
+/// Starts a local ICE restart: new local credentials, no remote credentials, candidates or pairs.
+///
+/// The caller signals the new `local_ufrag` and `local_pwd`, then gives the agent the remote's new credentials and candidates. The selected pair stays in use until the new checklist nominates one.
+pub fn restart(a: *Agent, now: i64) {
+    a.local_ufrag = random_text(8)
+    a.local_pwd = random_text(24)
+    a.remote_ufrag = ""
+    a.remote_pwd = ""
+    clear_checklist(a)
+    a.renominate = true
+    a.next_check = now
+}
+
+fn build_request(a: *Agent, local: Candidate, remote_ufrag: str, remote_pwd: str, local_ufrag: str, nominate: bool) -> stun.Message {
+    var m = stun.message(stun.Class.Request, stun.binding)
+    stun.add_text(mut m, stun.attr_username, "{remote_ufrag}:{local_ufrag}")
+    let reflexive = priority(Kind.PeerReflexive, local_pref_of(local), local.component)
+    stun.add_u32(mut m, stun.attr_priority, reflexive)
+    if a.controlling {
+        stun.add_u64(mut m, stun.attr_ice_controlling, a.tie_breaker)
+        if nominate {
+            stun.add(mut m, stun.attr_use_candidate, [])
+        }
+    } else {
+        stun.add_u64(mut m, stun.attr_ice_controlled, a.tie_breaker)
+    }
+    m
+}
+
+fn send_check(a: *Agent, pi: i64, nominate: bool, now: i64) {
+    let p = a.pairs[pi]
+    let local = a.locals[p.local]
+    let m = build_request(a, local.cand, a.remote_ufrag, a.remote_pwd, a.local_ufrag, nominate)
+    let protection = stun.Protection { key: bytes(a.remote_pwd) }
+    let wire = stun.seal(m, protection)
+    a.pairs[pi].transaction = m.transaction
+    a.pairs[pi].wire = wire
+    a.pairs[pi].sends = 1
+    a.pairs[pi].deadline = now + wait_after(a, 1)
+    a.pairs[pi].pending = true
+    a.pairs[pi].nominating = nominate
+    a.pairs[pi].sent_controlling = a.controlling
+    if a.pairs[pi].state != PairState.Succeeded {
+        a.pairs[pi].state = PairState.InProgress
+    }
+    send(a, local.base, a.remotes[p.remote].addr, wire, now)
+}
+
+fn unfreeze(a: *Agent, pi: i64) {
+    let p = a.pairs[pi]
+    for i, q in a.pairs {
+        if q.state == PairState.Frozen && a.locals[q.local].cand.foundation == a.locals[p.local].cand.foundation && a.remotes[q.remote].foundation == a.remotes[p.remote].foundation {
+            a.pairs[i].state = PairState.Waiting
+        }
+    }
+}
+
+fn mark_failed(a: *Agent, pi: i64) {
+    a.pairs[pi].state = PairState.Failed
+    a.pairs[pi].pending = false
+    a.pairs[pi].valid = false
+    a.pairs[pi].valid_pair = -1
+    if a.pairs[pi].nominating {
+        a.pairs[pi].nominating = false
+        a.nominating = false
+    }
+    unfreeze(a, pi)
+}
+
+fn enqueue(a: *Agent, pi: i64) {
+    for t in a.triggered {
+        if t == pi {
+            return
+        }
+    }
+    a.triggered.push(pi)
+}
+
+fn next_triggered(a: *Agent) -> i64 {
+    for a.triggered.len > 0 {
+        let pi = a.triggered[0]
+        a.triggered = a.triggered[1..]
+        if a.pairs[pi].state == PairState.Waiting {
+            return pi
+        }
+    }
+    -1
+}
+
+fn next_waiting(a: *Agent) -> i64 {
+    var best = -1
+    for i, p in a.pairs {
+        if p.state == PairState.Waiting && (best < 0 || p.priority > a.pairs[best].priority) {
+            best = i
+        }
+    }
+    if best >= 0 {
+        return best
+    }
+    for i, p in a.pairs {
+        if p.state == PairState.Frozen && (best < 0 || p.priority > a.pairs[best].priority) {
+            best = i
+        }
+    }
+    best
+}
+
+fn checking(a: *Agent) -> bool {
+    !a.config.lite && a.remote_pwd.len > 0 && (!has_selection(a) || a.renominate)
+}
+
+fn run_checks(a: *Agent, now: i64) {
+    for i in 0..a.pairs.len {
+        let p = a.pairs[i]
+        if !p.pending || now < p.deadline {
+            continue
+        }
+        if p.sends < a.config.transmissions {
+            let local = a.locals[p.local]
+            a.pairs[i].sends = p.sends + 1
+            a.pairs[i].deadline = now + wait_after(a, p.sends + 1)
+            send(a, local.base, a.remotes[p.remote].addr, p.wire, now)
+        } else {
+            mark_failed(a, i)
+        }
+    }
+    if checking(a) && now >= a.next_check {
+        var pi = next_triggered(a)
+        if pi < 0 {
+            pi = next_waiting(a)
+        }
+        if pi >= 0 {
+            send_check(a, pi, false, now)
+            a.next_check = now + a.config.pacing
+        }
+    }
+}
+
+fn run_gathers(a: *Agent, now: i64) {
+    for i in 0..a.gathers.len {
+        let g = a.gathers[i]
+        if g.done || now < g.deadline {
+            continue
+        }
+        if g.sends < a.config.transmissions {
+            a.gathers[i].sends = g.sends + 1
+            a.gathers[i].deadline = now + wait_after(a, g.sends + 1)
+            send(a, g.base, g.server, g.wire, now)
+        } else {
+            a.gathers[i].done = true
+        }
+    }
+    finish_gathering(a)
+}
+
+fn jitter(a: *Agent, interval: i64) -> i64 {
+    interval * (80 + rand.below(mut a.rng, 41)) / 100
+}
+
+fn run_consent(a: *Agent, now: i64) {
+    let sel = a.selection ?? return
+    if a.state == State.Closed || a.state == State.Failed {
+        return
+    }
+    let silence = now - a.last_consent
+    if silence > a.config.consent_timeout {
+        set_state(a, State.Failed)
+        return
+    }
+    if silence > a.config.disconnected_after && a.state == State.Completed {
+        set_state(a, State.Disconnected)
+    }
+    if a.config.lite {
+        return
+    }
+    if !a.config.consent {
+        if now - a.last_sent >= a.config.keepalive_interval {
+            var m = stun.message(stun.Class.Indication, stun.binding)
+            let bare = stun.Protection { key: [], sha1: false }
+            let wire = stun.seal(m, bare)
+            send(a, sel.base, sel.remote.addr, wire, now)
+        }
+        return
+    }
+    if a.consent_transaction.len > 0 && now >= a.consent_deadline {
+        if a.consent_sends < a.config.transmissions {
+            a.consent_sends += 1
+            a.consent_deadline = now + wait_after(a, a.consent_sends)
+            send(a, sel.base, sel.remote.addr, a.consent_wire, now)
+        } else {
+            a.consent_transaction = []
+        }
+    }
+    if a.consent_at >= 0 && now >= a.consent_at {
+        let m = build_request(a, sel.local, a.consent_ufrag, a.consent_pwd, a.consent_local_ufrag, false)
+        a.consent_transaction = m.transaction
+        let protection = stun.Protection { key: bytes(a.consent_pwd) }
+        a.consent_wire = stun.seal(m, protection)
+        a.consent_sends = 1
+        a.consent_deadline = now + wait_after(a, 1)
+        a.consent_at = now + jitter(a, a.config.consent_interval)
+        send(a, sel.base, sel.remote.addr, a.consent_wire, now)
+    }
+}
+
+/// Advances the agent to the time `now`: retransmits, starts the next check when the pacing interval has passed, and runs the consent and keepalive timers.
+pub fn tick(a: *Agent, now: i64) {
+    if a.state == State.Closed {
+        return
+    }
+    run_gathers(a, now)
+    run_checks(a, now)
+    run_consent(a, now)
+    evaluate(a, now)
+}
+
+fn earliest(best: i64, t: i64) -> i64 {
+    if t < 0 || (best >= 0 && best <= t) { best } else { t }
+}
+
+/// Returns the time `tick` next has work to do, or -1 when only a received datagram can change anything.
+pub fn next_timeout(a: *Agent) -> i64 {
+    if a.state == State.Closed || a.state == State.Failed {
+        return -1
+    }
+    var t = -1
+    for g in a.gathers {
+        if !g.done {
+            t = earliest(t, g.deadline)
+        }
+    }
+    for p in a.pairs {
+        if p.pending {
+            t = earliest(t, p.deadline)
+        }
+    }
+    if checking(a) {
+        t = earliest(t, a.checking_since + a.config.failure_timeout + 1)
+        var waiting = a.triggered.len > 0
+        for p in a.pairs {
+            if p.state == PairState.Waiting || p.state == PairState.Frozen {
+                waiting = true
+            }
+        }
+        if waiting {
+            t = earliest(t, a.next_check)
+        }
+    }
+    if has_selection(a) {
+        t = earliest(t, a.last_consent + a.config.disconnected_after + 1)
+        t = earliest(t, a.last_consent + a.config.consent_timeout + 1)
+        if !a.config.lite {
+            if a.config.consent {
+                t = earliest(t, a.consent_at)
+                if a.consent_transaction.len > 0 {
+                    t = earliest(t, a.consent_deadline)
+                }
+            } else {
+                t = earliest(t, a.last_sent + a.config.keepalive_interval)
+            }
+        }
+    }
+    t
+}
+
+/// Returns the next datagram the agent wants sent, or `none`.
+pub fn poll_transmit(a: *Agent) -> Transmit? {
+    if a.outbox.len == 0 {
+        return none
+    }
+    let t = a.outbox[0]
+    a.outbox = a.outbox[1..]
+    t
+}
+
+/// Returns the next event, or `none`.
+pub fn poll_event(a: *Agent) -> Event? {
+    if a.events.len == 0 {
+        return none
+    }
+    let e = a.events[0]
+    a.events = a.events[1..]
+    e
+}
+
+/// Returns whether `addr` is the address of a remote candidate, learned or given.
+pub fn knows_remote(a: *Agent, addr: net.Addr) -> bool {
+    find_remote(a, addr) >= 0
+}
+
+/// Returns the selected pair, or `none` before one is nominated.
+pub fn selected(a: *Agent) -> Selection? {
+    a.selection
+}
+
+/// Tells the agent a datagram went out on the selected pair at `now`, which postpones the next keepalive indication.
+pub fn note_sent(a: *Agent, now: i64) {
+    a.last_sent = now
+}
+
+/// Stops the agent: the state becomes `Closed` and nothing more is sent.
+pub fn close(a: *Agent) {
+    set_state(a, State.Closed)
+    a.outbox = []
+}
+
+fn best_valid(a: *Agent, nominated: bool) -> i64 {
+    var best = -1
+    for i, p in a.pairs {
+        if p.valid && (!nominated || p.nominated) && (best < 0 || p.priority > a.pairs[best].priority) {
+            best = i
+        }
+    }
+    best
+}
+
+fn select_pair(a: *Agent, pi: i64, now: i64) {
+    let p = a.pairs[pi]
+    let local = a.locals[p.local]
+    let remote = a.remotes[p.remote]
+    let changed = match a.selection {
+        some(s) => !same_addr(s.local.addr, local.cand.addr) || !same_addr(s.remote.addr, remote.addr)
+        none => true
+    }
+    a.selection = Selection { local: local.cand, base: local.base, remote }
+    a.consent_ufrag = a.remote_ufrag
+    a.consent_pwd = a.remote_pwd
+    a.consent_local_ufrag = a.local_ufrag
+    a.nominating = false
+    a.last_consent = now
+    a.consent_transaction = []
+    a.consent_at = now + jitter(a, a.config.consent_interval)
+    if changed || a.renominate {
+        emit(a, Event.Selected(local.cand, remote))
+    }
+    a.renominate = false
+    set_state(a, State.Completed)
+    for i in 0..a.pairs.len {
+        if i != pi && a.pairs[i].pending && !a.pairs[i].valid {
+            a.pairs[i].pending = false
+        }
+    }
+    a.triggered = []
+}
+
+fn evaluate(a: *Agent, now: i64) {
+    if a.state == State.Closed || a.state == State.Failed || a.config.lite {
+        return
+    }
+    let nominated = best_valid(a, true)
+    if nominated >= 0 && (!has_selection(a) || a.renominate) {
+        select_pair(a, nominated, now)
+        return
+    }
+    if has_selection(a) && !a.renominate {
+        return
+    }
+    if checking(a) && now - a.checking_since > a.config.failure_timeout {
+        set_state(a, State.Failed)
+        return
+    }
+    let valid = best_valid(a, false)
+    if valid >= 0 {
+        if a.state == State.Checking || a.state == State.New {
+            set_state(a, State.Connected)
+        }
+        if a.controlling && !a.nominating {
+            a.nominating = true
+            send_check(a, valid, true, now)
+        }
+        return
+    }
+    if a.remote_ended && a.remote_pwd.len > 0 && a.pairs.len > 0 {
+        for p in a.pairs {
+            if p.state != PairState.Failed {
+                return
+            }
+        }
+        set_state(a, State.Failed)
+    }
+}
+
+fn respond(a: *Agent, request: stun.Message, class: stun.Class, code: i64, reason: str, mapped: net.Addr?, local: net.Addr, to: net.Addr, now: i64) {
+    var m = stun.Message { class, method: stun.binding, transaction: request.transaction }
+    match mapped {
+        some(addr) => stun.add_xor_address(mut m, stun.attr_xor_mapped_address, addr)
+        none => {}
+    }
+    if class == stun.Class.Error {
+        stun.add_error_code(mut m, code, reason)
+    }
+    let local_key = bytes(a.local_pwd)
+    var p = stun.Protection { key: local_key }
+    if code == 401 || code == 400 {
+        p = stun.Protection { key: [], sha1: false }
+    }
+    let wire = stun.seal(m, p)
+    send(a, local, to, wire, now)
+}
+
+fn known_attributes() -> i64[] {
+    [
+        stun.attr_username
+        stun.attr_message_integrity
+        stun.attr_message_integrity_sha256
+        stun.attr_priority
+        stun.attr_use_candidate
+        stun.attr_software
+        stun.attr_fingerprint
+        stun.attr_ice_controlling
+        stun.attr_ice_controlled
+    ]
+}
+
+fn ufrag_of(a: *Agent, m: stun.Message) -> bool {
+    let user = stun.get_text(m, stun.attr_username) ?? return false
+    user.len > a.local_ufrag.len && user[..a.local_ufrag.len] == a.local_ufrag && user[a.local_ufrag.len] == ':'
+}
+
+fn on_request(a: *Agent, local: net.Addr, from: net.Addr, m: stun.Message, now: i64) {
+    stun.check_fingerprint(m) catch {
+        NotFound => {}
+        _ => return
+    }
+    if m.method != stun.binding {
+        return
+    }
+    let known = known_attributes()
+    let unknown = stun.unknown_required(m, known)
+    if unknown.len > 0 {
+        respond(a, m, stun.Class.Error, 420, "Unknown Attribute", none, local, from, now)
+        return
+    }
+    if !has_attribute(m, stun.attr_username) {
+        respond(a, m, stun.Class.Error, 400, "Bad Request", none, local, from, now)
+        return
+    }
+    let local_key = bytes(a.local_pwd)
+    let authentic = ufrag_of(a, m) && integrity_holds(m, local_key)
+    if !authentic {
+        respond(a, m, stun.Class.Error, 401, "Unauthorized", none, local, from, now)
+        return
+    }
+    let theirs_controlling = stun.get_u64(m, stun.attr_ice_controlling) or u64(0)
+    let theirs_controlled = stun.get_u64(m, stun.attr_ice_controlled) or u64(0)
+    let has_controlling = has_attribute(m, stun.attr_ice_controlling)
+    let has_controlled = has_attribute(m, stun.attr_ice_controlled)
+    if has_controlling && a.controlling {
+        if a.tie_breaker >= theirs_controlling {
+            respond(a, m, stun.Class.Error, 487, "Role Conflict", none, local, from, now)
+            return
+        }
+        switch_role(a)
+    } else if has_controlled && !a.controlling {
+        if a.tie_breaker >= theirs_controlled {
+            switch_role(a)
+        } else {
+            respond(a, m, stun.Class.Error, 487, "Role Conflict", none, local, from, now)
+            return
+        }
+    }
+    respond(a, m, stun.Class.Success, 0, "", from, local, from, now)
+    if has_selection(a) && a.config.lite {
+        a.last_consent = now
+    }
+    learn_from_request(a, local, from, m, now)
+}
+
+fn learn_from_request(a: *Agent, local: net.Addr, from: net.Addr, m: stun.Message, now: i64) {
+    let li = local_for_base(a, local)
+    if li < 0 {
+        return
+    }
+    var ri = find_remote(a, from)
+    if ri < 0 {
+        let fallback = priority(Kind.PeerReflexive, 65535, 1)
+        let announced = stun.get_u32(m, stun.attr_priority) or fallback
+        let learned = Candidate {
+            foundation: foundation(Kind.PeerReflexive, from.ip, [], "udp")
+            priority: announced
+            addr: from
+            kind: Kind.PeerReflexive
+        }
+        a.remotes.push(learned)
+        ri = a.remotes.len - 1
+        if !a.config.lite {
+            for other in 0..a.locals.len {
+                add_pair(a, other, ri)
+            }
+        }
+    }
+    let use_candidate = has_attribute(m, stun.attr_use_candidate)
+    if a.config.lite {
+        lite_request(a, li, ri, use_candidate, now)
+        return
+    }
+    let pi = add_pair(a, li, ri)
+    if pi < 0 {
+        return
+    }
+    if use_candidate && !a.controlling {
+        a.pairs[pi].nominate_on_success = true
+    }
+    match a.pairs[pi].state {
+        Succeeded => {
+            let produced = a.pairs[pi].valid_pair
+            if use_candidate && !a.controlling && produced >= 0 {
+                a.pairs[produced].nominated = true
+            }
+        }
+        InProgress => {}
+        _ => {
+            a.pairs[pi].state = PairState.Waiting
+            enqueue(a, pi)
+        }
+    }
+    evaluate(a, now)
+}
+
+fn lite_request(a: *Agent, li: i64, ri: i64, use_candidate: bool, now: i64) {
+    if a.state == State.New {
+        set_state(a, State.Connected)
+    }
+    if !use_candidate {
+        return
+    }
+    let local = a.locals[li]
+    let remote = a.remotes[ri]
+    let changed = match a.selection {
+        some(s) => !same_addr(s.remote.addr, remote.addr) || !same_addr(s.local.addr, local.cand.addr)
+        none => true
+    }
+    a.selection = Selection { local: local.cand, base: local.base, remote }
+    a.last_consent = now
+    if changed {
+        emit(a, Event.Selected(local.cand, remote))
+    }
+    set_state(a, State.Completed)
+}
+
+fn on_response(a: *Agent, local: net.Addr, from: net.Addr, m: stun.Message, now: i64) {
+    for g in 0..a.gathers.len {
+        let found = a.gathers[g]
+        if !found.done && hash.equal(found.transaction, m.transaction) && same_addr(found.server, from) {
+            gather_answer(a, g, m, now)
+            return
+        }
+    }
+    if a.consent_transaction.len > 0 && hash.equal(a.consent_transaction, m.transaction) {
+        consent_answer(a, from, m, now)
+        return
+    }
+    for pi in 0..a.pairs.len {
+        let p = a.pairs[pi]
+        if p.pending && hash.equal(p.transaction, m.transaction) {
+            let remote = a.remotes[p.remote]
+            if !same_addr(remote.addr, from) || !same_addr(a.locals[p.local].base, local) {
+                return
+            }
+            check_answer(a, pi, m, now)
+            return
+        }
+    }
+}
+
+fn consent_answer(a: *Agent, from: net.Addr, m: stun.Message, now: i64) {
+    let sel = a.selection ?? return
+    if !same_addr(sel.remote.addr, from) {
+        return
+    }
+    let key = bytes(a.consent_pwd)
+    stun.check_integrity(m, key, stun.Integrity.Sha1) or return
+    if m.class == stun.Class.Success {
+        a.consent_transaction = []
+        a.last_consent = now
+        if a.state == State.Disconnected {
+            set_state(a, State.Completed)
+        }
+    }
+}
+
+fn check_answer(a: *Agent, pi: i64, m: stun.Message, now: i64) {
+    let key = bytes(a.remote_pwd)
+    stun.check_integrity(m, key, stun.Integrity.Sha1) or {
+        return
+    }
+    a.pairs[pi].pending = false
+    if m.class == stun.Class.Error {
+        let code = match stun.error_code(m) {
+            some(e) => e.code
+            none => 0
+        }
+        if code == 487 {
+            if a.pairs[pi].sent_controlling == a.controlling {
+                switch_role(a)
+            }
+            a.pairs[pi].state = PairState.Waiting
+            a.pairs[pi].nominating = false
+            enqueue(a, pi)
+        } else {
+            mark_failed(a, pi)
+        }
+        evaluate(a, now)
+        return
+    }
+    let mapped = stun.reflexive_address(m) or {
+        mark_failed(a, pi)
+        evaluate(a, now)
+        return
+    }
+    let p = a.pairs[pi]
+    var li = find_local(a, mapped)
+    if li < 0 {
+        let base = a.locals[p.local]
+        let preference = local_pref_of(base.cand)
+        let learned = Candidate {
+            foundation: foundation(Kind.PeerReflexive, base.base.ip, [], "udp")
+            priority: priority(Kind.PeerReflexive, preference, 1)
+            addr: mapped
+            kind: Kind.PeerReflexive
+            related: base.base
+        }
+        li = add_local(a, learned, base.base, false)
+    }
+    var vi = pi
+    if li != p.local {
+        vi = find_pair(a, li, p.remote)
+        if vi < 0 {
+            let value = pair_value(a, a.locals[li].cand, a.remotes[p.remote])
+            a.pairs.push(Pair { local: li, remote: p.remote, priority: value, state: PairState.Succeeded })
+            vi = a.pairs.len - 1
+        }
+    }
+    a.pairs[pi].state = PairState.Succeeded
+    a.pairs[vi].state = PairState.Succeeded
+    a.pairs[vi].valid = true
+    a.pairs[pi].valid_pair = vi
+    if p.nominating || a.pairs[pi].nominate_on_success || a.pairs[vi].nominate_on_success {
+        a.pairs[vi].nominated = true
+    }
+    a.pairs[pi].nominating = false
+    unfreeze(a, pi)
+    evaluate(a, now)
+}
+
+/// Feeds the agent one datagram that arrived on the socket bound to `local` from `from`.
+///
+/// Only STUN messages belong here; the caller separates the DTLS, RTP and RTCP datagrams of the same socket (RFC 7983). A datagram that is not an authentic STUN message the agent expects is dropped.
+pub fn receive(a: *Agent, local: net.Addr, from: net.Addr, data: u8[], now: i64) {
+    if a.state == State.Closed || !stun.looks_like(data) {
+        return
+    }
+    let m = stun.parse(data) or return
+    match m.class {
+        Request => on_request(a, local, from, m, now)
+        Success => on_response(a, local, from, m, now)
+        Error => on_response(a, local, from, m, now)
+        Indication => {}
+    }
+}
