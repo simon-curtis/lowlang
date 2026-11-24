@@ -30,30 +30,30 @@ pub fn open_for(s: Surface) -> Gpu ! Error {
     g
 }
 
-/// Draws `s` into the next image of the window's swapchain and presents it, and uploads the rows of `atlas` that changed since the last call.
+/// Draws `s` into the next image of the window's swapchain and presents it, and uploads the rows of each of `atlases` that changed since the last call.
 ///
-/// The swapchain is made on the first call, at the size of `s` in device pixels, and is made again when the size of `s` changes or when presentation reports that it is out of date or suboptimal. A scene of no pixels presents nothing. The call returns once the frame is queued for presentation. The `Gpu` keeps one atlas texture that mirrors the atlas it was last given. After the call `atlas` is marked clean.
+/// The swapchain is made on the first call, at the size of `s` in device pixels, and is made again when the size of `s` changes or when presentation reports that it is out of date or suboptimal. A scene of no pixels presents nothing. A sprite samples the atlas at the index its `push_sprite_from` named, and the call fails with `InvalidTexture` when an index is not below `atlases.len`. The call returns once the frame is queued for presentation. The `Gpu` keeps one texture for each atlas it was last given, which mirrors that atlas, so every call passes the same atlases in the same order. After the call every atlas is marked clean.
 ///
 /// Fails with `NoSurface` on a `Gpu` that `open` made.
-pub fn present(g: Gpu, s: scene.Scene, mut atlas: scene.Atlas) ! Error {
-    present_frame(g.state.presenter, s, mut atlas)?
+pub fn present(g: Gpu, s: scene.Scene, mut atlases: scene.Atlas[]) ! Error {
+    present_frame(g.state.presenter, s, mut atlases)?
 }
 
-/// Draws `s` into the next image of `p`'s swapchain and presents it, and uploads the rows of `atlas` that changed since the last call.
+/// Draws `s` into the next image of `p`'s swapchain and presents it, and uploads the rows of each of `atlases` that changed since the last call.
 ///
-/// The presenter draws on the `Device` it was made from. Every presenter of that device draws through the same frame ring and the same atlas texture, so rows uploaded by a call with one presenter are sampled by the next call with any other, and `atlas` is marked clean after each call. The swapchain is made on the first call, at the size of `s` in device pixels, and is made again when the size of `s` changes or when presentation reports that it is out of date or suboptimal. A scene of no pixels presents nothing. The call returns once the frame is queued for presentation, and fails with `NoDevice` when the device was released.
+/// The presenter draws on the `Device` it was made from. Every presenter of that device draws through the same frame ring and the same atlas textures, so rows uploaded by a call with one presenter are sampled by the next call with any other, and every atlas is marked clean after each call. The swapchain is made on the first call, at the size of `s` in device pixels, and is made again when the size of `s` changes or when presentation reports that it is out of date or suboptimal. A scene of no pixels presents nothing. The call returns once the frame is queued for presentation, and fails with `NoDevice` when the device was released.
 ///
 /// Calls run in series on one queue, each waiting up to thirty seconds to acquire an image from a FIFO swapchain, so a window that stops consuming frames stalls the presents of the others.
-pub fn present_to(p: Presenter, s: scene.Scene, mut atlas: scene.Atlas) ! Error {
-    present_frame(p.handle.state, s, mut atlas)?
+pub fn present_to(p: Presenter, s: scene.Scene, mut atlases: scene.Atlas[]) ! Error {
+    present_frame(p.handle.state, s, mut atlases)?
 }
 
 /// Draws `s` into the next image of the swapchain of the presenter behind `h`, as `present_to` does. It fails with `NoSurface` once the presenter is closed.
-pub fn present_to_on(h: PresenterHandle, s: scene.Scene, mut atlas: scene.Atlas) ! Error {
-    present_frame(h.state, s, mut atlas)?
+pub fn present_to_on(h: PresenterHandle, s: scene.Scene, mut atlases: scene.Atlas[]) ! Error {
+    present_frame(h.state, s, mut atlases)?
 }
 
-fn present_frame(p: *PresenterState, s: scene.Scene, mut atlas: scene.Atlas) ! Error {
+fn present_frame(p: *PresenterState, s: scene.Scene, mut atlases: scene.Atlas[]) ! Error {
     let state = p.device
     if state.device.handle.handle == null {
         fail NoDevice
@@ -68,25 +68,24 @@ fn present_frame(p: *PresenterState, s: scene.Scene, mut atlas: scene.Atlas) ! E
     wait_frame(state.device, frame)?
     let index = acquire_image(state, p, frame, s.width, s.height)? ?? return
     let chain = p.swapchain
-    draw_swapchain(state, frame, chain, index, s, mut atlas) catch {
+    draw_swapchain(state, frame, chain, index, s, atlases) catch {
         e => {
             release_acquired(state, frame, p)
             fail e
         }
     }
     state.next_frame = (state.next_frame + 1) % state.frames.len
-    state.atlas_ready = true
-    scene.clean(mut atlas)
+    settle_atlases(state, mut atlases)
     queue_present(state, p, index)?
 }
 
-fn draw_swapchain(state: *DeviceState, frame: *Frame, chain: Swapchain, index: u32, s: scene.Scene, mut atlas: scene.Atlas) ! Error {
+fn draw_swapchain(state: *DeviceState, frame: *Frame, chain: Swapchain, index: u32, s: scene.Scene, atlases: scene.Atlas[]) ! Error {
     let pipelines = pipelines_for(state, chain.format)?
-    ensure_atlas(state, atlas.size)?
-    let band = atlas_band(state, atlas)
-    write_instances(state, frame, s, chain.width, chain.height)?
-    stage_atlas(state, frame, atlas, band)?
-    record_swapchain(state, frame, chain, index, pipelines, s, atlas, band)?
+    write_instances(state, frame, s, atlases.len, chain.width, chain.height)?
+    ensure_textures(state, atlases)?
+    let bands = atlas_bands(state, atlases)
+    stage_atlases(state, frame, atlases, bands)?
+    record_swapchain(state, frame, chain, index, pipelines, s, atlases, bands)?
     submit_swapchain(state, frame, chain.finished[index])?
 }
 
@@ -257,13 +256,13 @@ fn destroy_swapchain(d: Handles, chain: Swapchain) {
     vkDestroySwapchainKHR(d.handle, chain.handle, null)
 }
 
-fn record_swapchain(s: *DeviceState, f: *Frame, chain: Swapchain, index: u32, p: Pipelines, sc: scene.Scene, atlas: scene.Atlas, band: Band) ! Error {
+fn record_swapchain(s: *DeviceState, f: *Frame, chain: Swapchain, index: u32, p: Pipelines, sc: scene.Scene, atlases: scene.Atlas[], bands: Band[]) ! Error {
     using var pins = new_pins()
     let cmd = f.command_buffer
     check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer")?
     var begin = VkCommandBufferBeginInfo { flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT }
     check(vkBeginCommandBuffer(cmd, mut begin), "vkBeginCommandBuffer")?
-    record_atlas_upload(mut pins, cmd, s, f, atlas, band)
+    record_atlas_uploads(mut pins, cmd, s, f, atlases, bands)
     let image = chain.images[index]
     image_barrier(mut pins, cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,

@@ -1,69 +1,164 @@
 import std/ui/scene
 
+struct Texture {
+    image: Image
+    ready: bool = false
+}
+
 struct Band {
     top: i64
     bottom: i64
+    offset: i64
 }
 
-fn ensure_atlas(s: *DeviceState, size: i64) ! Error {
-    if size < 1 {
-        fail InvalidSize(size, size)
-    }
-    if s.atlas.handle.handle != 0 && s.atlas.width == size {
-        return
-    }
-    let d = s.device
-    let usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-    let image = create_image(d, VK_FORMAT_R8G8B8A8_UNORM, size, size, VK_SAMPLE_COUNT_1_BIT, usage)?
-    check(vkDeviceWaitIdle(d.handle), "vkDeviceWaitIdle")?
-    destroy_image(d, s.atlas)
-    s.atlas = image
-    s.atlas_ready = false
-    for f in s.frames {
-        for set in f.sets {
-            write_image_binding(d, set, s.sampler, image)
+fn samples_atlas(kind: scene.Kind) -> bool {
+    kind == scene.Kind.Sprites || kind == scene.Kind.SubpixelSprites || kind == scene.Kind.PolychromeSprites
+}
+
+fn check_textures(runs: scene.Batch[], count: i64) ! Error {
+    for b in runs {
+        if samples_atlas(b.kind) && (b.texture < 0 || b.texture >= count) {
+            fail InvalidTexture(b.texture, count)
         }
     }
 }
 
-fn atlas_band(s: *DeviceState, a: scene.Atlas) -> Band {
-    if !s.atlas_ready {
-        return Band { top: 0, bottom: a.size }
+fn ensure_textures(s: *DeviceState, atlases: scene.Atlas[]) ! Error {
+    for a in atlases {
+        if a.size < 1 {
+            fail InvalidSize(a.size, a.size)
+        }
+    }
+    drop_textures_after(s, atlases.len)?
+    for i, a in atlases {
+        if i >= s.textures.len || s.textures[i].image.width != a.size {
+            replace_texture(s, i, a.size)?
+        }
+    }
+}
+
+fn drop_textures_after(s: *DeviceState, keep: i64) ! Error {
+    if s.textures.len <= keep {
+        return
+    }
+    let d = s.device
+    check(vkDeviceWaitIdle(d.handle), "vkDeviceWaitIdle")?
+    for i in keep..s.textures.len {
+        destroy_image(d, s.textures[i].image)
+    }
+    s.textures = s.textures[..keep]
+}
+
+fn replace_texture(s: *DeviceState, index: i64, size: i64) ! Error {
+    let d = s.device
+    let usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    let image = create_image(d, VK_FORMAT_R8G8B8A8_UNORM, size, size, VK_SAMPLE_COUNT_1_BIT, usage)?
+    check(vkDeviceWaitIdle(d.handle), "vkDeviceWaitIdle") catch {
+        e => {
+            destroy_image(d, image)
+            fail e
+        }
+    }
+    if index < s.textures.len {
+        destroy_image(d, s.textures[index].image)
+        s.textures[index] = Texture { image }
+    } else {
+        s.textures.push(Texture { image })
+    }
+    for f in s.frames {
+        bind_texture(s, f, index)?
+    }
+}
+
+fn bind_texture(s: *DeviceState, f: *Frame, index: i64) ! Error {
+    for kind in scene.kinds() {
+        if !samples_atlas(kind) {
+            continue
+        }
+        for f.sets[kind.index].len <= index {
+            let set = allocate_sets(s, 1)?[0]
+            write_instances_binding(s.device, set, f.instances[kind.index])
+            f.sets[kind.index].push(set)
+        }
+        write_image_binding(s.device, f.sets[kind.index][index], s.sampler, s.textures[index].image)
+    }
+}
+
+fn atlas_bands(s: *DeviceState, atlases: scene.Atlas[]) -> Band[] {
+    var bands: Band[] = []
+    var offset = 0
+    for i, a in atlases {
+        let band = atlas_band(s.textures[i], a, offset)
+        offset += (band.bottom - band.top) * a.size * 4
+        bands.push(band)
+    }
+    bands
+}
+
+fn atlas_band(t: Texture, a: scene.Atlas, offset: i64) -> Band {
+    if !t.ready {
+        return Band { top: 0, bottom: a.size, offset }
     }
     if !scene.dirty(a) {
-        return Band { top: 0, bottom: 0 }
+        return Band { top: 0, bottom: 0, offset }
     }
     let top = if a.dirty_top > 0 { a.dirty_top } else { 0 }
     let bottom = if a.dirty_bottom < a.size { a.dirty_bottom } else { a.size }
-    Band { top, bottom }
+    Band { top, bottom, offset }
 }
 
-fn stage_atlas(s: *DeviceState, f: *Frame, a: scene.Atlas, band: Band) ! Error {
-    if band.bottom <= band.top {
+fn stage_atlases(s: *DeviceState, f: *Frame, atlases: scene.Atlas[], bands: Band[]) ! Error {
+    var bytes = 0
+    for i, band in bands {
+        bytes += (band.bottom - band.top) * atlases[i].size * 4
+    }
+    if bytes == 0 {
         return
     }
-    let bytes = (band.bottom - band.top) * a.size * 4
     ensure_buffer(s.device, mut f.staging, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)?
-    let at: ptr[u8] = f.staging.mapped
-    let rows = view(at, bytes)
-    __memmove(rows, a.pixels[band.top * a.size * 4..band.bottom * a.size * 4])
+    for i, band in bands {
+        stage_rows(f, atlases[i], band)
+    }
 }
 
-fn record_atlas_upload(mut pins: Pins, cmd: VkCommandBuffer, s: *DeviceState, f: *Frame, a: scene.Atlas, band: Band) {
+fn stage_rows(f: *Frame, a: scene.Atlas, band: Band) {
     if band.bottom <= band.top {
         return
     }
-    let from = if s.atlas_ready { VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } else { VK_IMAGE_LAYOUT_UNDEFINED }
-    image_barrier(mut pins, cmd, s.atlas.handle, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    let rows = (band.bottom - band.top) * a.size * 4
+    let base: ptr[u8] = f.staging.mapped
+    let staged = view(base, f.staging.size)
+    __memmove(staged[band.offset..band.offset + rows], a.pixels[band.top * a.size * 4..band.bottom * a.size * 4])
+}
+
+fn record_atlas_uploads(mut pins: Pins, cmd: VkCommandBuffer, s: *DeviceState, f: *Frame, atlases: scene.Atlas[], bands: Band[]) {
+    for i, band in bands {
+        record_atlas_upload(mut pins, cmd, s.textures[i], f, atlases[i], band)
+    }
+}
+
+fn record_atlas_upload(mut pins: Pins, cmd: VkCommandBuffer, t: Texture, f: *Frame, a: scene.Atlas, band: Band) {
+    if band.bottom <= band.top {
+        return
+    }
+    let from = if t.ready { VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } else { VK_IMAGE_LAYOUT_UNDEFINED }
+    image_barrier(mut pins, cmd, t.image.handle, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT)
     let layers = VkImageSubresourceLayers { aspectMask: VK_IMAGE_ASPECT_COLOR_BIT, layerCount: 1 }
     let offset = VkOffset3D { x: 0, y: i32(band.top), z: 0 }
     let extent = VkExtent3D { width: u32(a.size), height: u32(band.bottom - band.top), depth: 1 }
-    let copy = VkBufferImageCopy { imageSubresource: layers, imageOffset: offset, imageExtent: extent }
+    let copy = VkBufferImageCopy { bufferOffset: band.offset, imageSubresource: layers, imageOffset: offset, imageExtent: extent }
     let regions = pins.hold(copy)
-    vkCmdCopyBufferToImage(cmd, f.staging.handle, s.atlas.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, regions)
-    image_barrier(mut pins, cmd, s.atlas.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    vkCmdCopyBufferToImage(cmd, f.staging.handle, t.image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, regions)
+    image_barrier(mut pins, cmd, t.image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)
+}
+
+fn settle_atlases(s: *DeviceState, mut atlases: scene.Atlas[]) {
+    for i in 0..atlases.len {
+        s.textures[i].ready = true
+        scene.clean(mut atlases[i])
+    }
 }

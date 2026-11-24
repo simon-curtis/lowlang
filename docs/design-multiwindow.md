@@ -234,30 +234,30 @@ Opening needs no step of its own, because `open_window` is synchronous.
 | physical device, `VkDevice`, queue, family (`std/ui/gpu/gpu.low:73-88`) | `Swapchain`: images, views and `finished` semaphores (`std/ui/gpu/swapchain.low:3-12`) |
 | command pool, set layout, pipeline layout, sampler, descriptor pool (`std/ui/gpu/gpu.low:89-93`) | |
 | pipelines keyed by format (`std/ui/gpu/gpu.low:23`, `172-182`) | |
-| glyph atlas `Image` and `atlas_ready` (`std/ui/gpu/gpu.low:24-25`, `std/ui/gpu/atlas.low:8-39`) | |
+| the `Texture` of each atlas (`std/ui/gpu/gpu.low`, `std/ui/gpu/atlas.low`) | |
 | frame ring: command buffers, fences, `acquired` semaphores, instance buffers, staging (`std/ui/gpu/gpu.low:3-11`, `94-98`) | |
 
 ```low
 pub fn open_device(first: Surface) -> Device ! Error
 pub fn presenter(d: Device, s: Surface) -> Presenter ! Error
-pub fn present_to(p: Presenter, s: scene.Scene, mut atlas: scene.Atlas) ! Error
+pub fn present_to(p: Presenter, s: scene.Scene, mut atlases: scene.Atlas[]) ! Error
 ```
 
-`open_for` and `present` keep their signatures. They become a `Gpu` that holds one `Device` and one `Presenter`.
+`open_for` keeps its signature, and `present` takes the atlas slice as `present_to` does. They become a `Gpu` that holds one `Device` and one `Presenter`.
 
 Decisions:
 
 - **One device for every window.** The device is chosen against the first surface (`std/ui/gpu/device.low:72-89`). `presenter` checks each later surface with `vkGetPhysicalDeviceSurfaceSupportKHR` on the chosen family (`std/ui/gpu/device.low:91-95`) and fails with `gpu.Error.NoDevice` when the family cannot present to it, since no device the application holds qualifies for that surface. A device that cannot present to every monitor's window is rare. Section 7 lists it as a risk, not a design driver.
 - **The frame ring stays shared.** Presents run one after another on one thread. A frame slot holds a command buffer, a fence and an `acquired` semaphore, none of which depend on a swapchain. `wait_frame` (`std/ui/gpu/gpu.low:184-193`) makes a slot safe to reuse whichever window used it last. The `finished` semaphores belong to each swapchain image and move with the `Presenter`. `frames_in_flight` (`std/ui/gpu/gpu.low:38`) may need to rise to 3 if profiling shows the CPU waiting on fences with three windows due at once.
-- **One atlas texture.** `ensure_atlas` rewrites the atlas binding of every frame's descriptor sets (`std/ui/gpu/atlas.low:22-26`). Because the ring is shared, that keeps covering every window. The atlas band upload (`std/ui/gpu/swapchain.low:47-55`) runs in whichever window presents first after a change. The upload is recorded into that frame's command buffer, and every later submit on the one queue sees the new rows.
+- **One texture per atlas.** `replace_texture` rewrites the atlas binding of every frame's descriptor sets for that texture (`std/ui/gpu/atlas.low`). Because the ring is shared, that keeps covering every window. The atlas band upload runs in whichever window presents first after a change. The upload is recorded into that frame's command buffer, and every later submit on the one queue sees the new rows.
 - **Presenter teardown.** A `Presenter` must be released before its platform window (`std/ui/gpu/swapchain.low:21`). The `Device` keeps its live presenters and targets, so releasing it first destroys their swapchains, surfaces and images, and a later `Presenter` or `Target` release does nothing. Ring frames that presented to it may still be in flight, so closing a window waits on the fence of every submitted ring frame (`wait_frame`), then destroys the swapchain and the `VkSurfaceKHR`, and then releases the platform window. Closing is rare, so waiting on the ring costs little. `vkDeviceWaitIdle` would do the same job with a coarser wait.
 - **Pipelines by format.** Two windows whose swapchains choose the same surface format share pipelines. A different format adds an entry (`std/ui/gpu/gpu.low:172-182`).
 
 ### Text and images
 
 - One `uitext.System` serves the whole application and moves into `Shared`. Fonts added with `add_font`, pictures added with `add_image` (`std/ui/context.low:171-178`) and the system font set (`std/ui/ui.low:56`) are loaded once.
-- One atlas works across windows at different DPI. Built-in glyph tiles are keyed by the font, the glyph and the device pixel size (`std/ui/text/text.low:810-816`). System-font tiles also carry the scale and subpixel variant (`std/ui/text/text.low:848-852`). A glyph drawn at 1.0 and at 1.5 therefore occupies two tiles and is never shared wrongly.
-- `end_frame` runs at the start of every window's frame (`std/ui/context.low:341`). It clears the layout cache, which is safe because the cache is valid within one frame. When the atlas ran out of room, `end_frame` also clears the atlas (`std/ui/text/text.low:233-244`). After such a clear, every other window is marked due, so each one packs its glyphs again before it presents. Pixels that a window has already presented are unaffected.
+- The atlases work across windows at different DPI. Built-in glyph tiles are keyed by the font, the glyph and the device pixel size (`std/ui/text/text.low:810-816`). System-font tiles also carry the scale and subpixel variant (`std/ui/text/text.low:848-852`). A glyph drawn at 1.0 and at 1.5 therefore occupies two tiles and is never shared wrongly.
+- `end_frame` runs at the start of every window's frame (`std/ui/context.low:341`). It clears the layout cache, which is safe because the cache is valid within one frame. When the atlases ran out of room, `end_frame` also clears them. After such a clear, every other window is marked due, so each one packs its glyphs again before it presents. Pixels that a window has already presented are unaffected.
 - `params` (`std/ui/text/text.low:213-226`) and subpixel support (`std/ui/gpu/gpu.low:52-54`) come from the one device and the one text system, so every window blends text the same way.
 
 ## 4. Context
@@ -322,7 +322,7 @@ Decisions:
 
 - `ui.open` connects a `Display`, opens the main window in it, opens a `Device` and its `Presenter`, and creates `Shared` and the main window's `State`. `App` keeps its private fields and its public `cx`.
 - `ui.run(app, render)` runs the multi-window loop. With one window, each step does what the current loop does, in the same order. The `ui_test`, `reveal_test` and `compiler/tests/ui` fixtures pass unchanged and serve as the check.
-- `platform.open`, `platform.next`, `platform.waker` and `gpu.open_for` with `gpu.present` keep their signatures and behaviour. They are thin wrappers over `Display`, and over `Device` with `Presenter`.
+- `platform.open`, `platform.next`, `platform.waker` and `gpu.open_for` keep their signatures and behaviour, and `gpu.present` differs only in taking the atlas slice as `present_to` does. They are thin wrappers over `Display`, and over `Device` with `Presenter`.
 - `signal`, `get`, `set`, `update`, `background_spawn`, `spawn_into`, `post`, `handle`, `headless` and `advance_clock` keep their signatures. With one window, `Shared` has one entry, and "every window" means that one.
 
 ### Pull requests
@@ -381,7 +381,7 @@ Pull requests 3 and 4 do not depend on 1 and 2. Pull request 5 depends on nothin
 - **Sequential FIFO presents.** Swapchains use `VK_PRESENT_MODE_FIFO_KHR` with `minImageCount + 1` images (`std/ui/gpu/swapchain.low:121`, `136`). Acquire normally returns at once. But two windows due in one iteration on monitors with different refresh rates can block on acquire for one vblank each. This needs measuring with three windows animating, before deciding between per-window acquire timeouts and `MAILBOX` where it is supported.
 - **The Win32 modal size and move loop.** While the user drags any window's frame, `DispatchMessageW` stays inside `DefWindowProcW`'s modal loop, and `run` does not iterate, so no window repaints until the drag ends. This affects one window today too. Rendering from `WM_SIZE` or a `WM_TIMER` inside the modal loop is a separate change.
 - **A device that cannot present to a later surface.** With several adapters, a window on a monitor driven by another GPU may not be presentable from the chosen queue family. The design fails `open_window` with `Gpu(NoDevice)`. A presenter on a second device would need a second atlas and a second frame ring.
-- **Shared atlas pressure.** Three windows at different scales hold three sets of tiles in one 1024-square atlas (`std/ui/text/text.low:8`). A clear in one window's frame makes every window pack again. Growing the atlas, or making one atlas per distinct scale, can follow if clears show up in profiles.
+- **Shared atlas pressure.** Three windows at different scales hold three sets of tiles in the atlases of one `text.System`, which starts with one 1024-square atlas and adds up to seven of 4096 (`std/ui/text/text.low:8`). A clear in one window's frame makes every window pack again. Making one atlas per distinct scale can follow if clears show up in profiles.
 - **Drag between windows.** `on_drag` state is per window (`std/ui/context.low:89-93`), so dragging a tab from the main window into a tool window is not supported. Supporting it needs pointer capture across windows and a drag owned by `Shared`.
 - **Popups outside the window.** Menus and popovers are clamped to their window's viewport (`std/ui/layer.low:279-296`, `341-343`). Popups that reach past the window edge would be popup windows (`WS_POPUP`, or `xdg_popup` on Wayland), which is a separate design.
 - **`rem` per window or shared?** A theme that sets the rem once probably wants it shared. Per window is the conservative choice, because it keeps `set_rem_size` local.
