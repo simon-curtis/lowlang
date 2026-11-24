@@ -126,6 +126,7 @@
 	.set G_CTX, 104
 	.set G_LIMIT, 96
 	.set G_REGION, 112
+	.set G_OSERR, 120
 
 	.set REGION_SHIFT, 16
 	.set REGION_BITS, 36
