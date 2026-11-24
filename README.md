@@ -98,16 +98,36 @@ Each `bench/<name>/` holds one program as `main.low` and, for most, `main.ts`. T
 ./low abbench -a low-a.exe -b low-b.exe --runs 15 --dir ../app --same out-{side}.exe -- {exe} build src/app -o out-{side}.exe
 ```
 
-`{exe}` in the command becomes the `-a` or `-b` program and `{side}` becomes `a` or `b`. Options end at the command. `--same`, relative to `--dir`, deletes both files before the first run and fails unless both sides wrote identical files, checked after the `--warmup` runs and after the last timed run. The timed runs alternate `ab` and `ba`, and each run's process is measured on its own: wall time and, on Windows, CPU time, cycles from `QueryProcessCycleTime` and peak private memory. For each metric the report gives the median and spread of each side, the median of the paired `b/a` ratios and its 95% bootstrap interval; the verdict names a difference only when the interval excludes 1. `--affinity` restricts every run to a hexadecimal CPU mask and fails on other hosts.
+`{exe}` in the command becomes the `-a` or `-b` program and `{side}` becomes `a` or `b`. Options end at the command. `--same`, relative to `--dir`, deletes both files before the first run and fails unless both sides wrote identical files, checked after the `--warmup` runs and after the last timed run. The timed runs alternate `ab` and `ba`, and each run's process is measured on its own: wall time, CPU time, cycles, instructions and peak memory. On Windows the cycles come from `QueryProcessCycleTime`, the peak is private memory and instructions are not counted. On Linux the process starts stopped, `std/perf` counts the cycles and instructions of it and every process it starts, the CPU time and peak resident memory come from `waitid`, and a machine without hardware counters leaves cycles and instructions out. For each metric the report gives the median and spread of each side, the median of the paired `b/a` ratios and its 95% bootstrap interval; the verdict names a difference only when the interval excludes 1. `--affinity` restricts every run to a hexadecimal CPU mask.
 
-`low prof` samples a Windows program and reports where its cycles go; on other hosts it fails:
+`low prof` runs a program and reports where its cycles go:
+
+```sh
+./low prof --folded stacks.txt --callers rt_memmove -- ./low build ../app
+./low prof --event faults -- ./low build ../app
+```
+
+The report starts with the run's wall time, CPU time, peak resident memory, page faults, context switches, cycles and instructions. Then it gives the sampled events by category (`runtime` for the assembly runtime, `prelude`, `std`, `program` and `system` for the kernel, shared libraries and programs without symbols), and the `--top` functions with the most events of their own and the most including callees. `--folded` writes each stack root first with its weight, the input of flame graph tools, and `--callers <function>` lists the call chains that reach one function, indented where they fork. Options end at the program, and every argument after it goes to the program.
+
+On Linux the program starts stopped and the kernel samples it through `perf_event_open`, with every thread and process it starts, so `low prof low test std/ssh` covers the test programs as well. Each process is named from the symbol table of the file it executes, and a shared library from its dynamic symbols. `--event` picks what a sample stands for:
+
+| event | a sample is taken | shows |
+| --- | --- | --- |
+| `cycles` (default), `instructions`, `cache-misses`, `branch-misses` | about every `--interval` milliseconds of CPU time | where the processor's work goes |
+| `cpu-clock` | every `--interval` milliseconds of CPU time | the same on a machine without hardware counters, which `cycles` falls back to |
+| `faults` | every 16th page fault | which code first touches new memory, so where a growing heap or region comes from |
+| `switches` | every time a thread leaves its processor | where threads block or are preempted |
+
+The call chain comes from the frame pointers, so a runtime routine that keeps no frame, such as `rt_memmove`, appears under its caller's caller. A caller address outside every mapped file is left out, so code that keeps another value in `rbp`, as the collector's marking threads and most C programs do, shows its own function with few or no callers, and `[unmapped]` is code that ran outside every mapped file. Memory that the collector reuses takes no page fault, so `faults` shows growth, not every allocation. Sampling needs `/proc/sys/kernel/perf_event_paranoid` at 2 or less, and at 1 or less the samples include the kernel, as `[kernel]`.
+
+A Windows program is sampled by cycles and needs the map of `low build --map`:
 
 ```sh
 ./low build compiler/low -o low-mapped.exe --map low.map
 ./low prof --map low.map --folded stacks.txt -- ./low-mapped.exe build ../app
 ```
 
-Every `--interval` milliseconds it reads the state of the program's threads with `NtQuerySystemInformation`, suspends each thread that is running on a CPU, reads its instruction pointer and walks its `rbp` chain. A thread that is waiting is not sampled, so the work it did before it parked is not charged to the wait. Each sample stands for the time since the previous one, and the samples are scaled to the process's cycles from `QueryProcessCycleTime`. The query takes a few milliseconds, so a run gets a few hundred samples a second. A thread stopped outside the image, in Windows code, is attributed to the first return address into the image found on its stack and the frame record above it. The report gives the process's cycles and the number of samples, the cycles by category (`runtime` for the assembly runtime, `prelude`, `std`, `program` and `system` for code outside the image), and the `--top` functions with the most cycles of their own and the most cycles including callees. `--folded` writes each stack root first with its cycles, the input of flame graph tools. Options end at the program, and every argument after it goes to the program.
+Every `--interval` milliseconds it reads the state of the program's threads with `NtQuerySystemInformation`, suspends each thread that is running on a CPU, reads its instruction pointer and walks its `rbp` chain. A thread that is waiting is not sampled, so the work it did before it parked is not charged to the wait. Each sample stands for the time since the previous one, and the samples are scaled to the process's cycles from `QueryProcessCycleTime`. The query takes a few milliseconds, so a run gets a few hundred samples a second. A thread stopped outside the image, in Windows code, is attributed to the first return address into the image found on its stack and the frame record above it.
 
 ## Releases
 
