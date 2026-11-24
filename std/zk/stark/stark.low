@@ -1,0 +1,382 @@
+import std/crypto
+import std/zk/goldilocks
+
+/// The ways proving, reading a proof or checking parameters fails.
+pub enum Error {
+    /// The parameters are out of range, or the blowup is smaller than the number of composition columns the constraints need.
+    Params
+    /// The `Air` is malformed.
+    Air
+    /// The trace does not have `width` columns of `steps` values below the modulus.
+    Trace
+    /// The trace does not satisfy the constraints.
+    Unsatisfied
+    /// The evaluation domain is larger than `2^27` points.
+    TooLarge
+    /// A proof is cut short, has trailing bytes, a length out of range or a value that is not below the modulus.
+    Malformed
+    /// A proof header names other parameters or another shape of `Air` than the ones given.
+    Mismatch
+}
+
+/// The security parameters of a proof.
+///
+/// A proof is as strong as `security` reports for these values, so a verifier must fix them and never take them from the prover.
+pub struct Params {
+    /// The size of the evaluation domain over the trace length, a power of two from 2 to 64. It must be at least the number of composition columns the constraints need.
+    pub blowup: i64
+    /// The number of FRI queries, from 1 to 1024.
+    pub queries: i64
+    /// The number of leading zero bits the proof of work after the commitments must have, from 0 to 32.
+    pub grinding_bits: i64
+    /// Whether to blind the trace and the FRI input with randomness, so the proof reveals nothing about private trace cells beyond the public boundary values.
+    pub zero_knowledge: bool
+}
+
+/// The openings of one Merkle tree at the queried leaves, in increasing leaf order, with the sibling hashes that authenticate them together.
+pub struct Layer {
+    /// The values of each opened leaf.
+    pub leaves: u64[][]
+    /// The sibling hashes, level by level from the leaves.
+    pub siblings: u8[][]
+}
+
+/// A STARK proof.
+pub struct Proof {
+    /// The Merkle root of the trace on the evaluation domain.
+    pub trace_root: u8[]
+    /// The Merkle root of the composition columns on the evaluation domain.
+    pub composition_root: u8[]
+    /// The out-of-domain values: each trace column at `z`, each at `z` shifted by one row, then each composition column at `z`.
+    pub ood: goldilocks.Ext[]
+    /// The roots of the committed FRI layers after the first fold.
+    pub fri_roots: u8[][]
+    /// The coefficients of the last FRI polynomial.
+    pub remainder: goldilocks.Ext[]
+    /// The proof of work nonce.
+    pub nonce: u64
+    /// The openings of the trace.
+    pub trace: Layer
+    /// The openings of the composition columns.
+    pub composition: Layer
+    /// The openings of the FRI layers.
+    pub fri: Layer[]
+}
+
+const max_domain: i64 = 1 << 27
+const remainder_bound: i64 = 16
+
+struct Layout {
+    width: i64
+    steps: i64
+    trace_len: i64
+    stride: i64
+    domain: i64
+    half: i64
+    columns: i64
+    committed: i64
+    rounds: i64
+    remainder_len: i64
+    params: Params
+}
+
+fn params_valid(p: Params) -> bool {
+    power_of_two(p.blowup) && p.blowup >= 2 && p.blowup <= 64 && p.queries >= 1 && p.queries <= 1024 && p.grinding_bits >= 0 && p.grinding_bits <= 32
+}
+
+fn layout(air: Air, params: Params) -> Layout ! Error {
+    if !well_formed(air) {
+        fail Air
+    }
+    if !params_valid(params) {
+        fail Params
+    }
+    var n = air.steps
+    if params.zero_knowledge {
+        n *= 2
+        for n - air.steps < 4 * params.queries + 2 {
+            n *= 2
+        }
+    }
+    let domain = n * params.blowup
+    if domain > max_domain {
+        fail TooLarge
+    }
+    var top = n - 2
+    for e in air.transitions {
+        let d = polynomial_degree(air, e, n) - (air.steps - 1)
+        if d > top {
+            top = d
+        }
+    }
+    let columns = (top + n) / n
+    if columns > params.blowup {
+        fail Params
+    }
+    var rounds = 0
+    var remainder = n
+    for remainder > remainder_bound {
+        remainder /= 2
+        rounds += 1
+    }
+    let committed = if params.zero_knowledge { columns + 1 } else { columns }
+    Layout { width: air.width, steps: air.steps, trace_len: n, stride: n / air.steps, domain, half: domain / 2, columns, committed, rounds, remainder_len: remainder, params }
+}
+
+fn header(air: Air, l: Layout) -> u8[] {
+    var out: u8[] = []
+    put32(mut out, l.params.blowup)
+    put32(mut out, l.params.queries)
+    put32(mut out, l.params.grinding_bits)
+    out.push(if l.params.zero_knowledge { 1 } else { 0 })
+    put32(mut out, air.width)
+    put32(mut out, air.steps)
+    out
+}
+
+fn transcript_for(air: Air, l: Layout) -> *Transcript {
+    var seed = header(air, l)
+    append(mut seed, encode(air))
+    start(seed)
+}
+
+fn lde_of(big: goldilocks.Twiddles, coefficients: u64[], domain: i64) -> u64[] {
+    let out: u64[] = __make(domain)
+    __memmove(out, coefficients)
+    goldilocks.coset_ntt(big, out, goldilocks.generator)
+    out
+}
+
+fn ext_lde_of(big: goldilocks.Twiddles, coefficients: goldilocks.Ext[], domain: i64) -> goldilocks.Ext[] {
+    var out: goldilocks.Ext[] = []
+    for c in coefficients {
+        out.push(c)
+    }
+    for _ in coefficients.len..domain {
+        out.push(goldilocks.ext(0))
+    }
+    goldilocks.ext_coset_ntt(big, out, goldilocks.generator)
+    out
+}
+
+fn random_elements(count: i64) -> u64[] {
+    var out: u64[] = []
+    for out.len < count {
+        let bytes = crypto.random(8 * (count - out.len))
+        for i in 0..bytes.len / 8 {
+            let v = get(bytes, 8 * i)
+            if v < goldilocks.modulus {
+                out.push(v)
+            }
+        }
+    }
+    out
+}
+
+fn periodic_coefficients(air: Air) -> u64[][] {
+    var out: u64[][] = []
+    for column in air.periodic {
+        let c: u64[] = __make(column.len)
+        __memmove(c, column)
+        goldilocks.intt(goldilocks.twiddles(column.len), c)
+        out.push(c)
+    }
+    out
+}
+
+fn periodic_lde(air: Air, l: Layout, big: goldilocks.Twiddles) -> u64[][] {
+    var out: u64[][] = []
+    let coefficients = periodic_coefficients(air)
+    for q in coefficients {
+        let spread = l.steps / q.len
+        let sparse: u64[] = __make(l.domain)
+        for k in 0..q.len {
+            sparse[k * spread] = q[k]
+        }
+        goldilocks.coset_ntt(big, sparse, goldilocks.generator)
+        out.push(sparse)
+    }
+    out
+}
+
+fn periodic_at_point(air: Air, coefficients: u64[][], x: goldilocks.Ext) -> goldilocks.Ext[] {
+    var out: goldilocks.Ext[] = []
+    for q in coefficients {
+        let at = goldilocks.ext_pow(x, u64(air.steps / q.len))
+        out.push(goldilocks.ext_evaluate_base(q, at))
+    }
+    out
+}
+
+fn constraint_value(air: Air, l: Layout, alphas: goldilocks.Ext[], current: goldilocks.Ext[], next: goldilocks.Ext[], per: goldilocks.Ext[], x: goldilocks.Ext) -> goldilocks.Ext {
+    let g = goldilocks.root_of_unity(bits_of(l.trace_len))
+    let last = goldilocks.pow(g, u64(l.stride * (l.steps - 1)))
+    let vanishing = goldilocks.ext_sub(goldilocks.ext_pow(x, u64(l.steps)), goldilocks.ext(1))
+    let divisor = goldilocks.ext_mul(goldilocks.ext_sub(x, goldilocks.ext(last)), goldilocks.ext_inv(vanishing))
+    var acc = goldilocks.ext(0)
+    for i in 0..air.transitions.len {
+        acc = goldilocks.ext_add(acc, goldilocks.ext_mul(alphas[i], evaluate(air.transitions[i], current, next, per)))
+    }
+    acc = goldilocks.ext_mul(acc, divisor)
+    for k in 0..air.boundaries.len {
+        let b = air.boundaries[k]
+        let point = goldilocks.pow(g, u64(l.stride * b.row))
+        let quotient = goldilocks.ext_mul(goldilocks.ext_sub(current[b.column], goldilocks.ext(b.value)), goldilocks.ext_inv(goldilocks.ext_sub(x, goldilocks.ext(point))))
+        acc = goldilocks.ext_add(acc, goldilocks.ext_mul(alphas[air.transitions.len + k], quotient))
+    }
+    acc
+}
+
+fn bits_of(size: i64) -> i64 {
+    var log = 0
+    var s = size
+    for s > 1 {
+        s /= 2
+        log += 1
+    }
+    log
+}
+
+fn deep_value(l: Layout, gamma: goldilocks.Ext[], row: u64[], comp: goldilocks.Ext[], x: u64, z: goldilocks.Ext, zn: goldilocks.Ext, ood: goldilocks.Ext[]) -> goldilocks.Ext {
+    let w = l.width
+    var at_z = goldilocks.ext(0)
+    var at_zn = goldilocks.ext(0)
+    for c in 0..w {
+        let v = goldilocks.ext(row[c])
+        at_z = goldilocks.ext_add(at_z, goldilocks.ext_mul(gamma[c], goldilocks.ext_sub(v, ood[c])))
+        at_zn = goldilocks.ext_add(at_zn, goldilocks.ext_mul(gamma[w + c], goldilocks.ext_sub(v, ood[w + c])))
+    }
+    for k in 0..l.columns {
+        at_z = goldilocks.ext_add(at_z, goldilocks.ext_mul(gamma[2 * w + k], goldilocks.ext_sub(comp[k], ood[2 * w + k])))
+    }
+    let xe = goldilocks.ext(x)
+    var out = goldilocks.ext_add(goldilocks.ext_mul(at_z, goldilocks.ext_inv(goldilocks.ext_sub(xe, z))), goldilocks.ext_mul(at_zn, goldilocks.ext_inv(goldilocks.ext_sub(xe, zn))))
+    if l.params.zero_knowledge {
+        out = goldilocks.ext_add(out, goldilocks.ext_mul(gamma[2 * w + l.columns], comp[l.columns]))
+    }
+    out
+}
+
+fn out_of_domain(t: *Transcript, l: Layout) -> goldilocks.Ext {
+    let h = goldilocks.ext(goldilocks.pow(goldilocks.generator, u64(l.domain)))
+    for {
+        let z = challenge_ext(t)
+        let on_trace = goldilocks.ext_pow(z, u64(l.trace_len)) == goldilocks.ext(1)
+        let on_domain = goldilocks.ext_pow(z, u64(l.domain)) == h
+        if !on_trace && !on_domain {
+            return z
+        }
+    }
+}
+
+fn challenges(t: *Transcript, count: i64) -> goldilocks.Ext[] {
+    var out: goldilocks.Ext[] = []
+    for _ in 0..count {
+        out.push(challenge_ext(t))
+    }
+    out
+}
+
+fn sorted_unique(values: i64[]) -> i64[] {
+    var sorted: i64[] = []
+    for v in values {
+        var at = sorted.len
+        for at > 0 && sorted[at - 1] > v {
+            at -= 1
+        }
+        if at > 0 && sorted[at - 1] == v {
+            continue
+        }
+        sorted.push(v)
+        var k = sorted.len - 1
+        for k > at {
+            sorted[k] = sorted[k - 1]
+            k -= 1
+        }
+        sorted[at] = v
+    }
+    sorted
+}
+
+fn query_positions(t: *Transcript, l: Layout) -> i64[] {
+    var raw: i64[] = []
+    for _ in 0..l.params.queries {
+        raw.push(challenge_index(t, l.half))
+    }
+    sorted_unique(raw)
+}
+
+fn layer_indices(positions: i64[], size: i64) -> i64[] {
+    var raw: i64[] = []
+    for p in positions {
+        raw.push(p % (size / 2))
+    }
+    sorted_unique(raw)
+}
+
+fn find(indices: i64[], index: i64) -> i64 {
+    var lo = 0
+    var hi = indices.len - 1
+    for lo <= hi {
+        let mid = (lo + hi) / 2
+        if indices[mid] == index {
+            return mid
+        }
+        if indices[mid] < index {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    -1
+}
+
+fn fold_pair(a: goldilocks.Ext, b: goldilocks.Ext, x_inverse: u64, alpha: goldilocks.Ext) -> goldilocks.Ext {
+    let half: u64 = 0x7FFF_FFFF_8000_0001
+    let sum = goldilocks.ext_scale(goldilocks.ext_add(a, b), half)
+    let odd = goldilocks.ext_scale(goldilocks.ext_sub(a, b), goldilocks.mul(half, x_inverse))
+    goldilocks.ext_add(sum, goldilocks.ext_mul(alpha, odd))
+}
+
+fn fold(values: goldilocks.Ext[], shift: u64, alpha: goldilocks.Ext) -> goldilocks.Ext[] {
+    let half = values.len / 2
+    let root = goldilocks.root_of_unity(bits_of(values.len))
+    let step = goldilocks.inv(root)
+    var x_inverse = goldilocks.inv(shift)
+    var out: goldilocks.Ext[] = []
+    for p in 0..half {
+        out.push(fold_pair(values[p], values[p + half], x_inverse, alpha))
+        x_inverse = goldilocks.mul(x_inverse, step)
+    }
+    out
+}
+
+fn ext_pair_leaf(values: goldilocks.Ext[], j: i64) -> u64[] {
+    let half = values.len / 2
+    let a = values[j]
+    let b = values[j + half]
+    [a.c0, a.c1, a.c2, b.c0, b.c1, b.c2]
+}
+
+fn ext_flat(values: goldilocks.Ext[]) -> u64[] {
+    var out: u64[] = []
+    for e in values {
+        out.push(e.c0)
+        out.push(e.c1)
+        out.push(e.c2)
+    }
+    out
+}
+
+fn canonical(values: u64[]) -> bool {
+    for v in values {
+        if v >= goldilocks.modulus {
+            return false
+        }
+    }
+    true
+}
+
+fn point_at(shift: u64, root: u64, p: i64) -> u64 {
+    goldilocks.mul(shift, goldilocks.pow(root, u64(p)))
+}

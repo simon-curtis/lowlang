@@ -1,0 +1,244 @@
+import std/zk/goldilocks
+
+fn trace_shaped(air: Air, trace: u64[][]) -> bool {
+    if trace.len != air.width {
+        return false
+    }
+    for column in trace {
+        if column.len != air.steps || !canonical(column) {
+            return false
+        }
+    }
+    true
+}
+
+fn spread(column: u64[], l: Layout) -> u64[] {
+    let values: u64[] = if l.params.zero_knowledge { random_elements(l.trace_len) } else { __make(l.trace_len) }
+    for i in 0..l.steps {
+        values[i * l.stride] = column[i]
+    }
+    values
+}
+
+fn trace_leaf(lde: u64[][], j: i64, half: i64) -> u64[] {
+    var out: u64[] = []
+    for column in lde {
+        out.push(column[j])
+    }
+    for column in lde {
+        out.push(column[j + half])
+    }
+    out
+}
+
+fn composition_leaf(columns: goldilocks.Ext[][], j: i64, half: i64) -> u64[] {
+    var out: u64[] = []
+    for p in [j, j + half] {
+        for column in columns {
+            out.push(column[p].c0)
+            out.push(column[p].c1)
+            out.push(column[p].c2)
+        }
+    }
+    out
+}
+
+fn composition_values(air: Air, l: Layout, lde: u64[][], per: u64[][], alphas: goldilocks.Ext[]) -> goldilocks.Ext[] {
+    let big_root = goldilocks.root_of_unity(bits_of(l.domain))
+    let shift = l.stride * l.params.blowup
+    let current: goldilocks.Ext[] = __make(l.width)
+    let next: goldilocks.Ext[] = __make(l.width)
+    let periodic: goldilocks.Ext[] = __make(per.len)
+    var out: goldilocks.Ext[] = []
+    var x = goldilocks.generator
+    for j in 0..l.domain {
+        for c in 0..l.width {
+            current[c] = goldilocks.ext(lde[c][j])
+            next[c] = goldilocks.ext(lde[c][(j + shift) % l.domain])
+        }
+        for i in 0..per.len {
+            periodic[i] = goldilocks.ext(per[i][j])
+        }
+        out.push(constraint_value(air, l, alphas, current, next, periodic, goldilocks.ext(x)))
+        x = goldilocks.mul(x, big_root)
+    }
+    out
+}
+
+fn zero_from(values: goldilocks.Ext[], at: i64) -> bool {
+    for i in at..values.len {
+        if !goldilocks.ext_is_zero(values[i]) {
+            return false
+        }
+    }
+    true
+}
+
+fn random_ext(count: i64) -> goldilocks.Ext[] {
+    let raw = random_elements(3 * count)
+    var out: goldilocks.Ext[] = []
+    for i in 0..count {
+        out.push(ext_at(raw, i))
+    }
+    out
+}
+
+struct Committed {
+    tree: Tree
+    leaves: u64[][]
+}
+
+fn commit(leaves: u64[][]) -> Committed {
+    Committed { tree: build(leaves), leaves }
+}
+
+fn open_layer(c: Committed, indices: i64[]) -> Layer {
+    var picked: u64[][] = []
+    for i in indices {
+        picked.push(c.leaves[i])
+    }
+    Layer { leaves: picked, siblings: open(c.tree, indices) }
+}
+
+/// Returns a proof that `trace`, a column-major table of `air.width` columns of `air.steps` values below `goldilocks.modulus`, satisfies `air`, with the security `params`.
+///
+/// Fails with `Air` or `Params` when they are out of range, with `Trace` when the trace has the wrong shape, with `Unsatisfied` when a constraint does not hold, and with `TooLarge` when the evaluation domain would exceed `2^27` points. With `params.zero_knowledge` the randomness comes from `crypto.random`. The prover is not constant time: it branches on and indexes by trace values, so it does not hide them from a local observer.
+pub fn prove(air: Air, params: Params, trace: u64[][]) -> Proof ! Error {
+    let l = layout(air, params)?
+    if !trace_shaped(air, trace) {
+        fail Trace
+    }
+    if !satisfied(air, trace) {
+        fail Unsatisfied
+    }
+    build_proof(air, l, trace, true)
+}
+
+fn build_proof(air: Air, l: Layout, trace: u64[][], strict: bool) -> Proof ! Error {
+    let params = l.params
+    let small = goldilocks.twiddles(l.trace_len)
+    let big = goldilocks.twiddles(l.domain)
+    let t = transcript_for(air, l)
+
+    var coefficients: u64[][] = []
+    var lde: u64[][] = []
+    for column in trace {
+        let values = spread(column, l)
+        goldilocks.intt(small, values)
+        coefficients.push(values)
+        lde.push(lde_of(big, values, l.domain))
+    }
+    var trace_leaves: u64[][] = []
+    for j in 0..l.half {
+        trace_leaves.push(trace_leaf(lde, j, l.half))
+    }
+    let trace_commitment = commit(trace_leaves)
+    let trace_root = root(trace_commitment.tree)
+    absorb(t, trace_root)
+
+    let alphas = challenges(t, air.transitions.len + air.boundaries.len)
+    let values = composition_values(air, l, lde, periodic_lde(air, l, big), alphas)
+    goldilocks.ext_coset_intt(big, values, goldilocks.generator)
+    if strict && !zero_from(values, l.columns * l.trace_len) {
+        fail Unsatisfied
+    }
+    var pieces: goldilocks.Ext[][] = []
+    var piece_lde: goldilocks.Ext[][] = []
+    for k in 0..l.columns {
+        let piece = values[k * l.trace_len..(k + 1) * l.trace_len]
+        pieces.push(piece)
+        piece_lde.push(ext_lde_of(big, piece, l.domain))
+    }
+    if params.zero_knowledge {
+        piece_lde.push(ext_lde_of(big, random_ext(l.trace_len), l.domain))
+    }
+    var composition_leaves: u64[][] = []
+    for j in 0..l.half {
+        composition_leaves.push(composition_leaf(piece_lde, j, l.half))
+    }
+    let composition_commitment = commit(composition_leaves)
+    let composition_root = root(composition_commitment.tree)
+    absorb(t, composition_root)
+
+    let z = out_of_domain(t, l)
+    let g = goldilocks.root_of_unity(bits_of(l.trace_len))
+    let zn = goldilocks.ext_scale(z, goldilocks.pow(g, u64(l.stride)))
+    var ood: goldilocks.Ext[] = []
+    for c in coefficients {
+        ood.push(goldilocks.ext_evaluate_base(c, z))
+    }
+    for c in coefficients {
+        ood.push(goldilocks.ext_evaluate_base(c, zn))
+    }
+    for piece in pieces {
+        ood.push(goldilocks.ext_evaluate(piece, z))
+    }
+    absorb(t, ext_elements(ood))
+
+    let gamma = challenges(t, 2 * l.width + l.committed)
+    var deep: goldilocks.Ext[] = []
+    var x = goldilocks.generator
+    let big_root = goldilocks.root_of_unity(bits_of(l.domain))
+    for j in 0..l.domain {
+        var row: u64[] = []
+        for column in lde {
+            row.push(column[j])
+        }
+        var comp: goldilocks.Ext[] = []
+        for column in piece_lde {
+            comp.push(column[j])
+        }
+        deep.push(deep_value(l, gamma, row, comp, x, z, zn, ood))
+        x = goldilocks.mul(x, big_root)
+    }
+
+    var fri_roots: u8[][] = []
+    var fri_layers: Committed[] = []
+    var folded = deep
+    var shift = goldilocks.generator
+    for r in 0..l.rounds {
+        let alpha = challenge_ext(t)
+        folded = fold(folded, shift, alpha)
+        shift = goldilocks.mul(shift, shift)
+        if r + 1 < l.rounds {
+            var leaves: u64[][] = []
+            for j in 0..folded.len / 2 {
+                leaves.push(ext_pair_leaf(folded, j))
+            }
+            let c = commit(leaves)
+            fri_layers.push(c)
+            let r_root = root(c.tree)
+            fri_roots.push(r_root)
+            absorb(t, r_root)
+        }
+    }
+    goldilocks.ext_coset_intt(goldilocks.twiddles(folded.len), folded, shift)
+    if strict && !zero_from(folded, l.remainder_len) {
+        fail Unsatisfied
+    }
+    let remainder = folded[..l.remainder_len]
+    absorb(t, ext_elements(remainder))
+    let nonce = grind(t, params.grinding_bits)
+    var nonce_bytes: u8[] = []
+    put(mut nonce_bytes, nonce)
+    absorb(t, nonce_bytes)
+
+    let positions = query_positions(t, l)
+    var layers: Layer[] = []
+    var size = l.domain
+    for c in fri_layers {
+        size /= 2
+        layers.push(open_layer(c, layer_indices(positions, size)))
+    }
+    Proof {
+        trace_root
+        composition_root
+        ood
+        fri_roots
+        remainder
+        nonce
+        trace: open_layer(trace_commitment, positions)
+        composition: open_layer(composition_commitment, positions)
+        fri: layers
+    }
+}

@@ -1,0 +1,185 @@
+import std/zk/goldilocks
+
+fn layer_shaped(layer: Layer, count: i64, leaf_len: i64) -> bool {
+    if layer.leaves.len != count || layer.siblings.len > 64 * count {
+        return false
+    }
+    for leaf in layer.leaves {
+        if leaf.len != leaf_len || !canonical(leaf) {
+            return false
+        }
+    }
+    for s in layer.siblings {
+        if s.len != digest_size {
+            return false
+        }
+    }
+    true
+}
+
+fn ext_canonical(values: goldilocks.Ext[]) -> bool {
+    return canonical(ext_flat(values))
+}
+
+fn proof_shaped(l: Layout, proof: Proof) -> bool {
+    if proof.trace_root.len != digest_size || proof.composition_root.len != digest_size {
+        return false
+    }
+    if proof.ood.len != 2 * l.width + l.columns || proof.remainder.len != l.remainder_len || proof.fri_roots.len != max_zero(l.rounds - 1) {
+        return false
+    }
+    for r in proof.fri_roots {
+        if r.len != digest_size {
+            return false
+        }
+    }
+    ext_canonical(proof.ood) && ext_canonical(proof.remainder) && proof.fri.len == proof.fri_roots.len
+}
+
+fn max_zero(n: i64) -> i64 {
+    if n < 0 { 0 } else { n }
+}
+
+fn pair_values(leaf: u64[], first: i64, count: i64) -> goldilocks.Ext[] {
+    var out: goldilocks.Ext[] = []
+    for i in 0..count {
+        out.push(ext_at(leaf, first + i))
+    }
+    out
+}
+
+fn check_query(l: Layout, proof: Proof, positions: i64[], position: i64, gamma: goldilocks.Ext[], z: goldilocks.Ext, zn: goldilocks.Ext, indices: i64[][], fold_alphas: goldilocks.Ext[]) -> bool {
+    let at = find(positions, position)
+    let trace_leaf = proof.trace.leaves[at]
+    let comp_leaf = proof.composition.leaves[at]
+    let big_root = goldilocks.root_of_unity(bits_of(l.domain))
+    let x = point_at(goldilocks.generator, big_root, position)
+    let w = l.width
+    let first = deep_value(l, gamma, trace_leaf[0..w], pair_values(comp_leaf, 0, l.committed), x, z, zn, proof.ood)
+    let second = deep_value(l, gamma, trace_leaf[w..2 * w], pair_values(comp_leaf, l.committed, l.committed), goldilocks.neg(x), z, zn, proof.ood)
+    if l.rounds == 0 {
+        return first == goldilocks.ext_evaluate(proof.remainder, goldilocks.ext(x)) && second == goldilocks.ext_evaluate(proof.remainder, goldilocks.ext(goldilocks.neg(x)))
+    }
+    var size = l.domain
+    var a = first
+    var b = second
+    var pair_x = x
+    var location = position
+    for r in 0..l.rounds {
+        let folded = fold_pair(a, b, goldilocks.inv(pair_x), fold_alphas[r])
+        let folded_point = goldilocks.mul(pair_x, pair_x)
+        size /= 2
+        location = location % size
+        if r + 1 == l.rounds {
+            return folded == goldilocks.ext_evaluate(proof.remainder, goldilocks.ext(folded_point))
+        }
+        let leaf = proof.fri[r].leaves[find(indices[r], location % (size / 2))]
+        let side = if location < size / 2 { 0 } else { 1 }
+        if ext_at(leaf, side) != folded {
+            return false
+        }
+        a = ext_at(leaf, 0)
+        b = ext_at(leaf, 1)
+        pair_x = if location < size / 2 { folded_point } else { goldilocks.neg(folded_point) }
+    }
+    false
+}
+
+/// Returns whether `proof` shows that a trace satisfying `air` exists, with the security `params`.
+///
+/// It is false when the parameters or the `Air` are out of range, when the proof does not have the shape they give, or when any commitment, opening, constraint relation, FRI fold, remainder or proof of work fails. It never panics on a malformed `Proof`. The boundary values of `air` are the public inputs: a proof for other values fails. Everything it reads is public.
+pub fn verify(air: Air, params: Params, proof: Proof) -> bool {
+    let l = layout(air, params) or return false
+    if !proof_shaped(l, proof) {
+        return false
+    }
+    let t = transcript_for(air, l)
+    absorb(t, proof.trace_root)
+    let alphas = challenges(t, air.transitions.len + air.boundaries.len)
+    absorb(t, proof.composition_root)
+    let z = out_of_domain(t, l)
+    let g = goldilocks.root_of_unity(bits_of(l.trace_len))
+    let zn = goldilocks.ext_scale(z, goldilocks.pow(g, u64(l.stride)))
+    let w = l.width
+    let per = periodic_at_point(air, periodic_coefficients(air), z)
+    let expected = constraint_value(air, l, alphas, proof.ood[0..w], proof.ood[w..2 * w], per, z)
+    var combined = goldilocks.ext(0)
+    var power = goldilocks.ext(1)
+    let step = goldilocks.ext_pow(z, u64(l.trace_len))
+    for k in 0..l.columns {
+        combined = goldilocks.ext_add(combined, goldilocks.ext_mul(power, proof.ood[2 * w + k]))
+        power = goldilocks.ext_mul(power, step)
+    }
+    if combined != expected {
+        return false
+    }
+    absorb(t, ext_elements(proof.ood))
+    let gamma = challenges(t, 2 * w + l.committed)
+    var fold_alphas: goldilocks.Ext[] = []
+    for r in 0..l.rounds {
+        fold_alphas.push(challenge_ext(t))
+        if r + 1 < l.rounds {
+            absorb(t, proof.fri_roots[r])
+        }
+    }
+    absorb(t, ext_elements(proof.remainder))
+    if !meets(t, params.grinding_bits, proof.nonce) {
+        return false
+    }
+    var nonce_bytes: u8[] = []
+    put(mut nonce_bytes, proof.nonce)
+    absorb(t, nonce_bytes)
+    let positions = query_positions(t, l)
+    if !layer_shaped(proof.trace, positions.len, 2 * w) || !layer_shaped(proof.composition, positions.len, 2 * l.committed * 3) {
+        return false
+    }
+    if !check_openings(l, proof, positions) {
+        return false
+    }
+    let indices = fri_indices(l, positions)
+    if !check_fri_openings(l, proof, indices) {
+        return false
+    }
+    for position in positions {
+        if !check_query(l, proof, positions, position, gamma, z, zn, indices, fold_alphas) {
+            return false
+        }
+    }
+    true
+}
+
+fn fri_indices(l: Layout, positions: i64[]) -> i64[][] {
+    var out: i64[][] = []
+    var size = l.domain
+    for _ in 1..l.rounds {
+        size /= 2
+        out.push(layer_indices(positions, size))
+    }
+    out
+}
+
+fn leaf_hashes(layer: Layer) -> u8[][] {
+    var out: u8[][] = []
+    for leaf in layer.leaves {
+        out.push(leaf_hash(leaf))
+    }
+    out
+}
+
+fn check_openings(l: Layout, proof: Proof, positions: i64[]) -> bool {
+    authenticate(proof.trace_root, l.half, positions, leaf_hashes(proof.trace), proof.trace.siblings) && authenticate(proof.composition_root, l.half, positions, leaf_hashes(proof.composition), proof.composition.siblings)
+}
+
+fn check_fri_openings(l: Layout, proof: Proof, indices: i64[][]) -> bool {
+    var size = l.domain
+    for r in 0..indices.len {
+        size /= 2
+        if !layer_shaped(proof.fri[r], indices[r].len, 6) {
+            return false
+        }
+        if !authenticate(proof.fri_roots[r], size / 2, indices[r], leaf_hashes(proof.fri[r]), proof.fri[r].siblings) {
+            return false
+        }
+    }
+    true
+}
