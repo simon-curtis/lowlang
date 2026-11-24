@@ -412,3 +412,185 @@ Lessons:
 Engineering follow-ups for Low (not novel; production collectors size GC worker counts dynamically, for example HotSpot's UseDynamicNumberOfGCThreads):
 - Keep the mark loop in the single-worker form until a second worker takes work, so chain-shaped heaps pay nothing for recruited threads.
 - Measure the idle share of shuffle's workers (steal attempts, sleep time per collection) to split the plateau between work starvation and per-core miss capacity.
+
+## A7 Returning free heap pages on Windows (pre-registered before building)
+
+Machine for A7 and A8: i9-12950HX, 8 performance cores with two threads each and 8 efficiency cores (24 logical CPUs), 32 GB, Windows 11. Runs are pinned to the 16 performance-core CPUs (affinity `0xFFFF`). No figure from the Linux machine above transfers. Runtime: `runtime-instrumentation.patch` on ee9052b1, which applies cleanly.
+
+Observation that prompted it (default traces on this machine, before any change):
+- `rt_heap_release` and `rt_release_chunk` are empty on Windows and `rt_release_floor` names a bin that no chunk reaches, so no heap page is given back for the life of the process.
+- selfbuild's heap span reaches 146 MB while the last collections leave 26 to 47 MB live. From collection 45 on the span grows by 42 MB with 60% to 75% of it free.
+- A8's observation: 48 of selfbuild's 50 collections fire through the grow rule, before the allocation threshold.
+
+Idea: give Windows what Linux has. A free chunk of at least 256 KB that the sweep files, or that the walk after the sweep finds in a dirty bin, has its interior pages decommitted and committed again (`VirtualFree(MEM_DECOMMIT)` then `VirtualAlloc(MEM_COMMIT)`). The pages leave the working set, read as zero on the next touch, and the chunk goes to a clean bin, which is the contract `madvise(MADV_DONTNEED)` gives the Linux path. `LOW_GCRETURN=1` turns it on, so every arm runs one binary.
+Prior art (queries: "Go runtime mem_windows.go sysUnused VirtualFree MEM_DECOMMIT sysUsed VirtualAlloc MEM_COMMIT scavenger"; "garbage collector trigger based on committed heap size instead of live size non-moving collector reuse free space before collecting MEM_RESET working set"): Go's `sysUnused` and `sysUsed` on Windows are this pair of calls; JEP 346 returns idle committed memory from G1. Not new. A7 is a platform gap in Low, tested as a hypothesis because its counter-cost (system calls inside the pause, demand-zero faults on reuse) is unmeasured.
+
+Workloads: the bench programs, selfbuild, `low lint compiler/low`, and `bench/spike`, written for A7: it builds about 300 MB of live data, drops it, then churns at a few MB live for the rest of the run. The harness (`a7bench.py`) samples the working set every 5 ms; "end" is the median of the last 20 samples.
+
+Predictions (RET against D, 7 interleaved runs, medians):
+1. spike: working set at the end is at most 35% of D's.
+2. selfbuild: peak working set falls by at least 10%. `low lint compiler/low`: time-averaged working set falls by at least 10%.
+3. Wall time rises by at most 3% and CPU time by at most 5% on every workload.
+4. Self-build fixpoint holds with `LOW_GCRETURN=1`, alone and with `LOW_GC=stress`; `lowtest run` fails no case under `LOW_GCRETURN=1` that passes without it.
+
+Falsifiers:
+- A gate failure absent from the baseline.
+- spike's end working set above 60% of D's.
+- selfbuild's peak working set falls by under 3% and its time-averaged working set by under 5% (returning pages buys the compiler nothing).
+- Wall time 8% or more above D on any workload with at least 20 collections.
+
+Deviation: the research patch stubbed `rt_env_num` on Windows to return 0, so no numeric knob took effect there and the first gate runs passed without testing anything. The parser was written before any result below was taken; a check that each knob changes a trace came first.
+
+Result (`a7-out/run1.txt`; D2 is a second default arm for noise: wall within 0.5% of D except shuffle, 3.5%):
+
+| workload | wall, RET against D | sweep ms D / RET | peak working set MB D / RET | end working set MB D / RET |
+|---|---|---|---|---|
+| gcpause | +18% | 29 / 354 | 156 / 156 | 156 / 156 |
+| spike | +33% | 89 / 396 | 340 / 339 | 339 / 22 |
+| binarytrees | +48% | 13 / 215 | 63 / 60 | 63 / 54 |
+| jsonpar | +56% | 26 / 139 | 28 / 27 | 28 / 24 |
+| strings | +12% | 1.1 / 4.4 | 18 / 19 | 18 / 17 |
+| selfbuild | +5.8% | 14 / 63 | 193 / 150 | 173 / 118 |
+| lint | +1.0% | 8.8 / 11.9 | 111 / 109 | 98 / 99 |
+| sort | +0.8% | 0.04 / 1.2 | 66 / 50 | 65 / 49 |
+| maps | +3.9% | 0.16 / 4.4 | 101 / 85 | 66 / 61 |
+
+Against the pre-registration:
+1. spike's end working set at most 35% of D's: pass, 6%.
+2. selfbuild's peak working set at least 10% lower: pass, 22%. lint's time-averaged working set at least 10% lower: fail, 0.7%.
+3. Wall within 3%: fail on six workloads.
+4. Fixpoint holds with `LOW_GCRETURN=1`, alone and under stress. The fixture gate is reported under A9.
+- Falsifier fired: wall time is 12% to 56% above D on five workloads with at least 20 collections.
+
+Verdict: falsified as built. The memory claim holds and the cost claim does not. Each collection returns the chunks the program refills before the next one, and a freed chunk that merges with an already returned neighbour is returned whole again. The extra wall time is about twice the extra sweep time, so demand-zero faults on reuse cost as much as the system calls.
+Lesson: on Windows a decommit and commit pair is not `madvise(MADV_DONTNEED)` in cost. A port of the Linux policy needs a rule for what to keep.
+
+## A8 Span ratchet trigger (pre-registered before building)
+
+Idea: Low collects when the words allocated since the last collection reach the words that survived it. After the live size falls, the heap still owns the span it grew to, and on Windows that span stays resident (A7), so a collection that runs while owned free space remains saves no memory. `LOW_GCSPAN=1` sets the threshold to the larger of the default threshold and the free words of the span (span minus live). The grow rule keeps reading the default threshold, so an allocation that would move the heap end collects exactly when it does today and the ratchet cannot grow the span where the default would not.
+Prior art (query: "Boehm GC GC_free_space_divisor collection trigger heap size allocated since last collection min_bytes_allocd"): Boehm's heap-expansion rule compares allocation since the last collection with heap size over `GC_free_space_divisor`, so a trigger read from heap size is not new; `LOW_GCHW` in E5 is the neighbouring rule (headroom from the highest live size) and LIM the rule with the budget known in advance. A8's claim is narrower: on a platform that keeps the span resident, the ratchet is free in memory, and it stops being free once A7 returns pages.
+
+Arms: D, SPAN, RET, SPAN+RET, and R, a larger heap without the ratchet (`LOW_GCRATIO` tuned per workload until its collection count is within 10% of SPAN's).
+
+Predictions (written before any SPAN run):
+1. SPAN's peak working set is within 3% of D's on every workload.
+2. Collection count: at least 25% lower on jsonpar, at least 10% lower on binarytrees, within 3% on gcpause and shuffle (their span is about 1.25 times live), 4% to 20% lower on selfbuild.
+3. Summed mark time on jsonpar falls by at least 20%.
+4. R needs at least 5% more peak working set than SPAN to reach SPAN's collection count on jsonpar.
+5. Under RET the two trade: SPAN+RET's time-averaged working set is at least 10% above RET's on jsonpar or binarytrees, and its peak stays at or below D's.
+
+Falsifiers:
+- SPAN's peak working set more than 5% above D's on any workload (the span feeds back).
+- Under 10% fewer collections on jsonpar.
+- R reaches SPAN's collection count on jsonpar with peak working set within 3% of SPAN's (the ratchet is a larger heap by another name).
+
+Deviation: `bench/spike` was written for A7 after A8 was registered, so A8 names no prediction for it. It is scored under prediction 1 and the verdict leans on it.
+
+Result (`a7-out/run2.txt`, 7 interleaved runs, medians; RET2 is A7b's return):
+
+| workload | collections D / SPAN | mark ms D / SPAN | wall, SPAN against D | peak working set MB D / SPAN |
+|---|---|---|---|---|
+| spike | 1321 / 36 | 3237 / 800 | -52% (-38% in run 1) | 339 / 352 |
+| jsonpar | 316 / 239 | 90 / 66 | 0% | 28.0 / 27.7 |
+| binarytrees | 135 / 111 | 202 / 165 | -3.8% | 62.6 / 57.6 |
+| selfbuild | 51 / 51 | 85 / 83 | -2.2% | 193 / 186 |
+| gcpause, shuffle, maps, strings, sort, lint | equal | within 1% | within 1% | within 1% |
+
+Larger-heap control on jsonpar (`a7-out/jsonpar-ratio.txt`): `LOW_GCRATIO=150` reaches 242 collections at 29.4 MB peak and 27.1 MB time-averaged working set; SPAN reaches 239 at 27.1 MB and 25.2 MB.
+
+Against the pre-registration:
+1. Peak working set within 3% of D everywhere: fail on spike, +3.8% (13 MB, unexplained); binarytrees is 8% lower.
+2. Collection count: jsonpar 24% lower (predicted at least 25%: fail, narrowly); binarytrees 18% lower (pass); gcpause and shuffle unchanged (pass); selfbuild unchanged (predicted 4% to 20% lower: fail).
+3. jsonpar's summed mark time at least 20% lower: pass, 23% and 26% in the two runs.
+4. The ratio control needs at least 5% more peak working set for the same collection count: pass, 8.6%.
+5. Trade against return: fail as written and stronger than written. On jsonpar and binarytrees SPAN+RET2 and RET2 have the same time-averaged working set, because neither has free space to return. On spike SPAN+RET2 ends at 352 MB against RET2's 22 MB: the ratchet sets the threshold to the free span, A7b keeps twice the threshold, so nothing is returned.
+- No falsifier fired.
+
+Verdict: the ratchet is not a larger heap by another name on a sawtooth (jsonpar), and it is worth nothing to the compiler, whose collections come from the grow rule while live data rises. Its large win, spike, is the case where it holds a span the program has stopped using: 36 collections instead of 1,321, at the price of never giving the 330 MB back. A program that spikes and idles wants the return; one that spikes repeatedly wants the ratchet. Nothing in the runtime tells them apart, so the two knobs cannot both be on as built.
+Lesson: selfbuild's 48 early collections belong to the growth phase, where the span is 1.4 times live and there is no owned free space to ratchet to. The lever there is still the budget (E5's LIM).
+
+## A9 The prefetch ring is flushed whole whenever the mark stack empties (pre-registered before building)
+
+Observation (default trace of `bench/spike`, before any change): its second phase holds one 60,000-node linked list, 1.8 MB live, and each of about 1,300 collections marks it in 1.3 ms, 22 ns per node and 0.7 us per KB against the 0.18 us per KB of E2.
+Reading `MARK_DRAIN`: a candidate enters the 32-slot ring and is marked when a later candidate evicts it. When the mark stack is empty the loop reads and zeroes all 32 slots. A list node yields one candidate and leaves the stack empty, so every node pays a 32-slot pass, about 200 instructions. gcpause holds a 500,000-node list: 500,000 x 22 ns is 10.8 ms of its 12.7 ms mean mark.
+Hypothesis: most of gcpause's mark time is this flush, not the list's lack of parallelism (A6) and not a property of its 114 MB of live data (A4).
+
+Change: `LOW_GCRING=1` makes the flush visit only the slots filled since the last flush, oldest first. The ring index already counts insertions; the worker keeps the index of the last flush. The scan loop is unchanged.
+Prior art (query: "FIFO prefetch buffer mark stack empty flush cost linked list garbage collector prefetch on grey"): Cher, Hosking and Vijaykumar's FIFO buffer and Boehm's prefetch-on-grey, both already cited in A5. A9 is a defect in Low's drain, not a technique.
+
+Predictions (RING against D, same binary, 7 interleaved runs, medians of summed `mark_us`):
+1. gcpause: mark time falls by at least 60%, wall time by at least 30%.
+2. spike: mean mark time of the collections with under 4 MB live falls by at least 70%.
+3. No workload's summed mark time rises by more than 5% (binarytrees, jsonpar, shuffle, selfbuild, maps, strings, sort).
+4. Self-build fixpoint holds with `LOW_GCRING=1`, alone and with `LOW_GC=stress`; `lowtest run` fails no case under it that passes without it.
+
+Falsifiers:
+- gcpause's mark time falls by under 30% (the flush is not where the time goes).
+- Summed mark time more than 5% higher on any workload.
+- A gate failure absent from the baseline.
+
+Consequence to test if prediction 1 holds: A4's and A6's gcpause rows used a full mark that this flush inflates. Rerun minor mode against the memory-matched larger heap on gcpause with `LOW_GCRING=1` in both arms. Prediction: minor mode's advantage in summed mark time over the ratio-400 control falls from 2.4 times (A4: 292 ms against 699 ms) to under 1.3 times.
+
+Result (`a7-out/run1.txt`, 7 interleaved runs, medians; D2 is a second default arm):
+
+| workload | mark ms D / D2 / RING | wall s D / RING | largest pause ms D / RING |
+|---|---|---|---|
+| gcpause | 2296 / 2282 / 1263 | 3.376 / 2.362 | 16.1 / 9.7 |
+| spike | 2245 / 2255 / 629 | 3.278 / 1.648 | 64.1 / 23.2 |
+| binarytrees | 196.7 / 198.9 / 199.5 | 0.854 / 0.855 | 2.1 / 2.3 |
+| jsonpar | 92.4 / 91.4 / 93.1 | 0.355 / 0.356 | 0.9 / 1.0 |
+| shuffle | 614 / 641 / 627 | 0.818 / 0.833 | 23.2 / 25.6 |
+| selfbuild | 85.2 / 82.9 / 83.0 | 0.921 / 0.915 | 5.8 / 5.5 |
+| lint | 52.4 / 54.4 / 54.5 | 0.398 / 0.393 | 5.0 / 5.2 |
+| maps, strings, sort | equal | within 1.5% | equal |
+
+Against the pre-registration:
+1. gcpause: mark time falls by 45% (predicted at least 60%: fail); wall time falls by 30% (pass).
+2. spike: mean mark time of the collections under 4 MB live falls from 1,140 us to 273 us, 76% (pass).
+3. No workload's mark time rises by more than 5%: pass. The largest rise is lint's 4.0%, and its two default arms differ by 3.8%.
+4. Fixpoint holds with `LOW_GCRING=1` and with all three knobs under `LOW_GC=stress`. `lowtest run` skips every case on Windows, so the gate is `lowtest windows` (839 cases), which hands its environment to the programs it runs. Full runs by arm:
+
+| arm | runs | clean runs | cases that failed, with the number of runs |
+|---|---|---|---|
+| default | 4 | 2 | `std_nats` 2, `sleep_precision` 1, `std_testing_fail` 1 |
+| RET+RING | 3 | 1 | `std_testing_fail` 1, `std_file` 1 |
+| SPAN+RET2+RING | 2 | 0 | `std_testing_fail` 2 |
+
+`std_testing_fail` loses a test to its 400 ms timeout and fails with and without the knobs: 3 of 5 runs against 1 of 4, which these counts cannot tell apart. `std_file` printed `false` for whether a reopened file gets the handle value of the one just closed, a property of the operating system's handle table and not of heap contents; alone it passes 8 of 8 under RET+RING and 25 of 25 under RET+RING with `LOW_GC=stress`. No case fails only under a knob in a way that repeats, and the suite is not clean enough on this machine to show more than that.
+- No falsifier fired.
+
+The estimate behind prediction 1 counted spike's whole 22 ns per node as flush. The flush is about 14 ns per node on spike (1,140 us to 273 us over 60,000 nodes) and about 12 ns on gcpause: 6.2 ms of a 13.8 ms mean mark, not 10.8 ms. The remaining 7.6 ms is the walk itself.
+
+spike's default mark time depends on the build: 2,245 ms in run 1 and 3,237 ms in run 2, each within 1% over 7 runs, both over 1,321 collections. Between the runs the runtime gained A7b's code and nothing on the mark path, and `bench/spike` built by three compilers from this tree gives 2,790 to 3,530 ms unpinned. The flush loop's speed on a list that fits in cache moves with code layout. The RING arm is 629 ms and 635 ms in the two runs and the SPAN arm 781 ms and 800 ms, so the changed arms are stable and the default is not. Every table here compares arms of one binary; the table above is run 1, and in run 2 RING takes 80% off spike's mark instead of 72%, and the small-list mark falls from 1,892 us to 274 us (85%).
+
+Consequence test: not run. `LOW_GCMINOR=200` panics with "invalid memory access" on Windows in the research build, so A4's minor mode has no arm here. What was measured (`a7-out/gcpause-ratio400.txt`, 5 runs): the ratio-400 control's mark time falls from 605 ms to 336 ms with the ring change, 44%, and its wall time from 1.68 s to 1.43 s. A4 put minor mode at 292 ms against a 699 ms control on the Linux machine. If the control falls there by the same share it reaches about 390 ms, and minor mode, which marks few list nodes per minor collection, gains less; the 2.4 times advantage would fall to about 1.3 times. That is an extrapolation across machines, not a measurement.
+
+Verdict: holds, smaller than predicted on gcpause. Half of gcpause's full mark and three quarters of a small list's mark are the whole-ring flush.
+Standing: a defect with a fix of about 20 instructions and no measured cost. The runtime's `MARK_DRAIN` flushes this way without a knob (`W_FLUSHED`), so the research patches apply to main ee9052b1 and not to a tree that has the fix.
+Lesson: A4 and A6 read gcpause's mark as the cost of a serial pointer chase. Nearly half of it was the drain loop's own bookkeeping, and both the minor-collection and the worker-count conclusions for gcpause were drawn against that inflated figure. Rerun both on Linux with the change in before relying on them.
+
+## A7b Return only the free space the next cycle will not use (pre-registered before building)
+
+A7's wall-time falsifier fired: every collection decommits the chunks the program refills a moment later. `LOW_GCRETURN=2` keeps dirty free chunks, smallest bins first, until they add up to the next allocation threshold, and returns only the rest. The walk that runs before the heap end moves still returns every chunk.
+Predictions (RET2 against D, same harness): wall time within 3% on every workload; spike's end working set at most 35% of D's; selfbuild's peak working set at least 10% lower.
+Falsifiers: wall time 8% or more above D on a workload with at least 20 collections; spike's end working set above 60% of D's; selfbuild's peak working set under 3% lower.
+
+Deviations, both before the formal run and both seen on spike's trace: the first cut counted chunk sizes and returned whole chunks, and spike's sweep stayed at 317 ms, because the churned chunk merges with returned neighbours into one 220 MB chunk. The budget now counts dirty pages and only dirty runs are returned. With the budget at the threshold, spike's 4.1 MB of churn overran a 4.0 MB budget every cycle, so the budget is twice the threshold.
+
+Result (`a7-out/run2.txt`):
+
+| workload | wall, RET2 against D | sweep ms D / RET2 | peak working set MB D / RET2 | end working set MB D / RET2 |
+|---|---|---|---|---|
+| gcpause | 0.0% | 29 / 29 | 156 / 156 | 156 / 156 |
+| spike | +0.5% | 88 / 110 | 339 / 340 | 339 / 22 |
+| binarytrees | +2.1% | 14 / 16 | 62.6 / 60.3 | 62.5 / 60.2 |
+| jsonpar | +0.9% | 27 / 29 | 28.0 / 27.3 | 27.0 / 26.7 |
+| shuffle | +0.8% | 6.9 / 6.8 | 115 / 122 | 115 / 122 |
+| selfbuild | -0.1% | 14 / 15 | 193 / 154 | 170 / 132 |
+| lint | +3.2% | 9.2 / 9.3 | 109 / 110 | 99 / 99 |
+| maps, strings, sort | +0.8% to +1.3% | equal | within 1% | within 1% |
+
+Against the pre-registration: wall within 3% on every workload fails on lint by 0.2 points (its two default arms in run 1 differ by 1.8%); spike ends at 6.5% of D (pass); selfbuild's peak is 20% lower (pass). No falsifier fired. Fixpoint holds with `LOW_GCRETURN=2`, alone and with the other knobs under stress.
+Unexplained: shuffle's peak working set is 6% higher under RET2 in this run and equal in the SPAN+RET2 arm.
+What RET2 gives up against RET: sort (50 MB) and maps (85 MB) keep their default peaks, because what they could return is inside the budget.
+Standing: a working port for Windows. A long-running program that spikes ends at 22 MB instead of 339 MB, and the compiler's peak falls by a fifth, for wall time inside the noise.
