@@ -206,7 +206,7 @@ pub fn verify_bytes(
     Ok(log)
 }
 
-fn parse_points(text: &str) -> Vec<EqAffine> {
+pub fn parse_points(text: &str) -> Vec<EqAffine> {
     text.split('(')
         .skip(1)
         .map(|s| {
@@ -225,7 +225,7 @@ fn parse_points(text: &str) -> Vec<EqAffine> {
         .collect()
 }
 
-fn bracket_after<'a>(text: &'a str, marker: &str) -> &'a str {
+pub fn bracket_after<'a>(text: &'a str, marker: &str) -> &'a str {
     let start = text.find(marker).expect("marker") + marker.len();
     let rest = &text[start..];
     &rest[..rest.find(']').unwrap()]
