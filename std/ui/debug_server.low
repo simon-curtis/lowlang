@@ -1,0 +1,484 @@
+import std/io
+import std/json
+import std/sync
+import std/sys
+import std/ui/geometry
+import std/ui/platform
+
+const max_message = 8388608
+const read_chunk = 4096
+
+/// How `serve_debug` listens and how long a request waits for the window.
+pub struct DebugOptions {
+    /// Where to listen: a Unix socket path on Linux, a pipe name such as `\\.\pipe\app` on Windows. Empty means `debug_path` of this process.
+    pub path: str = ""
+    /// The milliseconds a request waits for the context's green thread to draw a frame, after which it is answered with an error.
+    pub timeout_ms: i64 = 10000
+}
+
+/// Why a request to a debug server failed.
+pub enum DebugError {
+    /// The connection could not be made, or failed while a request was in flight.
+    Io(io.Error)
+    /// The application answered with an error, such as an unknown method, a missing element or a window that drew no frame in time.
+    Remote(str)
+    /// The reply was not a JSON object of the protocol.
+    Protocol(str)
+}
+
+/// A running debug server.
+///
+/// Releasing it stops listening, removes the socket file on Linux and closes the connections that are open.
+pub struct DebugServer {
+    /// Where the server listens.
+    pub path: str
+    stop: fn()
+    drop stop()
+}
+
+/// A connection to the debug server of another process, which takes one request at a time.
+///
+/// Releasing it closes the connection.
+pub struct DebugClient {
+    wire: *Wire
+    drop wire.stream.close()
+}
+
+struct Wire {
+    stream: io.Stream
+    held: u8[] = []
+    scanned: i64 = 0
+    next_id: i64 = 1
+}
+
+struct Endpoint {
+    accept: fn() -> io.Stream ! io.Error
+    close: fn()
+}
+
+struct Registered {
+    id: i64
+    stream: io.Stream
+}
+
+struct Session {
+    cx: Context
+    host: Handle
+    timeout_ms: i64
+    lock: sync.Mutex
+    streams: Registered[] = []
+    last_id: i64 = 0
+    open: bool = true
+    waiting: fn()[] = []
+    ended: chan[bool] = chan[bool](1)
+}
+
+struct Outcome {
+    value: json.Value = json.Value.Null
+    error: str = ""
+}
+
+/// Returns where a process with the process id `pid` serves by default: `$XDG_RUNTIME_DIR/low-ui-<pid>.sock`, or `/tmp/low-ui-<uid>-<pid>.sock` without it, on Linux, and `\\.\pipe\low-ui-<pid>` on Windows.
+pub fn debug_path(pid: i64) -> str {
+    endpoint_path(pid)
+}
+
+/// Starts a server that lets another process of the same user list, click and type into the elements of `cx`, and returns it.
+///
+/// The server is off until an application calls this. Each line a client sends is one JSON request, `{"id": 1, "method": "elements", "params": {}}`, and each line the server answers is `{"id": 1, "result": ...}` or `{"id": 1, "error": "..."}`. A request runs on the context's green thread through `post` and is answered after the frame that follows it, so the reply shows what the request did. The methods are `elements` (an array of the `ElementInfo` of the last frame, with `key`, `id`, `label`, `role`, `text`, `bounds` as `x`, `y`, `width` and `height`, `visible` and `focused`), `element_at` (`x` and `y` in logical pixels, answers `{"key": ...}` or `null`), `click` (`key`, answers whether `click_element` sent the click), `type` (`text` and an optional `key` to focus first, answers whether a focused element received the text through a `Commit` event) and `text` (`key`, answers the `text` of that element, which is empty for a `masked` field). A request line is at most 8 MiB. A malformed request or an unknown method is answered with an error and the connection stays open.
+///
+/// On Linux the socket is made with mode 0600 and a peer that is not the same user is dropped before it is read; a socket file that no process listens on is replaced, and one that a process answers on fails with `AddrInUse`. On Windows the pipe is created with an access list that names only the current user and refuses clients on other machines. A failure to accept stops the server.
+pub fn serve_debug(cx: Context, options: DebugOptions) -> DebugServer ! io.Error {
+    let path = if options.path != "" { options.path } else { debug_path(sys.pid()) }
+    let endpoint = listen_endpoint(path)?
+    serve_endpoint(cx, endpoint, path, options.timeout_ms)
+}
+
+/// Connects to the debug server of another process at `path`, which `debug_path` gives for a process id.
+pub fn debug_connect(path: str) -> DebugClient ! DebugError {
+    let stream = dial(path) catch Io
+    DebugClient { wire: new(Wire { stream }) }
+}
+
+/// Returns the `ElementInfo` of every element the server's last frame drew, as `elements` does.
+pub fn debug_elements(c: DebugClient) -> ElementInfo[] ! DebugError {
+    let reply = debug_call(c.wire, "elements", [])?
+    var out: ElementInfo[] = []
+    match reply {
+        Array(items) => {
+            for item in items {
+                out.push(info_from(item))
+            }
+        }
+        _ => fail DebugError.Protocol("elements did not answer an array")
+    }
+    out
+}
+
+/// Returns the key of the topmost element that takes the pointer at `at`, as `element_at` does, or `none`.
+pub fn debug_element_at(c: DebugClient, at: geometry.Point) -> str? ! DebugError {
+    let reply = debug_call(c.wire, "element_at", [json.member("x", json.Value.Float(f64(at.x))), json.member("y", json.Value.Float(f64(at.y)))])?
+    json.field_text(reply, "key")
+}
+
+/// Clicks the element whose key is `key` as `click_element` does, and returns whether a click was sent.
+pub fn debug_click(c: DebugClient, key: str) -> bool ! DebugError {
+    let reply = debug_call(c.wire, "click", [json.text_member("key", key)])?
+    debug_flag(reply)?
+}
+
+/// Types `content` into the focused element and returns whether an element was focused to receive it.
+pub fn debug_type(c: DebugClient, content: str) -> bool ! DebugError {
+    let reply = debug_call(c.wire, "type", [json.text_member("text", content)])?
+    debug_flag(reply)?
+}
+
+/// Focuses the element whose key is `key`, types `content` into it and returns whether the frame drew that element.
+pub fn debug_type_into(c: DebugClient, key: str, content: str) -> bool ! DebugError {
+    let reply = debug_call(c.wire, "type", [json.text_member("text", content), json.text_member("key", key)])?
+    debug_flag(reply)?
+}
+
+/// Returns the `text` of the element whose key is `key`, which is empty for a `masked` field and an element that shows no text. Fails with `Remote` when the frame drew no such element.
+pub fn debug_text(c: DebugClient, key: str) -> str ! DebugError {
+    let reply = debug_call(c.wire, "text", [json.text_member("key", key)])?
+    match reply {
+        Str(value) => value
+        _ => fail DebugError.Protocol("text did not answer a string")
+    }
+}
+
+fn serve_endpoint(cx: Context, endpoint: Endpoint, path: str, timeout_ms: i64) -> DebugServer {
+    let session = new(Session { cx, host: handle(cx), timeout_ms, lock: sync.mutex() })
+    on_frame(cx, fn() { finish_requests(session) })
+    spawn accept_connections(session, endpoint)
+    DebugServer { path, stop: fn() { stop_session(session, endpoint) } }
+}
+
+fn accept_connections(s: *Session, endpoint: Endpoint) {
+    defer s.ended <- true
+    for {
+        let stream = endpoint.accept() catch {
+            e => return
+        }
+        let id = enroll_stream(s, stream) ?? {
+            stream.close()
+            endpoint.close()
+            return
+        }
+        spawn serve_stream(s, id, stream)
+    }
+}
+
+fn enroll_stream(s: *Session, stream: io.Stream) -> i64? {
+    sync.lock(s.lock)
+    defer sync.unlock(s.lock)
+    if !s.open {
+        return none
+    }
+    s.last_id += 1
+    s.streams.push(Registered { id: s.last_id, stream })
+    some(s.last_id)
+}
+
+fn dismiss_stream(s: *Session, id: i64) {
+    sync.lock(s.lock)
+    defer sync.unlock(s.lock)
+    var kept: Registered[] = []
+    for r in s.streams {
+        if r.id != id {
+            kept.push(r)
+        }
+    }
+    s.streams = kept
+}
+
+fn stop_session(s: *Session, endpoint: Endpoint) {
+    endpoint.close()
+    sync.lock(s.lock)
+    s.open = false
+    let open = s.streams
+    s.streams = []
+    sync.unlock(s.lock)
+    for r in open {
+        r.stream.close()
+    }
+    <-s.ended
+}
+
+fn serve_stream(s: *Session, id: i64, stream: io.Stream) {
+    converse(s, new(Wire { stream }))
+    dismiss_stream(s, id)
+    stream.close()
+}
+
+fn converse(s: *Session, w: *Wire) {
+    for {
+        let request = read_message(w) catch {
+            e => return
+        }
+        write_message(w.stream, answer(s, request)) catch {
+            e => return
+        }
+    }
+}
+
+fn read_message(w: *Wire) -> u8[] ! io.Error {
+    for {
+        let end = newline_at(w.held, w.scanned)
+        if end >= 0 {
+            let line = w.held[..end]
+            w.held = w.held[end + 1..]
+            w.scanned = 0
+            return line
+        }
+        w.scanned = w.held.len
+        if w.held.len > max_message {
+            fail TooLarge
+        }
+        let more = io.buffer(read_chunk)
+        let n = w.stream.read(more)?
+        if n == 0 {
+            fail Eof
+        }
+        io.append(mut w.held, more[..n])
+    }
+}
+
+fn newline_at(bytes: u8[], from: i64) -> i64 {
+    for i in from..bytes.len {
+        if bytes[i] == '\n' {
+            return i
+        }
+    }
+    -1
+}
+
+fn write_message(stream: io.Stream, body: str) ! io.Error {
+    io.write_str(stream, "{body}\n")?
+}
+
+fn answer(s: *Session, line: u8[]) -> str {
+    let request = json.parse(line) catch {
+        e => return reply_text(json.Value.Null, Outcome { error: "the request is not JSON" })
+    }
+    let id = json.field(request, "id")
+    let method = json.field_text(request, "method") ?? {
+        return reply_text(id, Outcome { error: "the request has no method" })
+    }
+    reply_text(id, perform(s, method, json.field(request, "params")))
+}
+
+fn reply_text(id: json.Value, o: Outcome) -> str {
+    if o.error != "" {
+        return json.stringify(json.object_value([json.member("id", id), json.text_member("error", o.error)]), 0)
+    }
+    json.stringify(json.object_value([json.member("id", id), json.member("result", o.value)]), 0)
+}
+
+fn refusal(message: str) -> Outcome {
+    Outcome { error: message }
+}
+
+fn answered(v: json.Value) -> Outcome {
+    Outcome { value: v }
+}
+
+fn perform(s: *Session, method: str, params: json.Value) -> Outcome {
+    match method {
+        "elements" => look(s, fn() -> Outcome { answered(listing(s.cx)) })
+        "element_at" => debug_locate(s, params)
+        "click" => debug_press(s, params)
+        "type" => debug_typing(s, params)
+        "text" => debug_reading(s, params)
+        _ => refusal("unknown method {method}")
+    }
+}
+
+fn debug_locate(s: *Session, params: json.Value) -> Outcome {
+    let x = number_of(json.field(params, "x")) ?? {
+        return refusal("element_at needs the numbers x and y")
+    }
+    let y = number_of(json.field(params, "y")) ?? {
+        return refusal("element_at needs the numbers x and y")
+    }
+    look(s, fn() -> Outcome {
+        match element_at(s.cx, geometry.point(f32(x), f32(y))) {
+            some(key) => answered(json.object_value([json.text_member("key", key)]))
+            none => answered(json.Value.Null)
+        }
+    })
+}
+
+fn debug_press(s: *Session, params: json.Value) -> Outcome {
+    let key = json.field_text(params, "key") ?? {
+        return refusal("click needs the string key")
+    }
+    ask(s, fn() -> fn() -> Outcome {
+        let sent = click_element(s.cx, key)
+        fn() -> Outcome { answered(json.Value.Bool(sent)) }
+    })
+}
+
+fn debug_typing(s: *Session, params: json.Value) -> Outcome {
+    let content = json.field_text(params, "text") ?? {
+        return refusal("type needs the string text")
+    }
+    let key = json.field_text(params, "key") ?? ""
+    ask(s, fn() -> fn() -> Outcome {
+        let sent = type_into(s.cx, key, content)
+        fn() -> Outcome { answered(json.Value.Bool(sent)) }
+    })
+}
+
+fn debug_reading(s: *Session, params: json.Value) -> Outcome {
+    let key = json.field_text(params, "key") ?? {
+        return refusal("text needs the string key")
+    }
+    look(s, fn() -> Outcome {
+        for e in elements(s.cx) {
+            if e.key == key {
+                return answered(json.Value.Str(e.text))
+            }
+        }
+        refusal("the last frame drew no element with the key {key}")
+    })
+}
+
+fn type_into(cx: Context, key: str, content: str) -> bool {
+    if key != "" {
+        if !is_drawn(cx, key) {
+            return false
+        }
+        set_focus(cx, key)
+    }
+    if focused(cx) == "" {
+        return false
+    }
+    dispatch(cx, platform.Event.Commit(content))
+    true
+}
+
+fn is_drawn(cx: Context, key: str) -> bool {
+    for e in elements(cx) {
+        if e.key == key {
+            return true
+        }
+    }
+    false
+}
+
+fn look(s: *Session, read: fn() -> Outcome) -> Outcome {
+    ask(s, fn() -> fn() -> Outcome { read })
+}
+
+fn ask(s: *Session, begin: fn() -> fn() -> Outcome) -> Outcome {
+    let reply = chan[Outcome](1)
+    post(s.host, fn() {
+        let finish = begin()
+        s.waiting.push(fn() { reply <- finish() })
+    })
+    select {
+        r = <-reply => r ?? refusal("the server stopped")
+        after(s.timeout_ms) => refusal("the window drew no frame in time")
+    }
+}
+
+fn finish_requests(s: *Session) {
+    let due = s.waiting
+    s.waiting = []
+    for f in due {
+        f()
+    }
+}
+
+fn listing(cx: Context) -> json.Value {
+    var items: json.Value[] = []
+    for e in elements(cx) {
+        items.push(info_json(e))
+    }
+    json.Value.Array(items)
+}
+
+fn info_json(e: ElementInfo) -> json.Value {
+    json.object_value([
+        json.text_member("key", e.key)
+        json.text_member("id", e.id)
+        json.text_member("label", e.label)
+        json.text_member("role", "{e.role}")
+        json.text_member("text", e.text)
+        json.object_member("bounds", [
+            json.member("x", json.Value.Float(f64(e.bounds.x)))
+            json.member("y", json.Value.Float(f64(e.bounds.y)))
+            json.member("width", json.Value.Float(f64(e.bounds.width)))
+            json.member("height", json.Value.Float(f64(e.bounds.height)))
+        ])
+        json.bool_member("visible", e.visible)
+        json.bool_member("focused", e.focused)
+    ])
+}
+
+fn info_from(v: json.Value) -> ElementInfo {
+    let box = json.field(v, "bounds")
+    ElementInfo {
+        key: json.text_of(v, "key")
+        id: json.text_of(v, "id")
+        label: json.text_of(v, "label")
+        role: role_named(json.text_of(v, "role"))
+        text: json.text_of(v, "text")
+        bounds: geometry.rect(f32(number_of(json.field(box, "x")) ?? 0.0), f32(number_of(json.field(box, "y")) ?? 0.0), f32(number_of(json.field(box, "width")) ?? 0.0), f32(number_of(json.field(box, "height")) ?? 0.0))
+        visible: flag_of(json.field(v, "visible"))
+        focused: flag_of(json.field(v, "focused"))
+    }
+}
+
+fn flag_of(v: json.Value) -> bool {
+    match v {
+        Bool(b) => b
+        _ => false
+    }
+}
+
+fn number_of(v: json.Value) -> f64? {
+    match v {
+        Int(n) => f64(n)
+        Float(x) => x
+        _ => none
+    }
+}
+
+fn role_named(name: str) -> Role {
+    let all = [Role.Generic, Role.Button, Role.Link, Role.Heading, Role.Text, Role.TextInput, Role.Image, Role.Checkbox, Role.List, Role.ListItem, Role.Tab, Role.Menu, Role.MenuItem, Role.Dialog]
+    for r in all {
+        if "{r}" == name {
+            return r
+        }
+    }
+    Role.Generic
+}
+
+fn debug_call(w: *Wire, method: str, params: json.Member[]) -> json.Value ! DebugError {
+    let id = w.next_id
+    w.next_id += 1
+    let request = json.object_value([json.int_member("id", id), json.text_member("method", method), json.object_member("params", params)])
+    write_message(w.stream, json.stringify(request, 0)) catch Io
+    let line = read_message(w) catch Io
+    let reply = json.parse(line) catch {
+        e => fail DebugError.Protocol("the reply is not JSON")
+    }
+    if json.field_int(reply, "id") != some(id) {
+        fail DebugError.Protocol("the reply answers another request")
+    }
+    match json.field_text(reply, "error") {
+        some(message) => fail DebugError.Remote(message)
+        none => {}
+    }
+    json.field(reply, "result")
+}
+
+fn debug_flag(v: json.Value) -> bool ! DebugError {
+    match v {
+        Bool(b) => b
+        _ => fail DebugError.Protocol("the reply is not a boolean")
+    }
+}

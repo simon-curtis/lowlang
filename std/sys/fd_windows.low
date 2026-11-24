@@ -5,6 +5,16 @@ extern "kernel32" {
     fn CreateNamedPipeW(name: ptr, open_mode: u32, pipe_mode: u32, instances: u32, out_size: u32, in_size: u32, timeout: u32, security: ptr) -> i64
     fn PeekNamedPipe(h: i64, buf: ptr, size: u32, read: ptr, mut available: u32, left: ptr) -> i32
     fn WaitForSingleObject(h: i64, millis: u32) -> u32
+    fn ConnectNamedPipe(h: i64, overlapped: ptr) -> i32
+}
+
+extern "advapi32" {
+    fn OpenProcessToken(process: i64, access: u32, mut token: i64) -> i32
+    fn GetTokenInformation(token: i64, class: u32, info: ptr, size: u32, mut needed: u32) -> i32
+    fn InitializeAcl(acl: ptr, size: u32, revision: u32) -> i32
+    fn AddAccessAllowedAce(acl: ptr, revision: u32, access: u32, sid: i64) -> i32
+    fn InitializeSecurityDescriptor(descriptor: ptr, revision: u32) -> i32
+    fn SetSecurityDescriptorDacl(descriptor: ptr, present: i32, acl: ptr, defaulted: i32) -> i32
 }
 
 extern "ws2_32" {
@@ -31,6 +41,18 @@ const pipe_open_retry = 20
 const error_pipe_busy = 231
 const error_cancelled = 995
 const invalid_function = 1
+const duplex_pipe: u32 = 3
+const unlimited_instances: u32 = 255
+const error_pipe_connected = 535
+const token_query: u32 = 8
+const token_user: u32 = 1
+const generic_all: u32 = 0x10000000
+const acl_revision: u32 = 2
+const descriptor_revision: u32 = 1
+const token_user_buffer = 256
+const acl_buffer = 256
+const descriptor_buffer = 64
+const security_attributes_size = 24
 
 fn is_socket(fd: i64) -> bool {
     event_of(fd) != 0 && !is_overlapped(fd)
@@ -256,6 +278,66 @@ pub fn open_pipe(path: str) -> i64 ! io.Error {
         sleep(pipe_open_retry)
     }
     fail TimedOut
+}
+
+fn owner_only_attributes(token: u8[], acl: ptr, acl_size: u32, descriptor: ptr, attributes: u8[]) ! io.Error {
+    var process_token: i64 = 0
+    checked(OpenProcessToken(GetCurrentProcess(), token_query, mut process_token))?
+    defer CloseHandle(process_token)
+    var needed: u32 = 0
+    checked(GetTokenInformation(process_token, token_user, __slice_ptr(token), u32(token.len), mut needed))?
+    let sid = io.le64(token, 0)
+    checked(InitializeAcl(acl, acl_size, acl_revision))?
+    checked(AddAccessAllowedAce(acl, acl_revision, generic_all, sid))?
+    checked(InitializeSecurityDescriptor(descriptor, descriptor_revision))?
+    checked(SetSecurityDescriptorDacl(descriptor, 1, acl, 0))?
+    io.set_le32(attributes, 0, security_attributes_size)
+    io.set_le64(attributes, 8, i64(descriptor))
+}
+
+/// Creates one instance of the named pipe at `path`, which only the current user can open, and returns its non-blocking descriptor number.
+///
+/// `path` is a name such as `\\.\pipe\app`. The instance waits for a client until `accept_pipe` returns, and the caller makes the next instance before it hands the connected one on, so a client finds a pipe to open. With `first` set the call fails with `Denied` when another process has already made an instance of that name, which stops another program from standing in for the server. The pipe refuses clients on other machines. Fails with `Unsupported` on Linux.
+pub fn listen_pipe(path: str, first: bool) -> i64 ! io.Error {
+    let token = io.buffer(token_user_buffer)
+    let attributes = io.buffer(security_attributes_size)
+    let kept_acl = pin(io.buffer(acl_buffer))
+    let kept_descriptor = pin(io.buffer(descriptor_buffer))
+    let kept_attributes = pin(attributes)
+    defer unpin(kept_attributes)
+    defer unpin(kept_descriptor)
+    defer unpin(kept_acl)
+    owner_only_attributes(token, kept_acl, u32(acl_buffer), kept_descriptor, attributes)?
+    let name = wide(path)
+    let mode = duplex_pipe | overlapped_file | (if first { first_pipe_instance } else { 0 })
+    let server = opened(CreateNamedPipeW(__slice_ptr(name), mode, reject_remote_clients, unlimited_instances, pipe_buffer, pipe_buffer, 0, kept_attributes))?
+    overlapped_end(server)?
+}
+
+/// Parks the green thread until a client opens the pipe instance that `h` views.
+///
+/// Returns at once when a client connected before the call. Fails with `NotConnected` when the view is closed, including while the call is waiting. The instance is then connected, and reads and writes on `h.fd` serve that client. Fails with `Unsupported` on Linux.
+pub fn accept_pipe(h: FdHandle) ! io.Error {
+    using lease = io.enter(h.guard)?
+    let operation = io.buffer(operation_size)
+    io.set_le64(operation, operation_event, event_of(h.fd))
+    let kept = pin(operation)
+    let started = ConnectNamedPipe(handle(h.fd), kept)
+    var code = GetLastError()
+    var ok = started != 0 || i64(code) == error_pipe_connected
+    if !ok && code == io_pending {
+        wait_readable(event_of(h.fd))
+        var done: u32 = 0
+        ok = GetOverlappedResult(handle(h.fd), kept, mut done, 1) != 0
+        code = GetLastError()
+    }
+    unpin(kept)
+    if !ok {
+        if i64(code) == error_cancelled {
+            fail NotConnected
+        }
+        fail win_error(i64(code))
+    }
 }
 
 /// Returns a pipe for one standard stream of a child process: the end the parent keeps is non-blocking and the end the child receives is blocking.
