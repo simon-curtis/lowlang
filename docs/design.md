@@ -2696,7 +2696,7 @@ Optimiser:
 - Spilling:
   - A value's spill weight is the sum over its uses and definitions of 8 raised to the block's loop depth, capped at depth 4. Loop depth counts the natural loops containing the block, found with the dominator tree the optimiser also uses; a cycle with more than one entry is not a loop.
   - When no register is free the allocator spills the conflicting value with the lowest spill cost, breaking ties by the later end of its live range.
-  - The allocator runs three times per function, with the spill cost set to the weight, to the weight divided by the length of the live range and to the weight divided by its square root. It keeps the assignment whose spilled values have the lowest total weight plus 2 for each callee-saved register it uses. The weight alone wins ties.
+  - The allocator runs up to three times per function, with the spill cost set to the weight, to the weight divided by the length of the live range and to the weight divided by its square root. It keeps the assignment whose spilled values have the lowest total weight plus 2 for each callee-saved register it uses. The weight alone wins ties. A run whose total is 0, or that never compared two spill costs, is kept without the runs after it, because they would assign the same registers.
 - Constants that fit in 32 bits are used as immediates and take no register. An undefined value used as an operand or stored to memory is the immediate 0, so a variant's unused payload words never hold stale pointers.
 - Narrow integer results:
   - Results of narrow integer operations that can leave the type's range are re-extended with `movsxd`, `movzx` or a 32-bit `mov`.
