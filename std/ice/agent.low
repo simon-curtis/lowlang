@@ -36,14 +36,16 @@ pub enum Event {
     Selected(local: Candidate, remote: Candidate)
 }
 
-/// A datagram the agent wants sent from the socket bound to `local` to the address `to`.
+/// A datagram the agent wants sent from the socket bound to `local` to the address `to`, or a message for the TCP or TLS connection to the TURN server `to`.
 pub struct Transmit {
-    /// The bound address of the socket to send from.
+    /// The bound address of the socket to send from, or the host address a stream relay was allocated for.
     pub local: net.Addr
     /// The destination.
     pub to: net.Addr
-    /// The datagram.
+    /// The datagram or message.
     pub data: u8[]
+    /// `Udp` to send from the socket bound to `local`; `Tcp` or `Tls` to write one message on the connection for `local` to the TURN server `to`, which the caller opens when there is none and reports with `relay_lost` when it closes.
+    pub transport: turn.Transport = turn.Transport.Udp
 }
 
 /// The pair an agent carries data on.
@@ -90,7 +92,7 @@ pub struct Config {
     pub failure_timeout: i64 = 30000
     /// The tie-breaker for role conflicts, random when 0.
     pub tie_breaker: u64 = 0
-    /// The TURN servers to allocate a relayed candidate on, one allocation per host address of the same family.
+    /// The TURN servers to allocate a relayed candidate on, one allocation per host address of the same family, each reached over its `transport`.
     pub turn_servers: turn.Config[] = []
     /// Whether the agent uses relayed candidates alone, the W3C `relay` transport policy: no host or server-reflexive candidate is gathered or announced.
     pub relay_only: bool = false
@@ -138,6 +140,7 @@ struct Local {
 struct Relay {
     base: net.Addr
     server: net.Addr
+    transport: turn.Transport
     client: *turn.Client
     relayed: net.Addr?
     settled: bool
@@ -331,7 +334,7 @@ fn drain_relay(a: *Agent, i: i64) {
     let r = a.relays[i]
     for {
         let d = turn.poll_transmit(r.client) ?? break
-        a.outbox.push(Transmit { local: r.base, to: r.server, data: d })
+        a.outbox.push(Transmit { local: r.base, to: r.server, data: d, transport: r.transport })
     }
     for {
         let e = turn.poll_event(r.client) ?? break
@@ -340,8 +343,8 @@ fn drain_relay(a: *Agent, i: i64) {
                 a.relays[i].relayed = relayed
                 a.relays[i].settled = true
                 let c = Candidate {
-                    foundation: foundation(Kind.Relayed, relayed.ip, r.server.ip, "udp")
-                    priority: priority(Kind.Relayed, local_preference(relayed.ip, i), 1)
+                    foundation: foundation(Kind.Relayed, relayed.ip, r.server.ip, transport_name(r.transport))
+                    priority: priority(Kind.Relayed, local_preference(relayed.ip, r.transport.index * 1024 + i), 1)
                     addr: relayed
                     kind: Kind.Relayed
                     related: mapped
@@ -365,16 +368,50 @@ fn release_relays(a: *Agent, now: i64) {
     a.relays = []
 }
 
-fn relay_from(a: *Agent, local: net.Addr, from: net.Addr) -> i64 {
+fn transport_name(t: turn.Transport) -> str {
+    match t {
+        Udp => "udp"
+        Tcp => "tcp"
+        Tls => "tls"
+    }
+}
+
+fn relay_on(a: *Agent, local: net.Addr, server: net.Addr, transport: turn.Transport) -> i64 {
     for i, r in a.relays {
-        if same_addr(r.base, local) && same_addr(r.server, from) {
+        if r.transport == transport && same_addr(r.base, local) && same_addr(r.server, server) {
             return i
         }
     }
     -1
 }
 
-/// Returns whether a datagram that arrived on the socket bound to `local` from `from` comes from one of the agent's TURN servers, and so belongs to `receive` whatever its first byte.
+fn relay_from(a: *Agent, local: net.Addr, from: net.Addr) -> i64 {
+    relay_on(a, local, from, turn.Transport.Udp)
+}
+
+/// Feeds the agent one message that arrived on the TCP or TLS connection for `local` to the TURN server `server`, split from the stream with a `turn.Framer`. It is handled as `receive` handles a datagram from a TURN server.
+pub fn receive_relay(a: *Agent, local: net.Addr, server: net.Addr, transport: turn.Transport, message: u8[], now: i64) {
+    if a.state == State.Closed {
+        return
+    }
+    let r = relay_on(a, local, server, transport)
+    if r >= 0 {
+        receive_relayed(a, r, message, now)
+    }
+}
+
+/// Tells the agent the TCP or TLS connection for `local` to the TURN server `server` closed or could not be made.
+///
+/// The allocation on it is gone, so its relayed candidate stops carrying data and its checks and consent fail; when gathering is running it counts as settled. The next `gather` opens a new connection.
+pub fn relay_lost(a: *Agent, local: net.Addr, server: net.Addr, transport: turn.Transport) {
+    let r = relay_on(a, local, server, transport)
+    if r >= 0 {
+        turn.connection_lost(a.relays[r].client)
+        drain_relay(a, r)
+    }
+}
+
+/// Returns whether a datagram that arrived on the socket bound to `local` from `from` comes from one of the agent's TURN servers over UDP, and so belongs to `receive` whatever its first byte.
 pub fn is_relay_server(a: *Agent, local: net.Addr, from: net.Addr) -> bool {
     relay_from(a, local, from) >= 0
 }
@@ -524,7 +561,7 @@ fn start_gather(a: *Agent, base: net.Addr, server: net.Addr, now: i64) {
 fn start_relay(a: *Agent, base: net.Addr, config: turn.Config, now: i64) {
     let client = turn.client(config)
     turn.start(client, now)
-    a.relays.push(Relay { base, server: config.server, client, relayed: none, settled: false })
+    a.relays.push(Relay { base, server: config.server, transport: config.transport, client, relayed: none, settled: false })
     drain_relay(a, a.relays.len - 1)
 }
 

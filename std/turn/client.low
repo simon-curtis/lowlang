@@ -4,20 +4,36 @@ import std/net
 import std/slices
 import std/stun
 
+/// How a client reaches its TURN server (RFC 8656 section 3.1). The relayed side, from the server to the peers, is UDP whichever is used.
+pub enum Transport {
+    /// Datagrams, each request retransmitted on the `stun.waits` schedule.
+    Udp = 0
+    /// A TCP connection, `turn:` with `?transport=tcp`.
+    Tcp = 1
+    /// TLS over a TCP connection, `turns:`.
+    Tls = 2
+}
+
 /// The TURN server of a client and the long-term credentials it accepts (RFC 8656 section 9.2).
 pub struct Config {
-    /// The server's UDP address.
+    /// The server's address: its UDP port, or the TCP port it listens on for `Tcp` and `Tls`.
     pub server: net.Addr
+    /// How the client reaches the server.
+    pub transport: Transport = Transport.Udp
+    /// The host name the server's TLS certificate is verified against and the client sends as SNI. Empty, the default, checks the certificate against the IP address of `server`. Unused unless `transport` is `Tls`.
+    pub server_name: str = ""
     /// The user name.
     pub username: str
     /// The password, used as given without SASLprep.
     pub password: str
     /// The allocation lifetime in seconds the client asks for.
     pub lifetime: i64 = 600
-    /// The first retransmission timeout of a request in milliseconds.
+    /// The first retransmission timeout of a request in milliseconds. Unused over `Tcp` and `Tls`.
     pub rto: i64 = 500
-    /// How many times a request is sent before it times out.
+    /// How many times a request is sent before it times out. Over `Tcp` and `Tls` a request is sent once.
     pub transmissions: i64 = 7
+    /// The milliseconds a request sent over `Tcp` or `Tls` waits for its response: Ti of RFC 8489 section 6.2.2, 39.5 seconds by default.
+    pub stream_timeout: i64 = 39500
 }
 
 /// The phase of an allocation.
@@ -79,9 +95,9 @@ struct Channel {
     expires: i64
 }
 
-/// One TURN allocation over UDP, without a socket or a clock: every datagram it makes goes to `Config.server`.
+/// One TURN allocation, without a socket or a clock: every message it makes goes to `Config.server` over `Config.transport`.
 ///
-/// The caller gives it the server's datagrams with `receive` and the time with `tick`, and sends what `poll_transmit` returns. Times are milliseconds from any origin that never goes backwards.
+/// Over `Tcp` and `Tls` each message is one write on the connection, and the caller splits what it reads with a `Framer`. The caller gives it the server's messages with `receive` and the time with `tick`, and sends what `poll_transmit` returns. Times are milliseconds from any origin that never goes backwards.
 pub struct Client {
     /// The phase of the allocation.
     pub state: State
@@ -128,7 +144,18 @@ fn same_addr(a: net.Addr, b: net.Addr) -> bool {
     a.port == b.port && hash.equal(a.ip, b.ip)
 }
 
+fn streamed(c: *Client) -> bool {
+    c.config.transport != Transport.Udp
+}
+
+fn sends_allowed(c: *Client) -> i64 {
+    if streamed(c) { 1 } else { c.config.transmissions }
+}
+
 fn wait_after(c: *Client, sends: i64) -> i64 {
+    if streamed(c) {
+        return c.config.stream_timeout
+    }
     stun.waits(stun.Config { rto: c.config.rto, transmissions: c.config.transmissions })[sends - 1]
 }
 
@@ -340,7 +367,7 @@ fn on_data(c: *Client, m: stun.Message) -> Payload? {
     Payload { peer, data }
 }
 
-/// Reads one datagram from the server: a response, a Data indication or a ChannelData message.
+/// Reads one message from the server, a datagram or what a `Framer` split from the stream: a response, a Data indication or a ChannelData message.
 ///
 /// Returns what a peer sent when the datagram carries it, and `none` otherwise. A response that matches no request or whose MESSAGE-INTEGRITY is wrong is ignored, as is data from a peer without a permission or on a channel that is not bound.
 pub fn receive(c: *Client, datagram: u8[], now: i64) -> Payload? {
@@ -416,7 +443,7 @@ fn retransmit(c: *Client, now: i64) {
             i += 1
             continue
         }
-        if r.sends >= c.config.transmissions {
+        if r.sends >= sends_allowed(c) {
             slices.remove(mut c.requests, i)
             match r.purpose {
                 Allocate => fail_allocation(c, 0, "no answer")
@@ -463,7 +490,7 @@ fn renew(c: *Client, now: i64) {
     }
 }
 
-/// Retransmits requests whose time has come, fails the allocation when an Allocate or Refresh goes unanswered, and refreshes the allocation, the permissions and the channel bindings a minute before each expires.
+/// Retransmits requests whose time has come over UDP, fails the allocation when an Allocate or Refresh goes unanswered, and refreshes the allocation, the permissions and the channel bindings a minute before each expires.
 pub fn tick(c: *Client, now: i64) {
     if c.state == State.Failed || c.state == State.Closed {
         return
@@ -528,6 +555,13 @@ pub fn poll_event(c: *Client) -> Event? {
     let e = c.events[0]
     c.events = c.events[1..]
     e
+}
+
+/// Tells the client its TCP or TLS connection to the server closed or could not be made.
+///
+/// The server deletes an allocation whose connection closes, because the allocation belongs to the connection's 5-tuple, so the allocation fails with `Event.Failed` of code 0. A new connection needs a new client.
+pub fn connection_lost(c: *Client) {
+    fail_allocation(c, 0, "connection closed")
 }
 
 /// Releases the allocation with a Refresh of lifetime 0, sent once, and stops the client.
