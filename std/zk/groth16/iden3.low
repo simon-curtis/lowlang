@@ -1,0 +1,273 @@
+import std/crypto/limb
+import std/crypto/nistec
+import std/crypto/pairing
+
+struct Section {
+    kind: i64
+    start: i64
+    end: i64
+}
+
+struct Cursor {
+    data: u8[]
+    at: i64
+}
+
+fn take_u32(k: *Cursor) -> i64 ! Error {
+    if k.at + 4 > k.data.len {
+        fail Malformed
+    }
+    var out = 0
+    for i in 0..4 {
+        out |= i64(k.data[k.at + i]) << (8 * i)
+    }
+    k.at += 4
+    out
+}
+
+fn take_u64(k: *Cursor) -> i64 ! Error {
+    if k.at + 8 > k.data.len {
+        fail Malformed
+    }
+    var out: u64 = 0
+    for i in 0..8 {
+        out |= u64(k.data[k.at + i]) << u64(8 * i)
+    }
+    k.at += 8
+    if out > 0x7fffffffffffffff {
+        fail Malformed
+    }
+    i64(out)
+}
+
+fn take_limbs(k: *Cursor, size: i64) -> u64[] ! Error {
+    if size < 0 || k.at + size > k.data.len {
+        fail Malformed
+    }
+    let out: u64[] = __make((size + 7) / 8)
+    for i in 0..size {
+        out[i / 8] |= u64(k.data[k.at + i]) << u64(8 * (i % 8))
+    }
+    k.at += size
+    out
+}
+
+fn has_prefix(data: u8[], magic: str) -> bool {
+    for i in 0..magic.len {
+        if data[i] != magic[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn sections(data: u8[], magic: str, version: i64) -> Section[] ! Error {
+    let k = new(Cursor { data, at: 0 })
+    if data.len < 12 || !has_prefix(data, magic) {
+        fail Malformed
+    }
+    k.at = 4
+    if take_u32(k)? != version {
+        fail Unsupported
+    }
+    let count = take_u32(k)?
+    var out: Section[] = []
+    for _ in 0..count {
+        let kind = take_u32(k)?
+        let size = take_u64(k)?
+        if size > data.len - k.at {
+            fail Malformed
+        }
+        out.push(Section { kind, start: k.at, end: k.at + size })
+        k.at += size
+    }
+    if k.at != data.len {
+        fail Malformed
+    }
+    out
+}
+
+fn section(list: Section[], kind: i64) -> Section ! Error {
+    for s in list {
+        if s.kind == kind {
+            return s
+        }
+    }
+    fail Malformed
+}
+
+fn check_prime(c: *pairing.Curve, k: *Cursor) ! Error {
+    let size = take_u32(k)?
+    if size != 8 * c.fr.m.len {
+        fail Curve
+    }
+    if !limb.equal(take_limbs(k, size)?, c.fr.m) {
+        fail Curve
+    }
+}
+
+fn scalar(c: *pairing.Curve, k: *Cursor) -> u64[] ! Error {
+    let plain = take_limbs(k, 8 * c.fr.m.len)?
+    if !nistec.below(plain, c.fr.m) {
+        fail Malformed
+    }
+    plain
+}
+
+fn combination(c: *pairing.Curve, k: *Cursor, wires: i64) -> Entry[] ! Error {
+    let count = take_u32(k)?
+    var out: Entry[] = []
+    for _ in 0..count {
+        let at = take_u32(k)?
+        if at >= wires {
+            fail Malformed
+        }
+        let coefficient = nistec.element(c.fr)
+        nistec.to_mont(c.fr, coefficient, scalar(c, k)?)
+        out.push(Entry { at, coefficient })
+    }
+    out
+}
+
+/// Returns the constraint system of the circom `.r1cs` file `data` (the iden3 binary format, version 1) for the curve `c`.
+///
+/// The wires keep circom's order: the constant one, the public outputs, the public inputs, then the private values, so `inputs` is the number of public outputs and public inputs. Fails with `Curve` when the file's prime is not the scalar field of `c`, with `Unsupported` for another version or a file with custom gates, and with `Malformed` for a file that is cut short, has a coefficient not below `r` or a wire out of range, or lacks a header or constraint section.
+pub fn read_r1cs(c: *pairing.Curve, data: u8[]) -> System ! Error {
+    let list = sections(data, "r1cs", 1)?
+    for s in list {
+        if s.kind == 4 || s.kind == 5 {
+            fail Unsupported
+        }
+    }
+    let header = section(list, 1)?
+    let body = section(list, 2)?
+    let k = new(Cursor { data, at: header.start })
+    check_prime(c, k)?
+    let wires = take_u32(k)?
+    let outputs = take_u32(k)?
+    let public = take_u32(k)?
+    k.at += 12
+    let count = take_u32(k)?
+    if outputs + public + 1 > wires {
+        fail Malformed
+    }
+    k.at = body.start
+    var rows: Row[] = []
+    for _ in 0..count {
+        let a = combination(c, k, wires)?
+        let b = combination(c, k, wires)?
+        rows.push(Row { a, b, c: combination(c, k, wires)? })
+    }
+    if k.at != body.end {
+        fail Malformed
+    }
+    System { inputs: outputs + public, variables: wires, rows }
+}
+
+/// Returns the assignment in the circom `.wtns` file `data` (the iden3 binary format, version 2) for the curve `c`, as plain integers least significant limb first in the order of the system: the value of every wire, starting with the constant one.
+///
+/// Fails with `Curve` when the file's prime is not the scalar field of `c` and with `Malformed` for a file that is cut short or has a value not below `r`.
+pub fn read_witness(c: *pairing.Curve, data: u8[]) -> u64[][] ! Error {
+    let list = sections(data, "wtns", 2)?
+    let header = section(list, 1)?
+    let values = section(list, 2)?
+    let k = new(Cursor { data, at: header.start })
+    check_prime(c, k)?
+    let count = take_u32(k)?
+    let size = 8 * c.fr.m.len
+    if values.end - values.start != count * size {
+        fail Malformed
+    }
+    k.at = values.start
+    var out: u64[][] = []
+    for _ in 0..count {
+        out.push(scalar(c, k)?)
+    }
+    out
+}
+
+struct Bytes {
+    out: u8[]
+}
+
+fn put_u32(o: *Bytes, value: i64) {
+    for i in 0..4 {
+        o.out.push(u8((value >> (8 * i)) & 255))
+    }
+}
+
+fn put_u64(o: *Bytes, value: i64) {
+    for i in 0..8 {
+        o.out.push(u8((value >> (8 * i)) & 255))
+    }
+}
+
+fn put_limbs(o: *Bytes, a: u64[]) {
+    for i in 0..8 * a.len {
+        o.out.push(u8(a[i / 8] >> u64(8 * (i % 8))))
+    }
+}
+
+fn put_section(o: *Bytes, kind: i64, body: *Bytes) {
+    put_u32(o, kind)
+    put_u64(o, body.out.len)
+    for b in body.out {
+        o.out.push(b)
+    }
+}
+
+fn put_file(magic: str, version: i64, header: *Bytes, body: *Bytes) -> u8[] {
+    let o = new(Bytes { out: [] })
+    for b in bytes(magic) {
+        o.out.push(b)
+    }
+    put_u32(o, version)
+    put_u32(o, 2)
+    put_section(o, 1, header)
+    put_section(o, 2, body)
+    o.out
+}
+
+fn put_combination(c: *pairing.Curve, o: *Bytes, entries: Entry[]) {
+    put_u32(o, entries.len)
+    for e in entries {
+        put_u32(o, e.at)
+        put_limbs(o, plain(c.fr, e.coefficient))
+    }
+}
+
+fn put_prime(c: *pairing.Curve, o: *Bytes) {
+    put_u32(o, 8 * c.fr.m.len)
+    put_limbs(o, c.fr.m)
+}
+
+/// Returns the circom `.r1cs` file, version 1, of the system `s`, with the header and constraint sections and no wire map. The outputs are not told apart from the inputs: the header declares every public wire an input.
+pub fn write_r1cs(c: *pairing.Curve, s: System) -> u8[] {
+    let header = new(Bytes { out: [] })
+    put_prime(c, header)
+    put_u32(header, s.variables)
+    put_u32(header, 0)
+    put_u32(header, s.inputs)
+    put_u32(header, s.variables - 1 - s.inputs)
+    put_u64(header, s.variables)
+    put_u32(header, s.rows.len)
+    let body = new(Bytes { out: [] })
+    for row in s.rows {
+        put_combination(c, body, row.a)
+        put_combination(c, body, row.b)
+        put_combination(c, body, row.c)
+    }
+    put_file("r1cs", 1, header, body)
+}
+
+/// Returns the circom `.wtns` file, version 2, of `assignment`, plain integers least significant limb first: the layout `read_witness` reads.
+pub fn write_witness(c: *pairing.Curve, assignment: u64[][]) -> u8[] {
+    let header = new(Bytes { out: [] })
+    put_prime(c, header)
+    put_u32(header, assignment.len)
+    let body = new(Bytes { out: [] })
+    for x in assignment {
+        put_limbs(body, x)
+    }
+    put_file("wtns", 2, header, body)
+}

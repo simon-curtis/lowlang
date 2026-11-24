@@ -1,0 +1,388 @@
+import std/crypto
+import std/crypto/limb
+import std/crypto/nistec
+import std/crypto/pairing
+
+/// The ways setting up or proving fails.
+pub enum Error {
+    /// The domain the system needs, the next power of two above its rows plus its public variables, is more than half the largest power-of-two subgroup of the scalar field.
+    TooLarge
+    /// The assignment has the wrong number of values, or a value is not below the group order `r`.
+    Assignment
+    /// The assignment does not satisfy every constraint.
+    Unsatisfied
+    /// The proving key was made for a system of another shape.
+    Key
+    /// A file or JSON text is not shaped as its format says, a number in it is not below the modulus it belongs to, or a file is cut short.
+    Malformed
+    /// A file or JSON text is for another curve than the one given.
+    Curve
+    /// A point is not on its curve or not in the subgroup of order `r`.
+    Point
+    /// A file has a section this module does not read, such as the custom gates of a circom `.r1cs`.
+    Unsupported
+}
+
+/// What a verifier needs: `alpha` in `G1`, `beta`, `gamma` and `delta` in `G2`, and `ic`, one point of `G1` for the constant one and for each public input.
+pub struct VerifyingKey {
+    /// `[alpha]_1`.
+    pub alpha: pairing.Point
+    /// `[beta]_2`.
+    pub beta: pairing.Point
+    /// `[gamma]_2`.
+    pub gamma: pairing.Point
+    /// `[delta]_2`.
+    pub delta: pairing.Point
+    /// `[(beta u_i + alpha v_i + w_i) / gamma]_1` for the constant one and each public input.
+    pub ic: pairing.Point[]
+}
+
+/// What a prover needs: the verifying key and the evaluations at the secret `tau` of the system's polynomials, as points.
+pub struct ProvingKey {
+    /// The verifying key that goes with it.
+    pub verifying: VerifyingKey
+    beta_g1: pairing.Point
+    delta_g1: pairing.Point
+    a: pairing.Point[]
+    b1: pairing.Point[]
+    b2: pairing.Point[]
+    l: pairing.Point[]
+    h: pairing.Point[]
+}
+
+/// A Groth16 proof: `a` and `c` in `G1`, `b` in `G2`.
+pub struct Proof {
+    /// `[A]_1`.
+    pub a: pairing.Point
+    /// `[B]_2`.
+    pub b: pairing.Point
+    /// `[C]_1`.
+    pub c: pairing.Point
+}
+
+struct Toxic {
+    tau: u64[]
+    alpha: u64[]
+    beta: u64[]
+    gamma: u64[]
+    delta: u64[]
+}
+
+struct Polynomials {
+    u: u64[][]
+    v: u64[][]
+    w: u64[][]
+}
+
+fn random_scalar(f: *nistec.Field) -> u64[] {
+    let bytes = crypto.random(64)
+    let out = nistec.reduce_mont(f, bytes)
+    crypto.wipe(bytes)
+    out
+}
+
+fn zeros(f: *nistec.Field, count: i64) -> u64[][] {
+    var out: u64[][] = []
+    for _ in 0..count {
+        out.push(nistec.element(f))
+    }
+    out
+}
+
+fn clear_all(values: u64[][]) {
+    for v in values {
+        limb.clear(v)
+    }
+}
+
+fn plain(f: *nistec.Field, a: u64[]) -> u64[] {
+    let out = nistec.element(f)
+    nistec.from_mont(f, out, a)
+    out
+}
+
+fn plains(f: *nistec.Field, values: u64[][]) -> u64[][] {
+    var out: u64[][] = []
+    for v in values {
+        out.push(plain(f, v))
+    }
+    out
+}
+
+fn inside(f: *nistec.Field, tau: u64[], size: i64) -> bool {
+    let t = nistec.element(f)
+    nistec.power(f, t, tau, [u64(size)])
+    limb.equal(t, f.one)
+}
+
+fn toxic(f: *nistec.Field, d: Domain) -> Toxic {
+    for {
+        let t = Toxic { tau: random_scalar(f), alpha: random_scalar(f), beta: random_scalar(f), gamma: random_scalar(f), delta: random_scalar(f) }
+        let degenerate = limb.zero_limbs(t.alpha) | limb.zero_limbs(t.beta) | limb.zero_limbs(t.gamma) | limb.zero_limbs(t.delta)
+        if degenerate == 0 && !inside(f, t.tau, 2 * d.size) {
+            return t
+        }
+    }
+}
+
+/// Returns the Lagrange basis polynomials of the domain of `total` points `x^total = 1`, evaluated at `tau`, for the `count` points `first step^j`: `x_j (tau^total - 1) / (total (tau - x_j))`.
+fn lagrange(f: *nistec.Field, tau: u64[], first: u64[], step: u64[], count: i64, total: i64) -> u64[][] {
+    var points: u64[][] = []
+    var denominators: u64[][] = []
+    let x = nistec.element(f)
+    __memmove(x, first)
+    for _ in 0..count {
+        let point = nistec.element(f)
+        __memmove(point, x)
+        points.push(point)
+        let denominator = nistec.element(f)
+        nistec.sub(f, denominator, tau, x)
+        denominators.push(denominator)
+        nistec.mul(f, x, x, step)
+    }
+    invert_all(f, denominators)
+    let factor = nistec.element(f)
+    nistec.power(f, factor, tau, [u64(total)])
+    nistec.sub(f, factor, factor, f.one)
+    nistec.mul(f, factor, factor, inverse_of(f, small(f, u64(total))))
+    for j in 0..count {
+        nistec.mul(f, points[j], points[j], denominators[j])
+        nistec.mul(f, points[j], points[j], factor)
+    }
+    clear_all(denominators)
+    limb.clear(factor)
+    points
+}
+
+fn accumulate(f: *nistec.Field, into: u64[][], entries: Entry[], weight: u64[]) {
+    let t = nistec.element(f)
+    for e in entries {
+        nistec.mul(f, t, e.coefficient, weight)
+        nistec.add(f, into[e.at], into[e.at], t)
+    }
+}
+
+fn polynomials(f: *nistec.Field, s: System, basis: u64[][]) -> Polynomials {
+    let out = Polynomials { u: zeros(f, s.variables), v: zeros(f, s.variables), w: zeros(f, s.variables) }
+    for j in 0..s.rows.len {
+        let row = s.rows[j]
+        accumulate(f, out.u, row.a, basis[j])
+        accumulate(f, out.v, row.b, basis[j])
+        accumulate(f, out.w, row.c, basis[j])
+    }
+    for k in 0..s.inputs + 1 {
+        nistec.add(f, out.u[k], out.u[k], basis[s.rows.len + k])
+    }
+    out
+}
+
+fn times(c: *pairing.Curve, base: pairing.Point, scalar: u64[]) -> pairing.Point {
+    let k = plain(c.fr, scalar)
+    let out = pairing.mul(c, base, k)
+    limb.clear(k)
+    out
+}
+
+fn all_times(c: *pairing.Curve, base: pairing.Point, scalars: u64[][]) -> pairing.Point[] {
+    var out: pairing.Point[] = []
+    for k in scalars {
+        out.push(times(c, base, k))
+    }
+    out
+}
+
+fn combined(f: *nistec.Field, t: Toxic, p: Polynomials, from: i64, to: i64, divisor: u64[]) -> u64[][] {
+    let inverse = inverse_of(f, divisor)
+    var out: u64[][] = []
+    for i in from..to {
+        let sum = nistec.element(f)
+        let term = nistec.element(f)
+        nistec.mul(f, sum, t.beta, p.u[i])
+        nistec.mul(f, term, t.alpha, p.v[i])
+        nistec.add(f, sum, sum, term)
+        nistec.add(f, sum, sum, p.w[i])
+        nistec.mul(f, sum, sum, inverse)
+        out.push(sum)
+    }
+    limb.clear(inverse)
+    out
+}
+
+fn domain_of(c: *pairing.Curve, s: System) -> Domain ! Error {
+    domain(c.fr, s.rows.len + s.inputs + 1) ?? fail TooLarge
+}
+
+/// Runs the trusted setup of Groth16 for the system `s`, drawing the secrets `tau`, `alpha`, `beta`, `gamma` and `delta` from `crypto.random` and wiping them before it returns.
+///
+/// It is a single-party setup: whoever runs it and keeps the secrets can prove false statements, so it suits tests and settings where the prover is the verifier. The secrets only meet constant-time field arithmetic and `pairing.mul`. The quotient part of the key is the Lagrange basis at the odd points of the domain of twice the size.
+pub fn setup(c: *pairing.Curve, s: System) -> ProvingKey ! Error {
+    let f = c.fr
+    let d = domain_of(c, s)?
+    let t = toxic(f, d)
+    let basis = lagrange(f, t.tau, f.one, d.root, d.size, d.size)
+    let p = polynomials(f, s, basis)
+    let ic = combined(f, t, p, 0, s.inputs + 1, t.gamma)
+    let l = combined(f, t, p, s.inputs + 1, s.variables, t.delta)
+    let h = lagrange(f, t.tau, d.shift, d.root, d.size, 2 * d.size)
+    let delta_inverse = inverse_of(f, t.delta)
+    for x in h {
+        nistec.mul(f, x, x, delta_inverse)
+    }
+    let key = ProvingKey {
+        verifying: VerifyingKey {
+            alpha: times(c, c.g1, t.alpha)
+            beta: times(c, c.g2, t.beta)
+            gamma: times(c, c.g2, t.gamma)
+            delta: times(c, c.g2, t.delta)
+            ic: all_times(c, c.g1, ic)
+        }
+        beta_g1: times(c, c.g1, t.beta)
+        delta_g1: times(c, c.g1, t.delta)
+        a: all_times(c, c.g1, p.u)
+        b1: all_times(c, c.g1, p.v)
+        b2: all_times(c, c.g2, p.v)
+        l: all_times(c, c.g1, l)
+        h: all_times(c, c.g1, h)
+    }
+    for values in [basis, p.u, p.v, p.w, ic, l, h, [t.tau, t.alpha, t.beta, t.gamma, t.delta, delta_inverse]] {
+        clear_all(values)
+    }
+    key
+}
+
+fn dot(f: *nistec.Field, entries: Entry[], z: u64[][]) -> u64[] {
+    let out = nistec.element(f)
+    let t = nistec.element(f)
+    for e in entries {
+        nistec.mul(f, t, e.coefficient, z[e.at])
+        nistec.add(f, out, out, t)
+    }
+    out
+}
+
+fn montgomery_assignment(f: *nistec.Field, s: System, assignment: u64[][]) -> u64[][] ! Error {
+    if assignment.len != s.variables {
+        fail Assignment
+    }
+    var out: u64[][] = []
+    for value in assignment {
+        if value.len > f.m.len {
+            fail Assignment
+        }
+        let x = nistec.element(f)
+        __memmove(x, value)
+        if !nistec.below(x, f.m) {
+            fail Assignment
+        }
+        nistec.to_mont(f, x, x)
+        out.push(x)
+    }
+    if !limb.equal(out[0], f.one) {
+        fail Assignment
+    }
+    out
+}
+
+/// Returns the values of `A`, `B` and `C` at the points of the domain, with the rows of the public variables, and whether every row holds, read through a mask over all rows.
+fn rows_of(f: *nistec.Field, s: System, d: Domain, z: u64[][]) -> Polynomials ! Error {
+    let out = Polynomials { u: zeros(f, d.size), v: zeros(f, d.size), w: zeros(f, d.size) }
+    var holds: u64 = 1
+    let product = nistec.element(f)
+    for j in 0..s.rows.len {
+        let row = s.rows[j]
+        __memmove(out.u[j], dot(f, row.a, z))
+        __memmove(out.v[j], dot(f, row.b, z))
+        __memmove(out.w[j], dot(f, row.c, z))
+        nistec.mul(f, product, out.u[j], out.v[j])
+        holds &= limb.same_limbs(product, out.w[j])
+    }
+    for k in 0..s.inputs + 1 {
+        __memmove(out.u[s.rows.len + k], z[k])
+    }
+    limb.clear(product)
+    if holds == 0 {
+        clear_all(out.u)
+        clear_all(out.v)
+        clear_all(out.w)
+        fail Unsatisfied
+    }
+    out
+}
+
+/// Returns the values of `(A B - C) (x)` at the odd points of the domain of twice the size, as plain integers, the scalars of the quotient part of the key.
+fn quotient(f: *nistec.Field, d: Domain, abc: Polynomials) -> u64[][] {
+    to_odd_points(f, d, abc.u)
+    to_odd_points(f, d, abc.v)
+    to_odd_points(f, d, abc.w)
+    var out: u64[][] = []
+    let t = nistec.element(f)
+    for i in 0..d.size {
+        nistec.mul(f, t, abc.u[i], abc.v[i])
+        nistec.sub(f, t, t, abc.w[i])
+        out.push(plain(f, t))
+    }
+    limb.clear(t)
+    out
+}
+
+/// Returns a proof that `assignment`, the constant one, the public inputs and the private values as plain integers least significant limb first, satisfies `s`, for the key `pk` that `setup` made for `s`.
+///
+/// Fails with `Assignment` when the assignment has the wrong length, its first value is not one or a value is not below `r`, with `Unsatisfied` when a constraint does not hold, and with `Key` when the key does not match the system. The private values and the blinding scalars `r` and `s`, drawn from `crypto.random`, only meet constant-time field arithmetic, transforms whose access pattern follows the system, `pairing.msm_secret` and `pairing.mul`; whether the assignment satisfies the system is decided once, after every row is read.
+pub fn prove(c: *pairing.Curve, pk: ProvingKey, s: System, assignment: u64[][]) -> Proof ! Error {
+    let f = c.fr
+    let d = domain_of(c, s)?
+    if pk.h.len != d.size || pk.a.len != s.variables || pk.verifying.ic.len != s.inputs + 1 {
+        fail Key
+    }
+    let z = montgomery_assignment(f, s, assignment)?
+    let abc = rows_of(f, s, d, z)?
+    let scalars = plains(f, z)
+    let h = quotient(f, d, abc)
+    let r = random_scalar(f)
+    let blind = random_scalar(f)
+    let a = pairing.add(c, pairing.add(c, pk.verifying.alpha, pairing.msm_secret(c, pk.a, scalars)), times(c, pk.delta_g1, r))
+    let b = pairing.add(c, pairing.add(c, pk.verifying.beta, pairing.msm_secret(c, pk.b2, scalars)), times(c, pk.verifying.delta, blind))
+    let b1 = pairing.add(c, pairing.add(c, pk.beta_g1, pairing.msm_secret(c, pk.b1, scalars)), times(c, pk.delta_g1, blind))
+    let rs = nistec.element(f)
+    nistec.mul(f, rs, r, blind)
+    nistec.sub(f, rs, nistec.element(f), rs)
+    var proof_c = pairing.add(c, pairing.msm_secret(c, pk.l, scalars[s.inputs + 1..]), pairing.msm_secret(c, pk.h, h))
+    proof_c = pairing.add(c, proof_c, times(c, a, blind))
+    proof_c = pairing.add(c, proof_c, times(c, b1, r))
+    proof_c = pairing.add(c, proof_c, times(c, pk.delta_g1, rs))
+    for values in [z, scalars, h, abc.u, abc.v, abc.w, [r, blind, rs]] {
+        clear_all(values)
+    }
+    Proof { a, b, c: proof_c }
+}
+
+fn padded_inputs(f: *nistec.Field, inputs: u64[][]) -> u64[][]? {
+    var out: u64[][] = []
+    for x in inputs {
+        if x.len > f.m.len {
+            return none
+        }
+        let padded = nistec.element(f)
+        __memmove(padded, x)
+        if !nistec.below(padded, f.m) {
+            return none
+        }
+        out.push(padded)
+    }
+    out
+}
+
+/// Returns whether `proof` shows knowledge of an assignment whose public inputs are `inputs`, plain integers least significant limb first, for the system of `vk`.
+///
+/// It is false when the number of inputs does not match the key, when an input is not below `r`, or when a proof point is not on its curve and in the subgroup of order `r`. It checks `e(A, B) = e(alpha, beta) e(sum x_i ic_i, gamma) e(C, delta)` with one product of four pairings. Everything it reads is public, and its running time depends on it.
+pub fn verify(c: *pairing.Curve, vk: VerifyingKey, inputs: u64[][], proof: Proof) -> bool {
+    if inputs.len + 1 != vk.ic.len {
+        return false
+    }
+    let scalars = padded_inputs(c.fr, inputs) ?? return false
+    if !pairing.in_subgroup(c, proof.a) || !pairing.in_subgroup(c, proof.b) || !pairing.in_subgroup(c, proof.c) {
+        return false
+    }
+    let sum = pairing.add(c, vk.ic[0], pairing.msm(c, vk.ic[1..], scalars))
+    pairing.check(c, [pairing.neg(c, proof.a), vk.alpha, sum, proof.c], [proof.b, vk.beta, vk.gamma, vk.delta])
+}
