@@ -1,0 +1,148 @@
+import std/bits
+import std/crypto
+import std/crypto/aead
+
+/// A ChaCha20 keystream that the samplers draw from.
+///
+/// `stream` keys it with 32 bytes from `crypto.random`; `seeded_stream` keys it with given bytes, so a test or a protocol that derives randomness from a shared seed gets the same samples again. Bytes are zeroed in the buffer as they are taken.
+pub struct Stream {
+    state: u32[]
+    buffer: u8[]
+    at: i64
+}
+
+const stream_blocks = 16
+const narrow_limit = 64.0
+
+/// Returns a stream keyed from the cryptographically secure generator of the process.
+pub fn stream() -> *Stream {
+    let seed = crypto.random(32)
+    let s = seeded_stream(seed)
+    crypto.wipe(seed)
+    s
+}
+
+/// Returns the stream keyed with the 32 bytes `seed`, starting at block 0 with an all-zero nonce, so its bytes are the RFC 8439 ChaCha20 keystream of that key. Panics unless `seed` has 32 bytes.
+pub fn seeded_stream(seed: u8[]) -> *Stream {
+    if seed.len != 32 {
+        panic("ring.seeded_stream: the seed has {seed.len} bytes, not 32")
+    }
+    let state: u32[] = __make(32)
+    for i in 0..8 {
+        state[4 + i] = u32(seed[4 * i]) | u32(seed[4 * i + 1]) << 8 | u32(seed[4 * i + 2]) << 16 | u32(seed[4 * i + 3]) << 24
+    }
+    let buffer: u8[] = __make(64 * stream_blocks)
+    new(Stream { state, buffer, at: buffer.len })
+}
+
+fn refill(s: *Stream) {
+    aead.chacha20_blocks(s.state, s.buffer, stream_blocks)
+    if s.state[12] == 0 {
+        s.state[13] += 1
+    }
+    s.at = 0
+}
+
+/// Returns the next eight bytes of `s` as a little-endian integer.
+pub fn next_word(s: *Stream) -> u64 {
+    if s.at + 8 > s.buffer.len {
+        refill(s)
+    }
+    var x: u64 = 0
+    for i in 0..8 {
+        x |= u64(s.buffer[s.at + i]) << u64(8 * i)
+        s.buffer[s.at + i] = 0
+    }
+    s.at += 8
+    x
+}
+
+fn below_modulus(s: *Stream, q: u64) -> u64 {
+    let mask = (u64(1) << u64(64 - bits.leading_zeros(q))) - 1
+    for {
+        let x = next_word(s) & mask
+        if x < q {
+            return x
+        }
+    }
+}
+
+/// Returns a polynomial whose residues are uniform modulo each prime of `b`, which makes it uniform modulo their product. It is uniform as coefficients and as transforms alike.
+pub fn uniform(s: *Stream, b: *Basis) -> Poly {
+    let p = zero(b)
+    for i in 0..b.moduli.len {
+        let q = b.moduli[i].value
+        let r = p.residues[i]
+        for j in 0..b.degree {
+            r[j] = below_modulus(s, q)
+        }
+    }
+    p
+}
+
+/// Returns `count` coefficients each `-1`, `0` or `1` with probability one third, independent of each other. The running time does not depend on the values.
+pub fn ternary(s: *Stream, count: i64) -> i64[] {
+    let out: i64[] = __make(count)
+    for i in 0..count {
+        out[i] = i64(__mulhi(next_word(s), 3)) - 1
+    }
+    out
+}
+
+fn cumulative_table(sigma: f64) -> i64[] {
+    let bound = i64(floor(6.0 * sigma))
+    let weights: f64[] = __make(bound + 1)
+    var total = 0.0
+    for k in 0..bound + 1 {
+        let w = exp(-f64(k * k) / (2.0 * sigma * sigma))
+        weights[k] = if k == 0 { w } else { 2.0 * w }
+        total += weights[k]
+    }
+    let table: i64[] = __make(bound)
+    var running = 0.0
+    let scale = 9223372036854775807.0
+    for k in 0..bound {
+        running += weights[k]
+        let c = running / total * scale
+        table[k] = if c >= scale { 9223372036854775807 } else { i64(c) }
+    }
+    table
+}
+
+fn narrow(s: *Stream, table: i64[]) -> i64 {
+    let word = next_word(s)
+    let u = i64(word >> 1)
+    var magnitude: i64 = 0
+    for c in table {
+        magnitude += (c - 1 - u) >> 63 & 1
+    }
+    let sign = -i64(word & 1)
+    (magnitude ^ sign) - sign
+}
+
+fn wide(s: *Stream, sigma: f64) -> i64 {
+    let unit = 1.0 / 9007199254740992.0
+    let u = f64((next_word(s) >> 11) + 1) * unit
+    let angle = i64(next_word(s) >> 11)
+    let radius = sqrt(-2.0 * ln(u))
+    let x = radius * turn(angle, 9007199254740992).cos * sigma
+    i64(floor(x + 0.5))
+}
+
+/// Returns `count` integers from the discrete Gaussian of standard deviation `sigma` centred on zero.
+///
+/// For `sigma` up to 64 each draw is one 63-bit uniform word looked up in a cumulative table of `exp(-k^2 / (2 * sigma^2))` cut at `6 * sigma`, scanning every entry so the running time does not depend on the result; this is the error distribution of BFV and CKKS, with `sigma` 3.2. A wider `sigma`, as the torus noise of TFHE needs, takes the Box-Muller transform of two 53-bit uniforms rounded to the nearest integer, with no cut.
+pub fn gaussian(s: *Stream, count: i64, sigma: f64) -> i64[] {
+    let out: i64[] = __make(count)
+    if sigma <= narrow_limit {
+        let table = cumulative_table(sigma)
+        for i in 0..count {
+            out[i] = narrow(s, table)
+        }
+        return out
+    }
+    for i in 0..count {
+        out[i] = wide(s, sigma)
+    }
+    out
+}

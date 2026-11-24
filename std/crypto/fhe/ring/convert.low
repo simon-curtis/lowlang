@@ -1,0 +1,321 @@
+import std/crypto/limb
+import std/slices
+import std/big
+
+/// The constants that move a polynomial from one basis to another without leaving the residue number system: exact basis extension, as Halevi, Polyakov and Shoup define it (HPS, "An Improved RNS Variant of the BFV Homomorphic Encryption Scheme", CT-RSA 2019, section 2.3).
+pub struct Extension {
+    source: *Basis
+    target: *Basis
+    hat_inverse: u64[]
+    hat_inverse_shoup: u64[]
+    hat: u64[][]
+    whole: u64[]
+    fraction_high: u64[]
+    fraction_low: u64[]
+}
+
+/// The constants that compute `round(t * x / D)` in a target basis from `x` in a source basis, where `D` is the product of the leading source primes (HPS section 2.4 and section 4).
+pub struct Scaler {
+    source: *Basis
+    target: Modulus[]
+    hat_inverse: u64[]
+    hat_inverse_shoup: u64[]
+    whole: u64[][]
+    fraction_high: u64[]
+    fraction_low: u64[]
+}
+
+fn residue(x: big.Int, m: u64) -> u64 {
+    let r = big.modulo(x, big.from_u64(m)) catch {
+        _ => panic("ring: modulus {m} is zero")
+    }
+    big.to_u64(r) catch {
+        _ => panic("ring: residue does not fit")
+    }
+}
+
+fn quotient(x: big.Int, m: u64) -> big.Int {
+    big.quo(x, big.from_u64(m)) catch {
+        _ => panic("ring: modulus {m} is zero")
+    }
+}
+
+fn fraction(numerator: big.Int, m: u64) -> big.Int {
+    quotient(big.shl(numerator, 128), m)
+}
+
+fn low_word(x: big.Int) -> u64 {
+    big.to_u64(big.bit_and(x, big.from_u64(0xffffffffffffffff))) catch {
+        _ => panic("ring: word does not fit")
+    }
+}
+
+fn high_word(x: big.Int) -> u64 {
+    low_word(big.shr(x, 64))
+}
+
+fn hat_inverses(b: *Basis) -> u64[] {
+    let q = product(b)
+    let out: u64[] = __make(b.moduli.len)
+    for i in 0..b.moduli.len {
+        let m = b.moduli[i]
+        out[i] = inverse_mod(m, residue(quotient(q, m.value), m.value))
+    }
+    out
+}
+
+fn shoups(moduli: Modulus[], values: u64[]) -> u64[] {
+    let out: u64[] = __make(values.len)
+    for i in 0..values.len {
+        out[i] = shoup(moduli[i], values[i])
+    }
+    out
+}
+
+/// Returns the constants that extend polynomials from `source` to `target`, two bases of one degree with no prime in common.
+pub fn extension(source: *Basis, target: *Basis) -> *Extension {
+    let q = product(source)
+    let k = source.moduli.len
+    let hat_inverse = hat_inverses(source)
+    var hat: u64[][] = []
+    let whole: u64[] = __make(target.moduli.len)
+    for j in 0..target.moduli.len {
+        let p = target.moduli[j].value
+        let row: u64[] = __make(k)
+        for i in 0..k {
+            row[i] = residue(quotient(q, source.moduli[i].value), p)
+        }
+        hat.push(row)
+        whole[j] = residue(q, p)
+    }
+    let fraction_high: u64[] = __make(k)
+    let fraction_low: u64[] = __make(k)
+    for i in 0..k {
+        let f = fraction(big.one(), source.moduli[i].value)
+        fraction_high[i] = high_word(f)
+        fraction_low[i] = low_word(f)
+    }
+    new(Extension {
+        source,
+        target,
+        hat_inverse,
+        hat_inverse_shoup: shoups(source.moduli, hat_inverse),
+        hat,
+        whole,
+        fraction_high,
+        fraction_low,
+    })
+}
+
+struct Wide {
+    w0: u64
+    w1: u64
+    w2: u64
+}
+
+fn accumulate_fraction(acc: *Wide, x: u64, high: u64, low: u64) {
+    let p_low = x * low
+    let p_mid = __mulhi(x, low)
+    let q_low = x * high
+    let q_high = __mulhi(x, high)
+    let s0 = acc.w0 + p_low
+    let c0 = limb.carry(acc.w0, p_low, s0)
+    let t1 = acc.w1 + p_mid
+    let c1 = limb.carry(acc.w1, p_mid, t1)
+    let s1 = t1 + q_low
+    let c2 = limb.carry(t1, q_low, s1)
+    let s1c = s1 + c0
+    let c3 = limb.carry(s1, c0, s1c)
+    acc.w0 = s0
+    acc.w1 = s1c
+    acc.w2 += q_high + c1 + c2 + c3
+}
+
+fn rounded(acc: *Wide) -> u64 {
+    acc.w2 + (acc.w1 >> 63)
+}
+
+fn dot(row: u64[], xs: u64[], m: Modulus) -> u64 {
+    var low: u64 = 0
+    var high: u64 = 0
+    for i in 0..xs.len {
+        let p = xs[i] * row[i]
+        let s = low + p
+        high += __mulhi(xs[i], row[i]) + limb.carry(low, p, s)
+        low = s
+    }
+    reduce_wide(m, high, low)
+}
+
+/// Returns the coefficients `x`, given modulo the source primes, as the coefficients of the same integers modulo the target primes.
+///
+/// Each coefficient is lifted to the representative in `-Q/2..Q/2`, `Q` being the source product, so a small negative coefficient stays small and negative. The rounding that picks the representative is computed in 128-bit fixed point, so it is exact unless a coefficient lies within about `k * 2^-67 * Q` of `Q/2`, `k` being the number of source primes.
+pub fn extend(e: *Extension, x: Poly) -> Poly {
+    let k = e.source.moduli.len
+    let out = zero(e.target)
+    let scaled: u64[] = __make(k)
+    let acc = new(Wide { w0: 0, w1: 0, w2: 0 })
+    for c in 0..e.source.degree {
+        acc.w0 = 0
+        acc.w1 = 0
+        acc.w2 = 0
+        for i in 0..k {
+            let s = mul_shoup(e.source.moduli[i], x.residues[i][c], e.hat_inverse[i], e.hat_inverse_shoup[i])
+            scaled[i] = s
+            accumulate_fraction(acc, s, e.fraction_high[i], e.fraction_low[i])
+        }
+        let v = rounded(acc)
+        for j in 0..e.target.moduli.len {
+            let m = e.target.moduli[j]
+            let sum = dot(e.hat[j], scaled, m)
+            out.residues[j][c] = sub_mod(m, sum, mul_mod(m, reduce(m, v), e.whole[j]))
+        }
+    }
+    out
+}
+
+/// Returns the constants that compute `round(t * x / D)` modulo each of `target`, for `x` given modulo the primes of `source` and `D` the product of its first `divisor_count` primes.
+///
+/// Every target must divide `t * P`, `P` being the product of the other source primes, so the result does not depend on which representative of `x` modulo the source product is rounded. With `divisor_count` equal to the source size and `target` the plaintext modulus `t` alone this is BFV decryption; with the source `Q` followed by an auxiliary basis `P` and `target` the primes of `P` it is the scaling step of the BFV product. Panics when a target does not divide `t * P`.
+pub fn scaler(source: *Basis, divisor_count: i64, t: u64, target: Modulus[]) -> *Scaler {
+    let k = source.moduli.len
+    var numerator = big.from_u64(t)
+    for i in divisor_count..k {
+        numerator = big.mul(numerator, big.from_u64(source.moduli[i].value))
+    }
+    for m in target {
+        if residue(numerator, m.value) != 0 {
+            panic("ring.scaler: {m.value} does not divide the numerator")
+        }
+    }
+    let hat_inverse = hat_inverses(source)
+    var whole: u64[][] = []
+    for m in target {
+        let row: u64[] = __make(k)
+        for i in 0..k {
+            row[i] = residue(quotient(numerator, source.moduli[i].value), m.value)
+        }
+        whole.push(row)
+    }
+    let fraction_high: u64[] = __make(k)
+    let fraction_low: u64[] = __make(k)
+    for i in 0..k {
+        let q = source.moduli[i].value
+        let f = fraction(big.from_u64(residue(numerator, q)), q)
+        fraction_high[i] = high_word(f)
+        fraction_low[i] = low_word(f)
+    }
+    new(Scaler {
+        source,
+        target,
+        hat_inverse,
+        hat_inverse_shoup: shoups(source.moduli, hat_inverse),
+        whole,
+        fraction_high,
+        fraction_low,
+    })
+}
+
+/// Returns `round(t * x / D)` for the coefficients `x` given modulo the source primes, as one residue slice per target modulus.
+///
+/// The fractional part is summed in 128-bit fixed point, so the rounding is exact unless `t * x / D` lies within about `k * 2^-67` of a half-integer.
+pub fn scale(s: *Scaler, x: Poly) -> u64[][] {
+    let k = s.source.moduli.len
+    let n = s.source.degree
+    var out: u64[][] = []
+    for _ in 0..s.target.len {
+        let r: u64[] = __make(n)
+        out.push(r)
+    }
+    let scaled: u64[] = __make(k)
+    let acc = new(Wide { w0: 0, w1: 0, w2: 0 })
+    for c in 0..n {
+        acc.w0 = 0
+        acc.w1 = 0
+        acc.w2 = 0
+        for i in 0..k {
+            let v = mul_shoup(s.source.moduli[i], x.residues[i][c], s.hat_inverse[i], s.hat_inverse_shoup[i])
+            scaled[i] = v
+            accumulate_fraction(acc, v, s.fraction_high[i], s.fraction_low[i])
+        }
+        let r = rounded(acc)
+        for j in 0..s.target.len {
+            let m = s.target[j]
+            out[j][c] = add_mod(m, dot(s.whole[j], scaled, m), reduce(m, r))
+        }
+    }
+    out
+}
+
+fn divided(b: *Basis, x: Poly, top: u64[], transformed: bool) -> Poly {
+    let last = x.residues.len - 1
+    let ml = b.moduli[last]
+    let half = ml.value >> 1
+    for c in 0..b.degree {
+        top[c] = add_mod(ml, top[c], half)
+    }
+    let out = zero_at(b, last)
+    let r: u64[] = __make(b.degree)
+    for i in 0..last {
+        let m = b.moduli[i]
+        let half_i = reduce(m, half)
+        for c in 0..b.degree {
+            r[c] = sub_mod(m, reduce(m, top[c]), half_i)
+        }
+        if transformed {
+            forward(b.transforms[i], r)
+        }
+        let w = inverse_mod(m, reduce(m, ml.value))
+        let w_shoup = shoup(m, w)
+        let a = x.residues[i]
+        let o = out.residues[i]
+        for c in 0..b.degree {
+            o[c] = mul_shoup(m, sub_mod(m, a[c], r[c]), w, w_shoup)
+        }
+    }
+    out
+}
+
+/// Returns `round(x / q)` for the coefficients `x`, where `q` is the last prime `x` has a residue for, without that residue.
+///
+/// This is the rescaling of CKKS, the modulus switching of BFV and the last step of key switching with a special prime.
+pub fn divide_round_last(b: *Basis, x: Poly) -> Poly {
+    divided(b, x, slices.clone(x.residues[x.residues.len - 1]), false)
+}
+
+/// Returns the transforms of `round(x / q)` for the transforms `x`, where `q` is the last prime `x` has a residue for, without that residue.
+pub fn divide_round_last_transform(b: *Basis, x: Poly) -> Poly {
+    let last = x.residues.len - 1
+    let top = slices.clone(x.residues[last])
+    backward(b.transforms[last], top)
+    divided(b, x, top, true)
+}
+
+/// Returns the coefficients `x`, given modulo the primes of `b`, as integers in `-Q/2..Q/2`, `Q` being the product of the primes `x` has residues for.
+pub fn compose(b: *Basis, x: Poly) -> big.Int[] {
+    let k = x.residues.len
+    let sub = slice(b, 0, k)
+    let q = product(sub)
+    let half = big.shr(q, 1)
+    var hats: big.Int[] = []
+    let inverses = hat_inverses(sub)
+    for i in 0..k {
+        hats.push(quotient(q, b.moduli[i].value))
+    }
+    var out: big.Int[] = []
+    for c in 0..b.degree {
+        var sum = big.zero()
+        for i in 0..k {
+            let s = mul_mod(b.moduli[i], x.residues[i][c], inverses[i])
+            sum = big.add(sum, big.mul(hats[i], big.from_u64(s)))
+        }
+        var v = big.modulo(sum, q) catch {
+            _ => panic("ring.compose: empty basis")
+        }
+        if big.cmp(v, half) > 0 {
+            v = big.sub(v, q)
+        }
+        out.push(v)
+    }
+    out
+}

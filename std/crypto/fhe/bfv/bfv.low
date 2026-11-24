@@ -1,0 +1,310 @@
+import std/big
+import std/bits
+import std/crypto/fhe/ring
+import std/crypto/limb
+import std/crypto/fhe/rlwe
+import std/slices
+
+/// The parameters of a BFV instance.
+pub struct Parameters {
+    /// The number of coefficients and of batching slots, a power of two from 1024 to 32768.
+    pub degree: i64
+    /// The plaintext modulus `t`. Batching needs a prime that is `1` modulo `2 * degree`.
+    pub plain_modulus: u64
+    /// The bit size of each ciphertext prime, at most 60.
+    pub prime_bits: i64[]
+    /// The bit size of the special prime that key switching works over, at least the largest ciphertext prime size.
+    pub special_bits: i64
+    /// The security level the product of all primes must meet.
+    pub security: rlwe.Security
+}
+
+/// The error type of the `bfv` functions.
+pub enum Error {
+    /// The degree is not a power of two the security standard lists.
+    Degree
+    /// A prime size is outside 20 to 60 bits, or the special prime is smaller than a ciphertext prime.
+    PrimeSize
+    /// The primes have `bits` bits together, more than the `limit` the security level allows.
+    ModulusTooLarge(bits: i64, limit: i64)
+    /// The plaintext modulus is below 2 or not below every ciphertext prime.
+    PlainModulus
+    /// The plaintext modulus is not a prime that is `1` modulo `2 * degree`, so slots are not available.
+    NoBatching
+    /// More values than slots were given.
+    TooManyValues
+    /// The Galois keys have no key for the rotation asked for.
+    MissingGaloisKey
+    /// The ciphertext is at the lowest level and cannot switch down.
+    LowestLevel
+    /// The operands are at different levels or have the wrong number of parts.
+    Mismatch
+}
+
+/// A plaintext: a polynomial with coefficients modulo the plaintext modulus.
+pub struct Plaintext {
+    /// The coefficients, each below the plaintext modulus.
+    pub coefficients: u64[]
+}
+
+/// A ciphertext: two parts, or three before relinearization, held as transforms at one level.
+pub struct Ciphertext {
+    /// The parts, each with residues for the primes of its level.
+    pub parts: ring.Poly[]
+}
+
+struct Level {
+    q: *ring.Basis
+    aux: *ring.Basis
+    joined: *ring.Basis
+    to_aux: *ring.Extension
+    from_aux: *ring.Extension
+    product: *ring.Scaler
+    decrypt: *ring.Scaler
+    delta: u64[]
+    remainder: u64
+}
+
+/// A BFV instance built from `Parameters`: the primes, the auxiliary primes of the product, the batching transform and the constants of every level.
+pub struct Context {
+    /// The parameters it was built from.
+    pub parameters: Parameters
+    /// The ring and key-switching context it shares with the other schemes.
+    pub rlwe: *rlwe.Context
+    plain: ring.Modulus
+    batch: *ring.Ntt?
+    slots: i64[]
+    aux: *ring.Basis
+    levels: *Level[]
+}
+
+const sigma = 3.19
+
+/// Returns the default parameters: degree 8192, plaintext modulus 65537, ciphertext primes of 43, 43, 44 and 44 bits and a 44-bit special prime, 218 bits in all, the limit for 128-bit security and the prime sizes of Microsoft SEAL's `BFVDefault(8192)`.
+pub fn default_parameters() -> Parameters {
+    Parameters { degree: 8192, plain_modulus: 65537, prime_bits: [43, 43, 44, 44], special_bits: 44, security: Classical128 }
+}
+
+fn validate(p: Parameters) ! Error {
+    let limit = rlwe.max_modulus_bits(p.degree, p.security)
+    if limit == 0 {
+        fail Error.Degree
+    }
+    var total = p.special_bits
+    for size in p.prime_bits {
+        if size < 20 || size > 60 || size > p.special_bits {
+            fail Error.PrimeSize
+        }
+        total += size
+    }
+    if p.special_bits > 60 || p.prime_bits.len == 0 {
+        fail Error.PrimeSize
+    }
+    if total > limit {
+        fail Error.ModulusTooLarge(total, limit)
+    }
+    var smallest = p.special_bits
+    for size in p.prime_bits {
+        if size < smallest {
+            smallest = size
+        }
+    }
+    if p.plain_modulus < 2 || p.plain_modulus >> u64(smallest - 1) != 0 {
+        fail Error.PlainModulus
+    }
+}
+
+fn slot_table(degree: i64) -> i64[] {
+    let table: i64[] = __make(degree)
+    let half = degree / 2
+    let m = 2 * degree
+    let width = bits.bit_length(u64(degree)) - 1
+    var pos = 1
+    for i in 0..half {
+        table[i] = reverse_bits((pos - 1) / 2, width)
+        table[half + i] = reverse_bits((m - pos - 1) / 2, width)
+        pos = pos * 3 % m
+    }
+    table
+}
+
+fn reverse_bits(x: i64, bits: i64) -> i64 {
+    var r = 0
+    for b in 0..bits {
+        r |= (x >> b & 1) << (bits - 1 - b)
+    }
+    r
+}
+
+fn level_constants(ctx: *Context, level: i64) -> *Level {
+    let t = ctx.parameters.plain_modulus
+    let q = ring.slice(ctx.rlwe.q, 0, level + 1)
+    let joined = ring.join(q, ctx.aux)
+    let product = ring.product(q)
+    let whole = big.quo(product, big.from_u64(t)) catch {
+        _ => panic("bfv: plaintext modulus is zero")
+    }
+    let delta: u64[] = __make(level + 1)
+    for i in 0..level + 1 {
+        delta[i] = residue_of(whole, q.moduli[i].value)
+    }
+    new(Level {
+        q,
+        aux: ctx.aux,
+        joined,
+        to_aux: ring.extension(q, ctx.aux),
+        from_aux: ring.extension(ctx.aux, q),
+        product: ring.scaler(joined, level + 1, t, ctx.aux.moduli),
+        decrypt: ring.scaler(q, level + 1, t, [ctx.plain]),
+        delta,
+        remainder: residue_of(product, t),
+    })
+}
+
+/// Returns the instance for `p`, or fails when the parameters break the security bound or are malformed.
+///
+/// The primes are the ones Microsoft SEAL picks for the same sizes. The product of two ciphertexts runs in an auxiliary basis of 61-bit primes whose product exceeds `t * degree * Q` with a margin of four bits, as Halevi, Polyakov and Shoup require.
+pub fn context(p: Parameters) -> *Context ! Error {
+    validate(p)?
+    var all_bits = p.prime_bits
+    all_bits.push(p.special_bits)
+    let primes = rlwe.chain_primes(all_bits, p.degree)
+    let q_primes = primes[..p.prime_bits.len]
+    let special = primes[p.prime_bits.len]
+    let r = rlwe.context(q_primes, special, p.degree, sigma)
+    let plain = ring.modulus(p.plain_modulus)
+    var batch: *ring.Ntt? = none
+    if ring.is_prime(p.plain_modulus) && (p.plain_modulus - 1) % u64(2 * p.degree) == 0 {
+        batch = new(ring.ntt(plain, p.degree))
+    }
+    let needed = ring.bit_count(r.q) + bits.bit_length(u64(p.degree)) + bits.bit_length(p.plain_modulus) + 4
+    let aux = ring.basis(ring.ntt_primes(61, (needed + 59) / 60, p.degree, primes), p.degree)
+    let ctx = new(Context { parameters: p, rlwe: r, plain, batch, slots: slot_table(p.degree), aux, levels: [] })
+    var levels: *Level[] = []
+    for l in 0..q_primes.len {
+        levels.push(level_constants(ctx, l))
+    }
+    ctx.levels = levels
+    ctx
+}
+
+/// Returns fresh keys drawn from `s`: a ternary secret, the public key and the relinearization key.
+pub fn generate(ctx: *Context, s: *ring.Stream) -> rlwe.Keys {
+    rlwe.generate(ctx.rlwe, s)
+}
+
+/// Returns the Galois keys for rotating the rows by each of `steps` and, when `swap` is set, for swapping the two rows.
+pub fn galois_keys(ctx: *Context, secret: *rlwe.SecretKey, steps: i64[], swap: bool, s: *ring.Stream) -> rlwe.GaloisKeys {
+    rlwe.galois_keys(ctx.rlwe, secret, steps, swap, s)
+}
+
+/// Returns the number of batching slots, which equals the degree, or `0` when the plaintext modulus does not allow batching.
+pub fn slot_count(ctx: *Context) -> i64 {
+    if ctx.batch == none {
+        return 0
+    }
+    ctx.parameters.degree
+}
+
+/// Returns the plaintext whose slots hold `values` reduced modulo the plaintext modulus, the rest zero.
+///
+/// The slots form two rows of `degree / 2`; `rotate_rows` turns both rows and `swap_rows` exchanges them. The layout is Microsoft SEAL's `BatchEncoder`, so the same values give the same plaintext.
+pub fn encode(ctx: *Context, values: i64[]) -> Plaintext ! Error {
+    let plan = ctx.batch ?? fail Error.NoBatching
+    if values.len > ctx.parameters.degree {
+        fail Error.TooManyValues
+    }
+    let out: u64[] = __make(ctx.parameters.degree)
+    for i in 0..values.len {
+        out[ctx.slots[i]] = ring.reduce_signed(ctx.plain, values[i])
+    }
+    ring.backward(plan, out)
+    Plaintext { coefficients: out }
+}
+
+/// Returns the values in the slots of `p`, each below the plaintext modulus.
+pub fn decode(ctx: *Context, p: Plaintext) -> u64[] ! Error {
+    let plan = ctx.batch ?? fail Error.NoBatching
+    let values = slices.clone(p.coefficients)
+    ring.forward(plan, values)
+    let out: u64[] = __make(ctx.parameters.degree)
+    for i in 0..out.len {
+        out[i] = values[ctx.slots[i]]
+    }
+    out
+}
+
+/// Returns a fresh encryption of `p` under the public key, at the top level.
+pub fn encrypt(ctx: *Context, public: rlwe.Pair, p: Plaintext, s: *ring.Stream) -> Ciphertext {
+    let zero = rlwe.encrypt_zero(ctx.rlwe, public, s)
+    let lv = ctx.levels[rlwe.top(ctx.rlwe)]
+    ring.add_into(lv.q, zero.c0, scaled_plain(ctx, lv, p))
+    Ciphertext { parts: [zero.c0, zero.c1] }
+}
+
+fn scaled_plain(ctx: *Context, lv: *Level, p: Plaintext) -> ring.Poly {
+    let t = ctx.parameters.plain_modulus
+    let half = (t + 1) / 2
+    let out = ring.zero(lv.q)
+    for c in 0..ctx.parameters.degree {
+        let m = p.coefficients[c]
+        let low = lv.remainder * m
+        let sum = low + half
+        let high = __mulhi(lv.remainder, m) + limb.carry(low, half, sum)
+        let fix = ring.divide_wide(high, sum, t)
+        for i in 0..out.residues.len {
+            let q = lv.q.moduli[i]
+            out.residues[i][c] = ring.add_mod(q, ring.mul_mod(q, lv.delta[i], m), fix)
+        }
+    }
+    ring.to_transform(lv.q, out)
+    out
+}
+
+fn residue_of(x: big.Int, m: u64) -> u64 {
+    let r = big.modulo(x, big.from_u64(m)) catch {
+        _ => panic("bfv: zero modulus")
+    }
+    big.to_u64(r) catch {
+        _ => panic("bfv: residue too wide")
+    }
+}
+
+fn plain_lift(ctx: *Context, b: *ring.Basis, p: Plaintext) -> ring.Poly {
+    let signed: i64[] = __make(ctx.parameters.degree)
+    for i in 0..signed.len {
+        signed[i] = ring.centre(ctx.plain, p.coefficients[i])
+    }
+    ring.from_signed(b, signed)
+}
+
+/// Returns the level of `c`: one below its number of primes.
+pub fn level(c: Ciphertext) -> i64 {
+    c.parts[0].residues.len - 1
+}
+
+/// Returns the plaintext `c` decrypts to under `secret`: `round(t * (c0 + c1 * s + ...) / Q)` modulo `t`.
+pub fn decrypt(ctx: *Context, secret: *rlwe.SecretKey, c: Ciphertext) -> Plaintext {
+    let lv = ctx.levels[level(c)]
+    let phase = rlwe.phase(ctx.rlwe, secret, c.parts)
+    Plaintext { coefficients: ring.scale(lv.decrypt, phase)[0] }
+}
+
+/// Returns the invariant noise budget of `c` in bits, as Microsoft SEAL defines it: `log2(Q) - log2(|t * (c0 + c1 * s)|) - 1` with the norm the largest centred coefficient modulo `Q`, or `0` when no budget remains. Decryption is correct while it is positive.
+pub fn noise_budget(ctx: *Context, secret: *rlwe.SecretKey, c: Ciphertext) -> i64 {
+    let lv = ctx.levels[level(c)]
+    let phase = rlwe.phase(ctx.rlwe, secret, c.parts)
+    let scaled = ring.mul_scalar(lv.q, phase, i64(ctx.parameters.plain_modulus))
+    var largest = 0
+    for v in ring.compose(lv.q, scaled) {
+        let bits = big.bit_len(big.abs(v))
+        if bits > largest {
+            largest = bits
+        }
+    }
+    let budget = ring.bit_count(lv.q) - largest - 1
+    if budget < 0 {
+        return 0
+    }
+    budget
+}

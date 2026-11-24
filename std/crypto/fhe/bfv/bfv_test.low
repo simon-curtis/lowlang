@@ -1,0 +1,318 @@
+import std/bits
+import std/crypto/fhe/ring
+import std/crypto/fhe/rlwe
+import std/crypto/hash
+import std/testing
+
+fn fixed(tag: u8) -> *ring.Stream {
+    let seed: u8[] = __make(32)
+    seed[0] = tag
+    ring.seeded_stream(seed)
+}
+
+fn small_parameters() -> Parameters {
+    Parameters { degree: 4096, plain_modulus: 40961, prime_bits: [36, 36], special_bits: 37, security: Classical128 }
+}
+
+fn built(t: *testing.T, p: Parameters) -> *Context {
+    context(p) catch {
+        e => {
+            t.fatal("context: {e}")
+            panic("unreachable")
+        }
+    }
+}
+
+fn digest_hex(coefficients: u64[]) -> str {
+    var bytes: u8[] = []
+    for c in coefficients {
+        for i in 0..8 {
+            bytes.push(u8(c >> u64(8 * i) & 0xff))
+        }
+    }
+    let digits = "0123456789abcdef"
+    var out = ""
+    for b in hash.sum(hash.sha256(), bytes) {
+        out = "{out}{digits[i64(b >> 4)..i64(b >> 4) + 1]}{digits[i64(b & 15)..i64(b & 15) + 1]}"
+    }
+    out
+}
+
+fn ramp(count: i64, t: u64) -> i64[] {
+    var values: i64[] = []
+    for i in 0..count {
+        values.push(i64(u64(i * 7 + 3) % t))
+    }
+    values
+}
+
+fn test_batching_matches_seal(t: *testing.T) {
+    let cases = [
+        Parameters { degree: 8192, plain_modulus: 65537, prime_bits: [43, 43, 44, 44], special_bits: 44, security: Classical128 },
+        small_parameters(),
+        Parameters { degree: 16384, plain_modulus: 786433, prime_bits: [48, 48, 48, 48, 48, 48, 48, 48], special_bits: 49, security: Classical128 },
+    ]
+    let digests = [
+        "e3a8d8d7f72dc51feb77842c4e0a035cf3323a03fd3bb563d6a12825b26bd855",
+        "394d183e96bc5876893817991c0f6119a08bc5d56c33469f6745efd4305acda6",
+        "7f168c77c62f1c759b0c66e25e13e3837c79b041f8656eff745610fc2720d509",
+    ]
+    for i in 0..cases.len {
+        let p = cases[i]
+        let ctx = built(t, p)
+        let plain = encode(ctx, ramp(p.degree, p.plain_modulus)) catch {
+            e => return t.fatal("encode: {e}")
+        }
+        t.equal(digest_hex(plain.coefficients), digests[i])
+        let back = decode(ctx, plain) catch {
+            e => return t.fatal("decode: {e}")
+        }
+        t.equal(back[1], 10)
+        t.equal(back[p.degree - 1], u64((p.degree - 1) * 7 + 3) % p.plain_modulus)
+    }
+}
+
+fn random_slots(s: *ring.Stream, count: i64, t: u64) -> i64[] {
+    var out: i64[] = []
+    for _ in 0..count {
+        out.push(i64(ring.next_word(s) % t))
+    }
+    out
+}
+
+fn slots_equal(t: *testing.T, ctx: *Context, secret: *rlwe.SecretKey, c: Ciphertext, want: i64[]) {
+    let got = decode(ctx, decrypt(ctx, secret, c)) catch {
+        e => return t.fatal("decode: {e}")
+    }
+    var mismatches = 0
+    for i in 0..want.len {
+        if got[i] != u64(want[i]) {
+            mismatches += 1
+        }
+    }
+    t.equal(mismatches, 0)
+}
+
+fn test_slot_arithmetic_and_rotations(t: *testing.T) {
+    let ctx = built(t, small_parameters())
+    let s = fixed(1)
+    let keys = generate(ctx, s)
+    let galois = galois_keys(ctx, keys.secret, [1, -3], true, s)
+    let n = 4096
+    let half = n / 2
+    let tm: i64 = 40961
+    let x = random_slots(s, n, 40961)
+    let y = random_slots(s, n, 40961)
+    let encrypt_values = fn(values: i64[]) -> Ciphertext {
+        let p = encode(ctx, values) catch {
+            _ => panic("encode")
+        }
+        encrypt(ctx, keys.public, p, s)
+    }
+    let cx = encrypt_values(x)
+    let cy = encrypt_values(y)
+    let py = encode(ctx, y) catch {
+        e => return t.fatal("encode: {e}")
+    }
+    var sum: i64[] = []
+    var difference: i64[] = []
+    var product: i64[] = []
+    var negated: i64[] = []
+    var left: i64[] = []
+    var right: i64[] = []
+    var swapped: i64[] = []
+    for i in 0..n {
+        sum.push((x[i] + y[i]) % tm)
+        difference.push((x[i] - y[i] + tm) % tm)
+        product.push(x[i] * y[i] % tm)
+        negated.push((tm - x[i]) % tm)
+        let row = i / half * half
+        left.push(x[row + (i - row + 1) % half])
+        right.push(x[row + (i - row - 3 + half) % half])
+        swapped.push(x[(i + half) % n])
+    }
+    let ops = [
+        add(ctx, cx, cy) catch { _ => cx },
+        sub(ctx, cx, cy) catch { _ => cx },
+        negate(ctx, cx),
+        add_plain(ctx, cx, py),
+        multiply_plain(ctx, cx, py),
+        multiply_relinearize(ctx, keys.relinearization, cx, cy) catch { _ => cx },
+        rotate_rows(ctx, galois, cx, 1) catch { _ => cx },
+        rotate_rows(ctx, galois, cx, -3) catch { _ => cx },
+        swap_rows(ctx, galois, cx) catch { _ => cx },
+    ]
+    let wants = [sum, difference, negated, sum, product, product, left, right, swapped]
+    for i in 0..ops.len {
+        slots_equal(t, ctx, keys.secret, ops[i], wants[i])
+    }
+    let three = multiply(ctx, cx, cy) catch {
+        e => return t.fatal("multiply: {e}")
+    }
+    t.equal(three.parts.len, 3)
+    slots_equal(t, ctx, keys.secret, three, product)
+}
+
+fn test_default_depth_and_noise_budgets_match_seal(t: *testing.T) {
+    let ctx = built(t, default_parameters())
+    let s = fixed(2)
+    let keys = generate(ctx, s)
+    let n = 8192
+    var expected = ramp(n, 65537)
+    let plain = encode(ctx, expected) catch {
+        e => return t.fatal("encode: {e}")
+    }
+    var c = encrypt(ctx, keys.public, plain, s)
+    let seal: i64[] = [150, 122, 93, 64, 35, 6]
+    let fresh = noise_budget(ctx, keys.secret, c)
+    t.is_true(fresh >= fresh_budget_bound(ctx))
+    t.is_true(fresh >= seal[0] - 2 && fresh <= seal[0] + 2)
+    var depth = 0
+    for round in 0..7 {
+        let before = noise_budget(ctx, keys.secret, c)
+        c = multiply_relinearize(ctx, keys.relinearization, c, c) catch {
+            e => return t.fatal("multiply: {e}")
+        }
+        for i in 0..n {
+            expected[i] = expected[i] * expected[i] % 65537
+        }
+        let budget = noise_budget(ctx, keys.secret, c)
+        let got = decode(ctx, decrypt(ctx, keys.secret, c)) catch {
+            e => return t.fatal("decode: {e}")
+        }
+        var right = true
+        for i in 0..n {
+            right = right && got[i] == u64(expected[i])
+        }
+        if budget > 0 {
+            t.is_true(right)
+            t.is_true(before - budget <= product_budget_cost(ctx))
+            t.is_true(budget >= seal[round + 1] - 2 && budget <= seal[round + 1] + 2)
+            depth += 1
+        } else {
+            t.is_false(right)
+        }
+    }
+    t.equal(depth, 5)
+}
+
+fn test_switching_down_keeps_the_plaintext(t: *testing.T) {
+    let ctx = built(t, default_parameters())
+    let s = fixed(3)
+    let keys = generate(ctx, s)
+    let x = random_slots(s, 8192, 65537)
+    let p = encode(ctx, x) catch {
+        e => return t.fatal("encode: {e}")
+    }
+    var c = encrypt(ctx, keys.public, p, s)
+    let squared = multiply_relinearize(ctx, keys.relinearization, c, c) catch {
+        e => return t.fatal("multiply: {e}")
+    }
+    var want: i64[] = []
+    for v in x {
+        want.push(v * v % 65537)
+    }
+    var lower = squared
+    for level_now in [2, 1, 0] {
+        let budget = noise_budget(ctx, keys.secret, lower)
+        lower = switch_down(ctx, lower) catch {
+            e => return t.fatal("switch: {e}")
+        }
+        t.equal(level(lower), level_now)
+        slots_equal(t, ctx, keys.secret, lower, want)
+        t.is_true(noise_budget(ctx, keys.secret, lower) <= budget)
+    }
+    var refused = ""
+    let unchanged = switch_down(ctx, lower) catch {
+        e => {
+            refused = "{e}"
+            lower
+        }
+    }
+    t.equal(refused, "LowestLevel")
+    t.equal(level(unchanged), 0)
+    var mixed = ""
+    let _ = add(ctx, lower, c) catch {
+        e => {
+            mixed = "{e}"
+            lower
+        }
+    }
+    t.equal(mixed, "Mismatch")
+}
+
+fn test_wrong_keys_and_tampering_break_decryption(t: *testing.T) {
+    let ctx = built(t, small_parameters())
+    let s = fixed(4)
+    let keys = generate(ctx, s)
+    let other = generate(ctx, s)
+    let x = random_slots(s, 4096, 40961)
+    let p = encode(ctx, x) catch {
+        e => return t.fatal("encode: {e}")
+    }
+    let c = encrypt(ctx, keys.public, p, s)
+    slots_equal(t, ctx, keys.secret, c, x)
+    t.equal(noise_budget(ctx, other.secret, c), 0)
+    let wrong = decode(ctx, decrypt(ctx, other.secret, c)) catch {
+        e => return t.fatal("decode: {e}")
+    }
+    var matching = 0
+    for i in 0..4096 {
+        if wrong[i] == u64(x[i]) {
+            matching += 1
+        }
+    }
+    t.is_true(matching < 10)
+    let tampered = Ciphertext { parts: [c.parts[0], ring.clone(c.parts[1])] }
+    tampered.parts[1].residues[0][17] ^= 1 << 20
+    t.equal(noise_budget(ctx, keys.secret, tampered), 0)
+    let squared_with_other = multiply_relinearize(ctx, other.relinearization, c, c) catch {
+        e => return t.fatal("multiply: {e}")
+    }
+    t.equal(noise_budget(ctx, keys.secret, squared_with_other), 0)
+    let galois = galois_keys(ctx, keys.secret, [1], false, s)
+    var refused = ""
+    let unrotated = rotate_rows(ctx, galois, c, 2) catch {
+        e => {
+            refused = "{e}"
+            c
+        }
+    }
+    t.equal(refused, "MissingGaloisKey")
+    t.equal(unrotated.parts.len, 2)
+}
+
+fn failure(p: Parameters) -> str {
+    let ctx = context(p) catch {
+        e => return "{e}"
+    }
+    "built degree {ctx.parameters.degree}"
+}
+
+fn test_parameters_outside_the_standard_are_rejected(t: *testing.T) {
+    t.equal(failure(Parameters { degree: 8192, plain_modulus: 65537, prime_bits: [43, 43, 44, 44], special_bits: 45, security: Classical128 }), "ModulusTooLarge{{bits: 219, limit: 218}}")
+    t.equal(failure(Parameters { degree: 8192, plain_modulus: 65537, prime_bits: [43, 43, 44, 44], special_bits: 44, security: Classical192 }), "ModulusTooLarge{{bits: 218, limit: 152}}")
+    t.equal(failure(Parameters { degree: 3000, plain_modulus: 65537, prime_bits: [30], special_bits: 30, security: Classical128 }), "Degree")
+    t.equal(failure(Parameters { degree: 4096, plain_modulus: 65537, prime_bits: [36, 30], special_bits: 29, security: Classical128 }), "PrimeSize")
+    t.equal(failure(Parameters { degree: 4096, plain_modulus: 1 << 30, prime_bits: [36, 30], special_bits: 37, security: Classical128 }), "PlainModulus")
+    let unbatched = built(t, Parameters { degree: 4096, plain_modulus: 1 << 20, prime_bits: [36, 36], special_bits: 37, security: Classical128 })
+    t.equal(slot_count(unbatched), 0)
+    var refused = ""
+    let empty = encode(unbatched, [1, 2, 3]) catch {
+        e => {
+            refused = "{e}"
+            Plaintext { coefficients: [] }
+        }
+    }
+    t.equal(refused, "NoBatching")
+    t.equal(empty.coefficients.len, 0)
+}
+
+fn fresh_budget_bound(ctx: *Context) -> i64 {
+    let p = ctx.parameters
+    ring.bit_count(ctx.rlwe.q) - bits.bit_length(p.plain_modulus * u64(p.degree + 4) / 2) - 1
+}
+
+fn product_budget_cost(ctx: *Context) -> i64 {
+    bits.bit_length(ctx.parameters.plain_modulus) + bits.bit_length(u64(ctx.parameters.degree)) + 2
+}
