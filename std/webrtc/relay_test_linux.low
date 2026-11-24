@@ -1,0 +1,172 @@
+import std/crypto
+import std/crypto/x509
+import std/datachannel
+import std/file
+import std/ice
+import std/io
+import std/net
+import std/os
+import std/process
+import std/rtp
+import std/testing
+import std/text
+import std/turn
+
+const turn_source = "testdata/turn/pion"
+
+fn build_turn_server(t: *testing.T) -> str? {
+    for name in ["go", "timeout"] {
+        if process.find(name) == none {
+            testing.skip(t, "{name} is not installed")
+            return none
+        }
+    }
+    var fetch = process.command("go", ["mod", "download"])
+    fetch.dir = turn_source
+    let fetched = process.run(fetch, []) or panic("go mod download")
+    if !process.success(fetched.status) {
+        testing.skip(t, "the pion/turn modules cannot be downloaded: {str(fetched.stderr)}")
+        return none
+    }
+    let binary = "{os.temp_dir_path()}/low-webrtc-turnserver-{os.pid()}"
+    var build = process.command("go", ["build", "-o", binary, "."])
+    build.dir = turn_source
+    let built = process.run(build, []) or panic("go build")
+    if !process.success(built.status) {
+        testing.fatal(t, "go build: {str(built.stderr)}")
+        return none
+    }
+    binary
+}
+
+fn read_ports(stream: io.Stream) -> i64[] {
+    let buf = io.buffer(64)
+    var line = ""
+    for !text.contains(line, "\n") {
+        let n = stream.read(buf) or 0
+        if n == 0 {
+            panic("the TURN server ended before printing its ports")
+        }
+        line = "{line}{str(buf[..n])}"
+    }
+    var ports: i64[] = []
+    for field in text.fields(line) {
+        ports.push(text.parse_int(field) or panic("port {field}"))
+    }
+    ports
+}
+
+fn write_certificate(base: str) {
+    let key = x509.generate_private_key(x509.KeyType.P256) or panic("key")
+    let certificate = x509.create_self_signed(x509.Template { serial: crypto.random(8), subject: "turn test", not_before: 0, not_after: 4102444800, dns_names: ["turn.test"], ip_addresses: [[127, 0, 0, 1]] }, key) or panic("certificate")
+    file.write_file("{base}.crt", bytes(x509.certificate_pem(certificate))) or panic("write certificate")
+    file.write_file("{base}.key", bytes(x509.private_key_pem(key) or panic("key pem"))) or panic("write key")
+}
+
+fn follow(from: Handle, to: Handle, selected: chan[ice.Kind], tracks: chan[RemoteTrack]) {
+    for {
+        let e = (<-from.events) ?? break
+        match e {
+            Candidate(value) => {
+                add_remote_candidate(to, value) or {}
+            }
+            Selected(local, _) => {
+                selected <- local.kind
+            }
+            Track(track) => {
+                tracks <- track
+            }
+            _ => {}
+        }
+    }
+}
+
+fn selected_kind(selected: chan[ice.Kind]) -> ice.Kind? {
+    select {
+        k = <-selected => k
+        after(15000) => none
+    }
+}
+
+fn echoed(t: *testing.T, from: datachannel.Channel, to: datachannel.Channel, message: str) {
+    datachannel.send_text(from, message) or panic("send {message}")
+    let got: datachannel.Message? = select {
+        m = <-to.messages => m
+        after(5000) => none
+    }
+    let m = got ?? {
+        testing.error(t, "{message} did not arrive")
+        return
+    }
+    testing.error_if(t, str(m.data) != message, "{str(m.data)} arrived for {message}")
+}
+
+fn heard(t: *testing.T, microphone: Track, remote: RemoteTrack, sequence: i64) {
+    send_rtp(microphone, rtp.Packet { payload_type: 111, sequence, timestamp: 0, ssrc: 0, payload: [1, 2, 3] }) or panic("send rtp")
+    let got: rtp.Packet? = select {
+        p = <-remote.packets => p
+        after(5000) => none
+    }
+    let p = got ?? {
+        testing.error(t, "audio packet {sequence} did not arrive")
+        return
+    }
+    testing.error_if(t, p.sequence != sequence, "audio packet {p.sequence} arrived for {sequence}")
+}
+
+fn restart_through(t: *testing.T, server: turn.Config) {
+    using caller = open(Config { bind: ["127.0.0.1"], ice: ice.Config { controlling: false, turn_servers: [server], relay_only: true } }) or panic("open the caller")
+    using callee = open(Config { bind: ["127.0.0.1"] }) or panic("open the callee")
+    let microphone = add_track(caller.handle, Kind.Audio, [opus()]) or panic("audio track")
+    let offer = create_offer(caller.handle) or panic("offer")
+    let answer = create_answer(callee.handle, offer) or panic("answer")
+    apply_answer(caller.handle, answer) or panic("apply the answer")
+    let caller_selected = chan[ice.Kind](4)
+    let callee_selected = chan[ice.Kind](4)
+    let tracks = chan[RemoteTrack](4)
+    spawn follow(caller.handle, callee.handle, caller_selected, chan[RemoteTrack](4))
+    spawn follow(callee.handle, caller.handle, callee_selected, tracks)
+    wait_connected(caller.handle) or panic("the caller did not connect")
+    wait_connected(callee.handle) or panic("the callee did not connect")
+    testing.error_if(t, selected_kind(caller_selected) != some(ice.Kind.Relayed), "the caller did not select its relayed candidate")
+    selected_kind(callee_selected)
+    let chat = create_data_channel(caller.handle, datachannel.Options { label: "chat" }) or panic("data channel")
+    datachannel.send_text(chat, "hello") or panic("send hello")
+    let accepted = (<-callee.handle.channels) ?? panic("no incoming channel")
+    datachannel.receive(accepted) or panic("receive hello")
+    let remote = (<-tracks) ?? panic("no remote track")
+    heard(t, microphone, remote, 1)
+
+    restart_ice(caller.handle) or panic("restart ice")
+    let restart = create_offer(caller.handle) or panic("restart offer")
+    echoed(t, chat, accepted, "after the restart offer")
+    echoed(t, accepted, chat, "back after the restart offer")
+    heard(t, microphone, remote, 2)
+    let restarted = create_answer(callee.handle, restart) or panic("answer the restart")
+    echoed(t, chat, accepted, "before the answer is applied")
+    echoed(t, accepted, chat, "back before the answer is applied")
+    heard(t, microphone, remote, 3)
+    apply_answer(caller.handle, restarted) or panic("apply the restart answer")
+    testing.error_if(t, selected_kind(caller_selected) != some(ice.Kind.Relayed), "the caller did not select its relayed candidate after the restart")
+    testing.error_if(t, selected_kind(callee_selected) == none, "the callee selected no pair after the restart")
+    echoed(t, chat, accepted, "after the restart")
+    echoed(t, accepted, chat, "back after the restart")
+    heard(t, microphone, remote, 4)
+}
+
+fn test_a_relayed_peer_keeps_its_data_channel_and_media_through_an_ice_restart(t: *testing.T) {
+    let binary = build_turn_server(t) ?? return
+    let base = "{os.temp_dir_path()}/low-webrtc-turnserver-{os.pid()}"
+    write_certificate(base)
+    defer {
+        file.remove("{base}.crt") or {}
+        file.remove("{base}.key") or {}
+    }
+    using child = process.start(process.Command { program: "timeout", args: ["60", binary, "{base}.crt", "{base}.key"], stdin: process.Stdio.Piped, stdout: process.Stdio.Piped, stderr: process.Stdio.Null }) or panic("start the TURN server")
+    let ports = read_ports(child.handle.stdout ?? panic("no stdout"))
+    for i, transport in [turn.Transport.Udp, turn.Transport.Tcp] {
+        restart_through(t, turn.Config { server: net.parse_addr("127.0.0.1:{ports[i]}") or panic("addr"), transport, username: "alice", password: "secret" })
+    }
+    let stdin = child.handle.stdin ?? panic("no stdin")
+    stdin.close()
+}
