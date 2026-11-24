@@ -1,0 +1,293 @@
+import std/io
+
+/// The size of the fixed RTP header in bytes.
+pub const header_size = 12
+
+/// The extension profile of the one-byte header extensions of RFC 8285.
+pub const profile_one_byte = 0xBEDE
+
+/// The extension profile of the two-byte header extensions of RFC 8285, with the low four bits left for the application.
+pub const profile_two_byte = 0x1000
+
+/// One header extension element: its local identifier and its value.
+///
+/// An extension block whose profile is neither `profile_one_byte` nor `profile_two_byte` is one element with identifier 0 that holds the whole block.
+pub struct Extension {
+    /// The identifier, 1 to 14 in the one-byte form and 1 to 255 in the two-byte form.
+    pub id: i64
+    /// The value, 1 to 16 bytes in the one-byte form and 0 to 255 in the two-byte form.
+    pub data: u8[]
+}
+
+/// A parsed RTP packet (RFC 3550 section 5.1).
+pub struct Packet {
+    /// The marker bit.
+    pub marker: bool = false
+    /// The 7-bit payload type.
+    pub payload_type: i64
+    /// The 16-bit sequence number.
+    pub sequence: i64
+    /// The 32-bit timestamp.
+    pub timestamp: i64
+    /// The 32-bit synchronization source.
+    pub ssrc: i64
+    /// The contributing sources, at most 15.
+    pub csrc: i64[] = []
+    /// The profile of the header extension, or 0 when the packet has none. `marshal` picks the one-byte or two-byte form that fits `extensions` when this is 0 and `extensions` is not empty.
+    pub extension_profile: i64 = 0
+    /// The header extension elements.
+    pub extensions: Extension[] = []
+    /// The payload without the padding.
+    pub payload: u8[] = []
+    /// The number of padding bytes at the end of the packet, written as zeros with the count in the last one. 0 means no padding.
+    pub padding: i64 = 0
+}
+
+fn extension_words(data: u8[], at: i64) -> i64 {
+    io.be16(data, at + 2)
+}
+
+/// Returns the length in bytes of the header at the start of `data`: the fixed header, the contributing sources and the extension block.
+///
+/// Fails with `Malformed` when `data` is not RTP version 2 or is shorter than the header it announces. SRTP uses this to find the part of a packet it encrypts.
+pub fn header_length(data: u8[]) -> i64 ! io.Error {
+    if data.len < header_size || data[0] >> 6 != 2 {
+        fail Malformed
+    }
+    var end = header_size + 4 * i64(data[0] & 0x0F)
+    if data[0] & 0x10 != 0 {
+        if data.len < end + 4 {
+            fail Malformed
+        }
+        end += 4 + 4 * extension_words(data, end)
+    }
+    if data.len < end {
+        fail Malformed
+    }
+    end
+}
+
+/// Returns the synchronization source of the RTP packet `data` without parsing the rest.
+///
+/// Fails with `Malformed` when `data` is shorter than the fixed header.
+pub fn ssrc_of(data: u8[]) -> i64 ! io.Error {
+    if data.len < header_size {
+        fail Malformed
+    }
+    io.be32(data, 8)
+}
+
+/// Returns the sequence number of the RTP packet `data` without parsing the rest.
+///
+/// Fails with `Malformed` when `data` is shorter than the fixed header.
+pub fn sequence_of(data: u8[]) -> i64 ! io.Error {
+    if data.len < header_size {
+        fail Malformed
+    }
+    io.be16(data, 2)
+}
+
+fn parse_one_byte(block: u8[]) -> Extension[] ! io.Error {
+    var out: Extension[] = []
+    var at = 0
+    for at < block.len {
+        if block[at] == 0 {
+            at += 1
+            continue
+        }
+        let id = i64(block[at] >> 4)
+        if id == 15 {
+            break
+        }
+        let size = i64(block[at] & 0x0F) + 1
+        if at + 1 + size > block.len {
+            fail Malformed
+        }
+        out.push(Extension { id, data: block[at + 1..at + 1 + size] })
+        at += 1 + size
+    }
+    out
+}
+
+fn parse_two_byte(block: u8[]) -> Extension[] ! io.Error {
+    var out: Extension[] = []
+    var at = 0
+    for at < block.len {
+        if block[at] == 0 {
+            at += 1
+            continue
+        }
+        if at + 2 > block.len {
+            fail Malformed
+        }
+        let id = i64(block[at])
+        let size = i64(block[at + 1])
+        if at + 2 + size > block.len {
+            fail Malformed
+        }
+        out.push(Extension { id, data: block[at + 2..at + 2 + size] })
+        at += 2 + size
+    }
+    out
+}
+
+/// Reads one RTP packet from `data`, which must be exactly one datagram.
+///
+/// Fails with `Malformed` when the version is not 2, the header or its extension runs past the end, or the padding count is zero or larger than the payload. The `payload` and the extension values share the bytes of `data`.
+pub fn parse(data: u8[]) -> Packet ! io.Error {
+    let end = header_length(data)?
+    let count = i64(data[0] & 0x0F)
+    var csrc: i64[] = []
+    for i in 0..count {
+        csrc.push(io.be32(data, header_size + 4 * i))
+    }
+    var profile = 0
+    var extensions: Extension[] = []
+    if data[0] & 0x10 != 0 {
+        let start = header_size + 4 * count
+        profile = io.be16(data, start)
+        let block = data[start + 4..end]
+        if profile == profile_one_byte {
+            extensions = parse_one_byte(block)?
+        } else if profile & 0xFFF0 == profile_two_byte {
+            extensions = parse_two_byte(block)?
+        } else {
+            extensions = [Extension { id: 0, data: block }]
+        }
+    }
+    var stop = data.len
+    var padding = 0
+    if data[0] & 0x20 != 0 {
+        padding = i64(data[data.len - 1])
+        if padding == 0 || end + padding > data.len {
+            fail Malformed
+        }
+        stop = data.len - padding
+    }
+    Packet {
+        marker: data[1] & 0x80 != 0
+        payload_type: i64(data[1] & 0x7F)
+        sequence: io.be16(data, 2)
+        timestamp: io.be32(data, 4)
+        ssrc: io.be32(data, 8)
+        csrc
+        extension_profile: profile
+        extensions
+        payload: data[end..stop]
+        padding
+    }
+}
+
+fn fits_u32(v: i64) -> bool {
+    v >= 0 && v <= 0xFFFFFFFF
+}
+
+fn fits_one_byte(extensions: Extension[]) -> bool {
+    for e in extensions {
+        if e.id < 1 || e.id > 14 || e.data.len < 1 || e.data.len > 16 {
+            return false
+        }
+    }
+    true
+}
+
+fn marshal_block(p: Packet) -> u8[] ! io.Error {
+    var block: u8[] = []
+    if p.extension_profile == profile_one_byte {
+        if !fits_one_byte(p.extensions) {
+            fail Invalid
+        }
+        for e in p.extensions {
+            block.push(u8(e.id << 4 | (e.data.len - 1)))
+            io.append(mut block, e.data)
+        }
+    } else if p.extension_profile & 0xFFF0 == profile_two_byte {
+        for e in p.extensions {
+            if e.id < 1 || e.id > 255 || e.data.len > 255 {
+                fail Invalid
+            }
+            block.push(u8(e.id))
+            block.push(u8(e.data.len))
+            io.append(mut block, e.data)
+        }
+    } else {
+        if p.extensions.len != 1 || p.extensions[0].id != 0 || p.extensions[0].data.len % 4 != 0 {
+            fail Invalid
+        }
+        io.append(mut block, p.extensions[0].data)
+    }
+    for block.len % 4 != 0 {
+        block.push(0)
+    }
+    block
+}
+
+/// Returns the wire form of `p`.
+///
+/// Fails with `Invalid` when there are more than 15 contributing sources, a field exceeds its width, an extension element does not fit the form its profile names, or an extension block of another profile is not one element of identifier 0 whose length is a multiple of four.
+pub fn marshal(p: Packet) -> u8[] ! io.Error {
+    if p.csrc.len > 15 || p.payload_type < 0 || p.payload_type > 127 || p.padding < 0 || p.padding > 255 {
+        fail Invalid
+    }
+    if p.sequence < 0 || p.sequence > 0xFFFF || !fits_u32(p.timestamp) || !fits_u32(p.ssrc) {
+        fail Invalid
+    }
+    for c in p.csrc {
+        if !fits_u32(c) {
+            fail Invalid
+        }
+    }
+    var q = p
+    if q.extension_profile == 0 && q.extensions.len > 0 {
+        q.extension_profile = if fits_one_byte(q.extensions) { profile_one_byte } else { profile_two_byte }
+    }
+    let extended = q.extension_profile != 0
+    var out: u8[] = []
+    var first = 0x80 | q.csrc.len
+    if extended {
+        first |= 0x10
+    }
+    if q.padding > 0 {
+        first |= 0x20
+    }
+    out.push(u8(first))
+    out.push(u8((if q.marker { 0x80 } else { 0 }) | q.payload_type))
+    io.put_be16(mut out, q.sequence)
+    io.put_be32(mut out, q.timestamp)
+    io.put_be32(mut out, q.ssrc)
+    for c in q.csrc {
+        io.put_be32(mut out, c)
+    }
+    if extended {
+        let block = marshal_block(q)?
+        if block.len > 4 * 65535 {
+            fail Invalid
+        }
+        io.put_be16(mut out, q.extension_profile)
+        io.put_be16(mut out, block.len / 4)
+        io.append(mut out, block)
+    }
+    io.append(mut out, q.payload)
+    for _ in 1..q.padding {
+        out.push(0)
+    }
+    if q.padding > 0 {
+        out.push(u8(q.padding))
+    }
+    out
+}
+
+/// Returns the value of the extension element `id` of `p`, or `none`.
+pub fn find_extension(p: Packet, id: i64) -> u8[]? {
+    for e in p.extensions {
+        if e.id == id {
+            return e.data
+        }
+    }
+    none
+}
+
+/// Returns whether the 16-bit sequence number `a` is later than `b` in the serial number arithmetic of RFC 1982, so that 0 is later than 65535.
+pub fn sequence_after(a: i64, b: i64) -> bool {
+    a != b && (a - b) & 0xFFFF < 0x8000
+}
