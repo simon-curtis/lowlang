@@ -1,129 +1,414 @@
 import std/sys
 
-/// What a program's windows share with the windowing system. On Windows it holds the thread lock, the window classes, the process's DPI awareness, the OLE initialisation and the message-only window that `waker_of` wakes. On Wayland each window keeps its own connection, and the display holds the windows that `wait` watches and the waker that `waker_of` returns.
-///
-/// Release every `Window` opened with `open_in` before the display that holds it.
-pub struct Display {
-    /// The copyable view of the display.
-    pub handle: DisplayHandle
-    drop close_display_on(handle)
+extern "c" {
+    fn errno_location() -> ptr[i32] = "__errno_location"
 }
 
-/// A copyable view of a `Display`, for code that cannot hold the owner, such as a closure, a slice or a pointer.
-///
-/// Every copy shares the display and its closed state. Once the display is released, `open_in_on` and `wait_on` fail with `Unsupported` and a waker from `waker_of_on` does nothing.
-pub struct DisplayHandle {
+struct DisplayAnchor {
     state: *DisplayState
 }
 
+struct WakerState {
+    signal: chan[bool]
+    bell: chan[bool]
+}
+
 struct DisplayState {
+    ifs: Interfaces
+    arm: chan[bool]
+    ready: chan[bool]
+    done: chan[bool]
+    bell: chan[bool]
     waker: *WakerState
-    notify: chan[bool]
     windows: *WindowState[] = []
+    display: ptr = null
+    registry: ptr = null
+    compositor: ptr = null
+    wm_base: ptr = null
+    seat: ptr = null
+    pointer: ptr = null
+    keyboard: ptr = null
+    cursor_manager: ptr = null
+    cursor_device: ptr = null
+    data_manager: ptr = null
+    data_device: ptr = null
+    incoming: ptr = null
+    incoming_type: str = ""
+    selection: ptr = null
+    selection_type: str = ""
+    source: ptr = null
+    source_text: str = ""
+    input_serial: u32 = 0
+    enter_serial: u32 = 0
+    text_manager: ptr = null
+    text_input: ptr = null
+    text_enabled: bool = false
+    preedit: str = ""
+    pending_preedit: str = ""
+    pending_cursor: TextRange? = none
+    pending_commit: str = ""
+    pointer_focus: *WindowState? = none
+    keyboard_focus: *WindowState? = none
+    text_focus: *WindowState? = none
+    handle: ptr = null
+    fd: i64 = -1
+    pumping: bool = false
+    armed: bool = false
+    wakes: i64 = 0
+    fault: Error? = none
     closed: bool = false
+    pointer_x: f32 = 0.0
+    pointer_y: f32 = 0.0
+    modifiers: Modifiers = Modifiers {}
+    clicks: *ClickCount = new(ClickCount {})
+    keys: Keys = Keys {}
+    repeat: Repeat = Repeat {}
 }
 
-/// Opens a display. On Windows it connects to the windowing system and locks the calling green thread to its OS thread until the display is released. Every window opened in the display must be used from the green thread that opened the display.
-pub fn open_display() -> Display ! Error {
-    let notify = chan[bool](1)
-    let waker = new(WakerState { signal: chan[bool](1), notify })
-    Display { handle: DisplayHandle { state: new(DisplayState { waker, notify }) } }
+enum Woke {
+    Data
+    Signalled
+    Idle
 }
 
-/// Opens a window in `d` with the title and logical content size of `o`, and returns once it can be drawn into. Releasing the window leaves `d` open.
-pub fn open_in(d: Display, o: Options) -> Window ! Error {
-    open_in_on(d.handle, o)?
+const idle_wait_ms = 60000
+const stop_timeout_ms = 2000
+const flush_attempts = 5000
+const errno_again = 11
+const errno_pipe = 32
+const errno_reset = 104
+
+fn new_display() -> *DisplayState {
+    let bell = chan[bool](1)
+    new(DisplayState {
+        ifs: interfaces()
+        arm: chan[bool](1)
+        ready: chan[bool](1)
+        done: chan[bool](1)
+        bell
+        waker: new(WakerState { signal: chan[bool](1), bell })
+    })
 }
 
-/// Opens a window in the display that `h` views, as `open_in` does. It fails with `Unsupported` once the display is released.
-pub fn open_in_on(h: DisplayHandle, o: Options) -> Window ! Error {
-    live_display(h.state)?
-    let state = open_window_with(o, h.state.notify)?
-    h.state.windows.push(state)
-    Window { handle: WindowHandle { state } }
-}
-
-/// Waits until a window of `d` has events for `next`, a waker made by `waker_of` fires, or `timeout_ms` milliseconds pass. A negative timeout waits without limit. The call takes no event out of any window and ends the wait of every wake that arrived before it returns.
-pub fn wait(d: Display, timeout_ms: i64) ! Error {
-    wait_on(d.handle, timeout_ms)?
-}
-
-/// Waits on the display that `h` views, as `wait` does. It fails with `Unsupported` once the display is released.
-pub fn wait_on(h: DisplayHandle, timeout_ms: i64) ! Error {
-    live_display(h.state)?
-    wait_display(h.state, timeout_ms)?
-}
-
-/// Returns a `Waker` that ends `wait` on `d` from any green thread, whether or not any window is open. It gives no `Woken` event to a window.
-pub fn waker_of(d: Display) -> Waker {
-    waker_of_on(d.handle)
-}
-
-/// Returns the `Waker` of the display that `h` views, as `waker_of` does.
-pub fn waker_of_on(h: DisplayHandle) -> Waker {
-    Waker { state: h.state.waker }
-}
-
-fn live_display(d: *DisplayState) ! Error {
-    if d.closed {
-        fail Unsupported("the display has closed")
-    }
-}
-
-fn close_display_on(h: DisplayHandle) {
-    h.state.closed = true
-    h.state.windows = []
-}
-
-fn wait_display(d: *DisplayState, timeout_ms: i64) ! Error {
-    empty_channel(d.notify)
-    var open: *WindowState[] = []
-    for s in d.windows {
-        if !s.closed {
-            open.push(s)
+fn connect_display() -> *DisplayState ! Error {
+    let d = new_display()
+    d.handle = pin(new(DisplayAnchor { state: d }))
+    connect(d) catch {
+        e => {
+            close_display(d)
+            fail e
         }
     }
-    d.windows = open
-    for s in open {
-        if window_ready(s)? {
-            empty_channel(d.waker.signal)
-            return
+    d
+}
+
+fn connect(d: *DisplayState) ! Error {
+    d.display = wl_display_connect(null)
+    if d.display == null {
+        fail NoDisplay("cannot connect to the Wayland compositor named by WAYLAND_DISPLAY")
+    }
+    d.fd = i64(wl_display_get_fd(d.display))
+    start_keys(d)?
+    d.registry = wl_display_get_registry(d.ifs, d.display)
+    wl_registry_add_listener(d.ifs, d.registry, WlRegistryListener { global: on_global }, d.handle)
+    for round in 0..3 {
+        roundtrip(d)?
+    }
+    if d.compositor == null {
+        fail Unsupported("the compositor does not offer wl_compositor")
+    }
+    if d.wm_base == null {
+        fail Unsupported("the compositor does not offer xdg_wm_base")
+    }
+    d.pumping = true
+    spawn pump(d.fd, d.arm, d.ready, d.done)
+}
+
+fn display_of(data: ptr) -> *DisplayState {
+    let at: ptr[DisplayAnchor] = data
+    load(at).state
+}
+
+fn display_closed(d: *DisplayState) -> bool {
+    d.closed
+}
+
+fn display_waker(d: *DisplayState) -> *WakerState {
+    d.waker
+}
+
+fn window_at(d: *DisplayState, surface: ptr) -> *WindowState? {
+    if surface == null {
+        return none
+    }
+    for w in d.windows {
+        if w.surface == surface {
+            return w
         }
     }
-    if timeout_ms < 0 {
+    none
+}
+
+fn is_window(focus: *WindowState?, s: *WindowState) -> bool {
+    match focus {
+        some(w) => w == s
+        none => false
+    }
+}
+
+fn forget_window(d: *DisplayState, s: *WindowState) {
+    var kept: *WindowState[] = []
+    for w in d.windows {
+        if w != s {
+            kept.push(w)
+        }
+    }
+    d.windows = kept
+}
+
+fn roundtrip(d: *DisplayState) ! Error {
+    if wl_display_roundtrip(d.display) < 0 {
+        fail failure("wl_display_roundtrip", display_error(d))
+    }
+    raise_fault(d)?
+}
+
+fn pump(fd: i64, arm: chan[bool], ready: chan[bool], done: chan[bool]) {
+    for requested in arm {
+        wait_readable(fd)
+        ready <- true
+    }
+    done <- true
+}
+
+fn raise_fault(d: *DisplayState) ! Error {
+    match d.fault {
+        some(e) => {
+            d.fault = none
+            fail e
+        }
+        none => {}
+    }
+}
+
+fn dispatch(d: *DisplayState) ! Error {
+    if wl_display_dispatch_pending(d.display) < 0 {
+        fail failure("wl_display_dispatch_pending", display_error(d))
+    }
+    raise_fault(d)?
+}
+
+fn service(d: *DisplayState) ! Error {
+    dispatch(d)?
+    collect_wakes(d)
+    emit_repeat(d)
+}
+
+fn collect_wakes(d: *DisplayState) {
+    select {
+        <-d.bell => {}
+        else => {}
+    }
+    for w in d.windows {
         select {
-            <-d.notify => {}
-            <-d.waker.signal => {}
-        }
-    } else {
-        select {
-            <-d.notify => {}
-            <-d.waker.signal => {}
-            after(timeout_ms) => {}
+            <-w.waker.signal => {
+                w.events.push(Event.Woken)
+            }
+            else => {}
         }
     }
-    empty_channel(d.waker.signal)
+    select {
+        <-d.waker.signal => {
+            d.wakes += 1
+        }
+        else => {}
+    }
 }
 
-fn window_ready(s: *WindowState) -> bool ! Error {
-    flush(s)?
-    dispatch(s)?
-    collect_wake(s)
-    if s.events.len > 0 || sys.readable_now(s.fd) {
+fn display_ready(d: *DisplayState) -> bool {
+    if d.wakes > 0 {
         return true
     }
-    if !s.armed {
-        s.armed = true
-        s.arm <- true
+    for w in d.windows {
+        if w.events.len > 0 {
+            return true
+        }
     }
     false
 }
 
-fn empty_channel(c: chan[bool]) {
+fn wait_display(d: *DisplayState, timeout_ms: i64) ! Error {
+    let deadline = now_ms() + timeout_ms
     for {
-        select {
-            <-c => {}
-            else => return
+        service(d)?
+        if display_ready(d) {
+            break
         }
+        let limit = if timeout_ms < 0 { idle_wait_ms } else { deadline - now_ms() }
+        let woke = wait_input(d, repeat_wait(d, limit))?
+        if woke == Woke.Idle && timeout_ms >= 0 && now_ms() >= deadline {
+            break
+        }
+    }
+    d.wakes = 0
+}
+
+fn flush(d: *DisplayState) ! Error {
+    for attempt in 0..flush_attempts {
+        if wl_display_flush(d.display) >= 0 {
+            return
+        }
+        let code = last_errno()
+        if code != errno_again {
+            fail failure("wl_display_flush", code)
+        }
+        sleep(1)
+    }
+    fail Failed("wl_display_flush", errno_again)
+}
+
+fn wait_input(d: *DisplayState, wait_ms: i64) -> Woke ! Error {
+    flush(d)?
+    if wl_display_prepare_read(d.display) != 0 {
+        return Woke.Data
+    }
+    if sys.readable_now(d.fd) {
+        read_events(d)?
+        return Woke.Data
+    }
+    if wait_ms <= 0 {
+        wl_display_cancel_read(d.display)
+        return Woke.Idle
+    }
+    if !d.armed {
+        d.armed = true
+        d.arm <- true
+    }
+    let woke = select {
+        <-d.ready => Woke.Data
+        <-d.bell => Woke.Signalled
+        after(wait_ms) => Woke.Idle
+    }
+    match woke {
+        Data => {
+            d.armed = false
+            read_events(d)?
+        }
+        Signalled => {
+            wl_display_cancel_read(d.display)
+            collect_wakes(d)
+        }
+        Idle => {
+            wl_display_cancel_read(d.display)
+        }
+    }
+    woke
+}
+
+fn read_events(d: *DisplayState) ! Error {
+    if wl_display_read_events(d.display) < 0 {
+        fail failure("wl_display_read_events", display_error(d))
+    }
+}
+
+fn last_errno() -> i64 {
+    i64(load(errno_location()))
+}
+
+fn display_error(d: *DisplayState) -> i64 {
+    let code = wl_display_get_error(d.display)
+    if code != 0 {
+        return i64(code)
+    }
+    last_errno()
+}
+
+fn failure(call: str, code: i64) -> Error {
+    if code == errno_pipe || code == errno_reset {
+        return Error.Disconnected
+    }
+    Error.Failed(call, code)
+}
+
+fn wake_window(k: *WakerState) {
+    select {
+        k.signal <- true => {}
+        else => {}
+    }
+    select {
+        k.bell <- true => {}
+        else => {}
+    }
+}
+
+fn close_display(d: *DisplayState) {
+    if d.closed {
+        return
+    }
+    d.closed = true
+    let open = d.windows
+    for w in open {
+        close_window(w)
+    }
+    stop_pump(d)
+    release_clipboard(d)
+    release_text_input(d)
+    if d.keyboard != null {
+        release_keyboard(d.keyboard)
+    }
+    if d.cursor_device != null {
+        wp_cursor_shape_device_v1_destroy(d.cursor_device)
+    }
+    if d.cursor_manager != null {
+        wp_cursor_shape_manager_v1_destroy(d.cursor_manager)
+    }
+    if d.pointer != null {
+        release_pointer(d.pointer)
+    }
+    if d.seat != null {
+        release_seat(d.seat)
+    }
+    if d.wm_base != null {
+        xdg_wm_base_destroy(d.wm_base)
+    }
+    if d.compositor != null {
+        wl_compositor_destroy(d.compositor)
+    }
+    if d.registry != null {
+        wl_registry_destroy(d.registry)
+    }
+    if d.display != null {
+        wl_display_flush(d.display)
+        wl_display_disconnect(d.display)
+    }
+    stop_keys(d)
+    release_interfaces(d.ifs)
+    if d.handle != null {
+        unpin(d.handle)
+    }
+    d.keyboard = null
+    d.cursor_device = null
+    d.cursor_manager = null
+    d.pointer = null
+    d.seat = null
+    d.wm_base = null
+    d.compositor = null
+    d.registry = null
+    d.display = null
+    d.handle = null
+}
+
+fn stop_pump(d: *DisplayState) {
+    if !d.pumping {
+        return
+    }
+    d.pumping = false
+    close(d.arm)
+    if d.armed {
+        sys.shutdown(d.fd, sys.Shutdown.Both) or {}
+    }
+    select {
+        <-d.done => {}
+        after(stop_timeout_ms) => {}
     }
 }
