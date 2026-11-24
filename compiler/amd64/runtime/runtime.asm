@@ -70,8 +70,10 @@ rt_vsign64:
 	.quad 0x8000000000000000
 	.quad 0x8000000000000000
 	.quad 0x8000000000000000
-rt_simd_env:
+rt_simd_sse2:
 	.asciz "LOW_SIMD=sse2"
+rt_simd_avx512:
+	.asciz "LOW_SIMD=avx512"
 rt_nl:
 	.ascii "\n"
 rt_panic_prefix:
@@ -2796,8 +2798,10 @@ rt_seed_fallback:
 	ret
 
 	.data
-	.globl rt_avx2
-rt_avx2:
+	.globl rt_simd_tier
+rt_simd_tier:
+	.byte 0
+rt_avx512_capable:
 	.byte 0
 
 	.text
@@ -2818,6 +2822,7 @@ rt_cpu_init:
 	jne 3f
 	xor ecx, ecx
 	xgetbv
+	mov r9d, eax
 	and eax, 6
 	cmp eax, 6
 	jne 3f
@@ -2826,7 +2831,14 @@ rt_cpu_init:
 	cpuid
 	test ebx, 32
 	jz 3f
-	mov byte ptr [rip+rt_avx2], 1
+	mov byte ptr [rip+rt_simd_tier], 1
+	and r9d, 0xE6
+	cmp r9d, 0xE6
+	jne 3f
+	and ebx, 0xC0030000
+	cmp ebx, 0xC0030000
+	jne 3f
+	mov byte ptr [rip+rt_avx512_capable], 1
 3:
 	test r12, r12
 	jz 9f
@@ -2834,13 +2846,23 @@ rt_cpu_init:
 	mov rsi, [r12]
 	test rsi, rsi
 	jz 9f
-	lea rdi, [rip+rt_simd_env]
+	lea rdi, [rip+rt_simd_sse2]
 	mov ecx, 14
 	repe cmpsb
 	jne 5f
-	mov byte ptr [rip+rt_avx2], 0
+	mov byte ptr [rip+rt_simd_tier], 0
 	jmp 9f
 5:
+	mov rsi, [r12]
+	lea rdi, [rip+rt_simd_avx512]
+	mov ecx, 16
+	repe cmpsb
+	jne 6f
+	cmp byte ptr [rip+rt_avx512_capable], 0
+	je 9f
+	mov byte ptr [rip+rt_simd_tier], 2
+	jmp 9f
+6:
 	add r12, 8
 	jmp 4b
 9:
