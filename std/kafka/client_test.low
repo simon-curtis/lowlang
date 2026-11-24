@@ -1,0 +1,709 @@
+import std/net
+import std/sync
+import std/testing
+import std/time
+
+fn fake_options(port: i64) -> Options {
+    Options { brokers: ["127.0.0.1:{port}"], timeout: 2000, retry_backoff: 1 }
+}
+
+fn standard(port: i64, topic: str, partitions: i64) -> fn(Request) -> Reply {
+    fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, topic, partitions, 0))
+            _ => say_nothing()
+        }
+    }
+}
+
+fn started(t: *testing.T, l: net.Listener, answer: fn(Request) -> Reply) -> *Fake {
+    start_fake(l, answer)
+}
+
+fn dialled(t: *testing.T, port: i64, o: Options) -> Client {
+    connect(o) catch {
+        e => {
+            t.fatal("connect failed: {testing.format(e)}")
+            panic("unreachable")
+        }
+    }
+}
+
+fn first_batch(req: Request) -> Record[] {
+    let c = cursor(req.body)
+    take_compact_nullable_string(c) or return []
+    take_i16(c) or return []
+    take_i32(c) or return []
+    take_compact_count(c) or return []
+    take_compact_string(c) or return []
+    take_compact_count(c) or return []
+    take_i32(c) or return []
+    let batch = take_compact_bytes(c) or return []
+    decode_batches(batch ?? []) or []
+}
+
+fn produce_header(req: Request) -> [str: i64] {
+    let c = cursor(req.body)
+    take_compact_nullable_string(c) or return [:]
+    let acks = take_i16(c) or return [:]
+    let timeout = take_i32(c) or return [:]
+    take_compact_count(c) or return [:]
+    let topic = take_compact_string(c) or return [:]
+    take_compact_count(c) or return [:]
+    let partition = take_i32(c) or return [:]
+    ["acks": acks, "timeout": timeout, "partition": partition, "topic_len": topic.len]
+}
+
+fn test_connect_negotiates_versions_then_loads_metadata(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let f = started(t, l, standard(l.handle.addr.port, "events", 1))
+    let c = dialled(t, l.handle.addr.port, Options { brokers: ["127.0.0.1:{l.handle.addr.port}"], client_id: "tester" })
+    close(c)
+    t.equal_slice(apis_seen(f), [18, 3])
+    t.equal(requests_of(f, 18)[0].client, "tester")
+    t.equal(requests_of(f, 18)[0].version, 3)
+    t.equal(requests_of(f, 3)[0].version, 9)
+}
+
+fn test_a_broker_that_lacks_a_needed_api_fails_only_that_call(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            0 => say(produce_reply("events", 0, 0, 7))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    t.equal(produce(c, "events", 0, [Record { value: some(bytes("a")) }], ProduceOptions {}) or -1, 7)
+    fetch(c, "events", 0, 0, FetchOptions {}) catch {
+        e => {
+            t.equal(e == Error.Unsupported, true)
+            t.equal(requests_of(f, 1).len, 0)
+            return
+        }
+    }
+    t.error("fetched from a broker without the Fetch API")
+}
+
+fn test_connect_fails_when_the_broker_has_no_metadata_api(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    started(t, l, fn(r: Request) -> Reply { say(versions_reply(3)) })
+    connect(fake_options(l.handle.addr.port)) catch {
+        e => {
+            t.equal(e == Error.Unsupported, true)
+            return
+        }
+    }
+    t.error("connected to a broker that cannot list metadata")
+}
+
+fn test_connect_maps_unsupported_version_to_unsupported(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    started(t, l, fn(r: Request) -> Reply {
+        var b: u8[] = []
+        put_i16(mut b, 35)
+        put_compact_count(mut b, 0)
+        put_i32(mut b, 0)
+        put_tags(mut b)
+        say(b)
+    })
+    connect(fake_options(l.handle.addr.port)) catch {
+        e => {
+            t.equal(e == Error.Unsupported, true)
+            return
+        }
+    }
+    t.error("connected to a broker that rejects ApiVersions v3")
+}
+
+fn test_connect_rejects_options_out_of_range(t: *testing.T) {
+    for o in [Options { brokers: [] }, Options { brokers: ["nohost"] }, Options { brokers: ["h:0"] }, Options { timeout: 0 }, Options { retries: -1 }, Options { max_response: 3 }] {
+        connect(o) catch {
+            e => {
+                t.equal(e == Error.Argument, true)
+                continue
+            }
+        }
+        t.error("accepted invalid options")
+    }
+}
+
+fn test_connect_tries_the_next_bootstrap_broker(t: *testing.T) {
+    using dead = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let dead_port = dead.handle.addr.port
+    net.close_listener(dead)
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    started(t, l, standard(port, "events", 1))
+    let c = connect(Options { brokers: ["127.0.0.1:{dead_port}", "127.0.0.1:{port}"], timeout: 2000 }) or panic("connect failed")
+    close(c)
+}
+
+fn test_a_response_larger_than_the_limit_ends_the_connection(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    started(t, l, standard(port, "events", 1))
+    connect(Options { brokers: ["127.0.0.1:{port}"], timeout: 2000, max_response: 40 }) catch {
+        e => {
+            t.equal(e == Error.TooLarge, true)
+            return
+        }
+    }
+    t.error("accepted a response above max_response")
+}
+
+fn test_produce_sends_one_batch_and_returns_the_base_offset(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 3, 0))
+            0 => say(produce_reply("events", 2, 0, 41))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    let base = produce(c, "events", 2, [Record { key: some(bytes("k")), value: some(bytes("v1")), timestamp: 5 }, Record { value: some(bytes("v2")), timestamp: 6 }], ProduceOptions { acks: 1, timeout: 1234 }) or -1
+    t.equal(base, 41)
+    let sent = requests_of(f, 0)
+    t.equal(sent.len, 1)
+    t.equal(sent[0].version, 9)
+    let head = produce_header(sent[0])
+    t.equal(head["acks"] ?? -9, 1)
+    t.equal(head["timeout"] ?? -9, 1234)
+    t.equal(head["partition"] ?? -9, 2)
+    t.equal(head["topic_len"] ?? -9, 6)
+    let records = first_batch(sent[0])
+    t.equal(records.len, 2)
+    t.equal(str(records[0].key ?? []), "k")
+    t.equal(str(records[1].value ?? []), "v2")
+    t.equal(records[1].timestamp, 6)
+}
+
+fn test_produce_with_no_acks_does_not_wait_for_an_answer(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, standard(port, "events", 1))
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    let base = produce(c, "events", 0, [Record { value: some(bytes("fire")) }], ProduceOptions { acks: 0 }) or -9
+    t.equal(base, -1)
+    await_requests(f, 0, 1)
+    t.equal(requests_of(f, 0).len, 1)
+}
+
+fn test_produce_retries_a_leader_change_after_refreshing_the_metadata(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let attempts = new(Counter { n: 0 })
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            0 => {
+                attempts.n += 1
+                if attempts.n == 1 {
+                    say(produce_reply("events", 0, 6, -1))
+                } else {
+                    say(produce_reply("events", 0, 0, 9))
+                }
+            }
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    t.equal(produce(c, "events", 0, [Record { value: some(bytes("x")) }], ProduceOptions {}) or -1, 9)
+    t.equal(requests_of(f, 0).len, 2)
+    t.equal(requests_of(f, 3).len, 2)
+}
+
+struct Counter {
+    n: i64
+}
+
+fn test_produce_does_not_retry_a_refusal(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            0 => say(produce_reply("events", 0, 10, -1))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    produce(c, "events", 0, [Record { value: some(bytes("x")) }], ProduceOptions {}) catch {
+        e => {
+            t.equal(code_of(e), 10)
+            match e {
+                Broker(code, name) => t.equal(name, "MESSAGE_TOO_LARGE")
+                _ => t.error("not a broker error")
+            }
+            t.equal(requests_of(f, 0).len, 1)
+            return
+        }
+    }
+    t.error("produce hid the broker's refusal")
+}
+
+fn test_produce_gives_up_after_the_retries(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            0 => say(produce_reply("events", 0, 6, -1))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, Options { brokers: ["127.0.0.1:{port}"], timeout: 2000, retries: 2, retry_backoff: 1 })
+    defer close(c)
+    produce(c, "events", 0, [Record { value: some(bytes("x")) }], ProduceOptions {}) catch {
+        e => {
+            t.equal(code_of(e), 6)
+            t.equal(requests_of(f, 0).len, 3)
+            return
+        }
+    }
+    t.error("produce did not fail")
+}
+
+fn test_produce_reconnects_after_the_connection_is_lost(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let attempts = new(Counter { n: 0 })
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            0 => {
+                attempts.n += 1
+                if attempts.n == 1 {
+                    hang_up()
+                } else {
+                    say(produce_reply("events", 0, 0, 3))
+                }
+            }
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    t.equal(produce(c, "events", 0, [Record { value: some(bytes("x")) }], ProduceOptions {}) or -1, 3)
+    t.equal(requests_of(f, 18).len, 2)
+}
+
+fn test_a_closed_client_fails_without_retrying(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    started(t, l, standard(port, "events", 1))
+    let c = dialled(t, port, Options { brokers: ["127.0.0.1:{port}"], timeout: 2000, retries: 5, retry_backoff: 5000 })
+    close(c)
+    close(c)
+    let started_at = time.now_millis()
+    produce(c, "events", 0, [Record { value: some(bytes("x")) }], ProduceOptions {}) catch {
+        e => {
+            t.equal(e == Error.Closed, true)
+            t.is_true(time.now_millis() - started_at < 1000)
+            return
+        }
+    }
+    t.error("produced through a closed client")
+}
+
+fn test_produce_rejects_bad_arguments(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    started(t, l, standard(port, "events", 1))
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    let one = [Record { value: some(bytes("x")) }]
+    t.equal(produce(c, "", 0, one, ProduceOptions {}) or -7, -7)
+    t.equal(produce(c, "events", -1, one, ProduceOptions {}) or -7, -7)
+    t.equal(produce(c, "events", 0, [], ProduceOptions {}) or -7, -7)
+    t.equal(fetch(c, "events", 0, -1, FetchOptions {}) catch { e => FetchResult { records: [], high_watermark: -7, log_start_offset: 0, next_offset: 0 } }.high_watermark, -7)
+}
+
+fn test_send_places_a_keyed_record_by_its_key(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 6, 0))
+            0 => say(produce_reply("events", 0, 0, 0))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    let key = bytes("order-17")
+    let sent = send(c, "events", Record { key: some(key), value: some(bytes("v")) }, ProduceOptions {}) or panic("send failed")
+    t.equal(sent.partition, partition_for(key, 6))
+    t.equal(produce_header(requests_of(f, 0)[0])["partition"] ?? -9, partition_for(key, 6))
+}
+
+fn test_send_spreads_records_without_a_key(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 3, 0))
+            0 => say(produce_reply("events", 0, 0, 0))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    var seen: i64[] = []
+    for i in 0..6 {
+        seen.push((send(c, "events", Record { value: some(bytes("v")) }, ProduceOptions {}) or panic("send failed")).partition)
+    }
+    t.equal_slice(seen, [0, 1, 2, 0, 1, 2])
+}
+
+fn test_fetch_decodes_batches_and_skips_a_cut_batch(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let whole = encode_batch([Record { value: some(bytes("a")), timestamp: 1 }, Record { value: some(bytes("b")), timestamp: 1 }], Compression.None, 1) or []
+    let second = encode_batch([Record { value: some(bytes("c")), timestamp: 1 }], Compression.None, 1) or []
+    var data = whole
+    var shifted = second
+    put_i64_at(mut shifted, 2)
+    for b in shifted[..shifted.len - 5] {
+        data.push(b)
+    }
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            1 => say(fetch_reply("events", 0, 0, 3, data))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    let got = fetch(c, "events", 0, 0, FetchOptions { max_wait: 77, min_bytes: 5, partition_bytes: 4096 }) or panic("fetch failed")
+    t.equal(got.records.len, 2)
+    t.equal(str(got.records[1].value ?? []), "b")
+    t.equal(got.next_offset, 2)
+    t.equal(got.high_watermark, 3)
+    let sent = requests_of(f, 1)
+    t.equal(sent[0].version, 12)
+    let cur = cursor(sent[0].body)
+    t.equal(take_i32(cur) or 0, -1)
+    t.equal(take_i32(cur) or 0, 77)
+    t.equal(take_i32(cur) or 0, 5)
+}
+
+fn put_i64_at(mut batch: u8[], base: i64) {
+    var head: u8[] = []
+    put_i64(mut head, base)
+    for i in 0..8 {
+        batch[i] = head[i]
+    }
+}
+
+fn test_fetch_from_inside_a_batch_drops_the_earlier_records(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let batch = encode_batch([Record { value: some(bytes("a")), timestamp: 1 }, Record { value: some(bytes("b")), timestamp: 1 }, Record { value: some(bytes("c")), timestamp: 1 }], Compression.None, 1) or []
+    started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            1 => say(fetch_reply("events", 0, 0, 3, batch))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    let got = fetch(c, "events", 0, 1, FetchOptions {}) or panic("fetch failed")
+    t.equal(got.records.len, 2)
+    t.equal(got.records[0].offset, 1)
+    t.equal(got.next_offset, 3)
+}
+
+fn test_fetch_with_nothing_returns_the_requested_offset(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            1 => say(fetch_reply("events", 0, 0, 12, []))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    let got = fetch(c, "events", 0, 12, FetchOptions {}) or panic("fetch failed")
+    t.equal(got.records.len, 0)
+    t.equal(got.next_offset, 12)
+}
+
+fn test_fetch_reports_an_offset_out_of_range(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            1 => say(fetch_reply("events", 0, 1, 12, []))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    fetch(c, "events", 0, 99, FetchOptions {}) catch {
+        e => {
+            t.equal(code_of(e), 1)
+            return
+        }
+    }
+    t.error("fetch hid the out of range error")
+}
+
+fn test_an_unknown_topic_is_reported_with_its_code(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 3))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, Options { brokers: ["127.0.0.1:{port}"], timeout: 2000, retries: 1, retry_backoff: 1 })
+    defer close(c)
+    fetch(c, "events", 0, 0, FetchOptions {}) catch {
+        e => {
+            t.equal(code_of(e), 3)
+            return
+        }
+    }
+    t.error("fetched from a topic that does not exist")
+}
+
+fn test_metadata_lists_partitions_and_their_leaders(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    started(t, l, standard(port, "events", 3))
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    let topics = metadata(c, ["events"]) or panic("metadata failed")
+    t.equal(topics.len, 1)
+    t.equal(topics[0].name, "events")
+    t.equal(topics[0].partitions.len, 3)
+    t.equal(topics[0].partitions[2].id, 2)
+    t.equal(topics[0].partitions[2].leader, 1)
+    t.equal(topics[0].partitions[2].leader_epoch, 4)
+    t.equal_slice(topics[0].partitions[2].replicas, [1])
+    t.equal_slice(topics[0].partitions[2].isr, [1])
+    t.equal_slice(list_topics(c) or [], ["events"])
+}
+
+fn test_list_offsets_asks_for_the_timestamp_and_returns_the_offset(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            2 => say(list_offsets_reply("events", 0, 0, 55))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    t.equal(list_offsets(c, "events", 0, earliest) or -9, 55)
+    let cur = cursor(requests_of(f, 2)[0].body)
+    take_i32(cur) or 0
+    take_i8(cur) or 0
+    take_compact_count(cur) or 0
+    take_compact_string(cur) or ""
+    take_compact_count(cur) or 0
+    t.equal(take_i32(cur) or 0, 0)
+    take_i32(cur) or 0
+    t.equal(take_i64(cur) or 0, -2)
+}
+
+fn test_create_and_delete_topic_send_their_requests(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, fn(r: Request) -> Reply {
+        var b: u8[] = []
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            19 => {
+                put_i32(mut b, 0)
+                put_compact_count(mut b, 1)
+                put_compact_string(mut b, "made")
+                put_i16(mut b, 36)
+                put_compact_nullable_string(mut b, none)
+                put_i32(mut b, 1)
+                put_i16(mut b, 1)
+                put_compact_count(mut b, 0)
+                put_tags(mut b)
+                put_tags(mut b)
+                say(b)
+            }
+            20 => {
+                put_i32(mut b, 0)
+                put_compact_count(mut b, 1)
+                put_compact_string(mut b, "made")
+                put_i16(mut b, 0)
+                put_tags(mut b)
+                put_tags(mut b)
+                say(b)
+            }
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    create_topic(c, "made", 3, 2, ["cleanup.policy": "compact"]) catch {
+        e => t.equal(code_of(e), 36)
+    }
+    let cur = cursor(requests_of(f, 19)[0].body)
+    t.equal(take_compact_count(cur) or 0, 1)
+    t.equal(take_compact_string(cur) or "", "made")
+    t.equal(take_i32(cur) or 0, 3)
+    t.equal(take_i16(cur) or 0, 2)
+    take_compact_count(cur) or 0
+    t.equal(take_compact_count(cur) or 0, 1)
+    t.equal(take_compact_string(cur) or "", "cleanup.policy")
+    t.equal(take_compact_nullable_string(cur) or none, some("compact"))
+    delete_topic(c, "made") or panic("delete failed")
+    t.equal(requests_of(f, 20).len, 1)
+    create_topic(c, "", 1, 1, [:]) catch {
+        e => t.equal(e == Error.Argument, true)
+    }
+}
+
+fn sasl_server(port: i64, accept: bool, seen: *Tokens) -> fn(Request) -> Reply {
+    fn(r: Request) -> Reply {
+        var b: u8[] = []
+        match r.api {
+            18 => say(versions_reply(-1))
+            17 => {
+                put_i16(mut b, 0)
+                put_i32(mut b, 1)
+                put_string(mut b, "PLAIN")
+                say(b)
+            }
+            36 => {
+                let c = cursor(r.body)
+                seen.token = take_compact_bytes(c) or none
+                put_i16(mut b, if accept { 0 } else { 58 })
+                put_compact_nullable_string(mut b, if accept { none } else { some("bad credentials") })
+                put_compact_bytes(mut b, [])
+                put_i64(mut b, 0)
+                put_tags(mut b)
+                say(b)
+            }
+            3 => say(metadata_reply(port, "events", 1, 0))
+            _ => say_nothing()
+        }
+    }
+}
+
+struct Tokens {
+    token: u8[]?
+}
+
+fn test_sasl_plain_sends_authzid_user_and_password(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let seen = new(Tokens { token: none })
+    let f = started(t, l, sasl_server(port, true, seen))
+    let c = connect(Options { brokers: ["127.0.0.1:{port}"], timeout: 2000, sasl: some(Mechanism.Plain("alice", "s3cret")) }) or panic("connect failed")
+    close(c)
+    t.equal_slice(seen.token ?? [], [0, 97, 108, 105, 99, 101, 0, 115, 51, 99, 114, 101, 116])
+    t.equal_slice(apis_seen(f), [18, 17, 36, 3])
+    let cur = cursor(requests_of(f, 17)[0].body)
+    t.equal(take_string(cur) or "", "PLAIN")
+}
+
+fn test_sasl_refusal_is_auth_with_the_broker_message(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    started(t, l, sasl_server(port, false, new(Tokens { token: none })))
+    connect(Options { brokers: ["127.0.0.1:{port}"], timeout: 2000, sasl: some(Mechanism.Plain("alice", "nope")) }) catch {
+        e => {
+            match e {
+                Auth(message) => t.equal(message, "bad credentials")
+                _ => t.error("expected Auth")
+            }
+            return
+        }
+    }
+    t.error("connected with refused credentials")
+}
+
+fn test_sasl_mechanism_the_broker_lacks_is_unsupported(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    started(t, l, fn(r: Request) -> Reply {
+        var b: u8[] = []
+        if r.api == 17 {
+            put_i16(mut b, 33)
+            put_i32(mut b, 1)
+            put_string(mut b, "PLAIN")
+            return say(b)
+        }
+        say(versions_reply(-1))
+    })
+    connect(Options { brokers: ["127.0.0.1:{l.handle.addr.port}"], timeout: 2000, sasl: some(Mechanism.Scram512("a", "b")) }) catch {
+        e => {
+            t.equal(e == Error.Unsupported, true)
+            return
+        }
+    }
+    t.error("connected although the broker lacks the mechanism")
+}
+
+fn test_concurrent_calls_share_one_client(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let port = l.handle.addr.port
+    let f = started(t, l, fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(port, "events", 1, 0))
+            0 => say(produce_reply("events", 0, 0, 1))
+            _ => say_nothing()
+        }
+    })
+    let c = dialled(t, port, fake_options(port))
+    defer close(c)
+    let done = sync.wait_group()
+    sync.add(done, 8)
+    let failures = new(Counter { n: 0 })
+    for i in 0..8 {
+        spawn writer(c, done, failures)
+    }
+    sync.wait(done)
+    t.equal(failures.n, 0)
+    t.equal(requests_of(f, 0).len, 40)
+}
+
+fn writer(c: Client, done: sync.WaitGroup, failures: *Counter) {
+    defer sync.done(done)
+    for i in 0..5 {
+        if (produce(c, "events", 0, [Record { value: some(bytes("x")) }], ProduceOptions {}) or -1) < 0 {
+            failures.n += 1
+        }
+    }
+}

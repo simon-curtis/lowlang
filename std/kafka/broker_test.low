@@ -1,0 +1,339 @@
+import std/io
+import std/net
+import std/sync
+
+struct Request {
+    api: i64
+    version: i64
+    client: str
+    body: u8[]
+}
+
+struct Reply {
+    body: u8[]
+    silent: bool
+    hangup: bool
+}
+
+struct Fake {
+    gate: sync.Mutex
+    seen: Request[]
+    answer: fn(Request) -> Reply
+}
+
+fn say(body: u8[]) -> Reply {
+    Reply { body, silent: false, hangup: false }
+}
+
+fn say_nothing() -> Reply {
+    Reply { body: [], silent: true, hangup: false }
+}
+
+fn hang_up() -> Reply {
+    Reply { body: [], silent: false, hangup: true }
+}
+
+fn start_fake(l: net.Listener, answer: fn(Request) -> Reply) -> *Fake {
+    let f = new(Fake { gate: sync.mutex(), seen: [], answer })
+    spawn accept_loop(l.handle, f)
+    f
+}
+
+fn accept_loop(l: net.ListenerHandle, f: *Fake) {
+    for {
+        let h = net.accept_handle(l) or return
+        spawn serve_connection(h, f)
+    }
+}
+
+fn serve_connection(h: net.ConnHandle, f: *Fake) {
+    using c = net.adopt(h)
+    let stream = net.stream(c)
+    let reader = io.reader(stream)
+    for {
+        let frame = io.read_exact(reader, 4) or return
+        let size = io.be32(frame, 0)
+        let data = io.read_exact(reader, size) or return
+        let cur = cursor(data)
+        let request = read_request(cur) or return
+        let id = io.be32(data, 4)
+        sync.lock(f.gate)
+        f.seen.push(request)
+        sync.unlock(f.gate)
+        let reply = f.answer(request)
+        if reply.hangup {
+            return
+        }
+        if reply.silent {
+            continue
+        }
+        var out: u8[] = []
+        put_i32(mut out, id)
+        if request.api != api_versions && request.api != api_sasl_handshake {
+            put_tags(mut out)
+        }
+        io.append(mut out, reply.body)
+        var framed: u8[] = []
+        put_i32(mut framed, out.len)
+        io.append(mut framed, out)
+        io.write_all(stream, framed) or return
+    }
+}
+
+fn read_request(c: *Cursor) -> Request ! Error {
+    let api = take_i16(c)?
+    let version = take_i16(c)?
+    take_i32(c)?
+    let client = take_nullable_string(c)? ?? ""
+    if api != api_sasl_handshake {
+        skip_tags(c)?
+    }
+    Request { api, version, client, body: c.data[c.at..] }
+}
+
+fn requests_of(f: *Fake, api: i64) -> Request[] {
+    sync.lock(f.gate)
+    defer sync.unlock(f.gate)
+    var out: Request[] = []
+    for r in f.seen {
+        if r.api == api {
+            out.push(r)
+        }
+    }
+    out
+}
+
+fn apis_seen(f: *Fake) -> i64[] {
+    sync.lock(f.gate)
+    defer sync.unlock(f.gate)
+    var out: i64[] = []
+    for r in f.seen {
+        out.push(r.api)
+    }
+    out
+}
+
+fn versions_reply(skipping: i64) -> u8[] {
+    var b: u8[] = []
+    put_i16(mut b, 0)
+    var apis: i64[] = []
+    for api in 0..40 {
+        if api != skipping {
+            apis.push(api)
+        }
+    }
+    put_compact_count(mut b, apis.len)
+    for api in apis {
+        put_i16(mut b, api)
+        put_i16(mut b, 0)
+        put_i16(mut b, 15)
+        put_tags(mut b)
+    }
+    put_i32(mut b, 0)
+    put_tags(mut b)
+    b
+}
+
+fn metadata_reply(port: i64, topic: str, partitions: i64, error: i64) -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_compact_count(mut b, 1)
+    put_i32(mut b, 1)
+    put_compact_string(mut b, "127.0.0.1")
+    put_i32(mut b, port)
+    put_compact_nullable_string(mut b, none)
+    put_tags(mut b)
+    put_compact_nullable_string(mut b, some("fake"))
+    put_i32(mut b, 1)
+    put_compact_count(mut b, 1)
+    put_i16(mut b, error)
+    put_compact_string(mut b, topic)
+    put_bool(mut b, false)
+    put_compact_count(mut b, if error == 0 { partitions } else { 0 })
+    if error == 0 {
+        for p in 0..partitions {
+            put_i16(mut b, 0)
+            put_i32(mut b, p)
+            put_i32(mut b, 1)
+            put_i32(mut b, 4)
+            put_compact_count(mut b, 1)
+            put_i32(mut b, 1)
+            put_compact_count(mut b, 1)
+            put_i32(mut b, 1)
+            put_compact_count(mut b, 0)
+            put_tags(mut b)
+        }
+    }
+    put_i32(mut b, 0)
+    put_tags(mut b)
+    put_i32(mut b, 0)
+    put_tags(mut b)
+    b
+}
+
+fn produce_reply(topic: str, partition: i64, error: i64, base: i64) -> u8[] {
+    var b: u8[] = []
+    put_compact_count(mut b, 1)
+    put_compact_string(mut b, topic)
+    put_compact_count(mut b, 1)
+    put_i32(mut b, partition)
+    put_i16(mut b, error)
+    put_i64(mut b, base)
+    put_i64(mut b, -1)
+    put_i64(mut b, 0)
+    put_compact_count(mut b, 0)
+    put_compact_nullable_string(mut b, none)
+    put_tags(mut b)
+    put_tags(mut b)
+    put_i32(mut b, 0)
+    put_tags(mut b)
+    b
+}
+
+fn fetch_reply(topic: str, partition: i64, error: i64, high: i64, data: u8[]) -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_i16(mut b, 0)
+    put_i32(mut b, 0)
+    put_compact_count(mut b, 1)
+    put_compact_string(mut b, topic)
+    put_compact_count(mut b, 1)
+    put_i32(mut b, partition)
+    put_i16(mut b, error)
+    put_i64(mut b, high)
+    put_i64(mut b, high)
+    put_i64(mut b, 0)
+    put_compact_count(mut b, 0)
+    put_i32(mut b, -1)
+    put_compact_bytes(mut b, data)
+    put_tags(mut b)
+    put_tags(mut b)
+    put_tags(mut b)
+    b
+}
+
+fn list_offsets_reply(topic: str, partition: i64, error: i64, offset: i64) -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_compact_count(mut b, 1)
+    put_compact_string(mut b, topic)
+    put_compact_count(mut b, 1)
+    put_i32(mut b, partition)
+    put_i16(mut b, error)
+    put_i64(mut b, -1)
+    put_i64(mut b, offset)
+    put_i32(mut b, -1)
+    put_tags(mut b)
+    put_tags(mut b)
+    put_tags(mut b)
+    b
+}
+
+fn find_coordinator_reply(port: i64, error: i64) -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_i16(mut b, error)
+    put_compact_nullable_string(mut b, none)
+    put_i32(mut b, 1)
+    put_compact_string(mut b, "127.0.0.1")
+    put_i32(mut b, port)
+    put_tags(mut b)
+    b
+}
+
+fn join_reply(error: i64, generation: i64, leader: str, member: str, members: Member[]) -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_i16(mut b, error)
+    put_i32(mut b, generation)
+    put_compact_string(mut b, "range")
+    put_compact_string(mut b, leader)
+    put_compact_string(mut b, member)
+    put_compact_count(mut b, members.len)
+    for m in members {
+        put_compact_string(mut b, m.id)
+        put_compact_nullable_string(mut b, none)
+        put_compact_bytes(mut b, m.metadata)
+        put_tags(mut b)
+    }
+    put_tags(mut b)
+    b
+}
+
+fn sync_reply(error: i64, assignment: u8[]) -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_i16(mut b, error)
+    put_compact_bytes(mut b, assignment)
+    put_tags(mut b)
+    b
+}
+
+fn offset_fetch_reply(topic: str, offsets: [i64: i64], error: i64) -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_compact_count(mut b, 1)
+    put_compact_string(mut b, topic)
+    put_compact_count(mut b, offsets.len)
+    for partition, offset in offsets {
+        put_i32(mut b, partition)
+        put_i64(mut b, offset)
+        put_i32(mut b, -1)
+        put_compact_nullable_string(mut b, none)
+        put_i16(mut b, error)
+        put_tags(mut b)
+    }
+    put_tags(mut b)
+    put_i16(mut b, 0)
+    put_tags(mut b)
+    b
+}
+
+fn offset_commit_reply(topic: str, partitions: i64[], error: i64) -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_compact_count(mut b, 1)
+    put_compact_string(mut b, topic)
+    put_compact_count(mut b, partitions.len)
+    for p in partitions {
+        put_i32(mut b, p)
+        put_i16(mut b, error)
+        put_tags(mut b)
+    }
+    put_tags(mut b)
+    put_tags(mut b)
+    b
+}
+
+fn heartbeat_reply(error: i64) -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_i16(mut b, error)
+    put_tags(mut b)
+    b
+}
+
+fn leave_reply() -> u8[] {
+    var b: u8[] = []
+    put_i32(mut b, 0)
+    put_i16(mut b, 0)
+    put_compact_count(mut b, 0)
+    put_tags(mut b)
+    b
+}
+
+fn code_of(e: Error) -> i64 {
+    match e {
+        Broker(code, name) => code
+        _ => 0
+    }
+}
+
+fn await_requests(f: *Fake, api: i64, n: i64) {
+    for i in 0..300 {
+        if requests_of(f, api).len >= n {
+            return
+        }
+        sleep(10)
+    }
+}

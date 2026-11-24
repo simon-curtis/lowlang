@@ -1,0 +1,535 @@
+import std/io
+
+/// A node of the cluster as the metadata lists it.
+struct Node {
+    id: i64
+    host: str
+    port: i64
+}
+
+/// A partition of a topic: its leader, replicas and in-sync replicas as broker ids.
+pub struct Partition {
+    /// The partition number.
+    pub id: i64
+    /// The broker id of the leader, or `-1` while the partition has none.
+    pub leader: i64
+    /// The leader epoch, which increases on each leader change.
+    pub leader_epoch: i64
+    /// The broker ids of the replicas.
+    pub replicas: i64[]
+    /// The broker ids of the replicas that are in sync.
+    pub isr: i64[]
+    /// The Kafka error code of the partition, `0` when it is available.
+    pub error: i64
+}
+
+/// A topic and its partitions, from `metadata`.
+pub struct Topic {
+    /// The topic name.
+    pub name: str
+    /// Whether Kafka keeps the topic for itself, such as `__consumer_offsets`.
+    pub internal: bool
+    /// The Kafka error code of the topic, `0` when it exists, `3` when it does not.
+    pub error: i64
+    /// The partitions in order of their numbers.
+    pub partitions: Partition[]
+}
+
+struct Metadata {
+    nodes: Node[]
+    topics: Topic[]
+}
+
+struct Produced {
+    error: i64
+    base_offset: i64
+}
+
+struct FetchedPartition {
+    error: i64
+    high_watermark: i64
+    log_start_offset: i64
+    data: u8[]
+}
+
+struct Listed {
+    error: i64
+    offset: i64
+}
+
+struct Joined {
+    generation: i64
+    leader: str
+    member_id: str
+    members: Member[]
+}
+
+struct Member {
+    id: str
+    metadata: u8[]
+}
+
+struct PartitionOffset {
+    topic: str
+    partition: i64
+    offset: i64
+    error: i64
+}
+
+fn take_partition(c: *Cursor) -> Partition ! Error {
+    let error = take_i16(c)?
+    let id = take_i32(c)?
+    let leader = take_i32(c)?
+    let epoch = take_i32(c)?
+    let replicas = take_i32_array(c)?
+    let isr = take_i32_array(c)?
+    take_i32_array(c)?
+    skip_tags(c)?
+    Partition { id, leader, leader_epoch: epoch, replicas, isr, error }
+}
+
+fn take_i32_array(c: *Cursor) -> i64[] ! Error {
+    let n = take_compact_count(c)?
+    var out: i64[] = []
+    for i in 0..n {
+        out.push(take_i32(c)?)
+    }
+    out
+}
+
+fn take_topic(c: *Cursor) -> Topic ! Error {
+    let error = take_i16(c)?
+    let name = take_compact_string(c)?
+    let internal = take_bool(c)?
+    let n = take_compact_count(c)?
+    var partitions: Partition[] = []
+    for i in 0..n {
+        partitions.push(take_partition(c)?)
+    }
+    take_i32(c)?
+    skip_tags(c)?
+    Topic { name, internal, error, partitions }
+}
+
+fn api_metadata_request(c: *Conn, topics: str[]?, auto_create: bool) -> Metadata ! Error {
+    var body: u8[] = []
+    match topics {
+        some(names) => {
+            put_compact_count(mut body, names.len)
+            for name in names {
+                put_compact_string(mut body, name)
+                put_tags(mut body)
+            }
+        }
+        none => put_uvarint(mut body, 0)
+    }
+    put_bool(mut body, auto_create)
+    put_bool(mut body, false)
+    put_bool(mut body, false)
+    put_tags(mut body)
+    let cur = call(c, api_metadata, v_metadata, true, body, c.timeout)?
+    take_i32(cur)?
+    let nodes_count = take_compact_count(cur)?
+    var nodes: Node[] = []
+    for i in 0..nodes_count {
+        let id = take_i32(cur)?
+        let host = take_compact_string(cur)?
+        let port = take_i32(cur)?
+        take_compact_nullable_string(cur)?
+        skip_tags(cur)?
+        nodes.push(Node { id, host, port })
+    }
+    take_compact_nullable_string(cur)?
+    take_i32(cur)?
+    let topic_count = take_compact_count(cur)?
+    var found: Topic[] = []
+    for i in 0..topic_count {
+        found.push(take_topic(cur)?)
+    }
+    take_i32(cur)?
+    skip_tags(cur)?
+    Metadata { nodes, topics: found }
+}
+
+fn api_produce_request(c: *Conn, topic: str, partition: i64, batch: u8[], acks: i64, timeout: i64) -> Produced ! Error {
+    var body: u8[] = []
+    put_compact_nullable_string(mut body, none)
+    put_i16(mut body, acks)
+    put_i32(mut body, timeout)
+    put_compact_count(mut body, 1)
+    put_compact_string(mut body, topic)
+    put_compact_count(mut body, 1)
+    put_i32(mut body, partition)
+    put_compact_bytes(mut body, batch)
+    put_tags(mut body)
+    put_tags(mut body)
+    put_tags(mut body)
+    if acks == 0 {
+        send_only(c, api_produce, v_produce, true, body)?
+        return Produced { error: 0, base_offset: -1 }
+    }
+    let cur = call(c, api_produce, v_produce, true, body, c.timeout + timeout)?
+    let topics = take_compact_count(cur)?
+    var out = Produced { error: 0, base_offset: -1 }
+    for i in 0..topics {
+        take_compact_string(cur)?
+        let parts = take_compact_count(cur)?
+        for j in 0..parts {
+            take_i32(cur)?
+            let error = take_i16(cur)?
+            let base = take_i64(cur)?
+            take_i64(cur)?
+            take_i64(cur)?
+            let errors = take_compact_count(cur)?
+            for k in 0..errors {
+                take_i32(cur)?
+                take_compact_nullable_string(cur)?
+                skip_tags(cur)?
+            }
+            take_compact_nullable_string(cur)?
+            skip_tags(cur)?
+            out = Produced { error, base_offset: base }
+        }
+        skip_tags(cur)?
+    }
+    take_i32(cur)?
+    skip_tags(cur)?
+    out
+}
+
+fn api_fetch_request(c: *Conn, topic: str, partition: i64, offset: i64, max_wait: i64, min_bytes: i64, max_bytes: i64, partition_bytes: i64) -> FetchedPartition ! Error {
+    var body: u8[] = []
+    put_i32(mut body, -1)
+    put_i32(mut body, max_wait)
+    put_i32(mut body, min_bytes)
+    put_i32(mut body, max_bytes)
+    put_i8(mut body, 0)
+    put_i32(mut body, 0)
+    put_i32(mut body, -1)
+    put_compact_count(mut body, 1)
+    put_compact_string(mut body, topic)
+    put_compact_count(mut body, 1)
+    put_i32(mut body, partition)
+    put_i32(mut body, -1)
+    put_i64(mut body, offset)
+    put_i32(mut body, -1)
+    put_i64(mut body, -1)
+    put_i32(mut body, partition_bytes)
+    put_tags(mut body)
+    put_tags(mut body)
+    put_compact_count(mut body, 0)
+    put_compact_string(mut body, "")
+    put_tags(mut body)
+    let cur = call(c, api_fetch, v_fetch, true, body, c.timeout + max_wait)?
+    take_i32(cur)?
+    let top = take_i16(cur)?
+    take_i32(cur)?
+    check(top)?
+    let topics = take_compact_count(cur)?
+    var out = FetchedPartition { error: 0, high_watermark: -1, log_start_offset: -1, data: [] }
+    for i in 0..topics {
+        take_compact_string(cur)?
+        let parts = take_compact_count(cur)?
+        for j in 0..parts {
+            take_i32(cur)?
+            let error = take_i16(cur)?
+            let high = take_i64(cur)?
+            take_i64(cur)?
+            let start = take_i64(cur)?
+            let aborted = take_compact_count(cur)?
+            for k in 0..aborted {
+                take_i64(cur)?
+                take_i64(cur)?
+                skip_tags(cur)?
+            }
+            take_i32(cur)?
+            let data = take_compact_bytes(cur)? ?? []
+            skip_tags(cur)?
+            out = FetchedPartition { error, high_watermark: high, log_start_offset: start, data }
+        }
+        skip_tags(cur)?
+    }
+    skip_tags(cur)?
+    out
+}
+
+fn api_list_offsets_request(c: *Conn, topic: str, partition: i64, timestamp: i64) -> Listed ! Error {
+    var body: u8[] = []
+    put_i32(mut body, -1)
+    put_i8(mut body, 0)
+    put_compact_count(mut body, 1)
+    put_compact_string(mut body, topic)
+    put_compact_count(mut body, 1)
+    put_i32(mut body, partition)
+    put_i32(mut body, -1)
+    put_i64(mut body, timestamp)
+    put_tags(mut body)
+    put_tags(mut body)
+    put_tags(mut body)
+    let cur = call(c, api_list_offsets, v_list_offsets, true, body, c.timeout)?
+    take_i32(cur)?
+    let topics = take_compact_count(cur)?
+    var out = Listed { error: 0, offset: -1 }
+    for i in 0..topics {
+        take_compact_string(cur)?
+        let parts = take_compact_count(cur)?
+        for j in 0..parts {
+            take_i32(cur)?
+            let error = take_i16(cur)?
+            take_i64(cur)?
+            let offset = take_i64(cur)?
+            take_i32(cur)?
+            skip_tags(cur)?
+            out = Listed { error, offset }
+        }
+        skip_tags(cur)?
+    }
+    skip_tags(cur)?
+    out
+}
+
+fn api_create_topic_request(c: *Conn, name: str, partitions: i64, replication: i64, configs: [str: str]) -> i64 ! Error {
+    var body: u8[] = []
+    put_compact_count(mut body, 1)
+    put_compact_string(mut body, name)
+    put_i32(mut body, partitions)
+    put_i16(mut body, replication)
+    put_compact_count(mut body, 0)
+    put_compact_count(mut body, configs.len)
+    for key, value in configs {
+        put_compact_string(mut body, key)
+        put_compact_nullable_string(mut body, some(value))
+        put_tags(mut body)
+    }
+    put_tags(mut body)
+    put_i32(mut body, c.timeout)
+    put_bool(mut body, false)
+    put_tags(mut body)
+    let cur = call(c, api_create_topics, v_create_topics, true, body, c.timeout)?
+    take_i32(cur)?
+    let n = take_compact_count(cur)?
+    var code = 0
+    for i in 0..n {
+        take_compact_string(cur)?
+        code = take_i16(cur)?
+        take_compact_nullable_string(cur)?
+        take_i32(cur)?
+        take_i16(cur)?
+        let configured = take_compact_count(cur)?
+        for k in 0..configured {
+            take_compact_string(cur)?
+            take_compact_nullable_string(cur)?
+            take_bool(cur)?
+            take_i8(cur)?
+            take_bool(cur)?
+            skip_tags(cur)?
+        }
+        skip_tags(cur)?
+    }
+    skip_tags(cur)?
+    code
+}
+
+fn api_delete_topic_request(c: *Conn, name: str) -> i64 ! Error {
+    var body: u8[] = []
+    put_compact_count(mut body, 1)
+    put_compact_string(mut body, name)
+    put_i32(mut body, c.timeout)
+    put_tags(mut body)
+    let cur = call(c, api_delete_topics, v_delete_topics, true, body, c.timeout)?
+    take_i32(cur)?
+    let n = take_compact_count(cur)?
+    var code = 0
+    for i in 0..n {
+        take_compact_string(cur)?
+        code = take_i16(cur)?
+        skip_tags(cur)?
+    }
+    skip_tags(cur)?
+    code
+}
+
+fn api_find_coordinator_request(c: *Conn, group: str) -> Node ! Error {
+    var body: u8[] = []
+    put_compact_string(mut body, group)
+    put_i8(mut body, 0)
+    put_tags(mut body)
+    let cur = call(c, api_find_coordinator, v_find_coordinator, true, body, c.timeout)?
+    take_i32(cur)?
+    check(take_i16(cur)?)?
+    take_compact_nullable_string(cur)?
+    let id = take_i32(cur)?
+    let host = take_compact_string(cur)?
+    let port = take_i32(cur)?
+    skip_tags(cur)?
+    Node { id, host, port }
+}
+
+fn api_join_group_request(c: *Conn, group: str, session_timeout: i64, rebalance_timeout: i64, member_id: str, protocols: [str: u8[]]) -> Joined ! Error {
+    var body: u8[] = []
+    put_compact_string(mut body, group)
+    put_i32(mut body, session_timeout)
+    put_i32(mut body, rebalance_timeout)
+    put_compact_string(mut body, member_id)
+    put_compact_nullable_string(mut body, none)
+    put_compact_string(mut body, "consumer")
+    put_compact_count(mut body, protocols.len)
+    for name, metadata in protocols {
+        put_compact_string(mut body, name)
+        put_compact_bytes(mut body, metadata)
+        put_tags(mut body)
+    }
+    put_tags(mut body)
+    let cur = call(c, api_join_group, v_join_group, true, body, c.timeout + rebalance_timeout)?
+    take_i32(cur)?
+    let code = take_i16(cur)?
+    let generation = take_i32(cur)?
+    take_compact_string(cur)?
+    let leader = take_compact_string(cur)?
+    let assigned = take_compact_string(cur)?
+    if code == 79 {
+        return Joined { generation: -1, leader, member_id: assigned, members: [] }
+    }
+    check(code)?
+    let n = take_compact_count(cur)?
+    var members: Member[] = []
+    for i in 0..n {
+        let id = take_compact_string(cur)?
+        take_compact_nullable_string(cur)?
+        let metadata = take_compact_bytes(cur)? ?? []
+        skip_tags(cur)?
+        members.push(Member { id, metadata })
+    }
+    skip_tags(cur)?
+    Joined { generation, leader, member_id: assigned, members }
+}
+
+fn api_sync_group_request(c: *Conn, group: str, generation: i64, member_id: str, assignments: Member[], wait: i64) -> u8[] ! Error {
+    var body: u8[] = []
+    put_compact_string(mut body, group)
+    put_i32(mut body, generation)
+    put_compact_string(mut body, member_id)
+    put_compact_nullable_string(mut body, none)
+    put_compact_count(mut body, assignments.len)
+    for a in assignments {
+        put_compact_string(mut body, a.id)
+        put_compact_bytes(mut body, a.metadata)
+        put_tags(mut body)
+    }
+    put_tags(mut body)
+    let cur = call(c, api_sync_group, v_sync_group, true, body, c.timeout + wait)?
+    take_i32(cur)?
+    check(take_i16(cur)?)?
+    let assignment = take_compact_bytes(cur)? ?? []
+    skip_tags(cur)?
+    assignment
+}
+
+fn api_heartbeat_request(c: *Conn, group: str, generation: i64, member_id: str) ! Error {
+    var body: u8[] = []
+    put_compact_string(mut body, group)
+    put_i32(mut body, generation)
+    put_compact_string(mut body, member_id)
+    put_compact_nullable_string(mut body, none)
+    put_tags(mut body)
+    let cur = call(c, api_heartbeat, v_heartbeat, true, body, c.timeout)?
+    take_i32(cur)?
+    check(take_i16(cur)?)?
+    skip_tags(cur)?
+}
+
+fn api_leave_group_request(c: *Conn, group: str, member_id: str) ! Error {
+    var body: u8[] = []
+    put_compact_string(mut body, group)
+    put_compact_count(mut body, 1)
+    put_compact_string(mut body, member_id)
+    put_compact_nullable_string(mut body, none)
+    put_tags(mut body)
+    put_tags(mut body)
+    let cur = call(c, api_leave_group, v_leave_group, true, body, c.timeout)?
+    take_i32(cur)?
+    check(take_i16(cur)?)?
+    let n = take_compact_count(cur)?
+    for i in 0..n {
+        take_compact_string(cur)?
+        take_compact_nullable_string(cur)?
+        take_i16(cur)?
+        skip_tags(cur)?
+    }
+    skip_tags(cur)?
+}
+
+fn api_offset_commit_request(c: *Conn, group: str, generation: i64, member_id: str, offsets: [str: [i64: i64]]) -> PartitionOffset[] ! Error {
+    var body: u8[] = []
+    put_compact_string(mut body, group)
+    put_i32(mut body, generation)
+    put_compact_string(mut body, member_id)
+    put_compact_nullable_string(mut body, none)
+    put_compact_count(mut body, offsets.len)
+    for topic, parts in offsets {
+        put_compact_string(mut body, topic)
+        put_compact_count(mut body, parts.len)
+        for partition, offset in parts {
+            put_i32(mut body, partition)
+            put_i64(mut body, offset)
+            put_i32(mut body, -1)
+            put_compact_nullable_string(mut body, none)
+            put_tags(mut body)
+        }
+        put_tags(mut body)
+    }
+    put_tags(mut body)
+    let cur = call(c, api_offset_commit, v_offset_commit, true, body, c.timeout)?
+    take_i32(cur)?
+    let topics = take_compact_count(cur)?
+    var out: PartitionOffset[] = []
+    for i in 0..topics {
+        let name = take_compact_string(cur)?
+        let parts = take_compact_count(cur)?
+        for j in 0..parts {
+            let partition = take_i32(cur)?
+            let error = take_i16(cur)?
+            skip_tags(cur)?
+            out.push(PartitionOffset { topic: name, partition, offset: 0, error })
+        }
+        skip_tags(cur)?
+    }
+    skip_tags(cur)?
+    out
+}
+
+fn api_offset_fetch_request(c: *Conn, group: str, topics: [str: i64[]]) -> PartitionOffset[] ! Error {
+    var body: u8[] = []
+    put_compact_string(mut body, group)
+    put_compact_count(mut body, topics.len)
+    for topic, parts in topics {
+        put_compact_string(mut body, topic)
+        put_compact_count(mut body, parts.len)
+        for p in parts {
+            put_i32(mut body, p)
+        }
+        put_tags(mut body)
+    }
+    put_tags(mut body)
+    let cur = call(c, api_offset_fetch, v_offset_fetch, true, body, c.timeout)?
+    take_i32(cur)?
+    let n = take_compact_count(cur)?
+    var out: PartitionOffset[] = []
+    for i in 0..n {
+        let name = take_compact_string(cur)?
+        let parts = take_compact_count(cur)?
+        for j in 0..parts {
+            let partition = take_i32(cur)?
+            let offset = take_i64(cur)?
+            take_i32(cur)?
+            take_compact_nullable_string(cur)?
+            let error = take_i16(cur)?
+            skip_tags(cur)?
+            out.push(PartitionOffset { topic: name, partition, offset, error })
+        }
+        skip_tags(cur)?
+    }
+    check(take_i16(cur)?)?
+    skip_tags(cur)?
+    out
+}

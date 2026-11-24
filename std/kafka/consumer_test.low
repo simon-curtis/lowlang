@@ -1,0 +1,537 @@
+import std/net
+import std/testing
+import std/time
+
+struct Codes {
+    queue: i64[]
+}
+
+fn next_code(c: *Codes) -> i64 {
+    if c.queue.len == 0 {
+        return 0
+    }
+    let first = c.queue[0]
+    c.queue = c.queue[1..]
+    first
+}
+
+struct Script {
+    port: i64
+    leader: str
+    partitions: i64
+    members: Member[]
+    owned: TopicPartition[]
+    offsets: [i64: i64]
+    earliest: i64
+    latest: i64
+    batch: u8[]
+    batch_end: i64
+    heartbeat: *Codes
+    commit: *Codes
+    fetch: *Codes
+    coordinator: *Codes
+}
+
+fn script(port: i64, partitions: i64) -> *Script {
+    var owned: TopicPartition[] = []
+    for p in 0..partitions {
+        owned.push(TopicPartition { topic: "events", partition: p })
+    }
+    new(Script {
+        port
+        leader: "m-1"
+        partitions
+        members: [Member { id: "m-1", metadata: encode_subscription(["events"]) }]
+        owned
+        offsets: [0: -1]
+        earliest: 0
+        latest: 100
+        batch: []
+        batch_end: 0
+        heartbeat: new(Codes { queue: [] })
+        commit: new(Codes { queue: [] })
+        fetch: new(Codes { queue: [] })
+        coordinator: new(Codes { queue: [] })
+    })
+}
+
+fn coordinator(s: *Script) -> fn(Request) -> Reply {
+    fn(r: Request) -> Reply {
+        match r.api {
+            18 => say(versions_reply(-1))
+            3 => say(metadata_reply(s.port, "events", s.partitions, 0))
+            10 => say(find_coordinator_reply(s.port, next_code(s.coordinator)))
+            11 => {
+                if joined_member(r) == "" {
+                    say(join_reply(79, -1, "", "m-1", []))
+                } else {
+                    say(join_reply(0, 7, s.leader, "m-1", s.members))
+                }
+            }
+            14 => say(sync_reply(0, encode_assignment(s.owned)))
+            9 => say(offset_fetch_reply("events", s.offsets, 0))
+            2 => say(list_offsets_reply("events", 0, 0, if listed_timestamp(r) == earliest { s.earliest } else { s.latest }))
+            1 => {
+                let code = next_code(s.fetch)
+                if code != 0 || fetched_offset(r) >= s.batch_end {
+                    say(fetch_reply("events", 0, code, s.batch_end, []))
+                } else {
+                    say(fetch_reply("events", 0, 0, s.batch_end, s.batch))
+                }
+            }
+            8 => say(offset_commit_reply("events", [0], next_code(s.commit)))
+            12 => say(heartbeat_reply(next_code(s.heartbeat)))
+            13 => say(leave_reply())
+            _ => say_nothing()
+        }
+    }
+}
+
+fn joined_member(r: Request) -> str {
+    let c = cursor(r.body)
+    take_compact_string(c) or return ""
+    take_i32(c) or return ""
+    take_i32(c) or return ""
+    take_compact_string(c) or ""
+}
+
+fn joined_members(f: *Fake) -> str[] {
+    var out: str[] = []
+    for r in requests_of(f, 11) {
+        out.push(joined_member(r))
+    }
+    out
+}
+
+fn synced_plan(r: Request) -> Member[] {
+    let c = cursor(r.body)
+    take_compact_string(c) or return []
+    take_i32(c) or return []
+    take_compact_string(c) or return []
+    take_compact_nullable_string(c) or return []
+    let n = take_compact_count(c) or return []
+    var out: Member[] = []
+    for i in 0..n {
+        let id = take_compact_string(c) or return out
+        let metadata = take_compact_bytes(c) or return out
+        skip_tags(c) or return out
+        out.push(Member { id, metadata: metadata ?? [] })
+    }
+    out
+}
+
+fn listed_timestamp(r: Request) -> i64 {
+    let c = cursor(r.body)
+    take_i32(c) or return 0
+    take_i8(c) or return 0
+    take_compact_count(c) or return 0
+    take_compact_string(c) or return 0
+    take_compact_count(c) or return 0
+    take_i32(c) or return 0
+    take_i32(c) or return 0
+    take_i64(c) or 0
+}
+
+fn fetched_offset(r: Request) -> i64 {
+    let c = cursor(r.body)
+    for i in 0..4 {
+        take_i32(c) or return 0
+    }
+    take_i8(c) or return 0
+    take_i32(c) or return 0
+    take_i32(c) or return 0
+    take_compact_count(c) or return 0
+    take_compact_string(c) or return 0
+    take_compact_count(c) or return 0
+    take_i32(c) or return 0
+    take_i32(c) or return 0
+    take_i64(c) or 0
+}
+
+struct Committed {
+    generation: i64
+    member: str
+    offsets: [i64: i64]
+}
+
+fn committed_by(r: Request) -> Committed {
+    let c = cursor(r.body)
+    var out = Committed { generation: -1, member: "", offsets: [:] }
+    take_compact_string(c) or return out
+    out.generation = take_i32(c) or return out
+    out.member = take_compact_string(c) or return out
+    take_compact_nullable_string(c) or return out
+    take_compact_count(c) or return out
+    take_compact_string(c) or return out
+    let n = take_compact_count(c) or return out
+    for i in 0..n {
+        let partition = take_i32(c) or return out
+        out.offsets[partition] = take_i64(c) or return out
+        take_i32(c) or return out
+        take_compact_nullable_string(c) or return out
+        skip_tags(c) or return out
+    }
+    out
+}
+
+fn two_records() -> u8[] {
+    encode_batch([Record { value: some(bytes("first")), timestamp: 1 }, Record { value: some(bytes("second")), timestamp: 1 }], Compression.None, 1) or []
+}
+
+fn options(topics: str[]) -> ConsumerOptions {
+    ConsumerOptions { group: "g", topics, heartbeat_interval: 1000, reset: Reset.Earliest }
+}
+
+fn running(t: *testing.T, l: net.Listener, s: *Script) -> *Fake {
+    start_fake(l, coordinator(s))
+}
+
+fn joined(t: *testing.T, c: Client, o: ConsumerOptions) -> Consumer {
+    subscribe(c, o) catch {
+        e => {
+            t.fatal("subscribe failed: {testing.format(e)}")
+            panic("unreachable")
+        }
+    }
+}
+
+fn client_of(port: i64) -> Client {
+    connect(Options { brokers: ["127.0.0.1:{port}"], timeout: 2000, retry_backoff: 1 }) or panic("connect failed")
+}
+
+fn test_subscribe_rejoins_with_the_assigned_id_and_resumes_committed_offsets(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 2)
+    s.offsets = [0: -1, 1: 5]
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    t.equal_slice(joined_members(f), ["", "m-1"])
+    t.equal(requests_of(f, 10).len, 1)
+    let got = assignment(cn)
+    t.equal(got.len, 2)
+    t.equal(got[1].partition, 1)
+    t.equal(position(cn, "events", 0) or -9, 0)
+    t.equal(position(cn, "events", 1) or -9, 5)
+    unsubscribe(cn)
+}
+
+fn test_the_leader_sends_a_range_plan_for_every_member(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 4)
+    s.members = [Member { id: "m-2", metadata: encode_subscription(["events"]) }, Member { id: "m-1", metadata: encode_subscription(["events"]) }]
+    s.owned = [TopicPartition { topic: "events", partition: 0 }, TopicPartition { topic: "events", partition: 1 }]
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    let plan = synced_plan(requests_of(f, 14)[0])
+    t.equal(plan.len, 2)
+    t.equal(plan[0].id, "m-2")
+    t.equal((decode_assignment(plan[0].metadata) or []).len, 2)
+    t.equal((decode_assignment(plan[0].metadata) or [])[0].partition, 2)
+    t.equal(plan[1].id, "m-1")
+    t.equal((decode_assignment(plan[1].metadata) or [])[1].partition, 1)
+    t.equal(assignment(cn).len, 2)
+    unsubscribe(cn)
+}
+
+fn test_a_follower_sends_an_empty_plan(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 2)
+    s.leader = "other"
+    s.members = []
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    t.equal(synced_plan(requests_of(f, 14)[0]).len, 0)
+    unsubscribe(cn)
+}
+
+fn test_poll_returns_records_with_their_partition_and_advances(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.batch = two_records()
+    s.batch_end = 2
+    running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    let got = poll(cn, 500) or []
+    t.equal(got.len, 2)
+    t.equal(got[0].topic, "events")
+    t.equal(got[0].partition, 0)
+    t.equal(got[1].record.offset, 1)
+    t.equal(str(got[1].record.value ?? []), "second")
+    t.equal(position(cn, "events", 0) or -9, 2)
+    t.equal((poll(cn, 30) or [Message { topic: "", partition: 0, record: Record {} }]).len, 0)
+    unsubscribe(cn)
+}
+
+fn test_poll_waits_for_the_timeout_when_nothing_arrives(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    let started = time.now_millis()
+    t.equal((poll(cn, 120) or [Message { topic: "", partition: 0, record: Record {} }]).len, 0)
+    t.is_true(time.now_millis() - started >= 100)
+    unsubscribe(cn)
+}
+
+fn test_commit_sends_the_positions_once(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.batch = two_records()
+    s.batch_end = 2
+    s.offsets = [0: 0]
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    commit(cn) or panic("commit failed")
+    t.equal(requests_of(f, 8).len, 0)
+    poll(cn, 500) or []
+    commit(cn) or panic("commit failed")
+    commit(cn) or panic("commit failed")
+    let sent = requests_of(f, 8)
+    t.equal(sent.len, 1)
+    let by = committed_by(sent[0])
+    t.equal(by.generation, 7)
+    t.equal(by.member, "m-1")
+    t.equal(by.offsets[0] ?? -9, 2)
+    unsubscribe(cn)
+}
+
+fn test_a_coordinator_that_moved_is_found_again(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.batch = two_records()
+    s.batch_end = 2
+    s.commit.queue = [16]
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    poll(cn, 500) or []
+    commit(cn) or panic("commit failed")
+    t.equal(requests_of(f, 10).len, 2)
+    t.equal(requests_of(f, 8).len, 2)
+    unsubscribe(cn)
+}
+
+fn test_a_coordinator_that_is_starting_is_waited_for(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.coordinator.queue = [15, 15, 15, 15, 15, 15, 15, 15]
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    t.equal(requests_of(f, 10).len, 9)
+    unsubscribe(cn)
+}
+
+fn test_a_commit_during_a_rebalance_fails_and_the_next_poll_rejoins(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.batch = two_records()
+    s.batch_end = 2
+    s.commit.queue = [27]
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    poll(cn, 500) or []
+    commit(cn) catch {
+        e => t.equal(code_of(e), 27)
+    }
+    poll(cn, 30) or []
+    t.equal_slice(joined_members(f), ["", "m-1", "m-1"])
+    unsubscribe(cn)
+}
+
+fn test_a_heartbeat_that_reports_a_rebalance_makes_poll_rejoin(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.heartbeat.queue = [27]
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    var o = options(["events"])
+    o.heartbeat_interval = 1
+    let cn = joined(t, c, o)
+    sleep(5)
+    poll(cn, 30) or []
+    t.equal_slice(joined_members(f), ["", "m-1", "m-1"])
+    t.equal(requests_of(f, 14).len, 2)
+    t.is_true(requests_of(f, 12).len >= 1)
+    unsubscribe(cn)
+}
+
+fn test_an_unknown_member_starts_over_with_no_id(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.heartbeat.queue = [25]
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    var o = options(["events"])
+    o.heartbeat_interval = 1
+    let cn = joined(t, c, o)
+    sleep(5)
+    poll(cn, 30) or []
+    t.equal_slice(joined_members(f), ["", "m-1", "", "m-1"])
+    unsubscribe(cn)
+}
+
+fn test_an_offset_out_of_range_follows_the_reset_policy(t: *testing.T) {
+    for policy in [Reset.Earliest, Reset.Latest] {
+        using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+        let s = script(l.handle.addr.port, 1)
+        s.offsets = [0: 50]
+        s.fetch.queue = [1]
+        running(t, l, s)
+        let c = client_of(s.port)
+        defer close(c)
+        var o = options(["events"])
+        o.reset = policy
+        let cn = joined(t, c, o)
+        poll(cn, 30) or []
+        t.equal(position(cn, "events", 0) or -9, if policy == Reset.Earliest { 0 } else { 100 })
+        unsubscribe(cn)
+    }
+}
+
+fn test_reset_fail_surfaces_the_missing_offset(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    var o = options(["events"])
+    o.reset = Reset.Fail
+    subscribe(c, o) catch {
+        e => {
+            t.equal(code_of(e), 1)
+            return
+        }
+    }
+    t.error("subscribed although no offset was committed and the policy is Fail")
+}
+
+fn test_auto_commit_sends_the_previous_polls_positions(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.batch = two_records()
+    s.batch_end = 2
+    s.offsets = [0: 0]
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    var o = options(["events"])
+    o.auto_commit_interval = 1
+    let cn = joined(t, c, o)
+    poll(cn, 500) or []
+    t.equal(requests_of(f, 8).len, 0)
+    sleep(5)
+    poll(cn, 10) or []
+    let sent = requests_of(f, 8)
+    t.equal(sent.len, 1)
+    t.equal(committed_by(sent[0]).offsets[0] ?? -9, 2)
+    unsubscribe(cn)
+}
+
+fn test_unsubscribe_leaves_the_group_once_and_closes_the_consumer(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.batch = two_records()
+    s.batch_end = 2
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    var o = options(["events"])
+    o.auto_commit_interval = 60000
+    let cn = joined(t, c, o)
+    poll(cn, 500) or []
+    unsubscribe(cn)
+    unsubscribe(cn)
+    t.equal(requests_of(f, 13).len, 1)
+    t.equal(requests_of(f, 8).len, 1)
+    poll(cn, 10) catch {
+        e => {
+            t.equal(e == Error.Closed, true)
+            []
+        }
+    }
+    commit(cn) catch {
+        e => t.equal(e == Error.Closed, true)
+    }
+}
+
+fn test_seek_and_position_work_on_owned_partitions_only(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    let cn = joined(t, c, options(["events"]))
+    seek(cn, "events", 0, 42) or panic("seek failed")
+    t.equal(position(cn, "events", 0) or -9, 42)
+    seek(cn, "events", 3, 1) catch { e => t.equal(e == Error.Argument, true) }
+    seek(cn, "other", 0, 1) catch { e => t.equal(e == Error.Argument, true) }
+    seek(cn, "events", 0, -1) catch { e => t.equal(e == Error.Argument, true) }
+    position(cn, "events", 3) catch {
+        e => {
+            t.equal(e == Error.Argument, true)
+            -1
+        }
+    }
+    unsubscribe(cn)
+}
+
+fn test_a_consumer_with_no_partitions_still_waits_and_heartbeats(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    s.owned = []
+    let f = running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    var o = options(["events"])
+    o.heartbeat_interval = 20
+    let cn = joined(t, c, o)
+    t.equal(assignment(cn).len, 0)
+    let started = time.now_millis()
+    t.equal((poll(cn, 90) or [Message { topic: "", partition: 0, record: Record {} }]).len, 0)
+    t.is_true(time.now_millis() - started >= 80)
+    t.is_true(requests_of(f, 12).len >= 2)
+    unsubscribe(cn)
+}
+
+fn test_subscribe_rejects_options_out_of_range(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen failed")
+    let s = script(l.handle.addr.port, 1)
+    running(t, l, s)
+    let c = client_of(s.port)
+    defer close(c)
+    var bad: ConsumerOptions[] = []
+    bad.push(ConsumerOptions { group: "", topics: ["events"] })
+    bad.push(ConsumerOptions { group: "g", topics: [] })
+    bad.push(ConsumerOptions { group: "g", topics: [""] })
+    bad.push(ConsumerOptions { group: "g", topics: ["events"], session_timeout: 1000, heartbeat_interval: 1000 })
+    bad.push(ConsumerOptions { group: "g", topics: ["events"], auto_commit_interval: -1 })
+    bad.push(ConsumerOptions { group: "g", topics: ["events"], partition_bytes: 0 })
+    for o in bad {
+        subscribe(c, o) catch {
+            e => {
+                t.equal(e == Error.Argument, true)
+                continue
+            }
+        }
+        t.error("accepted invalid consumer options")
+    }
+}

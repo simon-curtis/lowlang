@@ -1,0 +1,492 @@
+import std/slices
+import std/time
+
+/// What a consumer does with a partition that has no committed offset, or whose committed offset the broker no longer holds.
+pub enum Reset {
+    /// Start at the first offset the partition still holds.
+    Earliest
+    /// Start after the last record, so only records produced from now on arrive.
+    Latest
+    /// Fail with `Broker` code `1`, `OFFSET_OUT_OF_RANGE`.
+    Fail
+}
+
+/// Settings for `subscribe`.
+pub struct ConsumerOptions {
+    /// The consumer group id. Consumers with one id share the partitions of the topics they subscribe to, and the group keeps their committed offsets.
+    pub group: str
+    /// The topics to read.
+    pub topics: str[]
+    /// How long in milliseconds the coordinator waits without a heartbeat before it removes the consumer from the group. The broker limits it by `group.min.session.timeout.ms` and `group.max.session.timeout.ms`. Defaults to `45000`.
+    pub session_timeout: i64 = 45000
+    /// How long in milliseconds a rebalance waits for the members to rejoin. Defaults to `60000`.
+    pub rebalance_timeout: i64 = 60000
+    /// How often in milliseconds `poll` sends a heartbeat. Defaults to `3000`.
+    pub heartbeat_interval: i64 = 3000
+    /// Where to start a partition with no committed offset. Defaults to `Reset.Latest`.
+    pub reset: Reset = Reset.Latest
+    /// How long in milliseconds `poll` lets pass before it commits the positions of the records it returned earlier, or `0` for commits by `commit` only. Defaults to `0`.
+    pub auto_commit_interval: i64 = 0
+    /// The most bytes of records one fetch returns for a partition. Defaults to `1048576`.
+    pub partition_bytes: i64 = 1048576
+}
+
+/// A record and where it came from.
+pub struct Message {
+    /// The topic of the record.
+    pub topic: str
+    /// The partition of the record.
+    pub partition: i64
+    /// The record, with its offset.
+    pub record: Record
+}
+
+struct Slot {
+    at: TopicPartition
+    position: i64
+    committed: i64
+}
+
+struct Group {
+    client: Client
+    o: ConsumerOptions
+    member: str
+    generation: i64
+    coordinator: *Conn?
+    slots: Slot[]
+    stale: bool
+    last_beat: i64
+    last_commit: i64
+    turn: i64
+    left: bool
+}
+
+/// A member of a consumer group, from `subscribe`.
+///
+/// A `Consumer` belongs to one green thread at a time. It holds a connection of its own to the group coordinator, and shares the `Client`'s connections to the partition leaders.
+pub struct Consumer {
+    group: *Group
+}
+
+fn check_consumer(o: ConsumerOptions) ! Error {
+    if o.group.len == 0 || o.topics.len == 0 || o.session_timeout < 1 || o.rebalance_timeout < 1 || o.heartbeat_interval < 1 || o.heartbeat_interval >= o.session_timeout || o.auto_commit_interval < 0 || o.partition_bytes < 1 {
+        fail Argument
+    }
+    for t in o.topics {
+        if t.len == 0 {
+            fail Argument
+        }
+    }
+}
+
+/// Joins the consumer group `o.group` for `o.topics` and returns once the group has assigned this consumer its partitions.
+///
+/// The group's partitions are divided by the range assignor of the Java client, so consumers of both share one group. The first consumer of a group waits for the broker's `group.initial.rebalance.delay.ms`. A consumer whose records are processed more slowly than `o.session_timeout` loses its partitions, and its next `poll` rejoins. Fails with `Argument` for an option out of range and `Broker` for the coordinator's refusal, such as `30` `GROUP_AUTHORIZATION_FAILED` or `23` `INCONSISTENT_GROUP_PROTOCOL`.
+pub fn subscribe(c: Client, o: ConsumerOptions) -> Consumer ! Error {
+    check_consumer(o)?
+    let g = new(Group { client: c, o, member: "", generation: -1, coordinator: none, slots: [], stale: true, last_beat: 0, last_commit: time.now_millis(), turn: 0, left: false })
+    join(g) catch {
+        e => {
+            drop_coordinator(g)
+            fail e
+        }
+    }
+    Consumer { group: g }
+}
+
+fn drop_coordinator(g: *Group) {
+    match g.coordinator {
+        some(c) => close_conn(c)
+        none => {}
+    }
+    g.coordinator = none
+}
+
+fn coordinator_connection(g: *Group) -> *Conn ! Error {
+    match g.coordinator {
+        some(c) => {
+            if !c.closed {
+                return c
+            }
+        }
+        none => {}
+    }
+    let s = g.client.state
+    let node = api_find_coordinator_request(any_connection(s)?, g.o.group)?
+    let c = open(s.o, node.host, node.port)?
+    g.coordinator = some(c)
+    c
+}
+
+fn on_coordinator[T](g: *Group, request: fn(*Conn) -> T ! Error) -> T ! Error {
+    request(coordinator_connection(g)?)
+}
+
+fn coordinated[T](g: *Group, request: fn(*Conn) -> T ! Error) -> T ! Error {
+    let s = g.client.state
+    let started = time.now_millis()
+    var tries = 0
+    for {
+        return on_coordinator(g, request) catch {
+            e => {
+                let waiting = starting_up(e) && time.now_millis() - started < s.o.timeout
+                if !waiting && (tries >= s.o.retries || !retriable(s, e)) {
+                    fail e
+                }
+                drop_coordinator(g)
+                pause(s.o, tries)
+                tries += 1
+                continue
+            }
+        }
+    }
+}
+
+fn checked(results: PartitionOffset[]) -> PartitionOffset[] ! Error {
+    for r in results {
+        check(r.error)?
+    }
+    results
+}
+
+fn starting_up(e: Error) -> bool {
+    match e {
+        Broker(code, name) => code == 14 || code == 15
+        _ => false
+    }
+}
+
+fn rebalancing(e: Error) -> bool {
+    match e {
+        Broker(code, name) => code == 22 || code == 25 || code == 27
+        _ => false
+    }
+}
+
+fn unknown_member(e: Error) -> bool {
+    match e {
+        Broker(code, name) => code == 25
+        _ => false
+    }
+}
+
+fn join(g: *Group) ! Error {
+    for attempt in 0..20 {
+        if try_join(g)? {
+            return
+        }
+        pause(g.client.state.o, attempt)
+    }
+    fail broker_error(27)
+}
+
+fn try_join(g: *Group) -> bool ! Error {
+    let o = g.o
+    let subscription = encode_subscription(o.topics)
+    let joined = coordinated(g, fn(c: *Conn) -> Joined ! Error { api_join_group_request(c, o.group, o.session_timeout, o.rebalance_timeout, g.member, ["range": subscription]) }) catch {
+        e => {
+            if unknown_member(e) {
+                g.member = ""
+            }
+            if rebalancing(e) {
+                return false
+            }
+            fail e
+        }
+    }
+    g.member = joined.member_id
+    if joined.generation < 0 {
+        return false
+    }
+    g.generation = joined.generation
+    var plan: Member[] = []
+    if joined.leader == g.member {
+        plan = plan_group(g, joined.members)?
+    }
+    let mine = coordinated(g, fn(c: *Conn) -> u8[] ! Error { api_sync_group_request(c, o.group, g.generation, g.member, plan, o.rebalance_timeout) }) catch {
+        e => {
+            if unknown_member(e) {
+                g.member = ""
+            }
+            if rebalancing(e) {
+                return false
+            }
+            fail e
+        }
+    }
+    g.slots = start_positions(g, decode_assignment(mine)?)?
+    g.stale = false
+    g.last_beat = time.now_millis()
+    true
+}
+
+fn plan_group(g: *Group, members: Member[]) -> Member[] ! Error {
+    var subs: Subscription[] = []
+    var names: str[] = []
+    for m in members {
+        let topics = decode_subscription(m.metadata)?
+        subs.push(Subscription { member: m.id, topics })
+        for t in topics {
+            if !slices.contains(names, t) {
+                names.push(t)
+            }
+        }
+    }
+    var counts: [str: i64] = [:]
+    for t in refresh(g.client.state, some(names), false)? {
+        if t.error == 0 {
+            counts[t.name] = t.partitions.len
+        }
+    }
+    let owned = assign_range(subs, counts)
+    var plan: Member[] = []
+    for s in subs {
+        var mine: TopicPartition[] = []
+        for o in owned {
+            if o.member == s.member {
+                mine.push(o.owned)
+            }
+        }
+        plan.push(Member { id: s.member, metadata: encode_assignment(mine) })
+    }
+    plan
+}
+
+fn start_positions(g: *Group, owned: TopicPartition[]) -> Slot[] ! Error {
+    var slots: Slot[] = []
+    if owned.len == 0 {
+        return slots
+    }
+    var wanted: [str: i64[]] = [:]
+    for tp in owned {
+        var parts = wanted[tp.topic] ?? []
+        parts.push(tp.partition)
+        wanted[tp.topic] = parts
+    }
+    let group = g.o.group
+    let found = coordinated(g, fn(c: *Conn) -> PartitionOffset[] ! Error { checked(api_offset_fetch_request(c, group, wanted)?) })?
+    for tp in owned {
+        var committed = -1
+        for f in found {
+            if f.topic == tp.topic && f.partition == tp.partition {
+                committed = f.offset
+            }
+        }
+        var position = committed
+        if committed < 0 {
+            position = reset_position(g, tp)?
+        }
+        slots.push(Slot { at: tp, position, committed })
+    }
+    slots
+}
+
+fn reset_position(g: *Group, tp: TopicPartition) -> i64 ! Error {
+    match g.o.reset {
+        Earliest => list_offsets(g.client, tp.topic, tp.partition, earliest)?
+        Latest => list_offsets(g.client, tp.topic, tp.partition, latest)?
+        Fail => fail broker_error(1)
+    }
+}
+
+fn slot_of(g: *Group, topic: str, partition: i64) -> i64 ! Error {
+    for i, slot in g.slots {
+        if slot.at.topic == topic && slot.at.partition == partition {
+            return i
+        }
+    }
+    fail Argument
+}
+
+/// Returns the partitions this consumer owns, which change when a rebalance moves them.
+pub fn assignment(c: Consumer) -> TopicPartition[] {
+    var out: TopicPartition[] = []
+    for slot in c.group.slots {
+        out.push(slot.at)
+    }
+    out
+}
+
+/// Returns the offset `poll` reads next from an owned partition. Fails with `Argument` for a partition this consumer does not own.
+pub fn position(c: Consumer, topic: str, partition: i64) -> i64 ! Error {
+    let i = slot_of(c.group, topic, partition)?
+    c.group.slots[i].position
+}
+
+/// Moves the position of an owned partition to `offset`, so the next `poll` reads from there. Fails with `Argument` for a partition this consumer does not own or a negative offset.
+pub fn seek(c: Consumer, topic: str, partition: i64, offset: i64) ! Error {
+    let i = slot_of(c.group, topic, partition)?
+    if offset < 0 {
+        fail Argument
+    }
+    c.group.slots[i].position = offset
+}
+
+/// Returns the records that arrived for the consumer's partitions, waiting up to `timeout` milliseconds for the first one, and an empty slice when none did.
+///
+/// Sends heartbeats, rejoins the group after a rebalance or an expired session, and commits when `auto_commit_interval` has passed, so call it at least once per `session_timeout`. Reads each partition without waiting and then waits on one, so a quiet partition does not delay a busy one. A position the broker no longer holds follows `o.reset`. Fails with `Closed` after `unsubscribe`.
+pub fn poll(c: Consumer, timeout: i64) -> Message[] ! Error {
+    let g = c.group
+    if g.left {
+        fail Closed
+    }
+    let deadline = time.now_millis() + timeout
+    for {
+        maintain(g)?
+        let ready = read_all(g)?
+        if ready.len > 0 {
+            return ready
+        }
+        let remaining = deadline - time.now_millis()
+        if remaining <= 0 {
+            return []
+        }
+        let wait = if remaining < g.o.heartbeat_interval { remaining } else { g.o.heartbeat_interval }
+        if g.slots.len == 0 {
+            sleep(wait)
+            continue
+        }
+        let turn = g.turn % g.slots.len
+        g.turn += 1
+        let waited = read_slot(g, turn, wait)?
+        if waited.len > 0 {
+            return waited
+        }
+    }
+}
+
+fn maintain(g: *Group) ! Error {
+    let o = g.o
+    let now = time.now_millis()
+    if o.auto_commit_interval > 0 && now - g.last_commit >= o.auto_commit_interval {
+        commit_slots(g) catch {
+            e => {
+                if !rebalancing(e) {
+                    fail e
+                }
+            }
+        }
+    }
+    if g.stale {
+        join(g)?
+        return
+    }
+    if now - g.last_beat >= o.heartbeat_interval {
+        beat(g)?
+    }
+}
+
+fn beat(g: *Group) ! Error {
+    let o = g.o
+    coordinated(g, fn(c: *Conn) -> bool ! Error {
+        api_heartbeat_request(c, o.group, g.generation, g.member)?
+        true
+    }) catch {
+        e => {
+            if unknown_member(e) {
+                g.member = ""
+            }
+            if rebalancing(e) {
+                g.stale = true
+                return
+            }
+            fail e
+        }
+    }
+    g.last_beat = time.now_millis()
+}
+
+fn read_all(g: *Group) -> Message[] ! Error {
+    var out: Message[] = []
+    for i in 0..g.slots.len {
+        for m in read_slot(g, i, 0)? {
+            out.push(m)
+        }
+    }
+    out
+}
+
+fn read_slot(g: *Group, i: i64, wait: i64) -> Message[] ! Error {
+    let at = g.slots[i].at
+    let o = FetchOptions { max_wait: wait, partition_bytes: g.o.partition_bytes }
+    let got = fetch(g.client, at.topic, at.partition, g.slots[i].position, o) catch {
+        e => {
+            match e {
+                Broker(code, name) => {
+                    if code == 1 {
+                        g.slots[i].position = reset_position(g, at)?
+                        return []
+                    }
+                }
+                _ => {}
+            }
+            fail e
+        }
+    }
+    g.slots[i].position = got.next_offset
+    var out: Message[] = []
+    for r in got.records {
+        out.push(Message { topic: at.topic, partition: at.partition, record: r })
+    }
+    out
+}
+
+/// Commits the position of every partition whose records `poll` has returned since the last commit, so a consumer that restarts or takes the partition over resumes there.
+///
+/// Fails with `Broker` code `22`, `25` or `27` when a rebalance has moved the partitions; the next `poll` rejoins the group and resumes from the committed offsets.
+pub fn commit(c: Consumer) ! Error {
+    let g = c.group
+    if g.left {
+        fail Closed
+    }
+    commit_slots(g)?
+}
+
+fn commit_slots(g: *Group) ! Error {
+    g.last_commit = time.now_millis()
+    var offsets: [str: [i64: i64]] = [:]
+    var sent: i64[] = []
+    for i, slot in g.slots {
+        if slot.position != slot.committed {
+            var parts = offsets[slot.at.topic] ?? [:]
+            parts[slot.at.partition] = slot.position
+            offsets[slot.at.topic] = parts
+            sent.push(i)
+        }
+    }
+    if sent.len == 0 {
+        return
+    }
+    let group = g.o.group
+    coordinated(g, fn(c: *Conn) -> PartitionOffset[] ! Error { checked(api_offset_commit_request(c, group, g.generation, g.member, offsets)?) }) catch {
+        e => {
+            if rebalancing(e) {
+                g.stale = true
+            }
+            fail e
+        }
+    }
+    for i in sent {
+        g.slots[i].committed = g.slots[i].position
+    }
+}
+
+/// Commits when `auto_commit_interval` is set, leaves the group so that the others take the partitions over at once, and closes the consumer's connection to the coordinator. Does not close the `Client`.
+///
+/// Leaving is a courtesy: an error from it is not reported, and the group removes the consumer after `session_timeout` otherwise. Calling it twice is harmless.
+pub fn unsubscribe(c: Consumer) {
+    let g = c.group
+    if g.left {
+        return
+    }
+    if g.o.auto_commit_interval > 0 {
+        commit_slots(g) catch { e => {} }
+    }
+    let group = g.o.group
+    coordinated(g, fn(conn: *Conn) -> bool ! Error {
+        api_leave_group_request(conn, group, g.member)?
+        true
+    }) or false
+    g.left = true
+    drop_coordinator(g)
+}

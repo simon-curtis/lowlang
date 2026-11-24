@@ -1,0 +1,248 @@
+import std/io
+import std/kafka
+import std/net
+
+struct Log {
+    data: u8[]
+    next: i64
+}
+
+struct Reader {
+    data: u8[]
+    at: i64
+}
+
+fn skip(r: *Reader, n: i64) {
+    r.at += n
+}
+
+fn be16(r: *Reader) -> i64 {
+    let v = io.be16(r.data, r.at)
+    r.at += 2
+    v
+}
+
+fn be32(r: *Reader) -> i64 {
+    let v = io.be32(r.data, r.at)
+    r.at += 4
+    v
+}
+
+fn uvarint(r: *Reader) -> i64 {
+    var v = 0
+    var shift = 0
+    for {
+        let b = i64(r.data[r.at])
+        r.at += 1
+        v = v | ((b & 0x7F) << shift)
+        if b < 0x80 {
+            return v
+        }
+        shift += 7
+    }
+}
+
+fn put_uvarint(mut b: u8[], v: i64) {
+    var rest = v
+    for rest >= 0x80 {
+        b.push(u8(rest & 0x7F | 0x80))
+        rest = rest >> 7
+    }
+    b.push(u8(rest))
+}
+
+fn text(mut b: u8[], s: str) {
+    put_uvarint(mut b, s.len + 1)
+    io.append(mut b, bytes(s))
+}
+
+fn count(mut b: u8[], n: i64) {
+    put_uvarint(mut b, n + 1)
+}
+
+fn empty_tags(mut b: u8[]) {
+    b.push(0)
+}
+
+fn versions() -> u8[] {
+    var b: u8[] = []
+    io.put_be16(mut b, 0)
+    count(mut b, 4)
+    for api in [0, 1, 3, 18] {
+        io.put_be16(mut b, api)
+        io.put_be16(mut b, 0)
+        io.put_be16(mut b, 15)
+        empty_tags(mut b)
+    }
+    io.put_be32(mut b, 0)
+    empty_tags(mut b)
+    b
+}
+
+fn metadata(port: i64) -> u8[] {
+    var b: u8[] = []
+    io.put_be32(mut b, 0)
+    count(mut b, 1)
+    io.put_be32(mut b, 1)
+    text(mut b, "127.0.0.1")
+    io.put_be32(mut b, port)
+    b.push(0)
+    empty_tags(mut b)
+    b.push(0)
+    io.put_be32(mut b, 1)
+    count(mut b, 1)
+    io.put_be16(mut b, 0)
+    text(mut b, "orders")
+    b.push(0)
+    count(mut b, 1)
+    io.put_be16(mut b, 0)
+    io.put_be32(mut b, 0)
+    io.put_be32(mut b, 1)
+    io.put_be32(mut b, 0)
+    count(mut b, 1)
+    io.put_be32(mut b, 1)
+    count(mut b, 1)
+    io.put_be32(mut b, 1)
+    count(mut b, 0)
+    empty_tags(mut b)
+    io.put_be32(mut b, 0)
+    empty_tags(mut b)
+    io.put_be32(mut b, 0)
+    empty_tags(mut b)
+    b
+}
+
+fn append(log: *Log, r: *Reader) -> i64 {
+    uvarint(r)
+    skip(r, 2 + 4)
+    uvarint(r)
+    skip(r, uvarint(r) - 1)
+    uvarint(r)
+    skip(r, 4)
+    let size = uvarint(r) - 1
+    var batch = r.data[r.at..r.at + size]
+    let first = log.next
+    var head: u8[] = []
+    io.put_be64(mut head, first)
+    for i in 0..8 {
+        batch[i] = head[i]
+    }
+    io.append(mut log.data, batch)
+    log.next += (kafka.decode_batches(batch) or []).len
+    first
+}
+
+fn produced(base: i64) -> u8[] {
+    var b: u8[] = []
+    count(mut b, 1)
+    text(mut b, "orders")
+    count(mut b, 1)
+    io.put_be32(mut b, 0)
+    io.put_be16(mut b, 0)
+    io.put_be64(mut b, base)
+    io.put_be64(mut b, -1)
+    io.put_be64(mut b, 0)
+    count(mut b, 0)
+    b.push(0)
+    empty_tags(mut b)
+    empty_tags(mut b)
+    io.put_be32(mut b, 0)
+    empty_tags(mut b)
+    b
+}
+
+fn fetched(log: *Log, from: i64) -> u8[] {
+    var b: u8[] = []
+    io.put_be32(mut b, 0)
+    io.put_be16(mut b, 0)
+    io.put_be32(mut b, 0)
+    count(mut b, 1)
+    text(mut b, "orders")
+    count(mut b, 1)
+    io.put_be32(mut b, 0)
+    io.put_be16(mut b, 0)
+    io.put_be64(mut b, log.next)
+    io.put_be64(mut b, log.next)
+    io.put_be64(mut b, 0)
+    count(mut b, 0)
+    io.put_be32(mut b, -1)
+    var data: u8[] = []
+    if from < log.next {
+        data = log.data
+    }
+    put_uvarint(mut b, data.len + 1)
+    io.append(mut b, data)
+    empty_tags(mut b)
+    empty_tags(mut b)
+    empty_tags(mut b)
+    b
+}
+
+fn answer(log: *Log, port: i64, api: i64, r: *Reader) -> u8[] {
+    match api {
+        18 => versions()
+        3 => metadata(port)
+        0 => produced(append(log, r))
+        _ => {
+            skip(r, 16 + 1 + 4 + 4)
+            uvarint(r)
+            skip(r, uvarint(r) - 1)
+            uvarint(r)
+            skip(r, 4 + 4)
+            let offset = io.be64(r.data, r.at)
+            fetched(log, offset)
+        }
+    }
+}
+
+fn serve(l: net.ListenerHandle) {
+    let h = net.accept_handle(l) or return
+    using c = net.adopt(h)
+    let stream = net.stream(c)
+    let reader = io.reader(stream)
+    let log = new(Log { data: [], next: 0 })
+    for {
+        let size = io.be32(io.read_exact(reader, 4) or return, 0)
+        let data = io.read_exact(reader, size) or return
+        let r = new(Reader { data, at: 0 })
+        let api = be16(r)
+        skip(r, 2)
+        let id = be32(r)
+        skip(r, be16(r))
+        uvarint(r)
+        var out: u8[] = []
+        io.put_be32(mut out, id)
+        if api != 18 {
+            out.push(0)
+        }
+        io.append(mut out, answer(log, l.addr.port, api, r))
+        var frame: u8[] = []
+        io.put_be32(mut frame, out.len)
+        io.append(mut frame, out)
+        io.write_all(stream, frame) or return
+    }
+}
+
+fn run(port: i64) ! kafka.Error {
+    let client = kafka.connect(kafka.Options { brokers: ["127.0.0.1:{port}"] })?
+    defer kafka.close(client)
+    let records = [
+        kafka.Record { key: some(bytes("ada")), value: some(bytes("two keyboards")), timestamp: 1700000000000 }
+        kafka.Record { key: some(bytes("alan")), value: some(bytes("one monitor")), headers: [kafka.Header { key: "source", value: bytes("web") }], timestamp: 1700000001000 }
+    ]
+    let first = kafka.produce(client, "orders", 0, records, kafka.ProduceOptions { compression: kafka.Compression.Gzip })?
+    print("appended at offset {first}")
+    let got = kafka.fetch(client, "orders", 0, first, kafka.FetchOptions { max_wait: 100 })?
+    for r in got.records {
+        print("{r.offset} {str(r.key ?? [])}: {str(r.value ?? [])} ({r.headers.len} headers)")
+    }
+    print("next offset {got.next_offset}, high watermark {got.high_watermark}")
+}
+
+fn main() {
+    using l = net.listen("127.0.0.1", 0) or return
+    spawn serve(l.handle)
+    run(l.handle.addr.port) catch {
+        e => print("failed")
+    }
+}
