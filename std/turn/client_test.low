@@ -288,3 +288,143 @@ fn test_channel_data_framing(t: *testing.T) {
     testing.error_if(t, (parse_channel_data([0x50, 0x00, 0, 0]) or ChannelData { number: -1, data: [] }).number != -1, "number above 0x4FFF")
     testing.error_if(t, is_channel_data([0x40, 0, 0]) || is_channel_data([0x00, 0x01, 0, 0]), "short or STUN")
 }
+
+fn stream_exchange(c: *Client, s: *Server, now: i64, chunk: i64) -> Payload[] {
+    let f = framer()
+    var delivered: Payload[] = []
+    for round in 0..8 {
+        var wire: u8[] = []
+        for {
+            let d = poll_transmit(c) ?? break
+            for b in d {
+                wire.push(b)
+            }
+        }
+        let server_side = framer()
+        for message in feed(server_side, wire) or panic("client framing") {
+            serve(s, message)
+        }
+        var replies: u8[] = []
+        for d in s.to_client {
+            for b in d {
+                replies.push(b)
+            }
+        }
+        s.to_client = []
+        var at = 0
+        for at < replies.len {
+            let end = if chunk == 0 || at + chunk > replies.len { replies.len } else { at + chunk }
+            for message in feed(f, replies[at..end]) or panic("server framing") {
+                match receive(c, message, now) {
+                    some(p) => delivered.push(p)
+                    none => {}
+                }
+            }
+            at = end
+        }
+    }
+    if partial(f) != 0 {
+        panic("{partial(f)} bytes left over")
+    }
+    delivered
+}
+
+fn stream_config() -> Config {
+    Config { server: addr("192.0.2.1:3478"), transport: Transport.Tcp, username: "alice", password: "secret" }
+}
+
+fn test_framer_splits_coalesced_messages_and_reassembles_split_ones(t: *testing.T) {
+    var request = stun.message(stun.Class.Request, stun.allocate)
+    stun.add(mut request, stun.attr_requested_transport, [17, 0, 0, 0])
+    let first = stun.encode(request)
+    let channel = encode_channel_data(0x4001, [1, 2, 3, 4, 5])
+    let second = stun.encode(stun.message(stun.Class.Indication, stun.send))
+    var wire: u8[] = []
+    for part in [first, channel, second] {
+        for b in part {
+            wire.push(b)
+        }
+    }
+    for cut in 0..wire.len + 1 {
+        let f = framer()
+        var got = feed(f, wire[..cut]) or panic("feed")
+        for m in feed(f, wire[cut..]) or panic("feed") {
+            got.push(m)
+        }
+        testing.error_if(t, got.len != 3, "cut at {cut}: {got.len} messages")
+        if got.len == 3 {
+            testing.error_if(t, !slices.equal(got[0], first) || !slices.equal(got[2], second), "cut at {cut}: STUN messages")
+            testing.error_if(t, !slices.equal(got[1], [0x40, 0x01, 0, 5, 1, 2, 3, 4, 5]), "cut at {cut}: channel data {got[1]}")
+        }
+        testing.error_if(t, partial(f) != 0, "cut at {cut}: {partial(f)} bytes left")
+    }
+    let byte_at_a_time = framer()
+    var count = 0
+    for b in wire {
+        count += (feed(byte_at_a_time, [b]) or panic("feed")).len
+    }
+    testing.error_if(t, count != 3, "{count} messages a byte at a time")
+}
+
+fn test_framer_holds_a_partial_message_and_refuses_a_foreign_byte(t: *testing.T) {
+    let f = framer()
+    let message = stun.encode(stun.message(stun.Class.Request, stun.allocate))
+    testing.error_if(t, (feed(f, message[..13]) or panic("feed")).len != 0 || partial(f) != 13, "partial message")
+    let wrong = framer()
+    testing.error_if(t, (feed(wrong, [0x80, 0x60, 0, 1]) or [[1]]).len != 1, "an RTP packet is not a TURN message")
+    let unaligned = framer()
+    testing.error_if(t, (feed(unaligned, [0, 1, 0, 3]) or [[1]]).len != 1, "a STUN length that is not a multiple of four")
+}
+
+fn test_an_allocation_over_a_stream_survives_any_split_of_the_server_bytes(t: *testing.T) {
+    for chunk in [0, 1, 3, 7, 64] {
+        let s = server()
+        let c = client(stream_config())
+        start(c, 0)
+        stream_exchange(c, s, 0, chunk)
+        testing.error_if(t, c.state != State.Allocated, "chunk {chunk}: state {c.state}")
+        let peer = addr("198.51.100.20:5000")
+        send_to(c, peer, [1, 2, 3], 10)
+        stream_exchange(c, s, 10, chunk)
+        send_to(c, peer, [4, 5, 6, 7, 8], 10)
+        stream_exchange(c, s, 10, chunk)
+        testing.error_if(t, s.to_peers.len != 2 || !slices.equal(s.to_peers[1].data, [4, 5, 6, 7, 8]), "chunk {chunk}: channel data to the peer")
+        from_peer(s, peer, [9])
+        from_peer(s, peer, [10, 11])
+        let back = stream_exchange(c, s, 10, chunk)
+        testing.error_if(t, back.len != 2 || !slices.equal(back[0].data, [9]) || !slices.equal(back[1].data, [10, 11]), "chunk {chunk}: padded channel data from the peer")
+    }
+}
+
+fn test_a_request_over_a_stream_is_sent_once_and_times_out_after_ti(t: *testing.T) {
+    let c = client(stream_config())
+    start(c, 0)
+    var sends = 0
+    for poll_transmit(c) != none {
+        sends += 1
+    }
+    testing.error_if(t, next_timeout(c) != 39500, "timeout at {next_timeout(c)}")
+    tick(c, 39499)
+    testing.error_if(t, poll_transmit(c) != none || c.state != State.Allocating, "retransmitted over a stream")
+    tick(c, 39500)
+    testing.error_if(t, sends != 1 || c.state != State.Failed, "{sends} sends, state {c.state}")
+}
+
+fn test_a_lost_connection_fails_the_allocation(t: *testing.T) {
+    let s = server()
+    let c = client(stream_config())
+    start(c, 0)
+    stream_exchange(c, s, 0, 0)
+    poll_event(c)
+    connection_lost(c)
+    testing.error_if(t, c.state != State.Failed || next_timeout(c) != -1, "state {c.state}")
+    match poll_event(c) {
+        some(e) => match e {
+            Failed(code, _) => testing.error_if(t, code != 0, "code {code}")
+            _ => testing.error(t, "allocated")
+        }
+        none => testing.error(t, "no event")
+    }
+    send_to(c, addr("198.51.100.20:5000"), [1], 1)
+    testing.error_if(t, poll_transmit(c) != none, "sent after the connection closed")
+}
