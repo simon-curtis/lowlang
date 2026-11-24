@@ -1,0 +1,211 @@
+import std/bits
+import std/crypto/fhe/ring
+
+/// The parameters of a TFHE instance: a learning-with-errors sample of `lwe_size` torus elements for each bit, a ring of `degree` coefficients for the accumulator, and the gadget and key-switching bases.
+///
+/// Torus elements are 32-bit integers, `x / 2^32` of a turn. The standard deviations are fractions of the torus.
+pub struct Parameters {
+    /// The number of elements in the mask of a bit's ciphertext, the dimension `n` of the binary secret key.
+    pub lwe_size: i64
+    /// The number of coefficients of the accumulator polynomials, a power of two from 2 to 2^15.
+    pub degree: i64
+    /// The number of digits `l` of the gadget decomposition in the bootstrapping key.
+    pub gadget_levels: i64
+    /// The size of each gadget digit in bits: the base is `2^gadget_bits`.
+    pub gadget_bits: i64
+    /// The number of digits `t` of the key-switching decomposition.
+    pub key_switch_levels: i64
+    /// The size of each key-switching digit in bits.
+    pub key_switch_bits: i64
+    /// The standard deviation of a fresh ciphertext and of the key-switching key.
+    pub key_switch_sigma: f64
+    /// The standard deviation of the bootstrapping key.
+    pub bootstrapping_sigma: f64
+}
+
+/// The error type of the `tfhe` functions.
+pub enum Error {
+    /// The degree is not a power of two from 2 to 2^15.
+    Degree
+    /// The mask of a ciphertext has no elements.
+    LweSize
+    /// The gadget has no digits, has digits wider than 16 bits, or reaches below the 32 bits of the torus.
+    Gadget
+    /// The gadget digits and the degree are large enough that the exact product of a digit polynomial and the bootstrapping key could wrap around the prime.
+    ProductOverflow
+    /// The key-switching digits are missing, or reach below the 32 bits of the torus.
+    KeySwitch
+    /// A standard deviation is negative or not finite.
+    Sigma
+}
+
+/// A ciphertext of one bit or of one torus element: the mask `a` and the body `b = <a, s> + m + e`, so its phase `b - <a, s>` is the message plus a small error.
+pub struct Ciphertext {
+    /// The mask, one torus element per element of the secret.
+    pub a: u32[]
+    /// The body.
+    pub b: u32
+}
+
+/// The secret of one instance: the binary key of the bit ciphertexts and the binary key of the accumulator ring.
+pub struct SecretKey {
+    lwe: u32[]
+    ring_key: u32[]
+}
+
+/// The key that evaluates gates without the secret: one encryption of each bit of the lwe key as a ring ciphertext, in the number theoretic transform domain, and the key that switches the accumulator's key back to the bit key.
+pub struct CloudKey {
+    bootstrapping: u64[][]
+    key_switch: u32[]
+}
+
+/// The secret and cloud keys of one instance.
+pub struct KeySet {
+    /// The secret key.
+    pub secret: *SecretKey
+    /// The cloud key.
+    pub cloud: *CloudKey
+}
+
+/// A TFHE instance built from `Parameters`: the prime the exact torus products run modulo and its transform.
+pub struct Context {
+    /// The parameters it was built from.
+    pub parameters: Parameters
+    transform: *ring.Ntt
+    degree_bits: i64
+    gadget_offset: u32
+}
+
+/// A bit holds `true` as `eighth` and `false` as `-eighth`.
+const eighth: u32 = 536870912
+const quarter: u32 = 1073741824
+const torus_scale = 4294967296.0
+
+/// Returns the parameter set the reference TFHE library calls `default_128bit_gate_bootstrapping_parameters`, from Chillotti, Gama, Georgieva and Izabachene (CGGI 2019): `n = 630`, `N = 1024`, a gadget of 3 digits of 7 bits, a key switch of 8 digits of 2 bits, and standard deviations `2^-15` and `2^-25`.
+///
+/// The library estimates 129 bits of security for it. Parameters other than these are not checked against a security estimate.
+pub fn default_parameters() -> Parameters {
+    Parameters {
+        lwe_size: 630,
+        degree: 1024,
+        gadget_levels: 3,
+        gadget_bits: 7,
+        key_switch_levels: 8,
+        key_switch_bits: 2,
+        key_switch_sigma: 1.0 / 32768.0,
+        bootstrapping_sigma: 1.0 / 33554432.0,
+    }
+}
+
+fn validate(p: Parameters) ! Error {
+    if p.degree < 2 || p.degree > 32768 || p.degree & (p.degree - 1) != 0 {
+        fail Error.Degree
+    }
+    if p.lwe_size < 1 {
+        fail Error.LweSize
+    }
+    if p.gadget_levels < 1 || p.gadget_bits < 1 || p.gadget_bits > 16 || p.gadget_levels * p.gadget_bits > 32 {
+        fail Error.Gadget
+    }
+    let rows = 2 * p.gadget_levels
+    if rows * p.degree * (1 << p.gadget_bits) >= 1 << 28 {
+        fail Error.ProductOverflow
+    }
+    if p.key_switch_levels < 1 || p.key_switch_bits < 1 || p.key_switch_levels * p.key_switch_bits > 31 {
+        fail Error.KeySwitch
+    }
+    let sigmas = [p.key_switch_sigma, p.bootstrapping_sigma]
+    for s in sigmas {
+        if !(s >= 0.0 && s < 1.0) {
+            fail Error.Sigma
+        }
+    }
+}
+
+/// Returns the instance for `p`, or the error that says why the parameters are not allowed.
+pub fn context(p: Parameters) -> *Context ! Error {
+    validate(p)?
+    let prime = ring.ntt_primes(60, 1, p.degree, [])[0]
+    let transform = new(ring.ntt(ring.modulus(prime), p.degree))
+    var offset: u32 = 0
+    for i in 0..p.gadget_levels {
+        offset += u32(1) << u32(32 - (i + 1) * p.gadget_bits)
+    }
+    offset *= u32(1) << u32(p.gadget_bits - 1)
+    offset += u32(1) << u32(31 - p.gadget_levels * p.gadget_bits)
+    new(Context { parameters: p, transform, degree_bits: bits.bit_length(u64(p.degree)) - 1, gadget_offset: offset })
+}
+
+fn fill_uniform(s: *ring.Stream, out: u32[], from: i64, to: i64) {
+    var i = from
+    for i < to {
+        let word = ring.next_word(s)
+        out[i] = u32(word)
+        if i + 1 < to {
+            out[i + 1] = u32(word >> 32)
+        }
+        i += 2
+    }
+}
+
+fn noise(s: *ring.Stream, count: i64, sigma: f64) -> u32[] {
+    let out: u32[] = __make(count)
+    if sigma == 0.0 {
+        return out
+    }
+    let draws = ring.gaussian(s, count, sigma * torus_scale)
+    for i in 0..count {
+        out[i] = u32(draws[i])
+    }
+    out
+}
+
+fn binary_key(s: *ring.Stream, count: i64) -> u32[] {
+    let out: u32[] = __make(count)
+    for i in 0..count {
+        out[i] = u32(ring.next_word(s) >> 63)
+    }
+    out
+}
+
+/// Returns a fresh secret: two binary keys drawn from `s`.
+pub fn secret_key(ctx: *Context, s: *ring.Stream) -> *SecretKey {
+    let p = ctx.parameters
+    new(SecretKey { lwe: binary_key(s, p.lwe_size), ring_key: binary_key(s, p.degree) })
+}
+
+fn mask_sum(key: u32[], a: u32[]) -> u32 {
+    var sum: u32 = 0
+    for i in 0..key.len {
+        sum += a[i] * key[i]
+    }
+    sum
+}
+
+fn sample(key: u32[], message: u32, error: u32, s: *ring.Stream) -> Ciphertext {
+    let a: u32[] = __make(key.len)
+    fill_uniform(s, a, 0, key.len)
+    Ciphertext { a, b: message + error + mask_sum(key, a) }
+}
+
+/// Returns the phase `b - <a, s>` of `c` under `secret`: the message plus the error of `c`.
+pub fn phase(secret: *SecretKey, c: Ciphertext) -> u32 {
+    c.b - mask_sum(secret.lwe, c.a)
+}
+
+/// Returns a fresh encryption of `bit` under `secret`: the phase is `1/8` of a turn for `true` and `-1/8` for `false`, plus Gaussian noise of the key-switching deviation.
+pub fn encrypt(ctx: *Context, secret: *SecretKey, bit: bool, s: *ring.Stream) -> Ciphertext {
+    let e = noise(s, 1, ctx.parameters.key_switch_sigma)[0]
+    sample(secret.lwe, if bit { eighth } else { 0 - eighth }, e, s)
+}
+
+/// Returns the bit that `c` encrypts under `secret`: `true` when its phase, read as a signed integer, is above zero.
+pub fn decrypt(secret: *SecretKey, c: Ciphertext) -> bool {
+    i32(phase(secret, c)) > 0
+}
+
+/// Returns an encryption of `bit` with no mask and no noise, which anyone can make and anyone can read; `apply` and `not` treat it as any other bit.
+pub fn constant(ctx: *Context, bit: bool) -> Ciphertext {
+    let a: u32[] = __make(ctx.parameters.lwe_size)
+    Ciphertext { a, b: if bit { eighth } else { 0 - eighth } }
+}

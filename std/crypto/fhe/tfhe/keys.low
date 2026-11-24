@@ -1,0 +1,132 @@
+import std/crypto/fhe/ring
+
+fn zero_row(ctx: *Context, key_hat: u64[], s: *ring.Stream) -> Accumulator {
+    let p = ctx.parameters
+    let a: u32[] = __make(p.degree)
+    fill_uniform(s, a, 0, p.degree)
+    let b = multiply(ctx, a, key_hat)
+    let e = noise(s, p.degree, p.bootstrapping_sigma)
+    for j in 0..p.degree {
+        b[j] += e[j]
+    }
+    Accumulator { a, b }
+}
+
+fn encrypt_ring_bit(ctx: *Context, key_hat: u64[], bit: u32, s: *ring.Stream) -> u64[] {
+    let p = ctx.parameters
+    let n = p.degree
+    let out: u64[] = __make(4 * p.gadget_levels * n)
+    for part in 0..2 {
+        for level in 0..p.gadget_levels {
+            let row = zero_row(ctx, key_hat, s)
+            let target = if part == 0 { row.a } else { row.b }
+            target[0] += bit << u32(32 - (level + 1) * p.gadget_bits)
+            let r = part * p.gadget_levels + level
+            let a_hat = transformed(ctx, row.a)
+            let b_hat = transformed(ctx, row.b)
+            for j in 0..n {
+                out[2 * r * n + j] = a_hat[j]
+                out[(2 * r + 1) * n + j] = b_hat[j]
+            }
+        }
+    }
+    out
+}
+
+fn bootstrapping_key(ctx: *Context, secret: *SecretKey, s: *ring.Stream) -> u64[][] {
+    let key_hat = transformed(ctx, secret.ring_key)
+    var rows: u64[][] = []
+    for bit in secret.lwe {
+        rows.push(encrypt_ring_bit(ctx, key_hat, bit, s))
+    }
+    rows
+}
+
+fn key_switch_key(ctx: *Context, secret: *SecretKey, s: *ring.Stream) -> u32[] {
+    let p = ctx.parameters
+    let width = p.lwe_size + 1
+    let base = 1 << p.key_switch_bits
+    let count = p.degree * p.key_switch_levels * (base - 1)
+    let errors = noise(s, count, p.key_switch_sigma)
+    let out: u32[] = __make(count * width)
+    var index = 0
+    for i in 0..p.degree {
+        for j in 0..p.key_switch_levels {
+            for digit in 1..base {
+                let at = index * width
+                fill_uniform(s, out, at, at + p.lwe_size)
+                let a: u32[] = out[at..at + p.lwe_size]
+                let message = (secret.ring_key[i] * u32(digit)) << u32(32 - (j + 1) * p.key_switch_bits)
+                out[at + p.lwe_size] = message + errors[index] + mask_sum(secret.lwe, a)
+                index += 1
+            }
+        }
+    }
+    out
+}
+
+/// Returns the cloud key for `secret`: the bootstrapping key, one encryption of each bit of the lwe key under the ring key, and the key-switching key from the ring key to the lwe key.
+pub fn cloud_key(ctx: *Context, secret: *SecretKey, s: *ring.Stream) -> *CloudKey {
+    let bootstrapping = bootstrapping_key(ctx, secret, s)
+    new(CloudKey { bootstrapping, key_switch: key_switch_key(ctx, secret, s) })
+}
+
+/// Returns fresh keys drawn from `s`: the secret key and the cloud key that evaluates gates under it.
+pub fn generate(ctx: *Context, s: *ring.Stream) -> KeySet {
+    let secret = secret_key(ctx, s)
+    KeySet { secret, cloud: cloud_key(ctx, secret, s) }
+}
+
+fn key_switch(ctx: *Context, cloud: *CloudKey, c: Ciphertext) -> Ciphertext {
+    let p = ctx.parameters
+    let width = p.lwe_size + 1
+    let base = 1 << p.key_switch_bits
+    let mask = u32(base - 1)
+    let precision = p.key_switch_levels * p.key_switch_bits
+    let rounding = u32(1) << u32(31 - precision)
+    let a: u32[] = __make(p.lwe_size)
+    var b = c.b
+    for i in 0..p.degree {
+        let x = c.a[i] + rounding
+        for j in 0..p.key_switch_levels {
+            let digit = x >> u32(32 - (j + 1) * p.key_switch_bits) & mask
+            if digit != 0 {
+                let at = ((i * p.key_switch_levels + j) * (base - 1) + i64(digit) - 1) * width
+                for k in 0..p.lwe_size {
+                    a[k] -= cloud.key_switch[at + k]
+                }
+                b -= cloud.key_switch[at + p.lwe_size]
+            }
+        }
+    }
+    Ciphertext { a, b }
+}
+
+fn mod_switch(ctx: *Context, x: u32) -> i64 {
+    let shift = u64(31 - ctx.degree_bits)
+    i64((u64(x) + (u64(1) << (shift - 1))) >> shift & u64(2 * ctx.parameters.degree - 1))
+}
+
+fn blind_rotated(ctx: *Context, cloud: *CloudKey, c: Ciphertext, mu: u32) -> *Accumulator {
+    let p = ctx.parameters
+    let rotations: i64[] = __make(p.lwe_size)
+    for i in 0..p.lwe_size {
+        rotations[i] = mod_switch(ctx, c.a[i])
+    }
+    let b_rotation = mod_switch(ctx, c.b)
+    let table: u32[] = __make(p.degree)
+    for j in 0..p.degree {
+        table[j] = mu
+    }
+    let acc = new(Accumulator { a: __make(p.degree), b: shifted(table, (2 * p.degree - b_rotation) % (2 * p.degree)) })
+    blind_rotate(ctx, cloud, rotations, acc)
+    acc
+}
+
+fn bootstrap_extracted(ctx: *Context, cloud: *CloudKey, c: Ciphertext, mu: u32) -> Ciphertext {
+    extract(blind_rotated(ctx, cloud, c, mu))
+}
+
+fn bootstrap(ctx: *Context, cloud: *CloudKey, c: Ciphertext, mu: u32) -> Ciphertext {
+    key_switch(ctx, cloud, bootstrap_extracted(ctx, cloud, c, mu))
+}
