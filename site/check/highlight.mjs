@@ -24,7 +24,12 @@ function read(path) {
 function pages(folder) {
     const directory = join(site, folder);
     try {
-        return readdirSync(directory).filter((name) => name.endsWith(".html")).map((name) => join(directory, name));
+        return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+            if (entry.isDirectory()) {
+                return pages(join(folder, entry.name));
+            }
+            return entry.name.endsWith(".html") ? [join(directory, entry.name)] : [];
+        });
     } catch (error) {
         console.error(`highlight check: cannot list ${folder}: ${error.message}`);
         process.exit(1);

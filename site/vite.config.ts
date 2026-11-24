@@ -5,11 +5,14 @@ import { defineConfig } from "vite-plus";
 
 const root = import.meta.dirname;
 
-function pagesIn(folder: string): string[] {
+function pagesIn(folder: string, deep = false): string[] {
   const directory = resolve(root, folder);
-  return readdirSync(directory)
-    .filter((name) => name.endsWith(".html"))
-    .map((name) => resolve(directory, name));
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    if (entry.isDirectory()) {
+      return deep ? pagesIn(`${folder}/${entry.name}`, true) : [];
+    }
+    return entry.name.endsWith(".html") ? [resolve(directory, entry.name)] : [];
+  });
 }
 
 export default defineConfig({
@@ -31,7 +34,7 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     rollupOptions: {
-      input: [".", "docs", "packages", "playground"].flatMap(pagesIn),
+      input: [...pagesIn("."), ...pagesIn("docs"), ...pagesIn("packages", true), ...pagesIn("playground")],
     },
   },
   run: {
