@@ -4,6 +4,7 @@ import std/io
 import std/net
 import std/rand
 import std/stun
+import std/turn
 
 /// The connection state of an agent (RFC 8445 and the W3C ICE connection states).
 pub enum State {
@@ -89,6 +90,18 @@ pub struct Config {
     pub failure_timeout: i64 = 30000
     /// The tie-breaker for role conflicts, random when 0.
     pub tie_breaker: u64 = 0
+    /// The TURN servers to allocate a relayed candidate on, one allocation per host address of the same family.
+    pub turn_servers: turn.Config[] = []
+    /// Whether the agent uses relayed candidates alone, the W3C `relay` transport policy: no host or server-reflexive candidate is gathered or announced.
+    pub relay_only: bool = false
+}
+
+/// A datagram that is not STUN, received through a TURN relay from `from`.
+pub struct Delivery {
+    /// The bytes the peer sent.
+    pub data: u8[]
+    /// The peer's address.
+    pub from: net.Addr
 }
 
 enum PairState {
@@ -120,6 +133,14 @@ struct Pair {
 struct Local {
     cand: Candidate
     base: net.Addr
+}
+
+struct Relay {
+    base: net.Addr
+    server: net.Addr
+    client: *turn.Client
+    relayed: net.Addr?
+    settled: bool
 }
 
 struct Gather {
@@ -156,6 +177,8 @@ pub struct Agent {
     pairs: Pair[]
     triggered: i64[]
     gathers: Gather[]
+    relays: Relay[]
+    deliveries: Delivery[]
     gathered: bool
     gathering: bool
     remote_ended: bool
@@ -212,6 +235,8 @@ pub fn agent(config: Config) -> *Agent {
         pairs: []
         triggered: []
         gathers: []
+        relays: []
+        deliveries: []
         gathered: false
         gathering: false
         remote_ended: false
@@ -281,8 +306,87 @@ fn emit(a: *Agent, e: Event) {
 }
 
 fn send(a: *Agent, local: net.Addr, to: net.Addr, data: u8[], now: i64) {
-    a.outbox.push(Transmit { local, to, data })
     a.last_sent = now
+    for i, r in a.relays {
+        match r.relayed {
+            some(relayed) => {
+                if same_addr(relayed, local) {
+                    turn.send_to(r.client, to, data, now)
+                    drain_relay(a, i)
+                    return
+                }
+            }
+            none => {}
+        }
+    }
+    a.outbox.push(Transmit { local, to, data })
+}
+
+/// Queues `data` for `to` from the local candidate whose base is `local`: straight from the socket bound to `local`, or through the TURN allocation when `local` is a relayed address. `poll_transmit` returns what to send.
+pub fn send_from(a: *Agent, local: net.Addr, to: net.Addr, data: u8[], now: i64) {
+    send(a, local, to, data, now)
+}
+
+fn drain_relay(a: *Agent, i: i64) {
+    let r = a.relays[i]
+    for {
+        let d = turn.poll_transmit(r.client) ?? break
+        a.outbox.push(Transmit { local: r.base, to: r.server, data: d })
+    }
+    for {
+        let e = turn.poll_event(r.client) ?? break
+        match e {
+            Allocated(relayed, mapped) => {
+                a.relays[i].relayed = relayed
+                a.relays[i].settled = true
+                let c = Candidate {
+                    foundation: foundation(Kind.Relayed, relayed.ip, r.server.ip, "udp")
+                    priority: priority(Kind.Relayed, local_preference(relayed.ip, i), 1)
+                    addr: relayed
+                    kind: Kind.Relayed
+                    related: mapped
+                }
+                add_local(a, c, relayed, true)
+                finish_gathering(a)
+            }
+            Failed(_, _) => {
+                a.relays[i].settled = true
+                finish_gathering(a)
+            }
+        }
+    }
+}
+
+fn release_relays(a: *Agent, now: i64) {
+    for i, r in a.relays {
+        turn.close(r.client, now)
+        drain_relay(a, i)
+    }
+    a.relays = []
+}
+
+fn relay_from(a: *Agent, local: net.Addr, from: net.Addr) -> i64 {
+    for i, r in a.relays {
+        if same_addr(r.base, local) && same_addr(r.server, from) {
+            return i
+        }
+    }
+    -1
+}
+
+/// Returns whether a datagram that arrived on the socket bound to `local` from `from` comes from one of the agent's TURN servers, and so belongs to `receive` whatever its first byte.
+pub fn is_relay_server(a: *Agent, local: net.Addr, from: net.Addr) -> bool {
+    relay_from(a, local, from) >= 0
+}
+
+/// Returns the next datagram that arrived through a relay and is not STUN, or `none`.
+pub fn poll_delivery(a: *Agent) -> Delivery? {
+    if a.deliveries.len == 0 {
+        return none
+    }
+    let d = a.deliveries[0]
+    a.deliveries = a.deliveries[1..]
+    d
 }
 
 fn set_state(a: *Agent, s: State) {
@@ -417,12 +521,24 @@ fn start_gather(a: *Agent, base: net.Addr, server: net.Addr, now: i64) {
     send(a, base, server, wire, now)
 }
 
+fn start_relay(a: *Agent, base: net.Addr, config: turn.Config, now: i64) {
+    let client = turn.client(config)
+    turn.start(client, now)
+    a.relays.push(Relay { base, server: config.server, client, relayed: none, settled: false })
+    drain_relay(a, a.relays.len - 1)
+}
+
 fn finish_gathering(a: *Agent) {
     if a.gathered || !a.gathering {
         return
     }
     for g in a.gathers {
         if !g.done {
+            return
+        }
+    }
+    for r in a.relays {
+        if !r.settled {
             return
         }
     }
@@ -434,6 +550,7 @@ fn finish_gathering(a: *Agent) {
 ///
 /// Each candidate arrives as an `Event.LocalCandidate`, and `Event.GatheringComplete` follows the last STUN answer or timeout. A second call, after `restart`, reports the candidates again.
 pub fn gather(a: *Agent, now: i64) {
+    release_relays(a, now)
     a.gathered = false
     a.gathering = true
     a.gathers = []
@@ -446,12 +563,19 @@ pub fn gather(a: *Agent, now: i64) {
             addr: h
             kind: Kind.Host
         }
-        add_local(a, c, h, true)
+        if !a.config.relay_only {
+            add_local(a, c, h, true)
+        }
         rank += 1
         if !a.config.lite {
             for s in a.config.stun_servers {
-                if family_matches(h, s) {
+                if family_matches(h, s) && !a.config.relay_only {
                     start_gather(a, h, s, now)
+                }
+            }
+            for server in a.config.turn_servers {
+                if family_matches(h, server.server) {
+                    start_relay(a, h, server, now)
                 }
             }
         }
@@ -779,6 +903,10 @@ pub fn tick(a: *Agent, now: i64) {
         return
     }
     run_gathers(a, now)
+    for i, r in a.relays {
+        turn.tick(r.client, now)
+        drain_relay(a, i)
+    }
     run_checks(a, now)
     run_consent(a, now)
     evaluate(a, now)
@@ -798,6 +926,9 @@ pub fn next_timeout(a: *Agent) -> i64 {
         if !g.done {
             t = earliest(t, g.deadline)
         }
+    }
+    for r in a.relays {
+        t = earliest(t, turn.next_timeout(r.client))
     }
     for p in a.pairs {
         if p.pending {
@@ -872,6 +1003,7 @@ pub fn note_sent(a: *Agent, now: i64) {
 pub fn close(a: *Agent) {
     set_state(a, State.Closed)
     a.outbox = []
+    release_relays(a, a.last_sent)
 }
 
 fn best_valid(a: *Agent, nominated: bool) -> i64 {
@@ -1213,11 +1345,32 @@ fn check_answer(a: *Agent, pi: i64, m: stun.Message, now: i64) {
     evaluate(a, now)
 }
 
+fn receive_relayed(a: *Agent, i: i64, data: u8[], now: i64) {
+    let relay = a.relays[i]
+    let payload = turn.receive(relay.client, data, now)
+    drain_relay(a, i)
+    let p = payload ?? return
+    let relayed = relay.relayed ?? return
+    if stun.looks_like(p.data) {
+        receive(a, relayed, p.peer, p.data, now)
+        return
+    }
+    a.deliveries.push(Delivery { data: p.data, from: p.peer })
+}
+
 /// Feeds the agent one datagram that arrived on the socket bound to `local` from `from`.
 ///
-/// Only STUN messages belong here; the caller separates the DTLS, RTP and RTCP datagrams of the same socket (RFC 7983). A datagram that is not an authentic STUN message the agent expects is dropped.
+/// STUN messages belong here, and every datagram from a TURN server of the agent (`is_relay_server`); the caller separates the other DTLS, RTP and RTCP datagrams of the same socket (RFC 7983). A relayed STUN message is handled as if it arrived on the relayed address, and other relayed data waits for `poll_delivery`. A datagram that is not an authentic STUN message the agent expects is dropped.
 pub fn receive(a: *Agent, local: net.Addr, from: net.Addr, data: u8[], now: i64) {
-    if a.state == State.Closed || !stun.looks_like(data) {
+    if a.state == State.Closed {
+        return
+    }
+    let r = relay_from(a, local, from)
+    if r >= 0 {
+        receive_relayed(a, r, data, now)
+        return
+    }
+    if !stun.looks_like(data) {
         return
     }
     let m = stun.parse(data) or return

@@ -1,0 +1,290 @@
+import std/crypto/hash
+import std/net
+import std/slices
+import std/stun
+import std/testing
+
+struct Server {
+    username: str
+    password: str
+    realm: str
+    nonce: str
+    relayed: net.Addr
+    mapped: net.Addr
+    allocated: bool
+    stale_nonces: i64
+    lifetimes: i64[]
+    permissions: u8[][]
+    channels: [i64: net.Addr]
+    methods: i64[]
+    to_client: u8[][]
+    to_peers: Payload[]
+}
+
+fn addr(text: str) -> net.Addr {
+    net.parse_addr(text) or panic("addr {text}")
+}
+
+fn server() -> *Server {
+    new(Server {
+        username: "alice"
+        password: "secret"
+        realm: "example.org"
+        nonce: "n1"
+        relayed: addr("198.51.100.7:49152")
+        mapped: addr("203.0.113.5:40000")
+        allocated: false
+        stale_nonces: 0
+        lifetimes: []
+        permissions: []
+        channels: [:]
+        methods: []
+        to_client: []
+        to_peers: []
+    })
+}
+
+fn permitted(s: *Server, ip: u8[]) -> bool {
+    for p in s.permissions {
+        if hash.equal(p, ip) {
+            return true
+        }
+    }
+    false
+}
+
+fn answer(s: *Server, request: stun.Message, class: stun.Class) -> stun.Message {
+    stun.Message { class, method: request.method, transaction: request.transaction }
+}
+
+fn refuse(s: *Server, request: stun.Message, code: i64) {
+    var m = answer(s, request, stun.Class.Error)
+    stun.add_error_code(mut m, code, "refused")
+    stun.add_text(mut m, stun.attr_realm, s.realm)
+    stun.add_text(mut m, stun.attr_nonce, s.nonce)
+    s.to_client.push(stun.encode(m))
+}
+
+fn authenticated(s: *Server, m: stun.Message) -> bool {
+    let user = stun.get_text(m, stun.attr_username) ?? ""
+    if user.len == 0 {
+        refuse(s, m, 401)
+        return false
+    }
+    if (stun.get_text(m, stun.attr_nonce) ?? "") != s.nonce {
+        refuse(s, m, 438)
+        return false
+    }
+    let key = stun.long_term_key(s.username, s.realm, s.password)
+    var ok = user == s.username
+    stun.check_integrity(m, key, stun.Integrity.Sha1) catch {
+        _ => {
+            ok = false
+        }
+    }
+    if !ok {
+        refuse(s, m, 401)
+    }
+    ok
+}
+
+fn succeed(s: *Server, request: stun.Message, m: stun.Message) {
+    s.to_client.push(stun.seal(m, stun.Protection { key: stun.long_term_key(s.username, s.realm, s.password) }))
+}
+
+fn serve(s: *Server, datagram: u8[]) {
+    if is_channel_data(datagram) {
+        let framed = parse_channel_data(datagram) or return
+        let peer = s.channels[framed.number] ?? return
+        s.to_peers.push(Payload { peer, data: framed.data })
+        return
+    }
+    let m = stun.parse(datagram) or return
+    s.methods.push(m.method)
+    if m.class == stun.Class.Indication {
+        let peer = stun.get_xor_address(m, stun.attr_xor_peer_address) or return
+        if m.method == stun.send && permitted(s, peer.ip) {
+            s.to_peers.push(Payload { peer, data: stun.find(m, stun.attr_data) ?? [] })
+        }
+        return
+    }
+    if s.stale_nonces > 0 && stun.get_text(m, stun.attr_username) != none {
+        s.stale_nonces -= 1
+        s.nonce = "{s.nonce}x"
+    }
+    if !authenticated(s, m) {
+        return
+    }
+    var ok = answer(s, m, stun.Class.Success)
+    if m.method == stun.allocate {
+        s.allocated = true
+        stun.add_xor_address(mut ok, stun.attr_xor_relayed_address, s.relayed)
+        stun.add_xor_address(mut ok, stun.attr_xor_mapped_address, s.mapped)
+        stun.add_u32(mut ok, stun.attr_lifetime, 600)
+    } else if m.method == stun.refresh {
+        let lifetime = stun.get_u32(m, stun.attr_lifetime) or 600
+        s.lifetimes.push(lifetime)
+        s.allocated = lifetime > 0
+        stun.add_u32(mut ok, stun.attr_lifetime, lifetime)
+    } else if m.method == stun.create_permission {
+        let peer = stun.get_xor_address(m, stun.attr_xor_peer_address) or return
+        s.permissions.push(peer.ip)
+    } else if m.method == stun.channel_bind {
+        let peer = stun.get_xor_address(m, stun.attr_xor_peer_address) or return
+        let number = (stun.get_u32(m, stun.attr_channel_number) or 0) >> 16
+        s.channels[number] = peer
+        s.permissions.push(peer.ip)
+    }
+    succeed(s, m, ok)
+}
+
+fn from_peer(s: *Server, peer: net.Addr, data: u8[]) {
+    if !permitted(s, peer.ip) {
+        return
+    }
+    for number, bound in s.channels {
+        if bound.port == peer.port && hash.equal(bound.ip, peer.ip) {
+            s.to_client.push(encode_channel_data(number, data))
+            return
+        }
+    }
+    var m = stun.message(stun.Class.Indication, stun.data)
+    stun.add_xor_address(mut m, stun.attr_xor_peer_address, peer)
+    stun.add(mut m, stun.attr_data, data)
+    s.to_client.push(stun.encode(m))
+}
+
+fn exchange(c: *Client, s: *Server, now: i64) -> Payload[] {
+    var delivered: Payload[] = []
+    for round in 0..8 {
+        for {
+            let d = poll_transmit(c) ?? break
+            serve(s, d)
+        }
+        let replies = s.to_client
+        s.to_client = []
+        for d in replies {
+            match receive(c, d, now) {
+                some(p) => delivered.push(p)
+                none => {}
+            }
+        }
+    }
+    delivered
+}
+
+fn allocated_client(s: *Server) -> *Client {
+    let c = client(Config { server: addr("192.0.2.1:3478"), username: "alice", password: "secret" })
+    start(c, 0)
+    exchange(c, s, 0)
+    c
+}
+
+fn test_allocate_answers_the_401_challenge_with_long_term_credentials(t: *testing.T) {
+    let s = server()
+    let c = allocated_client(s)
+    testing.error_if(t, c.state != State.Allocated || !s.allocated, "state {c.state}")
+    testing.error_if(t, !slices.equal(s.methods, [stun.allocate, stun.allocate]), "methods {s.methods}")
+    match poll_event(c) {
+        some(e) => match e {
+            Allocated(relayed, mapped) => {
+                testing.error_if(t, relayed.port != 49152 || mapped.port != 40000, "addresses")
+            }
+            Failed(code, _) => testing.error(t, "failed {code}")
+        }
+        none => testing.error(t, "no event")
+    }
+}
+
+fn test_a_stale_nonce_gets_the_new_nonce_and_the_request_sent_again(t: *testing.T) {
+    let s = server()
+    s.stale_nonces = 1
+    let c = allocated_client(s)
+    testing.error_if(t, c.state != State.Allocated, "state {c.state}")
+    testing.error_if(t, s.methods.len != 3, "{s.methods.len} requests")
+}
+
+fn test_a_wrong_password_fails_the_allocation_with_401(t: *testing.T) {
+    let s = server()
+    s.password = "other"
+    let c = allocated_client(s)
+    testing.error_if(t, c.state != State.Failed, "state {c.state}")
+    let e = poll_event(c) ?? panic("no event")
+    match e {
+        Failed(code, _) => testing.error_if(t, code != 401, "code {code}")
+        _ => testing.error(t, "allocated")
+    }
+}
+
+fn test_data_waits_for_a_permission_then_moves_to_a_channel(t: *testing.T) {
+    let s = server()
+    let fresh = allocated_client(s)
+    let peer = addr("198.51.100.20:5000")
+    send_to(fresh, peer, [1, 2, 3], 10)
+    send_to(fresh, peer, [4], 10)
+    testing.error_if(t, fresh.outbox.len != 1, "{fresh.outbox.len} datagrams before the permission")
+    exchange(fresh, s, 10)
+    testing.error_if(t, s.to_peers.len != 2 || !slices.equal(s.to_peers[0].data, [1, 2, 3]) || !slices.equal(s.to_peers[1].data, [4]), "queued data {s.to_peers.len}")
+    testing.error_if(t, !slices.contains(s.methods, stun.create_permission) || !slices.contains(s.methods, stun.channel_bind), "methods {s.methods}")
+    let indications = s.methods.len
+    send_to(fresh, peer, [5, 6], 20)
+    exchange(fresh, s, 20)
+    testing.error_if(t, s.methods.len != indications, "a bound channel still sent a Send indication")
+    testing.error_if(t, s.to_peers.len != 3 || !slices.equal(s.to_peers[2].data, [5, 6]), "channel data to the peer")
+    from_peer(s, peer, [7, 8, 9])
+    let back = exchange(fresh, s, 20)
+    testing.error_if(t, back.len != 1 || !slices.equal(back[0].data, [7, 8, 9]) || back[0].peer.port != 5000, "channel data from the peer")
+    from_peer(s, addr("198.51.100.99:1"), [0])
+    testing.error_if(t, exchange(fresh, s, 20).len != 0, "data from a peer without a permission")
+}
+
+fn test_data_indications_from_a_permitted_peer_are_unwrapped(t: *testing.T) {
+    let s = server()
+    let c = allocated_client(s)
+    let peer = addr("198.51.100.20:5000")
+    s.permissions.push(peer.ip)
+    c.permissions.push(Permission { ip: peer.ip, granted: true, expires: 1000000, queued: [] })
+    from_peer(s, peer, [42])
+    let got = exchange(c, s, 0)
+    testing.error_if(t, got.len != 1 || got[0].data[0] != 42, "data indication")
+}
+
+fn test_the_allocation_is_refreshed_a_minute_before_it_expires_and_released_on_close(t: *testing.T) {
+    let s = server()
+    let c = allocated_client(s)
+    testing.error_if(t, next_timeout(c) != 540000, "refresh due at {next_timeout(c)}")
+    tick(c, 539999)
+    exchange(c, s, 539999)
+    testing.error_if(t, s.lifetimes.len != 0, "refreshed early")
+    tick(c, 540000)
+    exchange(c, s, 540000)
+    testing.error_if(t, !slices.equal(s.lifetimes, [600]), "refresh {s.lifetimes}")
+    close(c, 540001)
+    exchange(c, s, 540001)
+    testing.error_if(t, !slices.equal(s.lifetimes, [600, 0]) || s.allocated, "release {s.lifetimes}")
+}
+
+fn test_an_unanswered_allocate_fails_after_the_last_transmission(t: *testing.T) {
+    let c = client(Config { server: addr("192.0.2.1:3478"), username: "u", password: "p", transmissions: 3 })
+    start(c, 0)
+    var sends = 0
+    var now = 0
+    for c.state == State.Allocating && now < 100000 {
+        for poll_transmit(c) != none {
+            sends += 1
+        }
+        now = next_timeout(c)
+        tick(c, now)
+    }
+    testing.error_if(t, sends != 3 || c.state != State.Failed, "{sends} sends, state {c.state}")
+}
+
+fn test_channel_data_framing(t: *testing.T) {
+    let framed = encode_channel_data(0x4001, [1, 2, 3, 4, 5])
+    testing.error_if(t, framed.len != 12 || framed[0] != 0x40 || framed[1] != 0x01 || framed[3] != 5, "frame {framed}")
+    let back = parse_channel_data(framed) or panic("parse")
+    testing.error_if(t, back.number != 0x4001 || !slices.equal(back.data, [1, 2, 3, 4, 5]), "round trip")
+    testing.error_if(t, (parse_channel_data([0x40, 0x01, 0, 9, 1, 2, 3, 4]) or ChannelData { number: -1, data: [] }).number != -1, "length past the end")
+    testing.error_if(t, (parse_channel_data([0x50, 0x00, 0, 0]) or ChannelData { number: -1, data: [] }).number != -1, "number above 0x4FFF")
+    testing.error_if(t, is_channel_data([0x40, 0, 0]) || is_channel_data([0x00, 0x01, 0, 0]), "short or STUN")
+}

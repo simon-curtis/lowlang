@@ -1,0 +1,541 @@
+import std/crypto/hash
+import std/io
+import std/net
+import std/slices
+import std/stun
+
+/// The TURN server of a client and the long-term credentials it accepts (RFC 8656 section 9.2).
+pub struct Config {
+    /// The server's UDP address.
+    pub server: net.Addr
+    /// The user name.
+    pub username: str
+    /// The password, used as given without SASLprep.
+    pub password: str
+    /// The allocation lifetime in seconds the client asks for.
+    pub lifetime: i64 = 600
+    /// The first retransmission timeout of a request in milliseconds.
+    pub rto: i64 = 500
+    /// How many times a request is sent before it times out.
+    pub transmissions: i64 = 7
+}
+
+/// The phase of an allocation.
+pub enum State {
+    /// The Allocate request is in flight.
+    Allocating = 0
+    /// The server holds the allocation.
+    Allocated = 1
+    /// The allocation failed or expired.
+    Failed = 2
+    /// `close` released the allocation.
+    Closed = 3
+}
+
+/// What a client reports through `poll_event`.
+pub enum Event {
+    /// The server allocated `relayed` and saw the client at `mapped`.
+    Allocated(relayed: net.Addr, mapped: net.Addr)
+    /// The allocation failed: the server answered with the error `code`, or 0 when it did not answer or its answer did not authenticate.
+    Failed(code: i64, reason: str)
+}
+
+/// Data a peer sent through the relay, unwrapped from a Data indication or a ChannelData message.
+pub struct Payload {
+    /// The peer's address as the server saw it.
+    pub peer: net.Addr
+    /// The bytes the peer sent.
+    pub data: u8[]
+}
+
+enum Purpose {
+    Allocate
+    Refresh
+    Permission(ip: u8[])
+    Bind(peer: net.Addr, number: i64)
+}
+
+struct Request {
+    purpose: Purpose
+    transaction: u8[]
+    wire: u8[]
+    sends: i64
+    deadline: i64
+    signed: bool
+    retries: i64
+}
+
+struct Permission {
+    ip: u8[]
+    granted: bool
+    expires: i64
+    queued: Payload[]
+}
+
+struct Channel {
+    peer: net.Addr
+    number: i64
+    bound: bool
+    expires: i64
+}
+
+/// One TURN allocation over UDP, without a socket or a clock: every datagram it makes goes to `Config.server`.
+///
+/// The caller gives it the server's datagrams with `receive` and the time with `tick`, and sends what `poll_transmit` returns. Times are milliseconds from any origin that never goes backwards.
+pub struct Client {
+    /// The phase of the allocation.
+    pub state: State
+    /// The relayed transport address, set once allocated.
+    pub relayed: net.Addr?
+    config: Config
+    realm: str
+    nonce: str
+    key: u8[]
+    requests: Request[]
+    permissions: Permission[]
+    channels: Channel[]
+    refresh_at: i64
+    outbox: u8[][]
+    events: Event[]
+}
+
+const permission_lifetime = 300000
+const channel_lifetime = 600000
+const refresh_margin = 60000
+const queue_limit = 16
+const first_channel = 0x4000
+const last_channel = 0x4FFF
+
+/// Returns a client for `config`. `start` sends the first Allocate.
+pub fn client(config: Config) -> *Client {
+    new(Client {
+        state: State.Allocating
+        relayed: none
+        config
+        realm: ""
+        nonce: ""
+        key: []
+        requests: []
+        permissions: []
+        channels: []
+        refresh_at: 0
+        outbox: []
+        events: []
+    })
+}
+
+fn same_addr(a: net.Addr, b: net.Addr) -> bool {
+    a.port == b.port && hash.equal(a.ip, b.ip)
+}
+
+fn wait_after(c: *Client, sends: i64) -> i64 {
+    stun.waits(stun.Config { rto: c.config.rto, transmissions: c.config.transmissions })[sends - 1]
+}
+
+fn request_of(c: *Client, purpose: Purpose) -> stun.Message {
+    match purpose {
+        Allocate => {
+            var m = stun.message(stun.Class.Request, stun.allocate)
+            stun.add(mut m, stun.attr_requested_transport, [17, 0, 0, 0])
+            stun.add_u32(mut m, stun.attr_lifetime, c.config.lifetime)
+            m
+        }
+        Refresh => {
+            var m = stun.message(stun.Class.Request, stun.refresh)
+            stun.add_u32(mut m, stun.attr_lifetime, if c.state == State.Closed { 0 } else { c.config.lifetime })
+            m
+        }
+        Permission(ip) => {
+            var m = stun.message(stun.Class.Request, stun.create_permission)
+            stun.add_xor_address(mut m, stun.attr_xor_peer_address, net.Addr { ip, port: 0 })
+            m
+        }
+        Bind(peer, number) => {
+            var m = stun.message(stun.Class.Request, stun.channel_bind)
+            stun.add_u32(mut m, stun.attr_channel_number, number << 16)
+            stun.add_xor_address(mut m, stun.attr_xor_peer_address, peer)
+            m
+        }
+    }
+}
+
+fn seal(c: *Client, m: stun.Message) -> u8[] {
+    if c.realm.len == 0 {
+        return stun.seal(m, stun.Protection { key: [], sha1: false })
+    }
+    var signed = m
+    stun.add_text(mut signed, stun.attr_username, c.config.username)
+    stun.add_text(mut signed, stun.attr_realm, c.realm)
+    stun.add_text(mut signed, stun.attr_nonce, c.nonce)
+    stun.seal(signed, stun.Protection { key: c.key })
+}
+
+fn issue(c: *Client, purpose: Purpose, retries: i64, now: i64) {
+    let m = request_of(c, purpose)
+    let wire = seal(c, m)
+    c.requests.push(Request { purpose, transaction: m.transaction, wire, sends: 1, deadline: now + wait_after(c, 1), signed: c.realm.len > 0, retries })
+    c.outbox.push(wire)
+}
+
+/// Sends the Allocate request. The first one carries no credentials; the server's 401 answer gives the realm and nonce for the second.
+pub fn start(c: *Client, now: i64) {
+    issue(c, Purpose.Allocate, 0, now)
+}
+
+fn fail_allocation(c: *Client, code: i64, reason: str) {
+    if c.state == State.Failed || c.state == State.Closed {
+        return
+    }
+    c.state = State.Failed
+    c.requests = []
+    c.events.push(Event.Failed(code, reason))
+}
+
+fn find_request(c: *Client, transaction: u8[]) -> i64 {
+    for i, r in c.requests {
+        if hash.equal(r.transaction, transaction) {
+            return i
+        }
+    }
+    -1
+}
+
+fn permission_for(c: *Client, ip: u8[]) -> i64 {
+    for i, p in c.permissions {
+        if hash.equal(p.ip, ip) {
+            return i
+        }
+    }
+    -1
+}
+
+fn channel_for(c: *Client, peer: net.Addr) -> i64 {
+    for i, ch in c.channels {
+        if same_addr(ch.peer, peer) {
+            return i
+        }
+    }
+    -1
+}
+
+fn channel_numbered(c: *Client, number: i64) -> i64 {
+    for i, ch in c.channels {
+        if ch.number == number {
+            return i
+        }
+    }
+    -1
+}
+
+fn take_credentials(c: *Client, m: stun.Message) -> bool {
+    let realm = stun.get_text(m, stun.attr_realm) ?? c.realm
+    let nonce = stun.get_text(m, stun.attr_nonce) ?? return false
+    if realm.len == 0 {
+        return false
+    }
+    c.realm = realm
+    c.nonce = nonce
+    c.key = stun.long_term_key(c.config.username, realm, c.config.password)
+    true
+}
+
+fn authentic(c: *Client, m: stun.Message) -> bool {
+    if c.key.len == 0 {
+        return m.class == stun.Class.Error
+    }
+    if stun.find(m, stun.attr_message_integrity) == none {
+        return m.class == stun.Class.Error
+    }
+    stun.check_integrity(m, c.key, stun.Integrity.Sha1) or return false
+    true
+}
+
+fn on_failure(c: *Client, r: Request, m: stun.Message, now: i64) {
+    let error = stun.error_code(m) ?? stun.ErrorCode { code: 0, reason: "" }
+    let challenged = error.code == 401 && !r.signed
+    let stale = error.code == 438 && r.retries < 2
+    if (challenged || stale) && take_credentials(c, m) {
+        issue(c, r.purpose, r.retries + 1, now)
+        return
+    }
+    match r.purpose {
+        Allocate => fail_allocation(c, error.code, error.reason)
+        Refresh => fail_allocation(c, error.code, error.reason)
+        Permission(ip) => {
+            let at = permission_for(c, ip)
+            if at >= 0 {
+                slices.remove(mut c.permissions, at)
+            }
+        }
+        Bind(_, number) => {
+            let at = channel_numbered(c, number)
+            if at >= 0 {
+                slices.remove(mut c.channels, at)
+            }
+        }
+    }
+}
+
+fn on_success(c: *Client, r: Request, m: stun.Message, now: i64) {
+    match r.purpose {
+        Allocate => {
+            let relayed = stun.get_xor_address(m, stun.attr_xor_relayed_address) or {
+                fail_allocation(c, 0, "no XOR-RELAYED-ADDRESS")
+                return
+            }
+            let mapped = stun.get_xor_address(m, stun.attr_xor_mapped_address) or relayed
+            let lifetime = stun.get_u32(m, stun.attr_lifetime) or c.config.lifetime
+            c.state = State.Allocated
+            c.relayed = relayed
+            c.refresh_at = now + lifetime * 1000 - refresh_margin
+            c.events.push(Event.Allocated(relayed, mapped))
+        }
+        Refresh => {
+            let lifetime = stun.get_u32(m, stun.attr_lifetime) or c.config.lifetime
+            c.refresh_at = now + lifetime * 1000 - refresh_margin
+        }
+        Permission(ip) => {
+            let at = permission_for(c, ip)
+            if at < 0 {
+                return
+            }
+            c.permissions[at].granted = true
+            c.permissions[at].expires = now + permission_lifetime - refresh_margin
+            let queued = c.permissions[at].queued
+            c.permissions[at].queued = []
+            for p in queued {
+                wrap(c, p.peer, p.data, now)
+            }
+        }
+        Bind(_, number) => {
+            let at = channel_numbered(c, number)
+            if at >= 0 {
+                c.channels[at].bound = true
+                c.channels[at].expires = now + channel_lifetime - refresh_margin
+            }
+        }
+    }
+}
+
+fn on_response(c: *Client, m: stun.Message, now: i64) {
+    let at = find_request(c, m.transaction)
+    if at < 0 || !authentic(c, m) {
+        return
+    }
+    let r = c.requests[at]
+    slices.remove(mut c.requests, at)
+    if m.class == stun.Class.Success {
+        on_success(c, r, m, now)
+    } else {
+        on_failure(c, r, m, now)
+    }
+}
+
+fn on_data(c: *Client, m: stun.Message) -> Payload? {
+    let peer = stun.get_xor_address(m, stun.attr_xor_peer_address) or return none
+    let data = stun.find(m, stun.attr_data) ?? return none
+    if permission_for(c, peer.ip) < 0 {
+        return none
+    }
+    Payload { peer, data }
+}
+
+/// Reads one datagram from the server: a response, a Data indication or a ChannelData message.
+///
+/// Returns what a peer sent when the datagram carries it, and `none` otherwise. A response that matches no request or whose MESSAGE-INTEGRITY is wrong is ignored, as is data from a peer without a permission or on a channel that is not bound.
+pub fn receive(c: *Client, datagram: u8[], now: i64) -> Payload? {
+    if c.state == State.Failed || c.state == State.Closed {
+        return none
+    }
+    if is_channel_data(datagram) {
+        let framed = parse_channel_data(datagram) or return none
+        let at = channel_numbered(c, framed.number)
+        if at < 0 || !c.channels[at].bound {
+            return none
+        }
+        return Payload { peer: c.channels[at].peer, data: framed.data }
+    }
+    let m = stun.parse(datagram) or return none
+    match m.class {
+        Indication => {
+            if m.method == stun.data {
+                return on_data(c, m)
+            }
+        }
+        Success => on_response(c, m, now)
+        Error => on_response(c, m, now)
+        Request => {}
+    }
+    none
+}
+
+fn wrap(c: *Client, peer: net.Addr, data: u8[], now: i64) {
+    let at = channel_for(c, peer)
+    if at >= 0 && c.channels[at].bound {
+        c.outbox.push(encode_channel_data(c.channels[at].number, data))
+        return
+    }
+    var m = stun.message(stun.Class.Indication, stun.send)
+    stun.add_xor_address(mut m, stun.attr_xor_peer_address, peer)
+    stun.add(mut m, stun.attr_data, data)
+    c.outbox.push(stun.encode(m))
+    if at < 0 && c.channels.len <= last_channel - first_channel {
+        let number = first_channel + c.channels.len
+        c.channels.push(Channel { peer, number, bound: false, expires: 0 })
+        issue(c, Purpose.Bind(peer, number), 0, now)
+    }
+}
+
+/// Sends `data` to `peer` through the relay.
+///
+/// The first datagram to a peer's IP address asks for a permission (CreatePermission) and waits for it, with at most 16 datagrams queued per address; once granted, data goes out in Send indications and the client binds a channel for the peer (ChannelBind), after which it uses ChannelData. Does nothing unless allocated.
+pub fn send_to(c: *Client, peer: net.Addr, data: u8[], now: i64) {
+    if c.state != State.Allocated {
+        return
+    }
+    let at = permission_for(c, peer.ip)
+    if at >= 0 && c.permissions[at].granted {
+        wrap(c, peer, data, now)
+        return
+    }
+    if at < 0 {
+        c.permissions.push(Permission { ip: peer.ip, granted: false, expires: 0, queued: [Payload { peer, data }] })
+        issue(c, Purpose.Permission(peer.ip), 0, now)
+        return
+    }
+    if c.permissions[at].queued.len < queue_limit {
+        c.permissions[at].queued.push(Payload { peer, data })
+    }
+}
+
+fn retransmit(c: *Client, now: i64) {
+    var i = 0
+    for i < c.requests.len {
+        let r = c.requests[i]
+        if now < r.deadline {
+            i += 1
+            continue
+        }
+        if r.sends >= c.config.transmissions {
+            slices.remove(mut c.requests, i)
+            match r.purpose {
+                Allocate => fail_allocation(c, 0, "no answer")
+                Refresh => fail_allocation(c, 0, "no answer")
+                _ => {}
+            }
+            continue
+        }
+        c.requests[i].sends += 1
+        c.requests[i].deadline = now + wait_after(c, r.sends + 1)
+        c.outbox.push(r.wire)
+        i += 1
+    }
+}
+
+fn pending(c: *Client, purpose_index: i64, key: u8[]) -> bool {
+    for r in c.requests {
+        let same = match r.purpose {
+            Allocate => purpose_index == 0
+            Refresh => purpose_index == 1
+            Permission(ip) => purpose_index == 2 && hash.equal(ip, key)
+            Bind(peer, _) => purpose_index == 3 && hash.equal(peer.ip, key)
+        }
+        if same {
+            return true
+        }
+    }
+    false
+}
+
+fn renew(c: *Client, now: i64) {
+    if now >= c.refresh_at && !pending(c, 1, []) {
+        issue(c, Purpose.Refresh, 0, now)
+    }
+    for p in c.permissions {
+        if p.granted && now >= p.expires && !pending(c, 2, p.ip) {
+            issue(c, Purpose.Permission(p.ip), 0, now)
+        }
+    }
+    for ch in c.channels {
+        if ch.bound && now >= ch.expires && !pending(c, 3, ch.peer.ip) {
+            issue(c, Purpose.Bind(ch.peer, ch.number), 0, now)
+        }
+    }
+}
+
+/// Retransmits requests whose time has come, fails the allocation when an Allocate or Refresh goes unanswered, and refreshes the allocation, the permissions and the channel bindings a minute before each expires.
+pub fn tick(c: *Client, now: i64) {
+    if c.state == State.Failed || c.state == State.Closed {
+        return
+    }
+    retransmit(c, now)
+    if c.state == State.Allocated {
+        renew(c, now)
+    }
+}
+
+/// Returns the time `tick` is next due, or -1 when nothing is scheduled.
+pub fn next_timeout(c: *Client) -> i64 {
+    if c.state == State.Failed || c.state == State.Closed {
+        return -1
+    }
+    var t = -1
+    for r in c.requests {
+        if t < 0 || r.deadline < t {
+            t = r.deadline
+        }
+    }
+    if c.state == State.Allocated {
+        for due in renewals(c) {
+            if t < 0 || due < t {
+                t = due
+            }
+        }
+    }
+    t
+}
+
+fn renewals(c: *Client) -> i64[] {
+    var out: i64[] = [c.refresh_at]
+    for p in c.permissions {
+        if p.granted {
+            out.push(p.expires)
+        }
+    }
+    for ch in c.channels {
+        if ch.bound {
+            out.push(ch.expires)
+        }
+    }
+    out
+}
+
+/// Returns the next datagram for the server, or `none`.
+pub fn poll_transmit(c: *Client) -> u8[]? {
+    if c.outbox.len == 0 {
+        return none
+    }
+    let d = c.outbox[0]
+    c.outbox = c.outbox[1..]
+    d
+}
+
+/// Returns the next event, or `none`.
+pub fn poll_event(c: *Client) -> Event? {
+    if c.events.len == 0 {
+        return none
+    }
+    let e = c.events[0]
+    c.events = c.events[1..]
+    e
+}
+
+/// Releases the allocation with a Refresh of lifetime 0, sent once, and stops the client.
+pub fn close(c: *Client, now: i64) {
+    if c.state == State.Allocated {
+        c.state = State.Closed
+        c.outbox.push(seal(c, request_of(c, Purpose.Refresh)))
+    }
+    c.state = State.Closed
+    c.requests = []
+}

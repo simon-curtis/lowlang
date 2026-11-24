@@ -1,0 +1,115 @@
+import std/ice
+import std/io
+import std/net
+import std/os
+import std/process
+import std/testing
+import std/text
+import std/turn
+
+const server_source = "testdata/turn/pion"
+
+fn go(args: str[]) -> process.Output {
+    var command = process.command("go", args)
+    command.dir = server_source
+    process.run(command, []) or panic("go {args[0]}")
+}
+
+fn build_server(t: *testing.T) -> str? {
+    for name in ["go", "timeout"] {
+        if process.find(name) == none {
+            testing.skip(t, "{name} is not installed")
+            return none
+        }
+    }
+    let fetched = go(["mod", "download"])
+    if !process.success(fetched.status) {
+        testing.skip(t, "the pion/turn modules cannot be downloaded: {str(fetched.stderr)}")
+        return none
+    }
+    let binary = "{os.temp_dir_path()}/low-turnserver-{os.pid()}"
+    let built = go(["build", "-o", binary, "."])
+    if !process.success(built.status) {
+        testing.fatal(t, "go build: {str(built.stderr)}")
+        return none
+    }
+    binary
+}
+
+fn read_port(stream: io.Stream) -> i64 {
+    let buf = io.buffer(64)
+    var line = ""
+    for !text.contains(line, "\n") {
+        let n = stream.read(buf) or 0
+        if n == 0 {
+            panic("the TURN server ended before printing its port")
+        }
+        line = "{line}{str(buf[..n])}"
+    }
+    text.parse_int(text.trim(line)) or panic("port {line}")
+}
+
+fn forward(from: Handle, to: Handle, selected: chan[bool]) {
+    for {
+        let e = (<-from.events) ?? break
+        match e {
+            LocalCandidate(c) => {
+                add_remote_candidate(to, c) or break
+            }
+            Selected(_, _) => {
+                selected <- true
+            }
+            _ => {}
+        }
+    }
+}
+
+fn arrived(h: Handle) -> Datagram? {
+    select {
+        d = <-h.incoming => d
+        after(5000) => none
+    }
+}
+
+fn test_a_relay_only_agent_connects_through_pion_turn(t: *testing.T) {
+    let binary = build_server(t) ?? return
+    using child = process.start(process.Command { program: "timeout", args: ["60", binary], stdin: process.Stdio.Piped, stdout: process.Stdio.Piped, stderr: process.Stdio.Null }) or panic("start")
+    let port = read_port(child.handle.stdout ?? panic("no stdout"))
+    let server = turn.Config { server: net.parse_addr("127.0.0.1:{port}") or panic("addr"), username: "alice", password: "secret" }
+    using a = open(Options { config: ice.Config { controlling: true, turn_servers: [server], relay_only: true }, bind: ["127.0.0.1"] }) or panic("open a")
+    using b = open(Options { config: ice.Config { controlling: false }, bind: ["127.0.0.1"] }) or panic("open b")
+    let ca = credentials(a.handle) or panic("credentials")
+    let cb = credentials(b.handle) or panic("credentials")
+    set_remote_credentials(a.handle, cb.ufrag, cb.pwd) or panic("set")
+    set_remote_credentials(b.handle, ca.ufrag, ca.pwd) or panic("set")
+    let a_selected = chan[bool](1)
+    let b_selected = chan[bool](1)
+    spawn forward(a.handle, b.handle, a_selected)
+    spawn forward(b.handle, a.handle, b_selected)
+    gather(a.handle) or panic("gather")
+    gather(b.handle) or panic("gather")
+    for done in [a_selected, b_selected] {
+        let ok = select {
+            <-done => true
+            after(15000) => false
+        }
+        if !ok {
+            testing.fatal(t, "no pair selected")
+            return
+        }
+    }
+    let chosen = (selected(a.handle) or panic("selected")) ?? panic("none")
+    testing.error_if(t, chosen.local.kind != ice.Kind.Relayed, "selected a {chosen.local.kind} candidate")
+    let gathered = (candidates(a.handle) or []).len
+    testing.error_if(t, gathered != 1, "{gathered} local candidates")
+    send(a.handle, [0x16, 1, 2, 3]) or panic("send through the relay")
+    let there = arrived(b.handle) ?? panic("nothing arrived through the relay")
+    testing.error_if(t, there.data.len != 4 || there.data[3] != 3 || there.from.port != chosen.local.addr.port, "datagram from {net.format(there.from)}")
+    for i in 0..3 {
+        send(b.handle, [0x80, u8(i)]) or panic("send back")
+        let back = arrived(a.handle) ?? panic("nothing came back through the relay")
+        testing.error_if(t, back.data.len != 2 || back.data[1] != u8(i), "datagram {i} back")
+    }
+    let stdin = child.handle.stdin ?? panic("no stdin")
+    stdin.close()
+}
