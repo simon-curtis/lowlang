@@ -2259,3 +2259,17 @@ vpsllq ymm1, ymm2, xmm3
 vcmpps ymm0, ymm1, ymm2, 1
 vmovdqu ymm0, ymmword ptr [rax]
 sym:
+# lane width changes
+vpmovzxbw xmm2, xmm3
+vpmovzxbw ymm0, xmm1
+vpmovzxbw ymm17, xmm25
+vpmovzxbw zmm0, ymm1
+vpmovzxbw zmm17, ymm25
+vpmovwb xmm1, xmm2
+vpmovwb xmm1, ymm0
+vpmovwb xmm20, ymm30
+vpmovwb ymm1, zmm0
+vextracti64x4 ymm1, zmm0, 1
+vextracti64x4 ymm17, zmm28, 1
+vinserti64x4 zmm0, zmm0, ymm1, 1
+vinserti64x4 zmm20, zmm21, ymm22, 1

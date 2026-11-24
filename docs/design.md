@@ -304,12 +304,12 @@ fn find(data: u8[], c: u8) -> i64 {
 }
 ```
 
-- Vector types are 128 or 256 bits of one lane type: `u8x16`, `u8x32`, `u16x8`, `u16x16`, `i32x4`, `i32x8`, `u32x4`, `u32x8`, `i64x2`, `i64x4`, `u64x2`, `u64x4`, `f32x4`, `f32x8`, `f64x2` and `f64x4`.
+- Vector types are 128, 256 or 512 bits of one lane type: `u8x16`, `u8x32`, `u8x64`, `u16x8`, `u16x16`, `u16x32`, `i32x4`, `i32x8`, `i32x16`, `u32x4`, `u32x8`, `u32x16`, `i64x2`, `i64x4`, `i64x8`, `u64x2`, `u64x4`, `u64x8`, `f32x4`, `f32x8`, `f32x16`, `f64x2`, `f64x4` and `f64x8`. Every type works on every CPU; a 512-bit vector runs as two 256-bit or four 128-bit halves where the AVX-512 version is not selected.
 - `+`, `-`, `*`, `&`, `|`, `^`, `~` and unary `-` work lane by lane. `/` works on float lanes. `<<` and `>>` work on integer lanes by a scalar count, arithmetic on signed lanes, and follow the scalar rule on every lane type: a count of the lane width or more, or a negative one, gives 0, or the sign fill for `>>` on a negative signed lane. Compound assignments work the same way.
 - Comparisons work lane by lane and give a vector of the same type whose lanes are all ones or all zeros; unsigned lanes compare unsigned.
 - A scalar operand of the lane type is broadcast, so `chunk == '"'` compares every lane.
 - `u8x32(v)` reinterprets a vector of the same width.
-- `std/simd` provides `read` and `write` between a vector and a slice at an element index, `read_str`, `splat`, `mask` (one bit per lane from its top bit), `any`, `blend`, `min`, `max`, `lane`, `with_lane`, `shuffle` and `shuffle16` (a byte table lookup within each 16-byte half, zero where the index has its top bit set), `find_byte` and `find_byte_str`. Reads and writes are bounds-checked.
+- `std/simd` provides `read` and `write` between a vector and a slice at an element index, `read_str`, `splat`, `mask` (one bit per lane from its top bit), `any` and `all` (whether some or every lane has its top bit set), `blend`, `min`, `max`, `lane`, `with_lane`, `shuffle16`, `shuffle` and `shuffle64` (a byte table lookup within each 16-byte quarter of a `u8x16`, `u8x32` or `u8x64`, zero where the index has its top bit set), `find_byte` and `find_byte_str`. Reads and writes are bounds-checked.
 - Vectors are values: they can be passed, returned, stored in fields and slices, and compared lane by lane. They cannot be compared with `==` as a whole. They print as `<1, 2, 3, 4>`.
 
 ### Slices
@@ -1375,20 +1375,28 @@ Calling a numeric type converts a number to it, as in `u8(x)`, `f64(n)` and `i64
 | `chan` | `chan[T]` is a channel of `T` values. `chan[T](n)` makes one holding up to `n` values, and `chan[T]()` an unbuffered one. |
 | `u8x16` | 16 lanes of `u8`, 128 bits. |
 | `u8x32` | 32 lanes of `u8`, 256 bits. |
+| `u8x64` | 64 lanes of `u8`, 512 bits. |
 | `u16x8` | 8 lanes of `u16`, 128 bits. |
 | `u16x16` | 16 lanes of `u16`, 256 bits. |
+| `u16x32` | 32 lanes of `u16`, 512 bits. |
 | `i32x4` | 4 lanes of `i32`, 128 bits. |
 | `i32x8` | 8 lanes of `i32`, 256 bits. |
+| `i32x16` | 16 lanes of `i32`, 512 bits. |
 | `u32x4` | 4 lanes of `u32`, 128 bits. |
 | `u32x8` | 8 lanes of `u32`, 256 bits. |
+| `u32x16` | 16 lanes of `u32`, 512 bits. |
 | `i64x2` | 2 lanes of `i64`, 128 bits. |
 | `i64x4` | 4 lanes of `i64`, 256 bits. |
+| `i64x8` | 8 lanes of `i64`, 512 bits. |
 | `u64x2` | 2 lanes of `u64`, 128 bits. |
 | `u64x4` | 4 lanes of `u64`, 256 bits. |
+| `u64x8` | 8 lanes of `u64`, 512 bits. |
 | `f32x4` | 4 lanes of `f32`, 128 bits. |
 | `f32x8` | 8 lanes of `f32`, 256 bits. |
+| `f32x16` | 16 lanes of `f32`, 512 bits. |
 | `f64x2` | 2 lanes of `f64`, 128 bits. |
 | `f64x4` | 4 lanes of `f64`, 256 bits. |
+| `f64x8` | 8 lanes of `f64`, 512 bits. |
 
 ### Constants
 
@@ -2752,17 +2760,23 @@ Calling convention:
 ### Vectors
 
 - A vector local lives in a frame slot, like a variable passed as `mut`, and a vector expression evaluates to the address of a slot holding its result.
-- A vector operation is one IR instruction, `vector`, taking the destination and operand addresses, or `vectorscalar` for `mask`.
+- A vector operation is one IR instruction, `vector`, taking the destination and operand addresses, or `vectorscalar` for `mask`. `any` and `all` are a `mask` compared with 0 or with every lane bit set.
 - At calls, returns, fields and other aggregates a vector is its words, loaded from or stored to a slot. A `let` of a computed vector adopts the slot of the result instead of copying it.
 - A function containing vector instructions is compiled three times. Its symbol is a stub that reads the byte `rt_simd_tier` and jumps to the AVX-512 version (2), the AVX2 version (1) or the SSE2 version (0). `rt_cpu_init` sets the byte at startup from `cpuid` and `xgetbv`: 1 when the CPU and the operating system support AVX2, and an AVX-512 capability flag when `cpuid` leaf 7 lists AVX512F, AVX512DQ, AVX512BW and AVX512VL and `xgetbv` shows the SSE, AVX, opmask, `zmm` upper-half and `zmm16` to `zmm31` state enabled.
 - `LOW_SIMD=sse2` in the environment selects the SSE2 versions and `LOW_SIMD=avx512` the AVX-512 versions; the fixture runner uses both to test every tier. The AVX-512 versions are never chosen without `LOW_SIMD=avx512`: the request is ignored on a CPU or operating system without the AVX-512 state, which keeps the AVX2 or SSE2 choice, and Windows reads no environment, so it runs AVX2 or SSE2. Automatic selection of AVX-512 on a capable CPU is off until the tier has run on hardware.
-- The AVX-512 version is the AVX2 version on `xmm` and `ymm` registers 0 to 15 with these operations in EVEX form: 64-bit multiplication (`vpmullq`), minimum and maximum of 64-bit lanes, arithmetic 64-bit shifts (`vpsraq`, which fills with the sign for a count above 63), every integer comparison except equality and signed greater-than as a `vpcmp` into `k1` followed by `vpmovm2*` back to lane masks (unsigned comparisons need no sign-bit bias), `select` as `vpternlogq`, `~` as `vpternlogd`, a splat as a `vpbroadcast` from a general register, and `mask` of 16-bit lanes as `vpmovw2m` and `kmovw`.
-- The AVX2 version uses three-operand VEX instructions on `ymm` registers. An addition, subtraction, multiplication, minimum, maximum, floating-point division, bitwise operation, byte shuffle or integer equality is one instruction on the allocated registers, and its second operand may be the slot in memory. A splat broadcasts into the destination register. `vzeroupper` runs before every call and return of a vector function.
-- A vector slot whose uses are all vector instructions, vector loads and stores through the slot, and lane addresses (the slot plus an index) is a register slot. The register allocator treats it as one value whose home is the frame slot and gives it one of `ymm8` to `ymm15` (`xmm8` to `xmm15` for a 128-bit vector) with the same linear scan as the other values. A register slot that gets no register is read from and written to its home. Any other vector slot stays in memory.
-- A register slot is live in its register across blocks and loops. A pass after lowering inserts the transfers: a spill (`vmovdqu` to the home) before a word load from the slot and before a word store that writes only part of it, a fill (`vmovdqu` from the home) before the next read through the register, and a spill of every live register slot before a call, runtime call, C call or a syscall that is not emitted inline, with a fill after it where the value is read again. A run of word stores that writes the whole slot needs no spill. A block ends with every live-out register slot in its register. No `ymm` register survives a call.
+- The AVX-512 version is the AVX2 version on `xmm`, `ymm` and `zmm` registers 0 to 15, one register for a vector of any width, with these operations in EVEX form:
+  - 64-bit multiplication (`vpmullq`), minimum and maximum of 64-bit lanes, and arithmetic 64-bit shifts (`vpsraq`, which fills with the sign for a count above 63).
+  - Every integer comparison except equality and signed greater-than, and every comparison of a 512-bit vector, as a `vpcmp` or `vcmpps`/`vcmppd` into `k1` followed by `vpmovm2*` back to lane masks. Unsigned comparisons need no sign-bit bias.
+  - `mask` as `vpmov*2m` into `k1` and a `kmov` of the lane count's width. A comparison directly followed in its block by a `mask` of its result writes `k1` and the `mask` reads it, and the lane masks are written only when the result has another use, so `simd.any(a == b)` and `simd.all(a == b)` are a `vpcmp`, a `kmov` and a scalar comparison.
+  - Byte multiplication and byte shifts through 16-bit lanes: `vpmovzxbw` widens each operand, `vpmullw`, `vpsllw` or `vpsrlw` computes, and `vpmovwb` keeps the low bytes, so a count of 8 or more gives 0. A `u8x64` is widened as two 256-bit halves (`vextracti64x4`, `vinserti64x4`).
+  - `select` as `vpternlogq`, `~` as `vpternlogd`, a splat as a `vpbroadcast` from a general register, a bitwise operation on a 512-bit vector as `vpandq`, `vporq`, `vpxorq` or `vpandnq`, a float negation of one as `vpxord` or `vpxorq` with a broadcast sign constant, and moves of one as `vmovdqu64` and `vmovdqa64`.
+  - The tier uses AVX512F, AVX512DQ, AVX512BW and AVX512VL instructions and nothing from other extensions.
+- The AVX2 version uses three-operand VEX instructions on `ymm` registers and splits a 512-bit operation into two 256-bit halves. An addition, subtraction, multiplication, minimum, maximum, floating-point division, bitwise operation, byte shuffle or integer equality is one instruction on the allocated registers, and its second operand may be the slot in memory. A splat broadcasts into the destination register. `vzeroupper` runs before every call and return of a vector function.
+- A vector slot whose uses are all vector instructions, vector loads and stores through the slot, and lane addresses (the slot plus an index) is a register slot. The register allocator treats it as one value whose home is the frame slot and gives it one of registers 8 to 15, as `xmm`, `ymm` or `zmm` by the slot's width, with the same linear scan as the other values. A 512-bit slot is a register slot only in the AVX-512 version. A register slot that gets no register is read from and written to its home. Any other vector slot stays in memory. Slots are 8-byte aligned and every vector load and store is the unaligned form.
+- A register slot is live in its register across blocks and loops. A pass after lowering inserts the transfers: a spill (`vmovdqu`, or `vmovdqu64` for a `zmm` register, to the home) before a word load from the slot and before a word store that writes only part of it, a fill (`vmovdqu` from the home) before the next read through the register, and a spill of every live register slot before a call, runtime call, C call or a syscall that is not emitted inline, with a fill after it where the value is read again. A run of word stores that writes the whole slot needs no spill. A block ends with every live-out register slot in its register. No `ymm` or `zmm` register survives a call.
 - The poll stub of a block saves the register slots live out of the block to their homes, runs `vzeroupper`, calls `rt_poll`, loads them back and jumps to the block's continuation.
-- The SSE2 version splits 256-bit operations into two 128-bit halves and keeps every vector in memory.
-- An operation without an instruction in the version being generated runs as a scalar loop over the lanes in a scratch area of the frame. These operations are `pshufb` on SSE2, 64-bit multiplication, minimum, maximum and comparison where unavailable, byte shifts and arithmetic 64-bit shifts. Unsigned comparisons flip the sign bit of both operands and compare signed. The AVX-512 version has an instruction for 64-bit multiplication, minimum, maximum, comparison and arithmetic shifts, so only byte multiplication, byte shifts and the lanes the other versions also lack run as a scalar loop there. The scalar loop of a shift clamps the count, read as unsigned, to 63 before the lane loop, so a negative count or one above 63 gives the same lanes as a count of 63.
+- The SSE2 version splits 256-bit operations into two 128-bit halves and 512-bit operations into four, and keeps every vector in memory.
+- An operation without an instruction in the version being generated runs as a scalar loop over the lanes in a scratch area of the frame. These operations are `pshufb` on SSE2, 64-bit multiplication, minimum, maximum and comparison where unavailable, byte multiplication, byte shifts and arithmetic 64-bit shifts. Unsigned comparisons flip the sign bit of both operands and compare signed. The AVX-512 version has an instruction or a short sequence for each of these, so it runs no scalar loop. The scalar loop of a shift clamps the count, read as unsigned, to 63 before the lane loop, so a negative count or one above 63 gives the same lanes as a count of 63.
 
 ### WebAssembly
 
