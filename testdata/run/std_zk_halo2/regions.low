@@ -1,0 +1,162 @@
+import std/crypto/blake2b
+import std/crypto/nistec
+import std/crypto/pasta
+import std/text
+import std/zk/halo2
+
+struct Arith {
+    cs: *halo2.ConstraintSystem
+    table: halo2.Column
+    a: halo2.Column
+    b: halo2.Column
+    c: halo2.Column
+    d: halo2.Column
+    e: halo2.Column
+    inst: halo2.Column
+    s_mul: halo2.Selector
+    s_add: halo2.Selector
+    s_square: halo2.Selector
+    q_range: halo2.Selector
+}
+
+fn arith() -> Arith {
+    let cs = halo2.constraint_system()
+    let constants = halo2.fixed_column(cs)
+    let table = halo2.fixed_column(cs)
+    let a = halo2.advice_column(cs)
+    let b = halo2.advice_column(cs)
+    let c = halo2.advice_column(cs)
+    let d = halo2.advice_column(cs)
+    let e = halo2.advice_column(cs)
+    let inst = halo2.instance_column(cs)
+    halo2.enable_constant(cs, constants)
+    for column in [a, b, c, d, e, inst] {
+        halo2.enable_equality(cs, column)
+    }
+    let s_mul = halo2.selector(cs)
+    let s_add = halo2.selector(cs)
+    let s_square = halo2.selector(cs)
+    let q_range = halo2.complex_selector(cs)
+    let qa = halo2.query_advice(cs, a, 0)
+    let qb = halo2.query_advice(cs, b, 0)
+    let qc = halo2.query_advice(cs, c, 0)
+    let qd = halo2.query_advice(cs, d, 0)
+    let qe = halo2.query_advice(cs, e, 0)
+    halo2.create_gate(cs, [halo2.mul(halo2.query_selector(s_mul), halo2.sub(halo2.mul(qa, qb), qc))])
+    halo2.create_gate(cs, [halo2.mul(halo2.query_selector(s_add), halo2.sub(halo2.add(qa, qb), qc))])
+    halo2.create_gate(cs, [halo2.mul(halo2.query_selector(s_square), halo2.sub(halo2.mul(qd, qd), qe))])
+    halo2.lookup(cs, [halo2.mul(halo2.query_selector(q_range), qa)], [halo2.query_fixed(cs, table, 0)])
+    Arith { cs, table, a, b, c, d, e, inst, s_mul, s_add, s_square, q_range }
+}
+
+fn element(f: *nistec.Field, value: i64) -> u64[] {
+    pasta.field_from_u64(f, u64(value))
+}
+
+fn add_constant(f: *nistec.Field, l: *halo2.Layouter, ch: Arith, input: halo2.AssignedCell, value: u64[]) -> halo2.AssignedCell ! halo2.Error {
+    let r = halo2.region(l)
+    halo2.enable_selector(r, ch.s_add, 0)
+    let a = halo2.copy_advice(r, input, ch.a, 0)
+    let b = halo2.assign_advice_from_constant(r, ch.b, 0, value)
+    let out = halo2.assign_advice(r, ch.c, 0, pasta.field_add(f, a.value, b.value))
+    halo2.end_region(r)?
+    out
+}
+
+fn synthesize(p: *halo2.Params, ch: Arith, x: i64, y: i64) -> halo2.Assignment ! halo2.Error {
+    let f = p.curve.scalar
+    let l = halo2.layouter(p, ch.cs, [])
+    var range: u64[][] = []
+    for i in 0..8 {
+        range.push(element(f, i))
+    }
+    halo2.assign_table(l, ch.table, range)?
+
+    let mul = halo2.region(l)
+    halo2.enable_selector(mul, ch.s_mul, 0)
+    halo2.enable_selector(mul, ch.q_range, 0)
+    halo2.assign_advice(mul, ch.a, 0, element(f, x))
+    halo2.assign_advice(mul, ch.b, 0, element(f, y))
+    let product = halo2.assign_advice(mul, ch.c, 0, element(f, x * y))
+    halo2.end_region(mul)?
+
+    let sum = add_constant(f, l, ch, product, element(f, 5))?
+
+    let square = halo2.region(l)
+    halo2.enable_selector(square, ch.s_square, 0)
+    let d = halo2.copy_advice(square, sum, ch.d, 0)
+    let squared = halo2.assign_advice(square, ch.e, 0, pasta.field_square(f, d.value))
+    halo2.end_region(square)?
+
+    let shifted = add_constant(f, l, ch, squared, element(f, 7))?
+    halo2.constrain_instance(l, squared, ch.inst, 0)?
+    halo2.constrain_instance(l, shifted, ch.inst, 1)?
+    halo2.finish(l)
+}
+
+fn regions_vectors(t: *Tally, files: [str: str]) {
+    let c = pasta.vesta()
+    let f = c.scalar
+    let p = halo2.params(c, 4)
+    let ch = arith()
+    let keyed = synthesize(p, ch, 0, 0) or panic("layout failed")
+    let pk = halo2.keygen(p, ch.cs, keyed) or panic("keygen failed")
+    let vk = pk.vk
+    let pinned = record(files, "regions_pinned")
+    check(t, "regions: pinned verification key with combined selectors and a constants column", pinned.len == 1 && hex(bytes(halo2.pinned(vk))) == pinned[0])
+    check(t, "regions: fixed commitments", same_strings(encoded_points(c, vk.fixed_commitments), record(files, "regions_fixed_commitments")))
+    check(t, "regions: permutation commitments", same_strings(encoded_points(c, vk.permutation_commitments), record(files, "regions_permutation_commitments")))
+
+    let first = [[element(f, 289), element(f, 296)]]
+    let second = [[element(f, 1225), element(f, 1232)]]
+    let both = [first, second]
+    var listed: str[] = []
+    for v in [first[0][0], first[0][1], second[0][0], second[0][1]] {
+        listed.push(hex(pasta.field_to_bytes(f, v)))
+    }
+    check(t, "regions: public inputs", same_strings(listed, record(files, "regions_instances")))
+    let reference_proof = unhex(record(files, "regions_proof")[0])
+    check(t, "regions: reference proof of two circuits is accepted", accepts(p, vk, both, reference_proof))
+
+    let circuits = [synthesize(p, ch, 3, 4) or panic("layout failed"), synthesize(p, ch, 5, 6) or panic("layout failed")]
+    let own = halo2.prove(p, pk, circuits, both, seeded("halo2 regions fixture")) or panic("prove failed")
+    check(t, "regions: own proof of two circuits is accepted", accepts(p, vk, both, own))
+    check(t, "regions: own proof is the checked in proof", hex(own) == text.trim(files["low_regions_proof.hex"] ?? ""))
+    let digest = blake2b.sum(blake2b.Options { size: 32 }, own) or []
+    check(t, "regions: reference verifier accepts the own proof", same_strings(record(files, "regions_low_proof_verdict"), ["accepted", hex(digest)]))
+    check(t, "regions: proof length", own.len == reference_proof.len)
+    let wrong = synthesize(p, ch, 9, 4) or panic("layout failed")
+    check(t, "regions: a witness outside the lookup table is refused", refused(p, pk, [wrong], [[[element(f, 1681), element(f, 1688)]]]))
+    check(t, "regions: a public input that differs in one circuit of two is refused", refused(p, pk, circuits, [first, first]))
+    regions_tampering(t, p, vk, both, own, reference_proof)
+}
+
+fn refused(p: *halo2.Params, pk: *halo2.ProvingKey, circuits: halo2.Assignment[], instances: u64[][][][]) -> bool {
+    halo2.prove(p, pk, circuits, instances, seeded("refused")) or return true
+    false
+}
+
+fn regions_tampering(t: *Tally, p: *halo2.Params, vk: *halo2.VerifyingKey, both: u64[][][][], proof: u8[], other: u8[]) {
+    let f = p.curve.scalar
+    let changed = [both[0], [[both[1][0][0], pasta.field_add(f, both[1][0][1], pasta.field_one(f))]]]
+    check(t, "regions tamper: the instances swapped are rejected", all_rejected(p, vk, [both[1], both[0]], [proof, other]))
+    check(t, "regions tamper: one instance set for two proofs is rejected", all_rejected(p, vk, [both[0]], [proof, other]) && all_rejected(p, vk, [both[1]], [proof, other]))
+    check(t, "regions tamper: three instance sets for two proofs are rejected", all_rejected(p, vk, [both[0], both[1], both[1]], [proof, other]))
+    check(t, "regions tamper: a changed public input is rejected", all_rejected(p, vk, changed, [proof, other]))
+    var prefixes: u8[][] = []
+    var len = 0
+    for len < proof.len {
+        prefixes.push(proof[..len])
+        len += 31
+    }
+    check(t, "regions tamper: proper prefixes are rejected ({prefixes.len} proofs)", all_rejected(p, vk, both, prefixes))
+    check(t, "regions tamper: a trailing byte is rejected", all_rejected(p, vk, both, [replaced_append(proof, 0), replaced_append(other, 1)]))
+    var flips: u8[][] = []
+    var at = 0
+    for at < proof.len {
+        let target = if at % 64 == 0 { proof } else { other }
+        flips.push(replaced(target, at + at % 31, [target[at + at % 31] ^ u8(1 << (at % 8))]))
+        at += 32
+    }
+    check(t, "regions tamper: a flipped bit in every 32-byte word of one proof or the other is rejected ({flips.len} proofs)", all_rejected(p, vk, both, flips))
+}

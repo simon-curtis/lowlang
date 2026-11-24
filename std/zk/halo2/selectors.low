@@ -1,0 +1,222 @@
+import std/crypto/nistec
+
+fn has_simple(e: Expr) -> bool {
+    match e {
+        Selected(s) => s.simple
+        Negated(a) => has_simple(*a)
+        Sum(a, b) => has_simple(*a) || has_simple(*b)
+        Product(a, b) => has_simple(*a) || has_simple(*b)
+        Scaled(a, _) => has_simple(*a)
+        _ => false
+    }
+}
+
+fn selectors_fit(e: Expr, count: i64) -> bool {
+    match e {
+        Selected(s) => s.index >= 0 && s.index < count
+        Negated(a) => selectors_fit(*a, count)
+        Sum(a, b) => !has_simple(*a) && !has_simple(*b) && selectors_fit(*a, count) && selectors_fit(*b, count)
+        Product(a, b) => !(has_simple(*a) && has_simple(*b)) && selectors_fit(*a, count) && selectors_fit(*b, count)
+        Scaled(a, _) => selectors_fit(*a, count)
+        _ => true
+    }
+}
+
+fn selectors_used_well(cs: *ConstraintSystem) -> bool {
+    let count = cs.selectors.len
+    for g in cs.gates {
+        if !selectors_fit(g, count) {
+            return false
+        }
+    }
+    for l in cs.lookups {
+        for e in l.input {
+            if has_simple(e) || !selectors_fit(e, count) {
+                return false
+            }
+        }
+        for e in l.table {
+            if has_simple(e) || !selectors_fit(e, count) {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn simple_selector_of(e: Expr) -> i64 {
+    match e {
+        Selected(s) => if s.simple { s.index } else { -1 }
+        Negated(a) => simple_selector_of(*a)
+        Sum(a, b) => max_of(simple_selector_of(*a), simple_selector_of(*b))
+        Product(a, b) => max_of(simple_selector_of(*a), simple_selector_of(*b))
+        Scaled(a, _) => simple_selector_of(*a)
+        _ => -1
+    }
+}
+
+fn replaced(e: Expr, replacements: Expr[]) -> Expr {
+    match e {
+        Selected(s) => replacements[s.index]
+        Negated(a) => Negated(new(replaced(*a, replacements)))
+        Sum(a, b) => Sum(new(replaced(*a, replacements)), new(replaced(*b, replacements)))
+        Product(a, b) => Product(new(replaced(*a, replacements)), new(replaced(*b, replacements)))
+        Scaled(a, factor) => Scaled(new(replaced(*a, replacements)), factor)
+        _ => e
+    }
+}
+
+fn replaced_all(exprs: Expr[], replacements: Expr[]) -> Expr[] {
+    var out: Expr[] = []
+    for e in exprs {
+        out.push(replaced(e, replacements))
+    }
+    out
+}
+
+struct Compressed {
+    cs: *ConstraintSystem
+    columns: u64[][][]
+}
+
+fn copied_system(cs: *ConstraintSystem) -> *ConstraintSystem {
+    var fixed_queries: Rotated[] = []
+    for q in cs.fixed_queries {
+        fixed_queries.push(q)
+    }
+    new(ConstraintSystem {
+        fixed_columns: cs.fixed_columns,
+        advice_columns: cs.advice_columns,
+        instance_columns: cs.instance_columns,
+        selectors: cs.selectors,
+        constants: cs.constants,
+        gates: [],
+        advice_queries: cs.advice_queries,
+        instance_queries: cs.instance_queries,
+        fixed_queries,
+        advice_query_counts: cs.advice_query_counts,
+        permutation: cs.permutation,
+        lookups: [],
+    })
+}
+
+fn selector_column(cs: *ConstraintSystem) -> Expr {
+    cs.fixed_columns += 1
+    query_fixed(cs, Column { kind: Fixed, index: cs.fixed_columns - 1 }, 0)
+}
+
+fn overlaps(a: bool[], b: bool[]) -> bool {
+    for row in 0..a.len {
+        if a[row] && b[row] {
+            return true
+        }
+    }
+    false
+}
+
+fn excluded(activations: bool[][], members: i64[], candidate: i64) -> bool {
+    for m in members {
+        if overlaps(activations[candidate], activations[m]) {
+            return true
+        }
+    }
+    false
+}
+
+fn selector_degrees(cs: *ConstraintSystem) -> i64[] {
+    var degrees: i64[] = []
+    for _ in cs.selectors {
+        degrees.push(0)
+    }
+    for g in cs.gates {
+        let s = simple_selector_of(g)
+        if s >= 0 {
+            degrees[s] = max_of(degrees[s], expr_degree(g))
+        }
+    }
+    degrees
+}
+
+fn combined_expression(f: *nistec.Field, query: Expr, size: i64, assigned: i64) -> Expr {
+    var out = query
+    for root in 1..size + 1 {
+        if root != assigned {
+            out = mul(out, sub(constant(number(f, root)), query))
+        }
+    }
+    out
+}
+
+/// Returns the constraint system with every selector replaced by a query of a new fixed column, and the values of those columns, as `compress_selectors` of `halo2_proofs` 0.3.0 does: a complex selector, or one in no gate, gets a column of its own, and simple selectors that are never on in the same row share a column while the gates stay within the degree of `cs`, each on the rows where its column holds its own number.
+fn compress_selectors(f: *nistec.Field, cs: *ConstraintSystem, activations: bool[][]) -> Compressed {
+    let out = copied_system(cs)
+    let degrees = selector_degrees(cs)
+    let n = if activations.len > 0 { activations[0].len } else { 0 }
+    var replacements: Expr[] = []
+    for _ in cs.selectors {
+        replacements.push(constant(zero(f)))
+    }
+    var columns: u64[][][] = []
+    var remaining: i64[] = []
+    for s in 0..cs.selectors.len {
+        if degrees[s] > 0 {
+            remaining.push(s)
+            continue
+        }
+        replacements[s] = selector_column(out)
+        var column = zeros(f, n)
+        for row in 0..n {
+            if activations[s][row] {
+                column[row] = one(f)
+            }
+        }
+        columns.push(column)
+    }
+    let most = degree(cs)
+    var added: bool[] = []
+    for _ in remaining {
+        added.push(false)
+    }
+    for i in 0..remaining.len {
+        if added[i] {
+            continue
+        }
+        added[i] = true
+        var reach = degrees[remaining[i]] - 1
+        var members: i64[] = [remaining[i]]
+        for j in i + 1..remaining.len {
+            if reach + members.len == most {
+                break
+            }
+            let candidate = remaining[j]
+            if added[j] || excluded(activations, members, candidate) {
+                continue
+            }
+            let joined = max_of(reach, degrees[candidate] - 1)
+            if joined + members.len + 1 > most {
+                continue
+            }
+            reach = joined
+            members.push(candidate)
+            added[j] = true
+        }
+        let query = selector_column(out)
+        var column = zeros(f, n)
+        for k, member in members {
+            replacements[member] = combined_expression(f, query, members.len, k + 1)
+            for row in 0..n {
+                if activations[member][row] {
+                    column[row] = number(f, k + 1)
+                }
+            }
+        }
+        columns.push(column)
+    }
+    for g in cs.gates {
+        out.gates.push(replaced(g, replacements))
+    }
+    for l in cs.lookups {
+        out.lookups.push(Lookup { input: replaced_all(l.input, replacements), table: replaced_all(l.table, replacements) })
+    }
+    Compressed { cs: out, columns }
+}
