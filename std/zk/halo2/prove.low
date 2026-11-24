@@ -1,0 +1,635 @@
+import std/crypto/nistec
+import std/crypto/pasta
+
+struct Committed {
+    values: u64[][]
+    poly: u64[][]
+    coset: u64[][]
+    blind: u64[]
+}
+
+struct LookupWork {
+    input: Committed
+    table: Committed
+    product: Committed
+    compressed_input: u64[][]
+    compressed_table: u64[][]
+    compressed_input_coset: u64[][]
+    compressed_table_coset: u64[][]
+}
+
+struct Pool {
+    polys: u64[][][]
+    blinds: u64[][]
+    ids: i64[]
+    points: u64[][]
+}
+
+fn wrap(index: i64, length: i64) -> i64 {
+    ((index % length) + length) % length
+}
+
+fn evaluate_rows(f: *nistec.Field, e: Expr, fixed: u64[][][], advice: u64[][][], instance: u64[][][], row: i64, shift: i64) -> u64[] {
+    match e {
+        Constant(v) => v
+        Fixed(q) => fixed[q.column][wrap(row + q.rotation * shift, fixed[q.column].len)]
+        Advice(q) => advice[q.column][wrap(row + q.rotation * shift, advice[q.column].len)]
+        Instance(q) => instance[q.column][wrap(row + q.rotation * shift, instance[q.column].len)]
+        Negated(a) => negate(f, evaluate_rows(f, *a, fixed, advice, instance, row, shift))
+        Sum(a, b) => sum(f, evaluate_rows(f, *a, fixed, advice, instance, row, shift), evaluate_rows(f, *b, fixed, advice, instance, row, shift))
+        Product(a, b) => prod(f, evaluate_rows(f, *a, fixed, advice, instance, row, shift), evaluate_rows(f, *b, fixed, advice, instance, row, shift))
+        Scaled(a, s) => prod(f, evaluate_rows(f, *a, fixed, advice, instance, row, shift), s)
+    }
+}
+
+fn random_values(f: *nistec.Field, random: fn(i64) -> u8[], count: i64) -> u64[][] {
+    var out: u64[][] = []
+    for _ in 0..count {
+        out.push(random_scalar(f, random))
+    }
+    out
+}
+
+fn committed(d: Domain, values: u64[][], blind: u64[]) -> Committed {
+    let poly = lagrange_to_coeff(d, values)
+    Committed { values, poly, coset: coeff_to_extended(d, poly), blind }
+}
+
+fn compress_rows(f: *nistec.Field, exprs: Expr[], theta: u64[], fixed: u64[][][], advice: u64[][][], instance: u64[][][], rows: i64, shift: i64) -> u64[][] {
+    var out: u64[][] = []
+    for row in 0..rows {
+        var acc = zero(f)
+        for expr in exprs {
+            acc = sum(f, prod(f, acc, theta), evaluate_rows(f, expr, fixed, advice, instance, row, shift))
+        }
+        out.push(acc)
+    }
+    out
+}
+
+fn plain_less(a: u64[], b: u64[]) -> bool {
+    var i = a.len - 1
+    for i >= 0 {
+        if a[i] != b[i] {
+            return a[i] < b[i]
+        }
+        i -= 1
+    }
+    false
+}
+
+fn sort_plain(f: *nistec.Field, values: u64[][]) -> u64[][] {
+    var plain: u64[][] = []
+    for v in values {
+        plain.push(pasta.field_to_plain(f, v))
+    }
+    for i in 1..plain.len {
+        var j = i
+        for j > 0 && plain_less(plain[j], plain[j - 1]) {
+            let held = plain[j]
+            plain[j] = plain[j - 1]
+            plain[j - 1] = held
+            j -= 1
+        }
+    }
+    var out: u64[][] = []
+    for v in plain {
+        out.push(pasta.field_from_plain(f, v))
+    }
+    out
+}
+
+struct Pair {
+    input: u64[][]
+    table: u64[][]
+}
+
+fn is_first(sorted_input: u64[][], row: i64) -> bool {
+    row == 0 || !same(sorted_input[row], sorted_input[row - 1])
+}
+
+fn permute_pair(f: *nistec.Field, input: u64[][], table: u64[][], usable: i64, blinding: i64, random: fn(i64) -> u8[]) -> Pair ! Error {
+    let sorted_input = sort_plain(f, input[..usable])
+    let sorted_table = sort_plain(f, table[..usable])
+    var permuted_table = zeros(f, usable)
+    var taken: bool[] = []
+    var repeated: i64[] = []
+    for _ in 0..usable {
+        taken.push(false)
+    }
+    for row in 0..usable {
+        if !is_first(sorted_input, row) {
+            repeated.push(row)
+            continue
+        }
+        permuted_table[row] = sorted_input[row]
+        var found = false
+        for k in 0..usable {
+            if !found && !taken[k] && same(sorted_table[k], sorted_input[row]) {
+                taken[k] = true
+                found = true
+            }
+        }
+        if !found {
+            fail Unsatisfied
+        }
+    }
+    var next = repeated.len - 1
+    for k in 0..usable {
+        if !taken[k] {
+            permuted_table[repeated[next]] = sorted_table[k]
+            next -= 1
+        }
+    }
+    var permuted_input = copy_all(sorted_input)
+    for _ in 0..blinding + 1 {
+        permuted_input.push(random_scalar(f, random))
+        permuted_table.push(random_scalar(f, random))
+    }
+    Pair { input: permuted_input, table: permuted_table }
+}
+
+fn copy_all(values: u64[][]) -> u64[][] {
+    var out: u64[][] = []
+    for v in values {
+        out.push(v)
+    }
+    out
+}
+
+fn add_poly(pool: *Pool, poly: u64[][], blind: u64[]) -> i64 {
+    pool.polys.push(poly)
+    pool.blinds.push(blind)
+    pool.polys.len - 1
+}
+
+fn open_poly(pool: *Pool, id: i64, point: u64[]) {
+    pool.ids.push(id)
+    pool.points.push(point)
+}
+
+fn column_values(kind: Kind, fixed: u64[][][], advice: u64[][][], instance: u64[][][]) -> u64[][][] {
+    match kind {
+        Advice => advice
+        Fixed => fixed
+        Instance => instance
+    }
+}
+
+fn permutation_sets(d: Domain, pk: *ProvingKey, advice: u64[][][], instance: u64[][][], beta: u64[], gamma: u64[], random: fn(i64) -> u8[]) -> Committed[] ! Error {
+    let f = d.f
+    let cs = pk.vk.cs
+    let chunk_len = degree(cs) - 2
+    let blinding = blinding_factors(cs)
+    var out: Committed[] = []
+    var last_z = one(f)
+    var shift = one(f)
+    for set in 0..chunk_count(cs.permutation.len, chunk_len) {
+        let from = set * chunk_len
+        var to = from + chunk_len
+        if to > cs.permutation.len {
+            to = cs.permutation.len
+        }
+        var numerators = zeros(f, d.n)
+        var denominators = zeros(f, d.n)
+        for row in 0..d.n {
+            numerators[row] = one(f)
+            denominators[row] = one(f)
+        }
+        for j in from..to {
+            let column = cs.permutation[j]
+            let values = column_values(column.kind, pk.fixed_values, advice, instance)[column.index]
+            var point = shift
+            for row in 0..d.n {
+                denominators[row] = prod(f, denominators[row], sum(f, sum(f, prod(f, beta, pk.permutation_values[j][row]), gamma), values[row]))
+                numerators[row] = prod(f, numerators[row], sum(f, sum(f, prod(f, point, beta), gamma), values[row]))
+                point = prod(f, point, d.omega)
+            }
+            shift = prod(f, shift, d.delta)
+        }
+        var z: u64[][] = [last_z]
+        for row in 1..d.n {
+            z.push(prod(f, prod(f, z[row - 1], numerators[row - 1]), inverse(f, denominators[row - 1])))
+        }
+        for row in d.n - blinding..d.n {
+            z[row] = random_scalar(f, random)
+        }
+        last_z = z[d.n - (blinding + 1)]
+        out.push(committed(d, z, random_scalar(f, random)))
+    }
+    if cs.permutation.len > 0 && !same(last_z, one(f)) {
+        fail Unsatisfied
+    }
+    out
+}
+
+fn lookup_product(d: Domain, cs: *ConstraintSystem, l: LookupWork, beta: u64[], gamma: u64[], random: fn(i64) -> u8[]) -> Committed {
+    let f = d.f
+    let blinding = blinding_factors(cs)
+    var z: u64[][] = [one(f)]
+    for row in 1..d.n - blinding {
+        let left = prod(f, sum(f, l.compressed_input[row - 1], beta), sum(f, l.compressed_table[row - 1], gamma))
+        let right = prod(f, sum(f, l.input.values[row - 1], beta), sum(f, l.table.values[row - 1], gamma))
+        z.push(prod(f, z[row - 1], prod(f, left, inverse(f, right))))
+    }
+    for _ in 0..blinding {
+        z.push(random_scalar(f, random))
+    }
+    committed(d, z, random_scalar(f, random))
+}
+
+fn at(values: u64[][], index: i64, rotation: i64, ratio: i64) -> u64[] {
+    values[wrap(index + rotation * ratio, values.len)]
+}
+
+struct Cosets {
+    fixed: u64[][][]
+    advice: u64[][][]
+    instance: u64[][][]
+    l0: u64[][]
+    l_blind: u64[][]
+    l_last: u64[][]
+    points: u64[][]
+}
+
+fn quotient_at(d: Domain, pk: *ProvingKey, c: Cosets, sets: Committed[], lookups: LookupWork[], beta: u64[], gamma: u64[], y: u64[], i: i64) -> u64[] {
+    let f = d.f
+    let cs = pk.vk.cs
+    let ratio = 1 << (d.extended_k - d.k)
+    let bf = blinding_factors(cs)
+    let l0 = c.l0[i]
+    let l_last = c.l_last[i]
+    let active = diff(f, one(f), sum(f, l_last, c.l_blind[i]))
+    var terms: u64[][] = []
+    for g in cs.gates {
+        terms.push(evaluate_rows(f, g, c.fixed, c.advice, c.instance, i, ratio))
+    }
+    if sets.len > 0 {
+        terms.push(prod(f, diff(f, one(f), sets[0].coset[i]), l0))
+        let last = sets[sets.len - 1].coset[i]
+        terms.push(prod(f, diff(f, square(f, last), last), l_last))
+        for s in 1..sets.len {
+            terms.push(prod(f, diff(f, sets[s].coset[i], at(sets[s - 1].coset, i, -(bf + 1), ratio)), l0))
+        }
+        let chunk_len = degree(cs) - 2
+        for s in 0..sets.len {
+            let from = s * chunk_len
+            var to = from + chunk_len
+            if to > cs.permutation.len {
+                to = cs.permutation.len
+            }
+            var left = at(sets[s].coset, i, 1, ratio)
+            var right = sets[s].coset[i]
+            var current_delta = prod(f, beta, power(f, d.delta, from))
+            for j in from..to {
+                let column = cs.permutation[j]
+                let value = column_values(column.kind, c.fixed, c.advice, c.instance)[column.index][i]
+                left = prod(f, left, sum(f, sum(f, value, prod(f, beta, pk.permutation_cosets[j][i])), gamma))
+                right = prod(f, right, sum(f, sum(f, value, prod(f, current_delta, c.points[i])), gamma))
+                current_delta = prod(f, current_delta, d.delta)
+            }
+            terms.push(prod(f, diff(f, left, right), active))
+        }
+    }
+    for k in 0..lookups.len {
+        let l = lookups[k]
+        let z = l.product.coset
+        let left = prod(f, prod(f, at(z, i, 1, ratio), sum(f, l.input.coset[i], beta)), sum(f, l.table.coset[i], gamma))
+        let right = prod(f, prod(f, z[i], sum(f, l.compressed_input_coset[i], beta)), sum(f, l.compressed_table_coset[i], gamma))
+        let gap = diff(f, l.input.coset[i], l.table.coset[i])
+        terms.push(prod(f, l0, diff(f, one(f), z[i])))
+        terms.push(prod(f, l_last, diff(f, square(f, z[i]), z[i])))
+        terms.push(prod(f, diff(f, left, right), active))
+        terms.push(prod(f, l0, gap))
+        terms.push(prod(f, prod(f, gap, diff(f, l.input.coset[i], at(l.input.coset, i, -1, ratio))), active))
+    }
+    var h = zero(f)
+    for v in terms {
+        h = sum(f, prod(f, h, y), v)
+    }
+    h
+}
+
+fn extended_points(d: Domain) -> u64[][] {
+    var out: u64[][] = []
+    var current = d.zeta
+    for _ in 0..extended_len(d) {
+        out.push(current)
+        current = prod(d.f, current, d.extended_omega)
+    }
+    out
+}
+
+fn check_gates(d: Domain, cs: *ConstraintSystem, fixed: u64[][][], advice: u64[][][], instance: u64[][][]) ! Error {
+    let usable = usable_rows(d, cs)
+    for row in 0..usable {
+        for g in cs.gates {
+            if !is_zero(evaluate_rows(d.f, g, fixed, advice, instance, row, 1)) {
+                fail Unsatisfied
+            }
+        }
+    }
+}
+
+fn write_commitment(p: *Params, t: *Transcript, c: Committed) ! Error {
+    write_point(t, commit_lagrange(p, c.values, c.blind))?
+}
+
+fn chunked(f: *nistec.Field, coeffs: u64[][], n: i64, pieces: i64) -> u64[][][] {
+    var out: u64[][][] = []
+    for i in 0..pieces {
+        out.push(coeffs[i * n..(i + 1) * n])
+    }
+    out
+}
+
+/// Returns a proof that the witness `advice`, with the public inputs `instances`, satisfies the circuit of `pk`. `advice` holds the values of each advice column from row 0, at most as many as there are usable rows, and `instances` those of each instance column. `random` returns the number of random bytes it is asked for and must be unpredictable to anyone but the prover: the blinding of the commitments and of the opening, and so the zero knowledge of the proof, rest on it.
+/// Fails with `Instance` or `Circuit` when the columns do not fit the circuit, and with `Unsatisfied` when a gate, an equality or a lookup does not hold for the witness.
+pub fn prove(p: *Params, pk: *ProvingKey, advice: u64[][][], instances: u64[][][], random: fn(i64) -> u8[]) -> u8[] ! Error {
+    let vk = pk.vk
+    let c = p.curve
+    let f = c.scalar
+    let d = vk.domain
+    let cs = vk.cs
+    if p.k != d.k || advice.len != cs.advice_columns {
+        fail Circuit
+    }
+    if instances.len != cs.instance_columns {
+        fail Instance
+    }
+    let usable = usable_rows(d, cs)
+    let blinding = blinding_factors(cs)
+    let ratio = 1 << (d.extended_k - d.k)
+    for column in instances {
+        if column.len > usable {
+            fail Instance
+        }
+    }
+    for column in advice {
+        if column.len > usable {
+            fail Circuit
+        }
+    }
+    let t = writer(c)
+    common_scalar(t, vk.representative)
+
+    var instance_values: u64[][][] = []
+    var instance_polys: u64[][][] = []
+    var instance_cosets: u64[][][] = []
+    for column in instances {
+        let values = padded(f, column, d.n)
+        common_point(t, commit_lagrange(p, values, one(f)))?
+        instance_values.push(values)
+        let poly = lagrange_to_coeff(d, values)
+        instance_polys.push(poly)
+        instance_cosets.push(coeff_to_extended(d, poly))
+    }
+
+    var advice_values: u64[][][] = []
+    for column in advice {
+        var values = padded(f, column, usable)
+        for _ in 0..blinding + 1 {
+            values.push(random_scalar(f, random))
+        }
+        advice_values.push(values)
+    }
+    var advice_columns: Committed[] = []
+    for values in advice_values {
+        advice_columns.push(committed(d, values, random_scalar(f, random)))
+    }
+    var advice_polys: u64[][][] = []
+    var advice_cosets: u64[][][] = []
+    for column in advice_columns {
+        write_commitment(p, t, column)?
+        advice_polys.push(column.poly)
+        advice_cosets.push(column.coset)
+    }
+    check_gates(d, cs, pk.fixed_values, advice_values, instance_values)?
+
+    let theta = squeeze(t)
+    var lookups: LookupWork[] = []
+    for l in cs.lookups {
+        let compressed_input = compress_rows(f, l.input, theta, pk.fixed_values, advice_values, instance_values, d.n, 1)
+        let compressed_table = compress_rows(f, l.table, theta, pk.fixed_values, advice_values, instance_values, d.n, 1)
+        let pair = permute_pair(f, compressed_input, compressed_table, usable, blinding, random)?
+        let input = committed(d, pair.input, random_scalar(f, random))
+        let table = committed(d, pair.table, random_scalar(f, random))
+        write_commitment(p, t, input)?
+        write_commitment(p, t, table)?
+        lookups.push(LookupWork {
+            input,
+            table,
+            product: input,
+            compressed_input,
+            compressed_table,
+            compressed_input_coset: compress_rows(f, l.input, theta, pk.fixed_cosets, advice_cosets, instance_cosets, extended_len(d), ratio),
+            compressed_table_coset: compress_rows(f, l.table, theta, pk.fixed_cosets, advice_cosets, instance_cosets, extended_len(d), ratio),
+        })
+    }
+    let beta = squeeze(t)
+    let gamma = squeeze(t)
+    let sets = permutation_sets(d, pk, advice_values, instance_values, beta, gamma, random)?
+    for s in sets {
+        write_commitment(p, t, s)?
+    }
+    for k in 0..lookups.len {
+        lookups[k].product = lookup_product(d, cs, lookups[k], beta, gamma, random)
+        write_commitment(p, t, lookups[k].product)?
+    }
+
+    let random_poly = random_values(f, random, d.n)
+    let random_blind = random_scalar(f, random)
+    write_point(t, commit(p, random_poly, random_blind))?
+    let y = squeeze(t)
+
+    let cosets = Cosets {
+        fixed: pk.fixed_cosets,
+        advice: advice_cosets,
+        instance: instance_cosets,
+        l0: pk.l0,
+        l_blind: pk.l_blind,
+        l_last: pk.l_last,
+        points: extended_points(d),
+    }
+    var quotient: u64[][] = []
+    for i in 0..extended_len(d) {
+        quotient.push(quotient_at(d, pk, cosets, sets, lookups, beta, gamma, y, i))
+    }
+    let h_coeffs = extended_to_coeff(d, divide_by_vanishing(d, quotient))
+    let h_pieces = chunked(f, h_coeffs, d.n, d.quotient_degree)
+    var h_blinds: u64[][] = []
+    for piece in h_pieces {
+        let blind = random_scalar(f, random)
+        h_blinds.push(blind)
+        write_point(t, commit(p, piece, blind))?
+    }
+
+    let x = squeeze(t)
+    let xn = power(f, x, d.n)
+    let pool = new(Pool { polys: [], blinds: [], ids: [], points: [] })
+    var instance_ids: i64[] = []
+    for poly in instance_polys {
+        instance_ids.push(add_poly(pool, poly, one(f)))
+    }
+    var advice_ids: i64[] = []
+    for column in advice_columns {
+        advice_ids.push(add_poly(pool, column.poly, column.blind))
+    }
+    for q in cs.instance_queries {
+        write_scalar(t, evaluate(f, instance_polys[q.column], rotate_omega(d, x, q.rotation)))
+    }
+    for q in cs.advice_queries {
+        write_scalar(t, evaluate(f, advice_polys[q.column], rotate_omega(d, x, q.rotation)))
+    }
+    for q in cs.fixed_queries {
+        write_scalar(t, evaluate(f, pk.fixed_coeffs[q.column], rotate_omega(d, x, q.rotation)))
+    }
+    write_scalar(t, evaluate(f, random_poly, x))
+    for poly in pk.permutation_coeffs {
+        write_scalar(t, evaluate(f, poly, x))
+    }
+    let x_next = rotate_omega(d, x, 1)
+    let x_last = rotate_omega(d, x, -(blinding + 1))
+    let x_inv = rotate_omega(d, x, -1)
+    var set_ids: i64[] = []
+    for s in 0..sets.len {
+        set_ids.push(add_poly(pool, sets[s].poly, sets[s].blind))
+        write_scalar(t, evaluate(f, sets[s].poly, x))
+        write_scalar(t, evaluate(f, sets[s].poly, x_next))
+        if s != sets.len - 1 {
+            write_scalar(t, evaluate(f, sets[s].poly, x_last))
+        }
+    }
+    var lookup_ids: i64[][] = []
+    for l in lookups {
+        lookup_ids.push([add_poly(pool, l.product.poly, l.product.blind), add_poly(pool, l.input.poly, l.input.blind), add_poly(pool, l.table.poly, l.table.blind)])
+        write_scalar(t, evaluate(f, l.product.poly, x))
+        write_scalar(t, evaluate(f, l.product.poly, x_next))
+        write_scalar(t, evaluate(f, l.input.poly, x))
+        write_scalar(t, evaluate(f, l.input.poly, x_inv))
+        write_scalar(t, evaluate(f, l.table.poly, x))
+    }
+    var fixed_ids: i64[] = []
+    for poly in pk.fixed_coeffs {
+        fixed_ids.push(add_poly(pool, poly, one(f)))
+    }
+    var permutation_ids: i64[] = []
+    for poly in pk.permutation_coeffs {
+        permutation_ids.push(add_poly(pool, poly, one(f)))
+    }
+    var h_poly = zeros(f, d.n)
+    var h_blind = zero(f)
+    var i = h_pieces.len - 1
+    for i >= 0 {
+        h_poly = add_coeffs(f, scale_coeffs(f, h_poly, xn), h_pieces[i])
+        h_blind = sum(f, prod(f, h_blind, xn), h_blinds[i])
+        i -= 1
+    }
+    let h_id = add_poly(pool, h_poly, h_blind)
+    let random_id = add_poly(pool, random_poly, random_blind)
+
+    for q in cs.instance_queries {
+        open_poly(pool, instance_ids[q.column], rotate_omega(d, x, q.rotation))
+    }
+    for q in cs.advice_queries {
+        open_poly(pool, advice_ids[q.column], rotate_omega(d, x, q.rotation))
+    }
+    for s in 0..sets.len {
+        open_poly(pool, set_ids[s], x)
+        open_poly(pool, set_ids[s], x_next)
+    }
+    var r = sets.len - 2
+    for r >= 0 {
+        open_poly(pool, set_ids[r], x_last)
+        r -= 1
+    }
+    for ids in lookup_ids {
+        open_poly(pool, ids[0], x)
+        open_poly(pool, ids[1], x)
+        open_poly(pool, ids[2], x)
+        open_poly(pool, ids[1], x_inv)
+        open_poly(pool, ids[0], x_next)
+    }
+    for q in cs.fixed_queries {
+        open_poly(pool, fixed_ids[q.column], rotate_omega(d, x, q.rotation))
+    }
+    for id in permutation_ids {
+        open_poly(pool, id, x)
+    }
+    open_poly(pool, h_id, x)
+    open_poly(pool, random_id, x)
+
+    prove_openings(p, pool, t, random)?
+    t.output
+}
+
+fn scale_coeffs(f: *nistec.Field, values: u64[][], factor: u64[]) -> u64[][] {
+    var out: u64[][] = []
+    for v in values {
+        out.push(prod(f, v, factor))
+    }
+    out
+}
+
+fn add_coeffs(f: *nistec.Field, a: u64[][], b: u64[][]) -> u64[][] {
+    var out: u64[][] = []
+    for i in 0..a.len {
+        out.push(sum(f, a[i], b[i]))
+    }
+    out
+}
+
+fn prove_openings(p: *Params, pool: *Pool, t: *Transcript, random: fn(i64) -> u8[]) ! Error {
+    let f = p.curve.scalar
+    let x1 = squeeze(t)
+    let x2 = squeeze(t)
+    let pl = plan(pool.ids, pool.points)
+    var q_polys: u64[][][] = []
+    var q_blinds: u64[][] = []
+    var started: bool[] = []
+    for _ in 0..pl.sets.len {
+        q_polys.push([])
+        q_blinds.push(zero(f))
+        started.push(false)
+    }
+    for ci in 0..pl.ids.len {
+        let s = pl.set_of[ci]
+        let poly = pool.polys[pl.ids[ci]]
+        if started[s] {
+            q_polys[s] = add_coeffs(f, scale_coeffs(f, q_polys[s], x1), poly)
+        } else {
+            q_polys[s] = poly
+            started[s] = true
+        }
+        q_blinds[s] = sum(f, prod(f, q_blinds[s], x1), pool.blinds[pl.ids[ci]])
+    }
+    var q_prime: u64[][] = []
+    for s in 0..pl.sets.len {
+        var poly = q_polys[s]
+        for point in pl.sets[s] {
+            poly = divide_by_root(f, poly, point)
+        }
+        for poly.len < p.n {
+            poly.push(zero(f))
+        }
+        if s == 0 {
+            q_prime = poly
+        } else {
+            q_prime = add_coeffs(f, scale_coeffs(f, q_prime, x2), poly)
+        }
+    }
+    let q_prime_blind = random_scalar(f, random)
+    write_point(t, commit(p, q_prime, q_prime_blind))?
+    let x3 = squeeze(t)
+    for poly in q_polys {
+        write_scalar(t, evaluate(f, poly, x3))
+    }
+    let x4 = squeeze(t)
+    var combined = q_prime
+    var blind = q_prime_blind
+    for s in 0..pl.sets.len {
+        combined = add_coeffs(f, scale_coeffs(f, combined, x4), q_polys[s])
+        blind = sum(f, prod(f, blind, x4), q_blinds[s])
+    }
+    ipa_prove(p, t, random, combined, blind, x3)?
+}
