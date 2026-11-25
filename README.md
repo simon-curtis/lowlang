@@ -137,9 +137,22 @@ The `patch` workflow runs after each green `build` on `main` and, when a commit 
 
 The source at release N builds with release N-1, so the compiler uses a language feature only in the release after the one that adds it. Every green `build` on `main` that changes `compiler/` outside its tool and test directories, or `std/`, cuts a patch release, and the `release` workflow commits `bootstrap.txt` to `main` with that release and the SHA-256 of its `low-linux-amd64`, so the compiler can use a feature once the patch release that carries it has moved `bootstrap.txt`.
 
+## Change rules
+
+`.githooks/changes <base> <head>` checks the commits from the merge base of `base` and `head` to `head`, and fails with one report per broken rule:
+
+| Rule | A range breaks it when |
+|---|---|
+| `fixture` | a `feat` or `fix` commit changes `compiler/lexer`, `compiler/parser` or `compiler/check`, and nothing under `testdata/` or `compiler/tests/`, or a `_test.low` file, changes |
+| `docs` | a `feat` commit changes `compiler/lexer`, `compiler/parser` or `compiler/check/builtins.low`, and `docs/design.md` does not change |
+| `std-module` | a new `std/` module has no `examples/` program or no row in the `docs/design.md` module table |
+| `example-readme` | a new program under `docs/examples/` is not linked from the `README.md` in its folder |
+
+A commit's type is the word before `(` or `:` in its subject. A `Waive: <rule>` trailer in any commit message of the range skips that rule. The `changes` workflow runs it on every pull request to `main`, from the pull request's base to its head. The `pre-push` hook in `.githooks/` runs it for each pushed branch from `<remote>/main`, or from the remote `main` when `main` itself is pushed, and blocks the push when it fails; `bootstrap.sh` sets `core.hooksPath` to `.githooks` unless the repository already sets one.
+
 ## Website
 
-`site/` is a static site. `site/gen` is a Low program that writes the pages, and Vite+ bundles them with their styles and scripts into `site/dist`, which is what Cloudflare Pages serves. The `test` workflow runs the fixtures, the `compiler/tests` programs, five minutes of `compiler/lowfuzz` seeded from the run id and a build of the site on every push and pull request to `main`; a failed fuzz run uploads the findings as the `lowfuzz-findings` artifact. The `fuzz` workflow runs `compiler/lowfuzz` for an hour every night, or for the `time` given to a manual run, and opens an issue labelled `fuzz` with the findings when it fails. The `checklist` workflow fails a pull request while its body has an unticked item, so the website items of `.github/pull_request_template.md` are ticked by hand before merge. The `site` workflow builds the site and deploys `site/dist` on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
+`site/` is a static site. `site/gen` is a Low program that writes the pages, and Vite+ bundles them with their styles and scripts into `site/dist`, which is what Cloudflare Pages serves. The `test` workflow runs the fixtures, the `compiler/tests` programs, five minutes of `compiler/lowfuzz` seeded from the run id and a build of the site on every push and pull request to `main`; a failed fuzz run uploads the findings as the `lowfuzz-findings` artifact. The `fuzz` workflow runs `compiler/lowfuzz` for an hour every night, or for the `time` given to a manual run, and opens an issue labelled `fuzz` with the findings when it fails. The `site` workflow builds the site and deploys `site/dist` on every push to `main`, whether or not `test` passes. It also deploys when an issue is opened, edited, closed, reopened, deleted, labelled or unlabelled, so a roadmap change reaches the site.
 
 ```sh
 cd site

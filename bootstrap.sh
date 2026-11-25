@@ -70,6 +70,10 @@ fi
 
 chmod +x "$seed" || fail "cannot make $seed executable"
 
+if command -v git >/dev/null 2>&1 && git -C "$root" rev-parse --git-dir >/dev/null 2>&1 && [ -z "$(git -C "$root" config --local core.hooksPath || true)" ]; then
+    git -C "$root" config --local core.hooksPath .githooks
+fi
+
 work=$(mktemp -d) || fail "cannot create a temporary directory"
 trap 'rm -rf "$work"' EXIT INT TERM
 
