@@ -485,6 +485,7 @@ module.exports = grammar({
       field('value', $._expression),
       field('operator', 'when'),
       field('condition', $._expression),
+      optional(seq('else', field('fallback', $._expression))),
     )),
 
     struct_literal: $ => prec(0, seq(
