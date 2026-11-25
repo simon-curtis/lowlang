@@ -1,0 +1,162 @@
+import std/base64
+import std/crypto/hash
+import std/crypto/jose
+import std/crypto/x509
+import std/io
+import std/slices
+import std/text
+
+/// The text of a `dns-persist-01` TXT record: the CA and the account that may issue for the domain the record sits under.
+pub struct PersistRecord {
+    /// The issuer domain name of the CA, one of `Challenge.issuers`.
+    pub issuer: str
+    /// The `accounturi` parameter, which names the account: the account URL, or the URI of `account_hash_uri` for a server whose directory has `Directory.account_hash_prefix`.
+    pub account_uri: str
+    /// Whether the record carries `policy=wildcard`, which extends it from its own domain to the wildcard name and the subdomains.
+    pub wildcard: bool = false
+    /// The `persistUntil` parameter: the Unix seconds after which the record supports no new validation, or `none` for a record without a limit.
+    pub persist_until: i64? = none
+}
+
+fn persist_domain(domain: str) -> str {
+    let base = text.trim_prefix(domain, "*.")
+    text.lower(text.trim_suffix(base, "."))
+}
+
+/// Returns the TXT record name that DNS-PERSIST-01 validates for `domain`: `_validation-persist.` before the domain in lower case, without a leading `*.` or a trailing dot.
+pub fn dns_persist_name(domain: str) -> str {
+    "_validation-persist.{persist_domain(domain)}"
+}
+
+/// Returns the `accounturi` of a server that names accounts by a hash: `prefix`, `sha-256/` and the Base64url SHA-256 digest of the domain's length as one byte, the domain, the JWK thumbprint of `key` and `account_url`.
+///
+/// `prefix` is `Directory.account_hash_prefix`, `key` the account key and `account_url` the account URL. `domain` is normalised as `dns_persist_name` does, and `*` gives the URI that is not bound to one domain. The URI changes with the account key. Fails with `Unsupported` for an empty domain or one of more than 253 bytes.
+pub fn account_hash_uri(prefix: str, domain: str, key: x509.PrivateKey, account_url: str) -> str ! Error {
+    let name = if domain == "*" { domain } else { persist_domain(domain) }
+    if name.len == 0 || name.len > 253 {
+        fail Unsupported("{domain} is not a domain name of 1 to 253 bytes")
+    }
+    var input: u8[] = [u8(name.len)]
+    io.append(mut input, bytes(name))
+    io.append(mut input, bytes(jose.thumbprint(public_jwk(key))))
+    io.append(mut input, bytes(account_url))
+    let digest = hash.sum(hash.sha256(), input)
+    "{prefix}sha-256/{base64.encode_url(digest)}"
+}
+
+fn issuer_byte(octet: u8) -> bool {
+    (octet >= 'a' && octet <= 'z') || (octet >= '0' && octet <= '9') || octet == '-' || octet == '.'
+}
+
+fn value_byte(octet: u8) -> bool {
+    octet >= 0x21 && octet <= 0x7E && octet != ';'
+}
+
+fn all_bytes(value: str, allowed: fn(u8) -> bool) -> bool {
+    for octet in bytes(value) {
+        if !allowed(octet) {
+            return false
+        }
+    }
+    value.len > 0
+}
+
+fn quotable(octet: u8) -> bool {
+    value_byte(octet) && octet != '"' && octet != '\\'
+}
+
+/// Returns the TXT record text of `record`, in the issue-value syntax of RFC 8659: the issuer, `accounturi`, then `policy=wildcard` and `persistUntil` when set, separated by `; `.
+///
+/// The text may be longer than the 255 bytes of one TXT character-string; `dns_persist_strings` splits it. Fails with `Unsupported` when the issuer is not a lower case domain name of at most 253 bytes, when the account URI is empty or holds a space, a control or non-ASCII byte, `;`, `"` or `\`, and when `persist_until` is negative.
+pub fn dns_persist_value(record: PersistRecord) -> str ! Error {
+    if record.issuer.len > 253 || !all_bytes(record.issuer, issuer_byte) {
+        fail Unsupported("{record.issuer} is not a lower case issuer domain name")
+    }
+    if !all_bytes(record.account_uri, quotable) {
+        fail Unsupported("the account URI {record.account_uri} does not fit a TXT record parameter")
+    }
+    var out = "{record.issuer}; accounturi={record.account_uri}"
+    if record.wildcard {
+        out = "{out}; policy=wildcard"
+    }
+    match record.persist_until {
+        some(limit) => {
+            if limit < 0 {
+                fail Unsupported("persistUntil {limit} is negative")
+            }
+            out = "{out}; persistUntil={limit}"
+        }
+        none => {}
+    }
+    out
+}
+
+/// Splits `value` into the character-strings of one TXT record, each at most 255 bytes. A resolver joins them without a separator.
+pub fn dns_persist_strings(value: str) -> str[] {
+    var out: str[] = []
+    var at = 0
+    for value.len - at > 255 {
+        out.push(value[at..at + 255])
+        at += 255
+    }
+    out.push(value[at..])
+    out
+}
+
+fn digit(octet: u8) -> bool {
+    octet >= '0' && octet <= '9'
+}
+
+fn persist_limit(value: str) -> i64 ! Error {
+    if !all_bytes(value, digit) {
+        fail Unsupported("persistUntil {value} is not a decimal number")
+    }
+    text.parse_int(value) catch { _ => fail Unsupported("persistUntil {value} is too large") }
+}
+
+/// Parses the text of a `dns-persist-01` TXT record, the joined character-strings, as a server reads it.
+///
+/// Parameter names and the value of `policy` match without regard to case, spaces and tabs around the issuer, `;` and `=` are skipped, a parameter with another name is ignored and so is a `policy` other than `wildcard`. Fails with `Unsupported` when the issuer or `accounturi` is missing, when a parameter has no `=` or a value with a space in it, when `accounturi`, `policy` or `persistUntil` appears twice and when `persistUntil` is not a decimal number below 2^63.
+pub fn parse_dns_persist(value: str) -> PersistRecord ! Error {
+    let parts = text.split(value, ';')
+    let issuer = text.trim(parts[0])
+    if !all_bytes(issuer, value_byte) {
+        fail Unsupported("the record has no issuer domain name")
+    }
+    var record = PersistRecord { issuer, account_uri: "" }
+    var seen: str[] = []
+    for at in 1..parts.len {
+        let part = text.trim(parts[at])
+        if part.len == 0 && at == parts.len - 1 {
+            break
+        }
+        let pair = text.cut(part, "=")
+        let tag = text.lower(text.trim(pair.before))
+        let setting = text.trim(pair.after)
+        if !pair.found || tag.len == 0 || (setting.len > 0 && !all_bytes(setting, value_byte)) {
+            fail Unsupported("the record parameter {part} is not a tag, = and a value")
+        }
+        if tag != "accounturi" && tag != "policy" && tag != "persistuntil" {
+            continue
+        }
+        if slices.contains(seen, tag) {
+            fail Unsupported("the record has {tag} twice")
+        }
+        seen.push(tag)
+        match tag {
+            "accounturi" => {
+                record.account_uri = setting
+            }
+            "policy" => {
+                record.wildcard = text.equal_fold(setting, "wildcard")
+            }
+            _ => {
+                record.persist_until = some(persist_limit(setting)?)
+            }
+        }
+    }
+    if record.account_uri.len == 0 {
+        fail Unsupported("the record has no accounturi")
+    }
+    record
+}
