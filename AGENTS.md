@@ -8,6 +8,7 @@ Compiler for the Low language, written in Low. [docs/design.md](docs/design.md) 
 - `std/` is the standard library, one directory per module, embedded in `low`. `compiler/compiler/prelude/prelude.low` is the runtime and generic map code compiled ahead of every program, `compiler/compiler/prelude/browser.low` is the allocator, collector and lock routines written in Low and joined to every program for a target without an operating system, and `compiler/amd64/runtime/*.asm` is the runtime assembly.
 - `testdata/` holds the fixture programs, `bench/` the benchmark programs, `docs/` the design reference and examples, `editors/` the editor grammars, `research/` the experiment notes, scripts and results (`research/gc/` for the garbage collector) and `site/` the website.
 - `build.low` declares `compiler/low` as the repository's program, so `low install` at the repository root installs the compiler.
+- `.githooks/changes` checks that a range of commits carries its fixtures, docs and examples (README `## Change rules`); the `pre-push` hook and the `changes` workflow run it.
 - `bootstrap.txt` names the release that builds the compiler and the SHA-256 of its Linux binary. `bootstrap.sh` downloads it, builds the compiler three times and checks the last two builds are byte-identical.
 
 ### Compiler modules
