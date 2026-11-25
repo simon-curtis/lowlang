@@ -27,14 +27,73 @@ pub struct Inliner {
     pub budget: i64
     pub reserve: i64
     pub references: [i64: i64] = [:]
+    pub surveys: []Survey = []
+}
+
+struct Survey {
+    cost: i64 = 0
+    targets: []i64 = []
+    callees: []*Func = []
 }
 
 pub fn inline_calls(p: *Program, rw: Reworker, runner: Runner) {
-    let budget = program_budget(p)
-    let inl = new(Inliner { program: p, rw, budget, reserve: budget / loop_reserve_share })
+    let inl = new(Inliner { program: p, rw, budget: 0, reserve: 0 })
+    inl.survey_program(runner)
+    inl.budget = program_budget(inl)
+    inl.reserve = inl.budget / loop_reserve_share
     inl.count_references()
-    for depth, level in call_levels(inl) {
-        inline_level(inl, level, depth, runner)
+    for level in call_levels(inl) {
+        inline_level(inl, level, runner)
+        inl.summarise_level(level, runner)
+    }
+}
+
+fn survey_program(inl: *Inliner, runner: Runner) {
+    let funcs = inl.program.funcs
+    var surveys: []Survey = []
+    for _ in inl.program.all {
+        surveys.push(Survey {})
+    }
+    let spans = batches(funcs.len)
+    let each = runner.each
+    each(spans.len, fn(k: i64) {
+        let span = spans[k]
+        for i in span.start..span.start + span.len {
+            surveys[funcs[i].id] = inl.survey(funcs[i])
+        }
+    })
+    inl.surveys = surveys
+}
+
+fn survey(inl: *Inliner, f: *Func) -> Survey {
+    var targets: []i64 = []
+    var callees: []*Func = []
+    for at in flat_targets(f) {
+        let v = f.body.values[at]
+        targets.push(v.flat_target())
+        let target = inl.program.all[v.flat_target()]
+        if v.op == OpCall && !slices.contains(callees, target) {
+            callees.push(target)
+        }
+    }
+    Survey { cost: flat_cost(f), targets, callees }
+}
+
+fn summarise_level(inl: *Inliner, level: []*Func, runner: Runner) {
+    var measured: []CalleeSummary = []
+    for _ in level {
+        measured.push(CalleeSummary {})
+    }
+    let spans = batches(level.len)
+    let each = runner.each
+    each(spans.len, fn(k: i64) {
+        let span = spans[k]
+        for i in span.start..span.start + span.len {
+            measured[i] = measure(inl, level[i])
+        }
+    })
+    for i, f in level {
+        inl.summaries[f] = measured[i]
     }
 }
 
@@ -45,16 +104,13 @@ struct Pass {
     admitted: []InlineCandidate = []
 }
 
-fn inline_level(inl: *Inliner, level: []*Func, depth: i64, runner: Runner) {
+fn inline_level(inl: *Inliner, level: []*Func, runner: Runner) {
     var passes: []*Pass = []
     for f in level {
         passes.push(new(Pass { func: f }))
     }
     let each = runner.each
     for _ in 0..max_inline_rounds {
-        for pass in passes {
-            inl.summarise_callees(pass.func, depth)
-        }
         let spans = batches(passes.len)
         each(spans.len, fn(k: i64) {
             let span = spans[k]
@@ -87,23 +143,6 @@ fn inline_level(inl: *Inliner, level: []*Func, depth: i64, runner: Runner) {
     }
 }
 
-fn target_of(inl: *Inliner, f: *Func, at: i64) -> *Func {
-    inl.program.all[f.body.values[at].flat_target()]
-}
-
-fn summarise_callees(inl: *Inliner, f: *Func, depth: i64) {
-    for at in flat_targets(f) {
-        let target = inl.target_of(f, at)
-        if f.body.values[at].op != OpCall || target == f {
-            continue
-        }
-        let below = inl.level[target] ?? depth
-        if below < depth {
-            summarise(inl, target)
-        }
-    }
-}
-
 fn count_references(inl: *Inliner) {
     match inl.program.main {
         some(main) => inl.refer(main.id, 1)
@@ -112,9 +151,9 @@ fn count_references(inl: *Inliner) {
     for root in inl.program.runtime_roots {
         inl.refer(root.id, 1)
     }
-    for f in inl.program.funcs {
-        for at in flat_targets(f) {
-            inl.refer(f.body.values[at].flat_target(), 1)
+    for s in inl.surveys {
+        for target in s.targets {
+            inl.refer(target, 1)
         }
     }
 }
@@ -174,23 +213,12 @@ fn inflated_callee(inl: *Inliner, target: i64) -> *Func {
     local.func
 }
 
-fn program_budget(p: *Program) -> i64 {
+fn program_budget(inl: *Inliner) -> i64 {
     var total = 0
-    for f in p.funcs {
-        total += flat_cost(f)
+    for s in inl.surveys {
+        total += s.cost
     }
     math.min(max_program_growth, math.max(min_program_growth, total / program_share))
-}
-
-fn direct_callees(inl: *Inliner, f: *Func) -> []*Func {
-    var callees: []*Func = []
-    for at in flat_targets(f) {
-        let target = inl.target_of(f, at)
-        if f.body.values[at].op == OpCall && !slices.contains(callees, target) {
-            callees.push(target)
-        }
-    }
-    callees
 }
 
 pub struct CallGraph {
@@ -222,7 +250,7 @@ fn connect_graph(inl: *Inliner, g: *CallGraph, f: *Func) {
     g.next += 1
     g.stack.push(f)
     g.on_stack[f] = true
-    for c in inl.direct_callees(f) {
+    for c in inl.surveys[f.id].callees {
         if c == f {
             g.recursive[f] = true
         }
@@ -261,7 +289,7 @@ fn pop_component(inl: *Inliner, g: *CallGraph, root: *Func) {
     }
     var depth = 0
     for m in members {
-        for c in inl.direct_callees(m) {
+        for c in inl.surveys[m.id].callees {
             match g.level[c] {
                 some(l) => { depth = math.max(depth, l + 1) }
                 none => {}
@@ -277,16 +305,6 @@ fn pop_component(inl: *Inliner, g: *CallGraph, root: *Func) {
     for m in members {
         g.levels[depth].push(m)
     }
-}
-
-fn summarise(inl: *Inliner, g: *Func) -> CalleeSummary {
-    match inl.summaries[g] {
-        some(s) => return s
-        none => {}
-    }
-    let s = measure(inl, g)
-    inl.summaries[g] = s
-    s
 }
 
 fn measure(inl: *Inliner, g: *Func) -> CalleeSummary {
