@@ -2305,6 +2305,17 @@ rt_scan_g:
 	mov rdi, r14
 	mov rsi, r13
 	call rt_scan_range
+	lea r14, [r13+16]
+	mov r12, [r13+8]
+	mov r13, [r13]
+	test r13, r13
+	jz 7f
+	cmp r13, [rsp]
+	jae 7f
+	mov rdi, r14
+	mov rsi, r13
+	call rt_scan_range
+	jmp 2b
 5:
 	lea r14, [r13+16]
 	mov r12, [r13+8]
