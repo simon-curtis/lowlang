@@ -1,0 +1,514 @@
+import std/crypto
+import std/crypto/hash
+import std/crypto/x509
+import std/ice
+import std/io
+import std/net
+import std/stun
+import std/testing
+import std/tls
+import std/turn
+
+struct Behaviour {
+    drop_after_allocate: bool = false
+    cut_first_response: bool = false
+}
+
+struct Server {
+    listener: net.ListenerHandle
+    secure: tls.Config?
+    behaviour: Behaviour
+    accepted: chan[bool]
+    closed: chan[bool]
+}
+
+enum Happening {
+    FromClient(message: u8[])
+    FromPeer(peer: net.Addr, data: u8[])
+    ClientGone
+}
+
+struct Allocation {
+    events: chan[Happening]
+    out: chan[u8[]]
+    key: u8[]
+    relay: net.SocketHandle?
+    permissions: u8[][]
+    channels: [i64: net.Addr]
+    first: bool
+    behaviour: Behaviour
+}
+
+const realm = "low"
+const nonce = "n1"
+
+fn addr(text: str) -> net.Addr {
+    net.parse_addr(text) or panic("addr {text}")
+}
+
+fn pause(millis: i64) {
+    select {
+        after(millis) => {}
+    }
+}
+
+fn identity(names: str[], ips: u8[][]) -> tls.Config {
+    let key = x509.generate_private_key(x509.KeyType.P256) or panic("key")
+    let certificate = x509.create_self_signed(x509.Template { serial: crypto.random(8), subject: "turn test", not_before: 0, not_after: 4102444800, dns_names: names, ip_addresses: ips }, key) or panic("certificate")
+    tls.Config { certificates: [certificate], key }
+}
+
+fn root_of(config: tls.Config) -> x509.Certificate {
+    x509.parse(config.certificates[0]) or panic("parse")
+}
+
+fn start_server(secure: tls.Config?, behaviour: Behaviour) -> Server {
+    using var listener = net.listen("127.0.0.1", 0) or panic("listen")
+    let s = Server { listener: net.detach_listener(mut listener), secure, behaviour, accepted: chan[bool](16), closed: chan[bool](16) }
+    spawn accept_loop(s)
+    s
+}
+
+fn accept_loop(s: Server) {
+    var count = 0
+    for {
+        let h = net.accept_handle(s.listener) or return
+        count += 1
+        var behaviour = s.behaviour
+        if count > 1 {
+            behaviour = Behaviour {}
+        }
+        s.accepted <- true
+        spawn serve_connection(h, s.secure, behaviour, s.closed)
+    }
+}
+
+fn serve_connection(h: net.ConnHandle, secure: tls.Config?, behaviour: Behaviour, closed: chan[bool]) {
+    let stream = match secure {
+        some(config) => tls.stream_on(tls.server_handle(net.stream_on(h), config) or {
+            net.close_on(h)
+            return
+        })
+        none => net.stream_on(h)
+    }
+    let a = allocation(behaviour)
+    spawn write_split(stream, a.out, closed)
+    spawn read_client(stream, a.events)
+    serve(a)
+}
+
+fn allocation(behaviour: Behaviour) -> *Allocation {
+    new(Allocation { events: chan[Happening](256), out: chan[u8[]](256), key: stun.long_term_key("alice", realm, "secret"), relay: none, permissions: [], channels: [:], first: true, behaviour })
+}
+
+fn serve(a: *Allocation) {
+    for {
+        let happening = (<-a.events) ?? break
+        match happening {
+            FromClient(message) => from_client(a, message)
+            FromPeer(peer, data) => from_peer(a, peer, data)
+            ClientGone => break
+        }
+    }
+    match a.relay {
+        some(r) => net.close_socket_on(r)
+        none => {}
+    }
+    close(a.out)
+}
+
+fn start_udp_server() -> net.SocketHandle {
+    using var socket = net.bind_udp("127.0.0.1", 0) or panic("bind the server")
+    let h = net.detach_socket(mut socket)
+    spawn serve_datagrams(h)
+    h
+}
+
+fn serve_datagrams(h: net.SocketHandle) {
+    var clients: [str: *Allocation] = [:]
+    let buf = io.buffer(65536)
+    for {
+        let packet = net.receive_from_on(h, buf) or return
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        let key = net.format(packet.from)
+        let a = clients[key] ?? {
+            let fresh = allocation(Behaviour {})
+            clients[key] = fresh
+            spawn write_datagrams(h, packet.from, fresh.out)
+            spawn serve(fresh)
+            fresh
+        }
+        a.events <- Happening.FromClient(data)
+    }
+}
+
+fn write_datagrams(h: net.SocketHandle, to: net.Addr, out: chan[u8[]]) {
+    for {
+        let m = (<-out) ?? break
+        if m.len > 0 {
+            net.send_to_on(h, m, to) or 0
+        }
+    }
+}
+
+fn read_client(stream: io.Stream, events: chan[Happening]) {
+    let f = turn.framer()
+    let buf = io.buffer(4096)
+    for {
+        let n = stream.read(buf) or 0
+        if n == 0 {
+            break
+        }
+        for m in turn.feed(f, buf[..n]) or break {
+            events <- Happening.FromClient(m)
+        }
+    }
+    events <- Happening.ClientGone
+}
+
+fn write_split(stream: io.Stream, out: chan[u8[]], closed: chan[bool]) {
+    for {
+        let first = (<-out) ?? break
+        if first.len == 0 {
+            break
+        }
+        var wire = first
+        var closing = false
+        for {
+            let more: u8[]? = select {
+                m = <-out => m
+                else => none
+            }
+            let next = more ?? break
+            if next.len == 0 {
+                closing = true
+                break
+            }
+            for b in next {
+                wire.push(b)
+            }
+        }
+        let cut = if wire.len > 7 { 7 } else { wire.len }
+        io.write_all(stream, wire[..cut]) or break
+        pause(5)
+        io.write_all(stream, wire[cut..]) or break
+        if closing {
+            break
+        }
+    }
+    stream.close()
+    select {
+        closed <- true => {}
+        else => {}
+    }
+}
+
+fn read_relay(relay: net.SocketHandle, events: chan[Happening]) {
+    let buf = io.buffer(65536)
+    for {
+        let packet = net.receive_from_on(relay, buf) or return
+        let data = io.buffer(packet.size)
+        io.copy(data, buf[..packet.size])
+        events <- Happening.FromPeer(packet.from, data)
+    }
+}
+
+fn permitted(a: *Allocation, ip: u8[]) -> bool {
+    for p in a.permissions {
+        if hash.equal(p, ip) {
+            return true
+        }
+    }
+    false
+}
+
+fn answer(request: stun.Message, class: stun.Class) -> stun.Message {
+    stun.Message { class, method: request.method, transaction: request.transaction }
+}
+
+fn authenticated(a: *Allocation, m: stun.Message) -> bool {
+    if stun.get_text(m, stun.attr_username) == none {
+        var refused = answer(m, stun.Class.Error)
+        stun.add_error_code(mut refused, 401, "Unauthorized")
+        stun.add_text(mut refused, stun.attr_realm, realm)
+        stun.add_text(mut refused, stun.attr_nonce, nonce)
+        a.out <- stun.encode(refused)
+        return false
+    }
+    stun.check_integrity(m, a.key, stun.Integrity.Sha1) or return false
+    true
+}
+
+fn respond(a: *Allocation, wire: u8[]) {
+    if a.first && a.behaviour.cut_first_response {
+        a.out <- wire[..wire.len / 2]
+        a.out <- []
+        return
+    }
+    a.first = false
+    a.out <- wire
+}
+
+fn allocate(a: *Allocation, ok: stun.Message) -> stun.Message {
+    using var socket = net.bind_udp("127.0.0.1", 0) or panic("relay socket")
+    let relay = net.detach_socket(mut socket)
+    a.relay = relay
+    spawn read_relay(relay, a.events)
+    var m = ok
+    stun.add_xor_address(mut m, stun.attr_xor_relayed_address, relay.addr)
+    stun.add_xor_address(mut m, stun.attr_xor_mapped_address, relay.addr)
+    stun.add_u32(mut m, stun.attr_lifetime, 600)
+    m
+}
+
+fn relay_out(a: *Allocation, peer: net.Addr, data: u8[]) {
+    let relay = a.relay ?? return
+    if permitted(a, peer.ip) {
+        net.send_to_on(relay, data, peer) or 0
+    }
+}
+
+fn from_client(a: *Allocation, message: u8[]) {
+    if turn.is_channel_data(message) {
+        let framed = turn.parse_channel_data(message) or return
+        let peer = a.channels[framed.number] ?? return
+        relay_out(a, peer, framed.data)
+        return
+    }
+    let m = stun.parse(message) or return
+    if m.class == stun.Class.Indication {
+        let peer = stun.get_xor_address(m, stun.attr_xor_peer_address) or return
+        relay_out(a, peer, stun.find(m, stun.attr_data) ?? [])
+        return
+    }
+    if !authenticated(a, m) {
+        return
+    }
+    var ok = answer(m, stun.Class.Success)
+    if m.method == stun.allocate {
+        ok = allocate(a, ok)
+    } else if m.method == stun.refresh {
+        stun.add_u32(mut ok, stun.attr_lifetime, stun.get_u32(m, stun.attr_lifetime) or 600)
+    } else if m.method == stun.create_permission {
+        let peer = stun.get_xor_address(m, stun.attr_xor_peer_address) or return
+        a.permissions.push(peer.ip)
+    } else if m.method == stun.channel_bind {
+        let peer = stun.get_xor_address(m, stun.attr_xor_peer_address) or return
+        a.channels[(stun.get_u32(m, stun.attr_channel_number) or 0) >> 16] = peer
+        a.permissions.push(peer.ip)
+    }
+    respond(a, stun.seal(ok, stun.Protection { key: a.key }))
+    if m.method == stun.allocate && a.behaviour.drop_after_allocate {
+        a.out <- []
+    }
+}
+
+fn from_peer(a: *Allocation, peer: net.Addr, data: u8[]) {
+    if !permitted(a, peer.ip) {
+        return
+    }
+    for number, bound in a.channels {
+        if bound.port == peer.port && hash.equal(bound.ip, peer.ip) {
+            a.out <- turn.encode_channel_data(number, data)
+            return
+        }
+    }
+    var m = stun.message(stun.Class.Indication, stun.data)
+    stun.add_xor_address(mut m, stun.attr_xor_peer_address, peer)
+    stun.add(mut m, stun.attr_data, data)
+    a.out <- stun.encode(m)
+}
+
+fn forward(from: Handle, to: Handle, selected: chan[bool]) {
+    for {
+        let e = (<-from.events) ?? break
+        match e {
+            LocalCandidate(c) => {
+                add_remote_candidate(to, c) or break
+            }
+            Selected(_, _) => {
+                selected <- true
+            }
+            _ => {}
+        }
+    }
+}
+
+fn arrived(h: Handle) -> Datagram? {
+    select {
+        d = <-h.incoming => d
+        after(5000) => none
+    }
+}
+
+fn waited(c: chan[bool], millis: i64) -> bool {
+    select {
+        <-c => true
+        after(millis) => false
+    }
+}
+
+fn exchange_through(t: *testing.T, a: Handle, b: Handle) {
+    let chosen = (selected(a) or panic("selected")) ?? panic("none")
+    testing.error_if(t, chosen.local.kind != ice.Kind.Relayed, "selected a {chosen.local.kind} candidate")
+    send(a, [0x16, 1, 2, 3, 4, 5]) or panic("send through the relay")
+    let there = arrived(b) ?? panic("nothing arrived through the relay")
+    testing.error_if(t, there.data.len != 6 || there.data[5] != 5 || there.from.port != chosen.local.addr.port, "datagram from {net.format(there.from)}")
+    for i in 0..3 {
+        send(b, [0x80, u8(i), 5, 6, 7]) or panic("send back")
+        let back = arrived(a) ?? panic("nothing came back through the relay")
+        testing.error_if(t, back.data.len != 5 || back.data[1] != u8(i), "datagram {i} back")
+    }
+}
+
+/// Connects an agent with `relay_only` through `server` to an agent with host candidates, sends data both ways over the relayed pair and checks the agent gathered one candidate.
+///
+/// With `restarting`, the relay-only agent then restarts ICE and gathers again, data flows both ways over the old pair before the new credentials reach it, and once both sides select the new pair it uses the same relayed address and still carries data.
+fn connect_through(t: *testing.T, server: turn.Config, settings: tls.Config, restarting: bool) {
+    using a = open(Options { config: ice.Config { controlling: true, turn_servers: [server], relay_only: true }, bind: ["127.0.0.1"], tls: settings }) or panic("open a")
+    using b = open(Options { config: ice.Config { controlling: false }, bind: ["127.0.0.1"] }) or panic("open b")
+    let ca = credentials(a.handle) or panic("credentials")
+    let cb = credentials(b.handle) or panic("credentials")
+    set_remote_credentials(a.handle, cb.ufrag, cb.pwd) or panic("set")
+    set_remote_credentials(b.handle, ca.ufrag, ca.pwd) or panic("set")
+    let a_selected = chan[bool](1)
+    let b_selected = chan[bool](1)
+    spawn forward(a.handle, b.handle, a_selected)
+    spawn forward(b.handle, a.handle, b_selected)
+    gather(a.handle) or panic("gather")
+    gather(b.handle) or panic("gather")
+    if !waited(a_selected, 15000) || !waited(b_selected, 15000) {
+        testing.fatal(t, "no pair selected")
+        return
+    }
+    exchange_through(t, a.handle, b.handle)
+    if restarting {
+        let before = (selected(a.handle) or panic("selected")) ?? panic("none")
+        let fresh = restart(a.handle) or panic("restart")
+        set_remote_credentials(b.handle, fresh.ufrag, fresh.pwd) or panic("set")
+        gather(a.handle) or panic("gather again")
+        pause(300)
+        exchange_through(t, a.handle, b.handle)
+        set_remote_credentials(a.handle, cb.ufrag, cb.pwd) or panic("set")
+        for c in candidates(b.handle) or [] {
+            add_remote_candidate(a.handle, c) or panic("add")
+        }
+        if !waited(a_selected, 15000) || !waited(b_selected, 15000) {
+            testing.fatal(t, "no pair selected after the restart")
+            return
+        }
+        exchange_through(t, a.handle, b.handle)
+        let after = (selected(a.handle) or panic("selected")) ?? panic("none")
+        testing.error_if(t, net.format(after.local.addr) != net.format(before.local.addr), "the restart moved the relayed address to {net.format(after.local.addr)}")
+    }
+    let gathered = (candidates(a.handle) or []).len
+    testing.error_if(t, gathered != 1, "{gathered} local candidates")
+}
+
+fn gathered_nothing(t: *testing.T, server: turn.Config, settings: tls.Config, within: i64) {
+    using a = open(Options { config: ice.Config { controlling: true, turn_servers: [server], relay_only: true }, bind: ["127.0.0.1"], tls: settings }) or panic("open")
+    gather(a.handle) or panic("gather")
+    var complete = false
+    for !complete {
+        let e: ice.Event? = select {
+            e = <-a.handle.events => e
+            after(within) => none
+        }
+        let event = e ?? break
+        match event {
+            GatheringComplete => {
+                complete = true
+            }
+            _ => {}
+        }
+    }
+    testing.error_if(t, !complete, "gathering did not complete within {within} ms")
+    let gathered = (candidates(a.handle) or []).len
+    testing.error_if(t, gathered != 0, "{gathered} candidates")
+}
+
+fn stream_server(s: Server, transport: turn.Transport, name: str) -> turn.Config {
+    turn.Config { server: s.listener.addr, transport, server_name: name, username: "alice", password: "secret" }
+}
+
+fn test_a_relay_only_agent_connects_through_a_tcp_server(t: *testing.T) {
+    let s = start_server(none, Behaviour {})
+    defer net.close_listener_on(s.listener)
+    connect_through(t, stream_server(s, turn.Transport.Tcp, ""), tls.Config {}, false)
+}
+
+fn test_a_relay_only_agent_connects_through_a_tls_server_named_by_ip_or_host(t: *testing.T) {
+    let certificate = identity(["turn.test"], [[127, 0, 0, 1]])
+    let s = start_server(certificate, Behaviour {})
+    defer net.close_listener_on(s.listener)
+    let trusting = tls.Config { roots: [root_of(certificate)] }
+    connect_through(t, stream_server(s, turn.Transport.Tls, ""), trusting, false)
+    connect_through(t, stream_server(s, turn.Transport.Tls, "turn.test"), trusting, false)
+}
+
+fn test_a_relayed_pair_carries_data_through_an_ice_restart_over_udp_tcp_and_tls(t: *testing.T) {
+    let datagrams = start_udp_server()
+    defer net.close_socket_on(datagrams)
+    connect_through(t, turn.Config { server: datagrams.addr, username: "alice", password: "secret" }, tls.Config {}, true)
+    let plain = start_server(none, Behaviour {})
+    defer net.close_listener_on(plain.listener)
+    connect_through(t, stream_server(plain, turn.Transport.Tcp, ""), tls.Config {}, true)
+    let certificate = identity(["turn.test"], [[127, 0, 0, 1]])
+    let secure = start_server(certificate, Behaviour {})
+    defer net.close_listener_on(secure.listener)
+    connect_through(t, stream_server(secure, turn.Transport.Tls, "turn.test"), tls.Config { roots: [root_of(certificate)] }, true)
+}
+
+fn test_a_tls_server_with_the_wrong_name_or_an_untrusted_certificate_gives_no_candidate(t: *testing.T) {
+    let certificate = identity(["turn.test"], [])
+    let s = start_server(certificate, Behaviour {})
+    defer net.close_listener_on(s.listener)
+    gathered_nothing(t, stream_server(s, turn.Transport.Tls, "other.test"), tls.Config { roots: [root_of(certificate)] }, 5000)
+    gathered_nothing(t, stream_server(s, turn.Transport.Tls, ""), tls.Config { roots: [root_of(certificate)] }, 5000)
+    let stranger = identity(["turn.test"], [])
+    gathered_nothing(t, stream_server(s, turn.Transport.Tls, "turn.test"), tls.Config { roots: [root_of(stranger)] }, 5000)
+}
+
+fn test_a_partial_response_at_close_ends_gathering_without_waiting_for_the_timeout(t: *testing.T) {
+    let s = start_server(none, Behaviour { cut_first_response: true })
+    defer net.close_listener_on(s.listener)
+    gathered_nothing(t, stream_server(s, turn.Transport.Tcp, ""), tls.Config {}, 5000)
+}
+
+fn test_a_refused_connection_ends_gathering(t: *testing.T) {
+    let closed = {
+        using listener = net.listen("127.0.0.1", 0) or panic("listen")
+        listener.handle.addr
+    }
+    gathered_nothing(t, turn.Config { server: closed, transport: turn.Transport.Tcp, username: "alice", password: "secret" }, tls.Config {}, 5000)
+}
+
+fn test_a_lost_connection_fails_the_relay_and_the_next_gather_connects_again(t: *testing.T) {
+    let s = start_server(none, Behaviour { drop_after_allocate: true })
+    defer net.close_listener_on(s.listener)
+    using a = open(Options { config: ice.Config { controlling: true, turn_servers: [stream_server(s, turn.Transport.Tcp, "")], relay_only: true }, bind: ["127.0.0.1"] }) or panic("open a")
+    using b = open(Options { config: ice.Config { controlling: false }, bind: ["127.0.0.1"] }) or panic("open b")
+    let ca = credentials(a.handle) or panic("credentials")
+    let cb = credentials(b.handle) or panic("credentials")
+    set_remote_credentials(a.handle, cb.ufrag, cb.pwd) or panic("set")
+    set_remote_credentials(b.handle, ca.ufrag, ca.pwd) or panic("set")
+    let a_selected = chan[bool](1)
+    let b_selected = chan[bool](1)
+    spawn forward(a.handle, b.handle, a_selected)
+    spawn forward(b.handle, a.handle, b_selected)
+    gather(a.handle) or panic("gather")
+    gather(b.handle) or panic("gather")
+    testing.error_if(t, !waited(s.accepted, 5000) || !waited(s.closed, 5000), "the first connection did not open and close")
+    pause(200)
+    testing.error_if(t, waited(a_selected, 500), "a pair was selected through a closed connection")
+    gather(a.handle) or panic("gather again")
+    testing.error_if(t, !waited(s.accepted, 5000), "gather did not open a new connection")
+    if !waited(a_selected, 15000) || !waited(b_selected, 15000) {
+        testing.fatal(t, "no pair selected after the new gather")
+        return
+    }
+    exchange_through(t, a.handle, b.handle)
+    let relayed = candidates(a.handle) or []
+    testing.error_if(t, relayed.len != 2 || relayed[0].addr.port == relayed[1].addr.port, "{relayed.len} candidates")
+}

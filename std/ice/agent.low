@@ -4,6 +4,7 @@ import std/io
 import std/net
 import std/rand
 import std/stun
+import std/turn
 
 /// The connection state of an agent (RFC 8445 and the W3C ICE connection states).
 pub enum State {
@@ -35,14 +36,16 @@ pub enum Event {
     Selected(local: Candidate, remote: Candidate)
 }
 
-/// A datagram the agent wants sent from the socket bound to `local` to the address `to`.
+/// A datagram the agent wants sent from the socket bound to `local` to the address `to`, or a message for the TCP or TLS connection to the TURN server `to`.
 pub struct Transmit {
-    /// The bound address of the socket to send from.
+    /// The bound address of the socket to send from, or the host address a stream relay was allocated for.
     pub local: net.Addr
     /// The destination.
     pub to: net.Addr
-    /// The datagram.
+    /// The datagram or message.
     pub data: u8[]
+    /// `Udp` to send from the socket bound to `local`; `Tcp` or `Tls` to write one message on the connection for `local` to the TURN server `to`, which the caller opens when there is none and reports with `relay_lost` when it closes.
+    pub transport: turn.Transport = turn.Transport.Udp
 }
 
 /// The pair an agent carries data on.
@@ -89,6 +92,18 @@ pub struct Config {
     pub failure_timeout: i64 = 30000
     /// The tie-breaker for role conflicts, random when 0.
     pub tie_breaker: u64 = 0
+    /// The TURN servers to allocate a relayed candidate on, one allocation per host address of the same family, each reached over its `transport`.
+    pub turn_servers: turn.Config[] = []
+    /// Whether the agent uses relayed candidates alone, the W3C `relay` transport policy: no host or server-reflexive candidate is gathered or announced.
+    pub relay_only: bool = false
+}
+
+/// A datagram that is not STUN, received through a TURN relay from `from`.
+pub struct Delivery {
+    /// The bytes the peer sent.
+    pub data: u8[]
+    /// The peer's address.
+    pub from: net.Addr
 }
 
 enum PairState {
@@ -120,6 +135,16 @@ struct Pair {
 struct Local {
     cand: Candidate
     base: net.Addr
+}
+
+struct Relay {
+    base: net.Addr
+    server: net.Addr
+    transport: turn.Transport
+    client: *turn.Client
+    relayed: net.Addr?
+    settled: bool
+    kept: bool = false
 }
 
 struct Gather {
@@ -156,6 +181,8 @@ pub struct Agent {
     pairs: Pair[]
     triggered: i64[]
     gathers: Gather[]
+    relays: Relay[]
+    deliveries: Delivery[]
     gathered: bool
     gathering: bool
     remote_ended: bool
@@ -212,6 +239,8 @@ pub fn agent(config: Config) -> *Agent {
         pairs: []
         triggered: []
         gathers: []
+        relays: []
+        deliveries: []
         gathered: false
         gathering: false
         remote_ended: false
@@ -281,8 +310,160 @@ fn emit(a: *Agent, e: Event) {
 }
 
 fn send(a: *Agent, local: net.Addr, to: net.Addr, data: u8[], now: i64) {
-    a.outbox.push(Transmit { local, to, data })
     a.last_sent = now
+    for i, r in a.relays {
+        match r.relayed {
+            some(relayed) => {
+                if same_addr(relayed, local) {
+                    turn.send_to(r.client, to, data, now)
+                    drain_relay(a, i)
+                    return
+                }
+            }
+            none => {}
+        }
+    }
+    a.outbox.push(Transmit { local, to, data })
+}
+
+/// Queues `data` for `to` from the local candidate whose base is `local`: straight from the socket bound to `local`, or through the TURN allocation when `local` is a relayed address. `poll_transmit` returns what to send.
+pub fn send_from(a: *Agent, local: net.Addr, to: net.Addr, data: u8[], now: i64) {
+    send(a, local, to, data, now)
+}
+
+fn drain_relay(a: *Agent, i: i64) {
+    let r = a.relays[i]
+    for {
+        let d = turn.poll_transmit(r.client) ?? break
+        a.outbox.push(Transmit { local: r.base, to: r.server, data: d, transport: r.transport })
+    }
+    for {
+        let e = turn.poll_event(r.client) ?? break
+        match e {
+            Allocated(relayed, mapped) => {
+                a.relays[i].relayed = relayed
+                a.relays[i].settled = true
+                let c = Candidate {
+                    foundation: foundation(Kind.Relayed, relayed.ip, r.server.ip, transport_name(r.transport))
+                    priority: priority(Kind.Relayed, local_preference(relayed.ip, r.transport.index * 1024 + i), 1)
+                    addr: relayed
+                    kind: Kind.Relayed
+                    related: mapped
+                }
+                add_local(a, c, relayed, true)
+                finish_gathering(a)
+            }
+            Failed(_, _) => {
+                a.relays[i].settled = true
+                finish_gathering(a)
+            }
+        }
+    }
+}
+
+fn release_relays(a: *Agent, now: i64) {
+    for i, r in a.relays {
+        turn.close(r.client, now)
+        drain_relay(a, i)
+    }
+    a.relays = []
+}
+
+fn carries(r: Relay, base: net.Addr) -> bool {
+    let relayed = r.relayed ?? return false
+    r.client.state == turn.State.Allocated && same_addr(relayed, base)
+}
+
+fn release_unselected_relays(a: *Agent, now: i64) {
+    var kept: Relay[] = []
+    for i, r in a.relays {
+        let keep = match a.selection {
+            some(s) => carries(r, s.base)
+            none => false
+        }
+        if keep {
+            var k = r
+            k.kept = true
+            kept.push(k)
+        } else {
+            turn.close(r.client, now)
+            drain_relay(a, i)
+        }
+    }
+    a.relays = kept
+}
+
+fn release_kept_relays(a: *Agent, base: net.Addr, now: i64) {
+    var live: Relay[] = []
+    for i, r in a.relays {
+        if r.kept && !carries(r, base) {
+            turn.close(r.client, now)
+            drain_relay(a, i)
+        } else {
+            var k = r
+            k.kept = false
+            live.push(k)
+        }
+    }
+    a.relays = live
+}
+
+fn transport_name(t: turn.Transport) -> str {
+    match t {
+        Udp => "udp"
+        Tcp => "tcp"
+        Tls => "tls"
+    }
+}
+
+fn relay_on(a: *Agent, local: net.Addr, server: net.Addr, transport: turn.Transport) -> i64 {
+    for i, r in a.relays {
+        if r.transport == transport && same_addr(r.base, local) && same_addr(r.server, server) {
+            return i
+        }
+    }
+    -1
+}
+
+fn relay_from(a: *Agent, local: net.Addr, from: net.Addr) -> i64 {
+    relay_on(a, local, from, turn.Transport.Udp)
+}
+
+/// Feeds the agent one message that arrived on the TCP or TLS connection for `local` to the TURN server `server`, split from the stream with a `turn.Framer`. It is handled as `receive` handles a datagram from a TURN server.
+pub fn receive_relay(a: *Agent, local: net.Addr, server: net.Addr, transport: turn.Transport, message: u8[], now: i64) {
+    if a.state == State.Closed {
+        return
+    }
+    let r = relay_on(a, local, server, transport)
+    if r >= 0 {
+        receive_relayed(a, r, message, now)
+    }
+}
+
+/// Tells the agent the TCP or TLS connection for `local` to the TURN server `server` closed or could not be made.
+///
+/// The allocation on it is gone, so its relayed candidate stops carrying data and its checks and consent fail; when gathering is running it counts as settled. The next `gather` opens a new connection.
+pub fn relay_lost(a: *Agent, local: net.Addr, server: net.Addr, transport: turn.Transport) {
+    let r = relay_on(a, local, server, transport)
+    if r >= 0 {
+        turn.connection_lost(a.relays[r].client)
+        drain_relay(a, r)
+    }
+}
+
+/// Returns whether a datagram that arrived on the socket bound to `local` from `from` comes from one of the agent's TURN servers over UDP, and so belongs to `receive` whatever its first byte.
+pub fn is_relay_server(a: *Agent, local: net.Addr, from: net.Addr) -> bool {
+    relay_from(a, local, from) >= 0
+}
+
+/// Returns the next datagram that arrived through a relay and is not STUN, or `none`.
+pub fn poll_delivery(a: *Agent) -> Delivery? {
+    if a.deliveries.len == 0 {
+        return none
+    }
+    let d = a.deliveries[0]
+    a.deliveries = a.deliveries[1..]
+    d
 }
 
 fn set_state(a: *Agent, s: State) {
@@ -417,6 +598,26 @@ fn start_gather(a: *Agent, base: net.Addr, server: net.Addr, now: i64) {
     send(a, base, server, wire, now)
 }
 
+fn gather_relay(a: *Agent, base: net.Addr, config: turn.Config, now: i64) {
+    let kept = relay_on(a, base, config.server, config.transport)
+    if kept < 0 {
+        start_relay(a, base, config, now)
+        return
+    }
+    let relayed = a.relays[kept].relayed ?? return
+    let li = find_local(a, relayed)
+    if li >= 0 {
+        emit(a, Event.LocalCandidate(a.locals[li].cand))
+    }
+}
+
+fn start_relay(a: *Agent, base: net.Addr, config: turn.Config, now: i64) {
+    let client = turn.client(config)
+    turn.start(client, now)
+    a.relays.push(Relay { base, server: config.server, transport: config.transport, client, relayed: none, settled: false })
+    drain_relay(a, a.relays.len - 1)
+}
+
 fn finish_gathering(a: *Agent) {
     if a.gathered || !a.gathering {
         return
@@ -426,14 +627,20 @@ fn finish_gathering(a: *Agent) {
             return
         }
     }
+    for r in a.relays {
+        if !r.settled {
+            return
+        }
+    }
     a.gathered = true
     emit(a, Event.GatheringComplete)
 }
 
 /// Gathers the host candidates of `config.hosts` and starts asking each `config.stun_servers` entry of the same family for a server-reflexive candidate.
 ///
-/// Each candidate arrives as an `Event.LocalCandidate`, and `Event.GatheringComplete` follows the last STUN answer or timeout. A second call, after `restart`, reports the candidates again.
+/// Each candidate arrives as an `Event.LocalCandidate`, and `Event.GatheringComplete` follows the last STUN answer or timeout. A second call, after `restart`, reports the candidates again. It keeps the TURN allocation the selected pair uses and reports its relayed candidate again, so the pair carries data until the new checklist selects one, and releases it then when the new pair does not use it; the other allocations are released and made again.
 pub fn gather(a: *Agent, now: i64) {
+    release_unselected_relays(a, now)
     a.gathered = false
     a.gathering = true
     a.gathers = []
@@ -446,12 +653,19 @@ pub fn gather(a: *Agent, now: i64) {
             addr: h
             kind: Kind.Host
         }
-        add_local(a, c, h, true)
+        if !a.config.relay_only {
+            add_local(a, c, h, true)
+        }
         rank += 1
         if !a.config.lite {
             for s in a.config.stun_servers {
-                if family_matches(h, s) {
+                if family_matches(h, s) && !a.config.relay_only {
                     start_gather(a, h, s, now)
+                }
+            }
+            for server in a.config.turn_servers {
+                if family_matches(h, server.server) {
+                    gather_relay(a, h, server, now)
                 }
             }
         }
@@ -546,9 +760,25 @@ pub fn set_remote_lite(a: *Agent, lite: bool) {
 
 /// Adds a remote candidate and forms its pairs with the local candidates.
 ///
-/// A candidate that is not UDP component 1 is ignored, as is one already known.
+/// A candidate that is not UDP component 1 is ignored, as is one already known, except that a signalled candidate with the address of a peer-reflexive remote candidate takes its place, with its type and priority, as libwebrtc does when a check arrives before the candidate.
 pub fn add_remote_candidate(a: *Agent, c: Candidate, now: i64) {
-    if c.component != 1 || c.transport != "udp" || find_remote(a, c.addr) >= 0 {
+    if c.component != 1 || c.transport != "udp" {
+        return
+    }
+    let known = find_remote(a, c.addr)
+    if known >= 0 {
+        if a.remotes[known].kind == Kind.PeerReflexive && c.kind != Kind.PeerReflexive {
+            a.remotes[known] = c
+            recompute(a)
+            match a.selection {
+                some(chosen) => {
+                    if same_addr(chosen.remote.addr, c.addr) {
+                        a.selection = Selection { local: chosen.local, base: chosen.base, remote: c }
+                    }
+                }
+                none => {}
+            }
+        }
         return
     }
     a.remotes.push(c)
@@ -779,6 +1009,10 @@ pub fn tick(a: *Agent, now: i64) {
         return
     }
     run_gathers(a, now)
+    for i, r in a.relays {
+        turn.tick(r.client, now)
+        drain_relay(a, i)
+    }
     run_checks(a, now)
     run_consent(a, now)
     evaluate(a, now)
@@ -798,6 +1032,9 @@ pub fn next_timeout(a: *Agent) -> i64 {
         if !g.done {
             t = earliest(t, g.deadline)
         }
+    }
+    for r in a.relays {
+        t = earliest(t, turn.next_timeout(r.client))
     }
     for p in a.pairs {
         if p.pending {
@@ -853,9 +1090,13 @@ pub fn poll_event(a: *Agent) -> Event? {
     e
 }
 
-/// Returns whether `addr` is the address of a remote candidate, learned or given.
+/// Returns whether `addr` is the address of a remote candidate, learned or given, or of the selected pair's remote candidate, which an ICE restart keeps in use.
 pub fn knows_remote(a: *Agent, addr: net.Addr) -> bool {
-    find_remote(a, addr) >= 0
+    if find_remote(a, addr) >= 0 {
+        return true
+    }
+    let s = a.selection ?? return false
+    same_addr(s.remote.addr, addr)
 }
 
 /// Returns the selected pair, or `none` before one is nominated.
@@ -872,6 +1113,7 @@ pub fn note_sent(a: *Agent, now: i64) {
 pub fn close(a: *Agent) {
     set_state(a, State.Closed)
     a.outbox = []
+    release_relays(a, a.last_sent)
 }
 
 fn best_valid(a: *Agent, nominated: bool) -> i64 {
@@ -904,6 +1146,7 @@ fn select_pair(a: *Agent, pi: i64, now: i64) {
         emit(a, Event.Selected(local.cand, remote))
     }
     a.renominate = false
+    release_kept_relays(a, local.base, now)
     set_state(a, State.Completed)
     for i in 0..a.pairs.len {
         if i != pi && a.pairs[i].pending && !a.pairs[i].valid {
@@ -1213,11 +1456,32 @@ fn check_answer(a: *Agent, pi: i64, m: stun.Message, now: i64) {
     evaluate(a, now)
 }
 
+fn receive_relayed(a: *Agent, i: i64, data: u8[], now: i64) {
+    let relay = a.relays[i]
+    let payload = turn.receive(relay.client, data, now)
+    drain_relay(a, i)
+    let p = payload ?? return
+    let relayed = relay.relayed ?? return
+    if stun.looks_like(p.data) {
+        receive(a, relayed, p.peer, p.data, now)
+        return
+    }
+    a.deliveries.push(Delivery { data: p.data, from: p.peer })
+}
+
 /// Feeds the agent one datagram that arrived on the socket bound to `local` from `from`.
 ///
-/// Only STUN messages belong here; the caller separates the DTLS, RTP and RTCP datagrams of the same socket (RFC 7983). A datagram that is not an authentic STUN message the agent expects is dropped.
+/// STUN messages belong here, and every datagram from a TURN server of the agent (`is_relay_server`); the caller separates the other DTLS, RTP and RTCP datagrams of the same socket (RFC 7983). A relayed STUN message is handled as if it arrived on the relayed address, and other relayed data waits for `poll_delivery`. A datagram that is not an authentic STUN message the agent expects is dropped.
 pub fn receive(a: *Agent, local: net.Addr, from: net.Addr, data: u8[], now: i64) {
-    if a.state == State.Closed || !stun.looks_like(data) {
+    if a.state == State.Closed {
+        return
+    }
+    let r = relay_from(a, local, from)
+    if r >= 0 {
+        receive_relayed(a, r, data, now)
+        return
+    }
+    if !stun.looks_like(data) {
         return
     }
     let m = stun.parse(data) or return

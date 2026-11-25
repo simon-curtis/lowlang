@@ -3,6 +3,7 @@ import std/file
 import std/io
 import std/net
 import std/process
+import std/slices
 import std/testing
 import std/tls
 import std/text
@@ -17,20 +18,128 @@ struct Material {
 
 struct Case {
     name: str
+    flag: str
+    suites: i64[]
     suite: i64
-    cipher: str
+    cipher: str[]
+    cipher_name: str
     groups: i64[]
     group_name: str
+    server_group_name: str
     mtu: i64
+    version: i64
+    lost: i64[]
+}
+
+fn suite12(name: str, code: i64, cipher: str, groups: i64[], group_name: str, mtu: i64) -> Case {
+    Case { name, flag: "-dtls1_2", suites: [0x1301, code], suite: code, cipher: ["-cipher", cipher], cipher_name: cipher, groups, group_name, server_group_name: group_name, mtu, version: dtls.dtls12, lost: [] }
+}
+
+fn suite13(name: str, flag: str, code: i64, cipher: str, groups: i64[], group_name: str, mtu: i64) -> Case {
+    Case { name, flag, suites: [code, 0xC02B], suite: code, cipher: ["-ciphersuites", cipher], cipher_name: cipher, groups, group_name, server_group_name: group_name, mtu, version: dtls.dtls13, lost: [] }
+}
+
+fn retry_case() -> Case {
+    var c = suite13("dtls1.3 key share retry", "-dtls1_3", 0x1301, "TLS_AES_128_GCM_SHA256", [tls.group_p256, tls.group_x25519], "X25519:P-256", 1200)
+    c.server_group_name = "X25519"
+    c
+}
+
+fn lossy(c: Case, lost: i64[]) -> Case {
+    var out = c
+    out.name = "{c.name} losing datagrams"
+    out.lost = lost
+    out
 }
 
 fn cases() -> Case[] {
+    let both = [tls.group_x25519, tls.group_p256]
     [
-        Case { name: "aes128-gcm x25519", suite: 0xC02B, cipher: "ECDHE-ECDSA-AES128-GCM-SHA256", groups: [tls.group_x25519, tls.group_p256], group_name: "X25519:P-256", mtu: 1200 }
-        Case { name: "aes256-gcm p256", suite: 0xC02C, cipher: "ECDHE-ECDSA-AES256-GCM-SHA384", groups: [tls.group_p256], group_name: "P-256", mtu: 1200 }
-        Case { name: "chacha20-poly1305 x25519", suite: 0xCCA9, cipher: "ECDHE-ECDSA-CHACHA20-POLY1305", groups: [tls.group_x25519, tls.group_p256], group_name: "X25519:P-256", mtu: 1200 }
-        Case { name: "aes128-gcm p256 fragmented", suite: 0xC02B, cipher: "ECDHE-ECDSA-AES128-GCM-SHA256", groups: [tls.group_p256], group_name: "P-256", mtu: 300 }
+        suite12("dtls1.2 aes128-gcm x25519", 0xC02B, "ECDHE-ECDSA-AES128-GCM-SHA256", both, "X25519:P-256", 1200)
+        suite12("dtls1.2 aes256-gcm p256", 0xC02C, "ECDHE-ECDSA-AES256-GCM-SHA384", [tls.group_p256], "P-256", 1200)
+        suite12("dtls1.2 chacha20-poly1305 x25519", 0xCCA9, "ECDHE-ECDSA-CHACHA20-POLY1305", both, "X25519:P-256", 1200)
+        suite12("dtls1.2 aes128-gcm p256 fragmented", 0xC02B, "ECDHE-ECDSA-AES128-GCM-SHA256", [tls.group_p256], "P-256", 300)
+        suite13("dtls1.3 aes128-gcm x25519", "-dtls1_3", 0x1301, "TLS_AES_128_GCM_SHA256", both, "X25519", 1200)
+        suite13("dtls1.3 aes256-gcm p256", "-dtls1_3", 0x1302, "TLS_AES_256_GCM_SHA384", [tls.group_p256], "P-256", 1200)
+        suite13("dtls1.3 chacha20-poly1305 x25519", "-dtls1_3", 0x1303, "TLS_CHACHA20_POLY1305_SHA256", both, "X25519", 1200)
+        suite13("dtls1.3 aes128-gcm p256 fragmented", "-dtls1_3", 0x1301, "TLS_AES_128_GCM_SHA256", [tls.group_p256], "P-256", 300)
+        retry_case()
+        suite13("any version picks dtls1.3", "-dtls", 0x1301, "TLS_AES_128_GCM_SHA256", both, "X25519", 1200)
+        lossy(suite12("dtls1.2 aes128-gcm p256", 0xC02B, "ECDHE-ECDSA-AES128-GCM-SHA256", [tls.group_p256], "P-256", 300), [3, 4])
+        lossy(suite13("dtls1.3 aes128-gcm p256", "-dtls1_3", 0x1301, "TLS_AES_128_GCM_SHA256", [tls.group_p256], "P-256", 300), [2])
     ]
+}
+
+struct Counter {
+    sent: i64
+}
+
+fn transport(h: net.SocketHandle, remote: net.Addr, lost: i64[], incoming: chan[u8[]]) -> Transport {
+    let count = new(Counter { sent: 0 })
+    Transport {
+        send: fn(d) {
+            count.sent += 1
+            if !slices.contains(lost, count.sent) {
+                net.send_to_on(h, d, remote) or 0
+            }
+        }
+        incoming
+    }
+}
+
+fn skip_vector(d: u8[], at: i64, width: i64) -> i64 {
+    if at + width > d.len {
+        return d.len + 1
+    }
+    let size = if width == 1 { i64(d[at]) } else { io.be16(d, at) }
+    at + width + size
+}
+
+fn without_supported_versions(d: u8[]) -> u8[] {
+    if d.len < 25 || d[0] != 22 || d[13] != 1 || io.be16(d, 11) != d.len - 13 || io.be24(d, 14) != io.be24(d, 22) || io.be24(d, 19) != 0 {
+        return d
+    }
+    let body = d[25..]
+    var at = skip_vector(body, 34, 1)
+    at = skip_vector(body, at, 1)
+    at = skip_vector(body, at, 2)
+    at = skip_vector(body, at, 1)
+    if at + 2 > body.len || at + 2 + io.be16(body, at) != body.len {
+        return d
+    }
+    var kept: u8[] = []
+    var e = at + 2
+    for e + 4 <= body.len {
+        let kind = io.be16(body, e)
+        let size = io.be16(body, e + 2)
+        if kind != 43 && kind != 51 {
+            io.append(mut kept, body[e..e + 4 + size])
+        }
+        e += 4 + size
+    }
+    var hello: u8[] = []
+    io.append(mut hello, body[..at])
+    io.put_be16(mut hello, kept.len)
+    io.append(mut hello, kept)
+    var out: u8[] = []
+    io.append(mut out, d[..11])
+    io.put_be16(mut out, hello.len + 12)
+    out.push(1)
+    io.put_be24(mut out, hello.len)
+    io.append(mut out, d[17..19])
+    io.put_be24(mut out, 0)
+    io.put_be24(mut out, hello.len)
+    io.append(mut out, hello)
+    out
+}
+
+fn stripping_pump(h: net.SocketHandle, incoming: chan[u8[]], first: chan[net.Addr]) {
+    let raw = chan[u8[]](64)
+    spawn pump(h, raw, first)
+    for {
+        let d = (<-raw) ?? break
+        incoming <- without_supported_versions(d)
+    }
 }
 
 struct Captured {
@@ -45,6 +154,17 @@ fn missing_tool() -> str {
         }
     }
     ""
+}
+
+fn dtls13_supported() -> bool {
+    let help = process.run(process.command("openssl", ["s_client", "-help"]), []) or return false
+    text.contains(str(help.stderr), "-dtls1_3") || text.contains(str(help.stdout), "-dtls1_3")
+}
+
+fn runnable(t: *testing.T, c: Case, dtls13: bool) {
+    if c.version == dtls.dtls13 && !dtls13 {
+        testing.skip(t, "openssl has no DTLS 1.3")
+    }
 }
 
 fn make_material(dir: str) -> Material {
@@ -113,6 +233,23 @@ fn keying_material(output: str) -> str {
     text.lower(text.trim(if end < 0 { rest } else { rest[..end] }))
 }
 
+fn openssl_args(head: str[], material: Material, c: Case, groups: str) -> str[] {
+    var out = ["30", "openssl"]
+    for a in head {
+        out.push(a)
+    }
+    for a in c.cipher {
+        out.push(a)
+    }
+    for a in ["-cert", material.certificate, "-key", material.key, "-groups", groups, "-mtu", "{c.mtu}", "-use_srtp", "SRTP_AES128_CM_SHA1_80", "-keymatexport", "EXTRACTOR-dtls_srtp", "-keymatexportlen", "60"] {
+        out.push(a)
+    }
+    if c.version == dtls.dtls12 && head[0] == "s_server" && c.flag != "-dtls" {
+        out.push("-listen")
+    }
+    out
+}
+
 fn server_case(t: *testing.T, material: Material, c: Case) {
     using var socket = net.bind_udp("127.0.0.1", 0) or panic("bind")
     let h = net.detach_socket(mut socket)
@@ -121,7 +258,7 @@ fn server_case(t: *testing.T, material: Material, c: Case) {
     spawn pump(h, incoming, first)
     let command = process.Command {
         program: "timeout"
-        args: ["30", "openssl", "s_client", "-dtls1_2", "-connect", "127.0.0.1:{h.addr.port}", "-cert", material.certificate, "-key", material.key, "-cipher", c.cipher, "-groups", c.group_name, "-mtu", "{c.mtu}", "-use_srtp", "SRTP_AES128_CM_SHA1_80", "-keymatexport", "EXTRACTOR-dtls_srtp", "-keymatexportlen", "60"]
+        args: openssl_args(["s_client", c.flag, "-connect", "127.0.0.1:{h.addr.port}"], material, c, c.group_name)
         stdin: process.Stdio.Piped
         stdout: process.Stdio.Piped
         stderr: process.Stdio.Null
@@ -131,22 +268,31 @@ fn server_case(t: *testing.T, material: Material, c: Case) {
     spawn collect(child.handle.stdout ?? panic("no stdout"), seen, "pong")
     let remote = (<-first) ?? panic("no datagram")
     let identity = dtls.generate_identity("low", 1700000000, 4102444800) or panic("identity")
-    let config = dtls.Config { client: false, identity, fingerprints: [material.fingerprint], cipher_suites: [c.suite], groups: c.groups, mtu: c.mtu, retransmit_initial: 200, srtp_profiles: [dtls.srtp_aes128_cm_sha1_80] }
-    using s = open(config, Transport { send: fn(d) { net.send_to_on(h, d, remote) or 0 }, incoming })
+    let config = dtls.Config { client: false, identity, fingerprints: [material.fingerprint], cipher_suites: c.suites, groups: c.groups, mtu: c.mtu, retransmit_initial: 200, srtp_profiles: [dtls.srtp_aes128_cm_sha1_80] }
+    using s = open(config, transport(h, remote, c.lost, incoming))
     wait_connected(s.handle) or panic("handshake")
+    send(s.handle, bytes("ready\n")) or panic("send")
     let stdin = child.handle.stdin ?? panic("no stdin")
     stdin.write(bytes("hello\n")) or panic("write")
     let message = receive(s.handle) or panic("receive")
     testing.error_if(t, str(message) != "hello\n", "server received {str(message)}")
     let info = describe_session(s.handle) or panic("describe")
+    testing.error_if(t, info.version != c.version, "version {info.version}")
     testing.error_if(t, info.cipher_suite != c.suite, "suite {info.cipher_suite}")
+    if c.version == dtls.dtls13 {
+        update_keys(s.handle, true) or panic("update keys")
+        time.sleep_for(duration.milliseconds(300))
+        stdin.write(bytes("again\n")) or panic("write")
+        let later = receive(s.handle) or panic("receive")
+        testing.error_if(t, str(later) != "again\n", "server received {str(later)} after the key update")
+    }
     testing.error_if(t, info.srtp_profile != dtls.srtp_aes128_cm_sha1_80, "profile {info.srtp_profile}")
     let mine = text.encode_hex(export_keying_material(s.handle, "EXTRACTOR-dtls_srtp", 60) or panic("export"))
     send(s.handle, bytes("pong\n")) or panic("send")
     close_session(s.handle)
     <-seen.ready
     testing.error_if(t, !text.contains(seen.text, "SRTP Extension negotiated, profile=SRTP_AES128_CM_SHA1_80"), "openssl did not negotiate SRTP")
-    testing.error_if(t, !text.contains(seen.text, "Cipher is {c.cipher}"), "openssl negotiated another cipher")
+    testing.error_if(t, !text.contains(seen.text, "Cipher is {c.cipher_name}"), "openssl negotiated another cipher")
     testing.error_if(t, keying_material(seen.text) != mine, "keying material differs: openssl {keying_material(seen.text)} low {mine}")
 }
 
@@ -154,7 +300,7 @@ fn client_case(t: *testing.T, material: Material, c: Case) {
     let port = free_port()
     let command = process.Command {
         program: "timeout"
-        args: ["30", "openssl", "s_server", "-dtls1_2", "-accept", "127.0.0.1:{port}", "-cert", material.certificate, "-key", material.key, "-Verify", "1", "-cipher", c.cipher, "-groups", c.group_name, "-mtu", "{c.mtu}", "-use_srtp", "SRTP_AES128_CM_SHA1_80", "-keymatexport", "EXTRACTOR-dtls_srtp", "-keymatexportlen", "60", "-listen"]
+        args: openssl_args(["s_server", c.flag, "-accept", "127.0.0.1:{port}", "-Verify", "1"], material, c, c.server_group_name)
         stdin: process.Stdio.Piped
         stdout: process.Stdio.Piped
         stderr: process.Stdio.Null
@@ -168,14 +314,21 @@ fn client_case(t: *testing.T, material: Material, c: Case) {
     spawn pump(h, incoming, chan[net.Addr](1))
     let remote = net.parse_addr("127.0.0.1:{port}") or panic("addr")
     let identity = dtls.generate_identity("low", 1700000000, 4102444800) or panic("identity")
-    let config = dtls.Config { client: true, identity, fingerprints: [material.fingerprint], cipher_suites: [c.suite], groups: c.groups, mtu: c.mtu, retransmit_initial: 200, srtp_profiles: [dtls.srtp_aes128_cm_sha1_80] }
-    using s = open(config, Transport { send: fn(d) { net.send_to_on(h, d, remote) or 0 }, incoming })
+    let config = dtls.Config { client: true, identity, fingerprints: [material.fingerprint], cipher_suites: c.suites, groups: c.groups, mtu: c.mtu, retransmit_initial: 200, srtp_profiles: [dtls.srtp_aes128_cm_sha1_80] }
+    using s = open(config, transport(h, remote, c.lost, incoming))
     wait_connected(s.handle) or panic("handshake")
+    let info = describe_session(s.handle) or panic("describe")
+    testing.error_if(t, info.version != c.version, "version {info.version}")
     let mine = text.encode_hex(export_keying_material(s.handle, "EXTRACTOR-dtls_srtp", 60) or panic("export"))
+    if c.version == dtls.dtls13 {
+        time.sleep_for(duration.milliseconds(300))
+        update_keys(s.handle, true) or panic("update keys")
+        time.sleep_for(duration.milliseconds(300))
+    }
     send(s.handle, bytes("hello\n")) or panic("send")
     <-seen.ready
     testing.error_if(t, keying_material(seen.text) != mine, "keying material differs: openssl {keying_material(seen.text)} low {mine}")
-    testing.error_if(t, !text.contains(seen.text, "CIPHER is {c.cipher}"), "openssl negotiated another cipher")
+    testing.error_if(t, !text.contains(seen.text, "CIPHER is {c.cipher_name}"), "openssl negotiated another cipher")
     testing.error_if(t, !text.contains(seen.text, "SRTP Extension negotiated, profile=SRTP_AES128_CM_SHA1_80"), "openssl did not negotiate SRTP")
     close_session(s.handle)
 }
@@ -187,8 +340,10 @@ fn test_openssl_client_against_the_low_server(t: *testing.T) {
     }
     let dir = file.temp_dir("dtls-interop-server") or panic("temp dir")
     let material = make_material(dir)
+    let dtls13 = dtls13_supported()
     for c in cases() {
         testing.sub(t, c.name, fn(t) {
+            runnable(t, c, dtls13)
             server_case(t, material, c)
         })
     }
@@ -202,10 +357,104 @@ fn test_low_client_against_the_openssl_server(t: *testing.T) {
     }
     let dir = file.temp_dir("dtls-interop-client") or panic("temp dir")
     let material = make_material(dir)
+    let dtls13 = dtls13_supported()
     for c in cases() {
         testing.sub(t, c.name, fn(t) {
+            runnable(t, c, dtls13)
             client_case(t, material, c)
         })
     }
+    file.remove_all(dir) or panic("remove")
+}
+
+fn failure(s: Handle) -> str {
+    for {
+        let event = (<-s.events) ?? return "the session ended"
+        match event {
+            Failed(reason) => return reason
+            Connected => return "connected"
+            Closed => return "closed"
+        }
+    }
+}
+
+fn downgrade_case() -> Case {
+    var c = suite13("downgrade", "-dtls", 0x1301, "TLS_AES_128_GCM_SHA256", [tls.group_x25519, tls.group_p256], "X25519:P-256", 1200)
+    c.suites = [0x1301, 0xC02B]
+    c.cipher = ["-cipher", "ECDHE-ECDSA-AES128-GCM-SHA256"]
+    c
+}
+
+fn test_the_low_client_detects_an_openssl_server_downgraded_by_a_stripped_hello(t: *testing.T) {
+    let absent = missing_tool()
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    if !dtls13_supported() {
+        testing.skip(t, "openssl has no DTLS 1.3")
+    }
+    let dir = file.temp_dir("dtls-interop-downgrade-client") or panic("temp dir")
+    let material = make_material(dir)
+    let c = downgrade_case()
+    let port = free_port()
+    let command = process.Command {
+        program: "timeout"
+        args: openssl_args(["s_server", c.flag, "-accept", "127.0.0.1:{port}"], material, c, c.group_name)
+        stdin: process.Stdio.Piped
+        stdout: process.Stdio.Null
+        stderr: process.Stdio.Null
+    }
+    using child = process.start(command) or panic("start s_server")
+    time.sleep_for(duration.milliseconds(300))
+    using var socket = net.bind_udp("127.0.0.1", 0) or panic("bind")
+    let h = net.detach_socket(mut socket)
+    let incoming = chan[u8[]](64)
+    spawn pump(h, incoming, chan[net.Addr](1))
+    let remote = net.parse_addr("127.0.0.1:{port}") or panic("addr")
+    let identity = dtls.generate_identity("low", 1700000000, 4102444800) or panic("identity")
+    let config = dtls.Config { client: true, identity, fingerprints: [material.fingerprint], cipher_suites: c.suites, groups: c.groups, retransmit_initial: 200, handshake_timeout: 5000 }
+    using s = open(config, Transport { send: fn(d) { net.send_to_on(h, without_supported_versions(d), remote) or 0 }, incoming })
+    t.equal(failure(s.handle), "downgrade to DTLS 1.2 detected")
+    close_session(s.handle)
+    file.remove_all(dir) or panic("remove")
+}
+
+fn test_the_openssl_client_detects_a_low_server_downgraded_by_a_stripped_hello(t: *testing.T) {
+    let absent = missing_tool()
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+    }
+    if !dtls13_supported() {
+        testing.skip(t, "openssl has no DTLS 1.3")
+    }
+    let dir = file.temp_dir("dtls-interop-downgrade-server") or panic("temp dir")
+    let material = make_material(dir)
+    let c = downgrade_case()
+    using var socket = net.bind_udp("127.0.0.1", 0) or panic("bind")
+    let h = net.detach_socket(mut socket)
+    let incoming = chan[u8[]](64)
+    let first = chan[net.Addr](1)
+    spawn stripping_pump(h, incoming, first)
+    let command = process.Command {
+        program: "timeout"
+        args: openssl_args(["s_client", c.flag, "-connect", "127.0.0.1:{h.addr.port}"], material, c, c.group_name)
+        stdin: process.Stdio.Piped
+        stdout: process.Stdio.Null
+        stderr: process.Stdio.Piped
+    }
+    using child = process.start(command) or panic("start s_client")
+    let seen = new(Captured { text: "", ready: chan[bool](1) })
+    spawn collect(child.handle.stderr ?? panic("no stderr"), seen, "fallback")
+    let remote = (<-first) ?? panic("no datagram")
+    let identity = dtls.generate_identity("low", 1700000000, 4102444800) or panic("identity")
+    let config = dtls.Config { client: false, identity, fingerprints: [material.fingerprint], cipher_suites: c.suites, groups: c.groups, retransmit_initial: 200, handshake_timeout: 5000 }
+    using s = open(config, transport(h, remote, [], incoming))
+    t.equal(failure(s.handle), "the peer sent a fatal alert")
+    select {
+        <-seen.ready => {}
+        <-time.after(duration.seconds(5)) => {}
+    }
+    testing.error_if(t, !text.contains(text.lower(seen.text), "inappropriate fallback"), "openssl did not report the downgrade: {seen.text}")
+    close_session(s.handle)
     file.remove_all(dir) or panic("remove")
 }

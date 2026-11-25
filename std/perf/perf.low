@@ -1,0 +1,473 @@
+import std/file
+import std/io
+import std/os/signal
+import std/process
+import std/slices
+import std/sys
+import std/text
+import std/time
+import std/time/duration
+
+/// Something the kernel counts while a process runs.
+pub struct Source {
+    kind: i64
+    config: i64
+}
+
+const hardware = 0
+const software = 1
+
+/// Processor cycles.
+pub fn cycles() -> Source {
+    Source { kind: hardware, config: 0 }
+}
+
+/// Instructions the processor retired.
+pub fn instructions() -> Source {
+    Source { kind: hardware, config: 1 }
+}
+
+/// Reads and writes that missed the last cache level.
+pub fn cache_misses() -> Source {
+    Source { kind: hardware, config: 3 }
+}
+
+/// Branches the processor predicted wrongly.
+pub fn branch_misses() -> Source {
+    Source { kind: hardware, config: 5 }
+}
+
+/// Nanoseconds on a processor, from the kernel's timer. Every machine counts it.
+pub fn cpu_clock() -> Source {
+    Source { kind: software, config: 0 }
+}
+
+/// Page faults, which a process takes when it first touches a page of memory.
+pub fn faults() -> Source {
+    Source { kind: software, config: 2 }
+}
+
+/// The times a thread leaves its processor, because it blocks or is preempted.
+pub fn switches() -> Source {
+    Source { kind: software, config: 3 }
+}
+
+fn event(s: Source, kernel: bool) -> sys.PerfEvent {
+    sys.PerfEvent { kind: s.kind, config: s.config, kernel }
+}
+
+fn open(e: sys.PerfEvent, pid: i64, cpu: i64) -> i64 ! io.Error {
+    sys.perf_open(e, pid, cpu) catch {
+        Denied => {
+            if !e.kernel {
+                fail Denied
+            }
+            var user = e
+            user.kernel = false
+            sys.perf_open(user, pid, cpu)?
+        }
+        other => fail other
+    }
+}
+
+/// Fails unless this machine counts `s` for the calling user.
+///
+/// Fails with `Unsupported` for a source the machine lacks, as most virtual machines and containers lack the hardware ones, and `Denied` when `/proc/sys/kernel/perf_event_paranoid` above 2 or a system call filter refuses every source.
+pub fn available(s: Source) ! io.Error {
+    sys.close_fd(open(event(s, true), 0, -1)?)
+}
+
+const shell = "/bin/sh"
+const hold_script = "kill -STOP $$; exec \"$0\" \"$@\""
+const stop_polls = 5000
+
+/// Returns a command that starts `c` held: the process stops itself before it executes the program of `c`.
+///
+/// Start it, wait with `await_held`, open counters and samplers on its process id, and let it go with `release`. Events opened while it is held start with the first instruction of the program, so nothing of the run is missed. The command runs through `/bin/sh`, which replaces itself with the program, so the process id stays the same. Fails with `NotFound` when `process.find` does not find the program.
+pub fn held(c: process.Command) -> process.Command ! io.Error {
+    let program = process.find(c.program) ?? fail NotFound
+    var args: str[] = ["-c", hold_script, program]
+    for a in c.args {
+        args.push(a)
+    }
+    var h = c
+    h.program = shell
+    h.args = args
+    h
+}
+
+fn state_of(pid: i64) -> u8 {
+    let stat = file.read_text("/proc/{pid}/stat") or return 'Z'
+    let rest = text.fields(text.last_cut(stat, ")").after)
+    if rest.len == 0 || rest[0].len == 0 {
+        return 'Z'
+    }
+    rest[0][0]
+}
+
+/// Waits until the process `pid`, started from a `held` command, has stopped itself.
+///
+/// Fails with `NotFound` when the process ended first and `TimedOut` when it has not stopped after five seconds.
+pub fn await_held(pid: i64) ! io.Error {
+    for _ in 0..stop_polls {
+        let state = state_of(pid)
+        if state == 'T' {
+            return
+        }
+        if state == 'Z' {
+            fail NotFound
+        }
+        time.sleep_for(duration.milliseconds(1))
+    }
+    fail TimedOut
+}
+
+/// Lets the held process `pid` go on to execute its program.
+pub fn release(pid: i64) ! io.Error {
+    signal.send(pid, signal.Signal.Continue)?
+}
+
+/// A running count of one source over a process and everything it starts.
+pub struct Counter {
+    fd: i64
+}
+
+/// Starts counting `s` in the held process `pid`, from the moment it executes its program.
+///
+/// The count covers every thread and process the measured one starts. Events in the kernel are counted when the system allows it. Fails with `Unsupported` when the machine does not count `s` and `Denied` when the system refuses.
+pub fn counter(pid: i64, s: Source) -> Counter ! io.Error {
+    Counter { fd: open(event(s, true), pid, -1)? }
+}
+
+/// Returns the count of `c` and stops counting.
+///
+/// Call it after the measured process has ended: the count of a thread or process is added when it ends.
+pub fn count(c: Counter) -> i64 ! io.Error {
+    let n = sys.perf_count(c.fd) catch {
+        failure => {
+            sys.close_fd(c.fd)
+            fail failure
+        }
+    }
+    sys.close_fd(c.fd)
+    n
+}
+
+/// Returns whether the child process `pid` has ended, without reaping it.
+pub fn exited(pid: i64) -> bool {
+    sys.child_usage(pid) != none
+}
+
+/// Returns what the ended child process `pid` and the descendants it waited for used, or `none` while it runs.
+///
+/// Call it before `process.wait` reaps the child.
+pub fn usage(pid: i64) -> sys.ChildUsage? {
+    sys.child_usage(pid)
+}
+
+/// Restricts this process and every process it starts afterwards to the processors whose bits are set in `mask`.
+///
+/// Every OS thread of the process is restricted, so it holds whichever thread starts a child. Fails with `Invalid` when `mask` names no processor the process may run on.
+pub fn restrict_cpus(mask: u64) ! io.Error {
+    for _ in 0..2 {
+        for name in file.list("/proc/self/task")? {
+            let thread = text.parse_int(name) or continue
+            sys.set_affinity(thread, mask) catch {
+                Invalid => fail Invalid
+                _ => continue
+            }
+        }
+    }
+}
+
+fn online_cpus() -> i64[] {
+    var cpus: i64[] = []
+    let listed = file.read_text("/sys/devices/system/cpu/online") or "0"
+    for span in text.split(text.trim(listed), ',') {
+        let ends = text.cut(span, "-")
+        let first = text.parse_int(ends.before) or continue
+        let last = if ends.found { text.parse_int(ends.after) or first } else { first }
+        for cpu in first..last + 1 {
+            cpus.push(cpu)
+        }
+    }
+    cpus
+}
+
+const page = 4096
+const largest_ring_pages = 128
+const smallest_ring_pages = 8
+const head_offset = 1024
+const tail_offset = 1032
+const scratch_size = 65536
+
+struct Ring {
+    fd: i64
+    view: sys.MapView
+    data: u8[]
+    tail: i64
+}
+
+/// The sample buffers of one source over a process and everything it starts, one for each processor.
+pub struct Sampler {
+    rings: Ring[]
+    scratch: u8[]
+    period: i64
+    /// Whether samples taken in the kernel are recorded.
+    pub kernel: bool
+}
+
+fn max_rate() -> i64 {
+    let listed = file.read_text("/proc/sys/kernel/perf_event_max_sample_rate") or return 1000
+    text.parse_int(text.trim(listed)) or 1000
+}
+
+struct Fitted {
+    view: sys.MapView
+    pages: i64
+}
+
+fn map_ring(fd: i64, most: i64) -> Fitted ! io.Error {
+    var pages = most
+    for {
+        let mapped = sys.map_file(fd, Shared, 0, (1 + pages) * page) catch {
+            failure => {
+                if pages <= smallest_ring_pages {
+                    fail failure
+                }
+                pages /= 2
+                continue
+            }
+        }
+        return Fitted { view: mapped, pages }
+    }
+}
+
+fn allows_kernel(pid: i64, s: Source) -> bool {
+    let fd = sys.perf_open(event(s, true), pid, -1) catch {
+        Denied => return false
+        _ => return true
+    }
+    sys.close_fd(fd)
+    true
+}
+
+/// How often a `Sampler` takes a sample.
+pub enum Pace {
+    /// About `n` samples a second on each processor the process runs on, no more than `/proc/sys/kernel/perf_event_max_sample_rate`. The kernel adjusts the period to keep the rate, so it suits sources that advance steadily, like cycles.
+    Hertz(n: i64)
+    /// One sample every `n` events, so every sample weighs the same. It suits sources that come in bursts, like page faults.
+    Events(n: i64)
+}
+
+/// Starts sampling `s` in the held process `pid`, from the moment it executes its program.
+///
+/// Each sample carries up to `depth` callers, found through the frame pointers, which every Low program keeps. Samples cover every thread and process the measured one starts. Samples in the kernel are recorded when the system allows it, as `Sampler.kernel` says. Read the records with `drain` often enough that the buffers do not fill, and end with `close`. Fails with `Unsupported` when the machine does not count `s`, `Denied` when the system refuses to measure the process or to lock the buffers in memory, and `Invalid` for a pace below 1.
+pub fn sampler(pid: i64, s: Source, pace: Pace, depth: i64) -> *Sampler ! io.Error {
+    var e = event(s, allows_kernel(pid, s))
+    match pace {
+        Hertz(n) => {
+            let limit = max_rate()
+            e.rate = if n > limit { limit } else { n }
+        }
+        Events(n) => {
+            e.period = n
+        }
+    }
+    if e.rate < 1 && e.period < 1 {
+        fail Invalid
+    }
+    e.depth = depth
+    let out = new(Sampler { rings: [], scratch: io.buffer(scratch_size), period: e.period, kernel: e.kernel })
+    var pages = largest_ring_pages
+    for cpu in online_cpus() {
+        let fd = sys.perf_open(e, pid, cpu) catch {
+            failure => {
+                out.close()
+                fail failure
+            }
+        }
+        let fitted = map_ring(fd, pages) catch {
+            failure => {
+                sys.close_fd(fd)
+                out.close()
+                fail failure
+            }
+        }
+        pages = fitted.pages
+        let start: ptr[u8] = ptr(fitted.view.address + page)
+        out.rings.push(Ring { fd, view: fitted.view, data: view(start, pages * page), tail: 0 })
+    }
+    out
+}
+
+/// Stops sampling and releases the buffers of `s`.
+pub fn close(s: *Sampler) {
+    for r in s.rings {
+        sys.unmap_view(r.view)
+        sys.close_fd(r.fd)
+    }
+    s.rings = []
+}
+
+/// Calls `take` with each record the kernel has written since the last call, and frees their space in the buffers.
+///
+/// Records of one processor arrive in time order and those of different processors do not, so order them by their times.
+pub fn drain(s: *Sampler, take: fn(Record)) {
+    for i in 0..s.rings.len {
+        s.rings[i].tail = s.drain_ring(s.rings[i], take)
+    }
+}
+
+fn drain_ring(s: *Sampler, r: Ring, take: fn(Record)) -> i64 {
+    let head_at: ptr[u64] = ptr(r.view.address + head_offset)
+    let tail_at: ptr[u64] = ptr(r.view.address + tail_offset)
+    let head = i64(load(head_at))
+    let size = r.data.len
+    var tail = r.tail
+    for tail < head {
+        let at = tail % size
+        let length = i64(r.data[(at + 6) % size]) | i64(r.data[(at + 7) % size]) << 8
+        if length < 8 || length > scratch_size {
+            tail = head
+            break
+        }
+        if at + length <= size {
+            take(parse(r.data[at..at + length], s.period))
+        } else {
+            let first = size - at
+            for k in 0..length {
+                s.scratch[k] = if k < first { r.data[at + k] } else { r.data[k - first] }
+            }
+            take(parse(s.scratch[..length], s.period))
+        }
+        tail += length
+    }
+    store(tail_at, u64(tail))
+    tail
+}
+
+/// One sample: where a thread was when the source reached its period.
+pub struct Hit {
+    /// The process sampled.
+    pub pid: i64
+    /// The time of the sample on the kernel's event clock, in nanoseconds.
+    pub at: i64
+    /// The events of the source this sample stands for.
+    pub weight: i64
+    /// The instruction addresses, innermost first: where the thread was, then the return address in each caller. An address for which `kernel_address` holds is where the thread was in the kernel, and the user addresses that led there follow it.
+    pub frames: i64[]
+}
+
+/// One executable mapping a process made: where a program or library was loaded.
+pub struct Mapping {
+    /// The process that mapped the file.
+    pub pid: i64
+    /// The time of the mapping on the kernel's event clock, in nanoseconds.
+    pub at: i64
+    /// The first address of the mapping.
+    pub start: i64
+    /// The number of bytes mapped.
+    pub size: i64
+    /// The file offset mapped at `start`.
+    pub offset: i64
+    /// The path of the mapped file, or a name in brackets or after `//` for memory no file backs.
+    pub path: str
+}
+
+/// One record of a `Sampler`.
+pub enum Record {
+    /// A sample.
+    Sampled(hit: Hit)
+    /// A process mapped executable memory.
+    Mapped(mapping: Mapping)
+    /// The process `parent` started the process `pid`, which begins with its parent's mappings. A new thread is reported the same way, with `pid` equal to `parent`.
+    Forked(pid: i64, parent: i64, at: i64)
+    /// The process `pid` executed a program, which discards its mappings.
+    Executed(pid: i64, at: i64)
+    /// The buffer was full and the kernel dropped `count` records.
+    Lost(count: i64)
+    /// A record of any other kind.
+    Other
+}
+
+const record_lost = 2
+const record_comm = 3
+const record_fork = 7
+const record_sample = 9
+const record_mmap2 = 10
+const misc_exec = 0x2000
+const context_floor = -4095
+const sample_fixed = 48
+const mapping_fixed = 72
+
+/// Returns whether `address` lies in the kernel's half of the address space.
+pub fn kernel_address(address: i64) -> bool {
+    address < 0
+}
+
+fn trailing_time(r: u8[], period: i64) -> i64 {
+    io.le64(r, r.len - if period > 0 { 16 } else { 8 })
+}
+
+fn parse(r: u8[], period: i64) -> Record {
+    if r.len < 24 {
+        return Other
+    }
+    match io.le32(r, 0) {
+        record_sample => parse_sample(r, period)
+        record_mmap2 => parse_mapping(r, period)
+        record_fork => {
+            if r.len < 32 {
+                return Other
+            }
+            Forked(io.le32(r, 8), io.le32(r, 12), io.le64(r, 24))
+        }
+        record_comm => {
+            if io.le16(r, 4) & misc_exec == 0 {
+                return Other
+            }
+            Executed(io.le32(r, 8), trailing_time(r, period))
+        }
+        record_lost => Lost(io.le64(r, 16))
+        _ => Other
+    }
+}
+
+fn parse_sample(r: u8[], period: i64) -> Record {
+    if r.len < sample_fixed {
+        return Other
+    }
+    let ip = io.le64(r, 8)
+    let callers = io.le64(r, 40)
+    var frames: i64[] = []
+    if kernel_address(ip) {
+        frames.push(ip)
+    }
+    for i in 0..callers {
+        let at = sample_fixed + i * 8
+        if at + 8 > r.len {
+            break
+        }
+        let frame = io.le64(r, at)
+        if frame < context_floor || frame >= 0 {
+            frames.push(frame)
+        }
+    }
+    if frames.len == 0 {
+        frames.push(ip)
+    }
+    let weight = if period > 0 { period } else { io.le64(r, 32) }
+    Sampled(Hit { pid: io.le32(r, 16), at: io.le64(r, 24), weight, frames })
+}
+
+fn parse_mapping(r: u8[], period: i64) -> Record {
+    if r.len < mapping_fixed + 16 {
+        return Other
+    }
+    var end = mapping_fixed
+    for end < r.len && r[end] != 0 {
+        end += 1
+    }
+    Mapped(Mapping { pid: io.le32(r, 8), at: trailing_time(r, period), start: io.le64(r, 16), size: io.le64(r, 24), offset: io.le64(r, 32), path: str(slices.clone(r[mapping_fixed..end])) })
+}

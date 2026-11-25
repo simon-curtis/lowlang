@@ -151,10 +151,6 @@ rt_release_floor:
 rt_prefault:
 	ret
 
-rt_release_chunk:
-	xor r10d, r10d
-	ret
-
 rt_mmap_stack:
 	OS_ENTER
 	xor ecx, ecx

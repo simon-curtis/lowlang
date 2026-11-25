@@ -1,0 +1,475 @@
+import std/crypto/hash
+import std/io
+import std/testing
+import std/text
+import std/tls
+
+struct Vector {
+    suite: tls.Suite
+    traffic: str
+    record: str
+    seq: i64
+    exporter: str
+    keying: str
+}
+
+fn openssl_vectors() -> Vector[] {
+    [
+        Vector {
+            suite: Aes128Gcm
+            traffic: "51caf9f5c243c50f909389e05393b30b9d652c8637996feb7e1196eec6c90a55"
+            record: "2f85ed00176f41422c45367c63d6b7940806f3e94732f0ce4953406c"
+            seq: 0
+            exporter: "037b212f758d936aa60d7f0217fa4cc87ae89fb7679a1275ecd19436387ecc16"
+            keying: "96f9a40b9039c5b81c7ef1b6afb5786025fdc22563dfb33886a518186b80c487d769b7375d3efbbe8cc5f5b3ffc5e1bfaa6b3bd38881cabd068962af"
+        }
+        Vector {
+            suite: Aes256Gcm
+            traffic: "1b61166e564baa81f1e5c6b617b7eedae7c6cb7892df4faae6f14b726f4432d280d92fee3b7e385563787a1714a471cc"
+            record: "2f724b0017e4a0ed26e6816b72ee687709345ae6dd6314cd28e90508"
+            seq: 0
+            exporter: "af2cb6fed662454fc0aac51e906bd083db1bb4106bb21271d8e873ccf521bea8e23af023cbfa6b0ea59cab34058ebd66"
+            keying: "d2ce9c0e1a0d2bbc4b411365cde347e0553236c82afe2388b2d49df2f1f0dafbfeffcfb3ddad87ed11b0ed3ad641288f693add31959434856aff01ba"
+        }
+        Vector {
+            suite: ChaCha20Poly1305
+            traffic: "ec707ac23a748aa6ba97ac8b7cedec0989733d05abfe11841bbea238c2388eab"
+            record: "2f5f020017611f39e614e08678ed48d2328e3a78d6c584fa38adefab"
+            seq: 2
+            exporter: "fa35bea1247ad7841b8450fa9f5e203f7d557f82b455709640cbb9d3b16e62b9"
+            keying: "c548bc759dd80c7e8ec8a46f8a7c3809df99b4e22acf8741257e75c3fe431d4aaa7fbe32cab3352fd8d6f5761a9a0433114ec78e64555c0137bf8481"
+        }
+    ]
+}
+
+fn hex(s: str) -> u8[] {
+    text.decode_hex(s) or []
+}
+
+fn epoch3_keys(t: *testing.T, suite: tls.Suite, secret: u8[]) -> Keys13? {
+    keys13(suite, secret, 3) catch {
+        _ => {
+            testing.error(t, "keys13 failed")
+            return none
+        }
+    }
+}
+
+fn test_openssl_records_open_and_seal_back_to_the_same_bytes(t: *testing.T) {
+    for v in openssl_vectors() {
+        let keys = epoch3_keys(t, v.suite, hex(v.traffic)) ?? return
+        let record = hex(v.record)
+        let raws = split_records(record)
+        t.equal(raws.len, 1)
+        t.equal(raws[0].epoch, 3)
+        let reader = new(Reader { keys, window: window() })
+        let opened = open13(reader, raws[0]) ?? {
+            testing.error(t, "the OpenSSL record did not open")
+            return
+        }
+        t.equal(opened.kind, type_application)
+        t.equal(opened.seq, v.seq)
+        t.equal(str(opened.plain), "hello\n")
+        t.is_none(open13(reader, raws[0]))
+        let sender = new(Sender { keys, seq: v.seq })
+        t.equal_slice(seal13(sender, type_application, bytes("hello\n")), record)
+    }
+}
+
+fn test_the_exporter_matches_openssl(t: *testing.T) {
+    for v in openssl_vectors() {
+        let k = tls.key_schedule(v.suite, label_prefix, [], [])
+        let got = tls.export_secret(k, hex(v.exporter), "EXTRACTOR-dtls_srtp", [], 60)
+        t.equal(text.encode_hex(got), v.keying)
+    }
+}
+
+fn test_a_sequence_number_is_recovered_from_its_low_bits(t: *testing.T) {
+    t.equal(closest(5, 8, 0), 5)
+    t.equal(closest(0x02, 16, 0x1_FFFE), 0x2_0002)
+    t.equal(closest(0xFFFF, 16, 0x2_0001), 0x1_FFFF)
+    t.equal(closest(250, 8, 260), 250)
+    t.equal(closest(4, 8, 260), 260)
+    t.equal(closest(0xFFFF, 16, 0), 0xFFFF)
+}
+
+fn test_a_record_with_an_eight_bit_number_and_no_length_opens(t: *testing.T) {
+    let v = openssl_vectors()[0]
+    let keys = epoch3_keys(t, v.suite, hex(v.traffic)) ?? return
+    let header: u8[] = [0x23, 7]
+    let sealed = keys.aead.seal(nonce13(keys.iv, 7), [0x41, 0x42, u8(type_application), 0, 0], header)
+    let mask = keys.mask(sealed[..16])
+    var record: u8[] = [0x23, 7 ^ mask[0]]
+    io.append(mut record, sealed)
+    let raws = split_records(record)
+    t.equal(raws.len, 1)
+    let reader = new(Reader { keys, window: window() })
+    let opened = open13(reader, raws[0]) ?? {
+        testing.error(t, "the record did not open")
+        return
+    }
+    t.equal(opened.seq, 7)
+    t.equal(opened.kind, type_application)
+    t.equal_slice(opened.plain, [0x41, 0x42])
+}
+
+fn test_a_record_with_a_connection_id_is_not_read(t: *testing.T) {
+    t.equal(split_records([0x3E, 1, 2, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).len, 0)
+}
+
+fn config13(t: *testing.T, client: bool) -> Config {
+    Config { client, identity: identity_for(t, if client { "alpha" } else { "beta" }), unverified: true, retransmit_initial: 100 }
+}
+
+fn deliver(from: *Conn, to: *Conn, now: i64) -> i64 {
+    var n = 0
+    for {
+        let d = poll_transmit(from) ?? break
+        receive(to, d, now)
+        n += 1
+    }
+    n
+}
+
+fn exchange(p: Pair, now: i64) {
+    for _ in 0..30 {
+        let moved = deliver(p.a, p.b, now) + deliver(p.b, p.a, now)
+        if moved == 0 {
+            return
+        }
+    }
+}
+
+fn hello_reply(server: *Conn, hello: u8[]) -> u8[] {
+    receive(server, hello, 0)
+    let reply = poll_transmit(server) ?? []
+    let records = split_records(reply)
+    if records.len == 0 || records[0].body.len < handshake_header + 34 || records[0].body[0] != u8(msg_server_hello) {
+        return []
+    }
+    records[0].body[handshake_header + 2..handshake_header + 34]
+}
+
+fn test_a_server_answers_a_first_hello_with_a_retry_and_keeps_no_state(t: *testing.T) {
+    let client = conn(config13(t, true))
+    let server = conn(config13(t, false))
+    start(client, 0)
+    let hello = poll_transmit(client) ?? []
+    t.equal_slice(hello_reply(server, hello), tls.retry_random())
+    t.equal(state(server), State.Idle)
+    t.equal(server.version, 0)
+    t.equal(server.transcript.len, 0)
+    t.equal(server.assemblies.len, 0)
+    t.is_false(server.timer)
+}
+
+fn test_a_retry_cookie_from_another_server_is_ignored(t: *testing.T) {
+    let client = conn(config13(t, true))
+    let first = conn(config13(t, false))
+    let second = conn(config13(t, false))
+    start(client, 0)
+    let hello = poll_transmit(client) ?? []
+    receive(first, hello, 0)
+    deliver(first, client, 0)
+    let again = poll_transmit(client) ?? []
+    receive(second, again, 0)
+    t.is_none(poll_transmit(second))
+    t.equal(state(second), State.Idle)
+    let random = hello_reply(first, again)
+    t.equal(random.len, 32)
+    t.is_false(hash.equal(random, tls.retry_random()))
+    t.equal(state(first), State.Handshaking)
+}
+
+fn test_a_server_without_cookies_retries_only_for_a_missing_key_share(t: *testing.T) {
+    var server = config13(t, false)
+    server.cookies = false
+    let direct = conn(config13(t, true))
+    start(direct, 0)
+    let fits = hello_reply(conn(server), poll_transmit(direct) ?? [])
+    t.equal(fits.len, 32)
+    t.is_false(hash.equal(fits, tls.retry_random()))
+    var other = config13(t, true)
+    other.groups = [tls.group_p256, tls.group_x25519]
+    let p = pair_of(other, server)
+    start(p.a, 0)
+    receive(p.b, poll_transmit(p.a) ?? [], 0)
+    let retry = poll_transmit(p.b) ?? []
+    t.equal(first_handshake_type(retry), msg_server_hello)
+    t.equal_slice(split_records(retry)[0].body[handshake_header + 2..handshake_header + 34], tls.retry_random())
+    receive(p.a, retry, 0)
+    exchange(p, 0)
+    t.is_true(both_connected(p))
+}
+
+fn test_a_dtls12_only_client_connects_and_sees_the_sentinel(t: *testing.T) {
+    var client = config13(t, true)
+    client.max_version = dtls12
+    let p = pair_of(client, config13(t, false))
+    t.is_true(settle_clean(p))
+    t.equal(p.a.version, dtls12)
+    t.equal(p.b.version, dtls12)
+    t.equal_slice(p.a.server_random[24..], tls.downgrade_sentinel(1))
+}
+
+fn test_a_dtls12_only_server_connects_without_the_sentinel(t: *testing.T) {
+    var server = config13(t, false)
+    server.max_version = dtls12
+    let p = pair_of(config13(t, true), server)
+    t.is_true(settle_clean(p))
+    t.equal(p.a.version, dtls12)
+    t.is_false(hash.equal(p.a.server_random[24..], tls.downgrade_sentinel(1)))
+}
+
+fn test_peers_without_a_common_version_fail(t: *testing.T) {
+    var client = config13(t, true)
+    client.min_version = dtls13
+    var server = config13(t, false)
+    server.max_version = dtls12
+    let p = pair_of(client, server)
+    t.is_false(settle_clean(p))
+    t.equal(state(p.a), State.Failed)
+    t.equal(state(p.b), State.Failed)
+    var old = config13(t, true)
+    old.max_version = dtls12
+    var strict = config13(t, false)
+    strict.min_version = dtls13
+    let q = pair_of(old, strict)
+    t.is_false(settle_clean(q))
+    t.equal(state(q.b), State.Failed)
+}
+
+fn without_versions(d: u8[]) -> u8[] {
+    let records = split_records(d)
+    if records.len != 1 || records[0].kind != type_handshake || records[0].body[0] != u8(msg_client_hello) {
+        return d
+    }
+    let body = records[0].body[handshake_header..]
+    let c = cursor(body)
+    let _ = take(c, 34) or return d
+    let _ = vector8(c) or return d
+    let _ = vector8(c) or return d
+    let _ = vector16(c) or return d
+    let _ = vector8(c) or return d
+    let head = body[..c.at]
+    let exts = extensions(c) or return d
+    var kept: u8[] = []
+    for e in exts {
+        if e.kind != 43 && e.kind != 51 {
+            put_extension(mut kept, e.kind, e.body)
+        }
+    }
+    var hello: u8[] = []
+    io.append(mut hello, head)
+    put_vector16(mut hello, kept)
+    let seq = io.be16(records[0].body, 4)
+    let message = unfragmented(msg_client_hello, seq, hello)
+    frame(type_handshake, 0, records[0].seq, message)
+}
+
+fn test_a_hello_stripped_of_supported_versions_is_detected_as_a_downgrade(t: *testing.T) {
+    let p = pair_of(config13(t, true), config13(t, false))
+    start(p.a, 0)
+    for _ in 0..10 {
+        for {
+            let d = poll_transmit(p.a) ?? break
+            receive(p.b, without_versions(d), 0)
+        }
+        deliver(p.b, p.a, 0)
+    }
+    t.equal(p.b.version, dtls12)
+    t.equal(state(p.a), State.Failed)
+    let events = events_of(p.a)
+    var reason = ""
+    for e in events {
+        match e {
+            Failed(why) => {
+                reason = why
+            }
+            _ => {}
+        }
+    }
+    t.equal(reason, "downgrade to DTLS 1.2 detected")
+}
+
+fn connected13(t: *testing.T) -> Pair {
+    let p = pair_of(config13(t, true), config13(t, false))
+    t.require(t.is_true(settle_clean(p)))
+    t.require(t.equal(p.a.version, dtls13))
+    p
+}
+
+fn update_error(c: *Conn, request_peer: bool, now: i64) -> io.Error? {
+    var failure: io.Error? = none
+    update_keys(c, request_peer, now) catch {
+        e => {
+            failure = e
+        }
+    }
+    failure
+}
+
+fn test_a_key_update_moves_both_directions_to_the_next_epoch(t: *testing.T) {
+    let p = connected13(t)
+    t.equal(p.a.write_epoch, 3)
+    t.is_none(update_error(p.a, true, 0))
+    t.equal(update_error(p.a, false, 0) ?? io.Error.Invalid, io.Error.WouldBlock)
+    let update = poll_transmit(p.a) ?? []
+    let old = sends(t, p.a, bytes("old keys"))
+    receive(p.b, update, 0)
+    exchange(p, 0)
+    t.equal(p.a.write_epoch, 4)
+    t.equal(p.b.write_epoch, 4)
+    t.equal(p.a.timer, false)
+    let fresh_record = sends(t, p.a, bytes("new keys"))
+    t.equal(i64(fresh_record[0]) & 3, 0)
+    receive(p.b, fresh_record, 0)
+    receive(p.b, old, 0)
+    t.equal(str(read(p.b) ?? []), "new keys")
+    t.equal(str(read(p.b) ?? []), "old keys")
+    let back = sends(t, p.b, bytes("reply"))
+    receive(p.a, back, 0)
+    t.equal(str(read(p.a) ?? []), "reply")
+}
+
+fn test_a_lost_key_update_is_retransmitted_and_the_keys_wait_for_its_ack(t: *testing.T) {
+    let p = connected13(t)
+    t.is_none(update_error(p.b, false, 1000))
+    discard(p.b)
+    t.equal(p.b.write_epoch, 3)
+    t.equal(next_timeout(p.b), 1100)
+    tick(p.b, 1100)
+    exchange(p, 1100)
+    t.equal(p.b.write_epoch, 4)
+    t.equal(p.a.write_epoch, 3)
+    t.equal(next_timeout(p.b), -1)
+}
+
+fn test_update_keys_is_refused_before_the_handshake_and_on_dtls12(t: *testing.T) {
+    let p = pair_of(config13(t, true), config13(t, false))
+    t.equal(update_error(p.a, false, 0) ?? io.Error.Invalid, io.Error.NotConnected)
+    var client = config13(t, true)
+    client.max_version = dtls12
+    let q = pair_of(client, config13(t, false))
+    t.require(t.is_true(settle_clean(q)))
+    t.equal(update_error(q.a, false, 0) ?? io.Error.Invalid, io.Error.Unsupported)
+}
+
+fn test_the_client_retransmits_its_last_flight_until_the_server_acknowledges_it(t: *testing.T) {
+    let p = pair_of(config13(t, true), config13(t, false))
+    start(p.a, 0)
+    for _ in 0..10 {
+        deliver(p.a, p.b, 0)
+        deliver(p.b, p.a, 0)
+        if state(p.a) == State.Connected {
+            break
+        }
+    }
+    t.equal(state(p.a), State.Connected)
+    discard(p.a)
+    t.equal(state(p.b), State.Handshaking)
+    t.equal(next_timeout(p.a), 100)
+    tick(p.a, 100)
+    deliver(p.a, p.b, 100)
+    t.equal(state(p.b), State.Connected)
+    t.is_true(deliver(p.b, p.a, 100) > 0)
+    t.equal(next_timeout(p.a), -1)
+}
+
+fn test_a_repeated_last_flight_is_acknowledged_again(t: *testing.T) {
+    let p = pair_of(config13(t, true), config13(t, false))
+    start(p.a, 0)
+    var last: u8[][] = []
+    for _ in 0..10 {
+        for {
+            let d = poll_transmit(p.a) ?? break
+            last.push(d)
+            receive(p.b, d, 0)
+        }
+        deliver(p.b, p.a, 0)
+        if both_connected(p) {
+            break
+        }
+    }
+    t.require(t.is_true(both_connected(p)))
+    for d in last {
+        receive(p.b, d, 10)
+    }
+    let ack = poll_transmit(p.b) ?? []
+    let records = split_records(ack)
+    t.equal(records.len, 1)
+    t.equal(records[0].epoch, 3)
+    t.equal(state(p.b), State.Connected)
+}
+
+fn test_an_unacknowledged_last_flight_is_given_up_without_failing(t: *testing.T) {
+    var client = config13(t, true)
+    client.handshake_timeout = 5000
+    let p = pair_of(client, config13(t, false))
+    start(p.a, 0)
+    for _ in 0..10 {
+        deliver(p.a, p.b, 0)
+        deliver(p.b, p.a, 0)
+        if state(p.a) == State.Connected {
+            break
+        }
+    }
+    discard(p.a)
+    var now = 0
+    for next_timeout(p.a) >= 0 && now < 100000 {
+        now = next_timeout(p.a)
+        tick(p.a, now)
+        discard(p.a)
+    }
+    t.equal(state(p.a), State.Connected)
+    t.is_true(now >= 5000)
+    t.is_none(write_error(p.a, bytes("still")))
+}
+
+fn records_in(d: u8[]) -> i64 {
+    split_records(d).len
+}
+
+fn test_an_ack_of_part_of_a_flight_leaves_only_the_rest_to_retransmit(t: *testing.T) {
+    var client = config13(t, true)
+    client.mtu = 200
+    var server = config13(t, false)
+    server.mtu = 200
+    server.cookies = false
+    let p = pair_of(client, server)
+    start(p.a, 0)
+    deliver(p.a, p.b, 0)
+    var flight: u8[][] = []
+    for {
+        let d = poll_transmit(p.b) ?? break
+        flight.push(d)
+    }
+    t.require(t.is_true(flight.len >= 4))
+    var sent = 0
+    for d in flight {
+        sent += records_in(d)
+    }
+    for i, d in flight {
+        if i != 1 {
+            receive(p.a, d, 0)
+        }
+    }
+    t.equal(state(p.a), State.Handshaking)
+    let acks = deliver(p.a, p.b, 0)
+    t.is_true(acks > 0)
+    tick(p.b, 100)
+    var again = 0
+    var datagrams: u8[][] = []
+    for {
+        let d = poll_transmit(p.b) ?? break
+        again += records_in(d)
+        datagrams.push(d)
+    }
+    t.is_true(again > 0)
+    t.is_true(again < sent)
+    for d in datagrams {
+        receive(p.a, d, 100)
+    }
+    exchange(p, 100)
+    t.is_true(both_connected(p))
+}

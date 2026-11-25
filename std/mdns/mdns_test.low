@@ -1,0 +1,97 @@
+import std/io
+import std/net
+import std/net/dns
+import std/slices
+import std/testing
+import std/text
+
+const chromium_name = "7e5ec06c-7749-4811-a598-94b963d218e3.local"
+
+fn chromium_response() -> u8[] {
+    text.decode_hex("0000840000000001000000012437653565633036632d373734392d343831312d613539382d393462393633643231386533056c6f63616c0000018001000000780004c000020a2437653565633036632d373734392d343831312d613539382d393462393633643231386533056c6f63616c00002f8001000000780005c046000140") or panic("hex")
+}
+
+fn addr(s: str) -> net.Addr {
+    net.parse_addr(s) or panic("addr {s}")
+}
+
+fn hosts() -> Host[] {
+    [Host { name: "a1.local", ip: [192, 0, 2, 7] }, Host { name: "b2.local", ip: net.parse_ip("2001:db8::9") or panic("ip") }]
+}
+
+fn question(id: i64, name: str, kind: i64, class: i64) -> u8[] {
+    var m = dns.query(id, name, kind, 0)
+    m.questions[0].class = class
+    dns.encode(m) or panic("encode")
+}
+
+fn decoded(r: Reply?) -> dns.Message {
+    let reply = r ?? panic("no reply")
+    dns.decode(reply.data) or panic("decode")
+}
+
+fn test_the_address_is_read_from_a_chromium_response_with_the_cache_flush_bit(t: *testing.T) {
+    let ip = answer(chromium_response(), chromium_name) ?? panic("no address")
+    testing.error_if(t, !slices.equal(ip, [192, 0, 2, 10]), "address {ip}")
+    testing.error_if(t, answer(chromium_response(), "other.local") != none, "another name")
+    testing.error_if(t, answer(query(chromium_name, dns.type_a), chromium_name) != none, "a query is not an answer")
+}
+
+fn test_a_query_asks_one_question_without_recursion(t: *testing.T) {
+    let m = dns.decode(query("x.local", dns.type_aaaa)) or panic("decode")
+    testing.error_if(t, m.id != 0 || m.response || m.recursion_desired || m.questions.len != 1, "header")
+    testing.error_if(t, m.questions[0].kind != dns.type_aaaa || m.questions[0].class != dns.class_in || m.questions[0].name != "x.local", "question")
+}
+
+fn test_a_query_from_port_5353_is_answered_to_the_group_with_cache_flush(t: *testing.T) {
+    let r = respond(hosts(), question(0, "A1.local", dns.type_a, dns.class_in), addr("192.0.2.50:5353")) ?? panic("no reply")
+    testing.error_if(t, net.format(r.to) != "224.0.0.251:5353", "to {net.format(r.to)}")
+    let m = decoded(r)
+    testing.error_if(t, m.id != 0 || !m.response || !m.authoritative || m.questions.len != 0 || m.answers.len != 1, "header")
+    let a = m.answers[0]
+    testing.error_if(t, a.class != (dns.class_in | 0x8000) || a.ttl != 120 || a.name != "a1.local", "record {a.class} {a.ttl}")
+    testing.error_if(t, !slices.equal(answer(r.data, "a1.local") ?? [], [192, 0, 2, 7]), "address")
+    let unicast = respond(hosts(), question(0, "a1.local", dns.type_a, dns.class_in | 0x8000), addr("192.0.2.50:5353")) ?? panic("no reply")
+    testing.error_if(t, net.format(unicast.to) != "192.0.2.50:5353", "a unicast-response question went to {net.format(unicast.to)}")
+}
+
+fn test_a_one_shot_query_from_another_port_gets_a_unicast_answer_with_its_id(t: *testing.T) {
+    let r = respond(hosts(), question(0x2345, "b2.local", dns.type_aaaa, dns.class_in), addr("192.0.2.50:40000")) ?? panic("no reply")
+    testing.error_if(t, net.format(r.to) != "192.0.2.50:40000", "to {net.format(r.to)}")
+    let m = decoded(r)
+    testing.error_if(t, m.id != 0x2345 || m.questions.len != 1 || m.questions[0].name != "b2.local", "the ID and question are not echoed")
+    testing.error_if(t, m.answers.len != 1 || m.answers[0].class != dns.class_in || m.answers[0].ttl != 10, "record")
+}
+
+fn test_queries_for_other_names_types_and_responses_are_not_answered(t: *testing.T) {
+    let from = addr("192.0.2.50:5353")
+    testing.error_if(t, respond(hosts(), question(0, "c3.local", dns.type_a, dns.class_in), from) != none, "unknown name")
+    testing.error_if(t, respond(hosts(), question(0, "a1.local", dns.type_aaaa, dns.class_in), from) != none, "AAAA for an IPv4 host")
+    testing.error_if(t, respond(hosts(), chromium_response(), from) != none, "a response")
+    testing.error_if(t, (decoded(respond(hosts(), question(0, "a1.local", dns.type_any, dns.class_in), from))).answers.len != 1, "ANY")
+}
+
+fn test_names(t: *testing.T) {
+    let name = random_name()
+    testing.error_if(t, name.len != 42 || name[14] != '4' || !is_local(name), "random name {name}")
+    testing.error_if(t, random_name() == name, "two random names are equal")
+    testing.error_if(t, !is_local("Host.LOCAL.") || is_local("local") || is_local(".local") || is_local("example.com"), "is_local")
+}
+
+fn test_the_responder_answers_the_resolver_over_loopback(t: *testing.T) {
+    using var bound = net.bind_udp("127.0.0.1", 0) or panic("bind")
+    using r = start(mut bound, [])
+    publish(r.handle, Host { name: "loop.local", ip: [127, 0, 0, 1] })
+    using asker = net.bind_udp("127.0.0.1", 0) or panic("bind")
+    let inbox = chan[Datagram](64)
+    spawn read_into(asker.handle, inbox)
+    let ip = ask(asker.handle, inbox, r.handle.addr, "LOOP.local", 2000) or panic("no answer")
+    testing.error_if(t, !slices.equal(ip, [127, 0, 0, 1]), "address {ip}")
+    let missing = ask(asker.handle, inbox, r.handle.addr, "gone.local", 300) catch {
+        e => {
+            testing.error_if(t, e != io.Error.TimedOut, "error {e}")
+            return
+        }
+    }
+    testing.error(t, "an unknown name resolved to {missing}")
+}

@@ -1,4 +1,6 @@
+import compiler
 import std/io
+import std/process
 import std/time
 
 extern "kernel32" {
@@ -68,12 +70,55 @@ struct Sampler {
     query_size: i64
     running: []i64
     threads: [i64: i64]
-    samples: []Sample
+    stacks: []Stack
 }
 
-fn require_host() ! Error {}
+struct Stack {
+    weight: i64
+    frames: []i64
+}
 
-fn record(pid: i64, interval_ms: i64, depth: i64, code: Span) -> Recording ! Error {
+struct Walk {
+    stacks: []Stack
+    cycles: i64
+    threads: i64
+}
+
+pub const needs_map = true
+
+fn capture(config: Config) -> Recording ! Error {
+    if config.event != "cycles" {
+        fail Failed("a Windows program is sampled by cycles only")
+    }
+    let image = read_image(config.command[0])?
+    let symbols = load_symbols(config.map, image)?
+    let c = process.command(config.command[0], config.command[1..])
+    let handle = process.start_handle(c) catch {
+        e => fail Failed("{c.program}: {compiler.reason(e)}")
+    }
+    using child = process.adopt(handle)
+    let walk = record(handle.pid, config.interval_ms, config.depth, image.code)?
+    let exit = process.wait(child) catch {
+        e => fail Failed("{c.program}: {compiler.reason(e)}")
+    }
+    if !process.success(exit) {
+        let note = config.note
+        note("{c.program} failed; the profile covers the run up to its exit")
+    }
+    var samples: []Sample = []
+    for stack in walk.stacks {
+        var frames: []str = []
+        for rva in stack.frames {
+            frames.push(name_at(symbols, rva))
+        }
+        samples.push(Sample { weight: stack.weight, frames })
+    }
+    let unit = Unit { name: "cycles", suffix: "G", scale: 1000000000.0 }
+    let fact = "process cycles {amount(unit, walk.cycles)} G, {samples.len} on-CPU samples over {walk.threads} threads"
+    Recording { samples, unit, facts: [fact] }
+}
+
+fn record(pid: i64, interval_ms: i64, depth: i64, code: Span) -> Walk ! Error {
     let process = OpenProcess(process_access, 0, u32(pid))
     if process == 0 {
         fail Failed("cannot open process {pid}")
@@ -84,7 +129,7 @@ fn record(pid: i64, interval_ms: i64, depth: i64, code: Span) -> Recording ! Err
         fail Failed("cannot allocate the thread context")
     }
     let frame_at: ptr[u8] = ptr(i64(memory) + frame_offset)
-    let s = new(Sampler { process, pid, base: 0, code, depth, memory, context: view(memory, context_size), frame: view(frame_at, scan_bytes), readable: 0, query: null, query_size: 0, running: [], threads: [:], samples: [] })
+    let s = new(Sampler { process, pid, base: 0, code, depth, memory, context: view(memory, context_size), frame: view(frame_at, scan_bytes), readable: 0, query: null, query_size: 0, running: [], threads: [:], stacks: [] })
     timeBeginPeriod(1)
     var last = time.monotonic()
     for {
@@ -113,20 +158,20 @@ fn record(pid: i64, interval_ms: i64, depth: i64, code: Span) -> Recording ! Err
         VirtualFree(s.query, 0, release)
     }
     s.to_cycles(i64(total))
-    Recording { samples: s.samples, process_cycles: i64(total), threads: s.threads.len }
+    Walk { stacks: s.stacks, cycles: i64(total), threads: s.threads.len }
 }
 
 fn to_cycles(s: *Sampler, total: i64) {
     var observed = 0
-    for sample in s.samples {
-        observed += sample.weight
+    for stack in s.stacks {
+        observed += stack.weight
     }
     if observed == 0 {
         return
     }
     let scale = f64(total) / f64(observed)
-    for i in 0..s.samples.len {
-        s.samples[i].weight = i64(f64(s.samples[i].weight) * scale)
+    for i in 0..s.stacks.len {
+        s.stacks[i].weight = i64(f64(s.stacks[i].weight) * scale)
     }
 }
 
@@ -219,10 +264,10 @@ fn sample_thread(s: *Sampler, handle: i64, weight: i64) {
     if SuspendThread(handle) == suspend_failed {
         return
     }
-    let frames = s.capture(handle)
+    let frames = s.walk_thread(handle)
     ResumeThread(handle)
     if frames.len > 0 {
-        s.samples.push(Sample { weight, frames })
+        s.stacks.push(Stack { weight, frames })
     }
 }
 
@@ -231,7 +276,7 @@ struct Found {
     ret: i64
 }
 
-fn capture(s: *Sampler, thread: i64) -> []i64 {
+fn walk_thread(s: *Sampler, thread: i64) -> []i64 {
     io.set_le32(s.context, flags_offset, context_flags)
     if GetThreadContext(thread, i64(s.memory)) == 0 {
         return []

@@ -3,6 +3,8 @@ import std/ice
 import std/io
 import std/net
 import std/time
+import std/tls
+import std/turn
 
 /// One datagram that is not STUN, received from a known remote address: DTLS, RTP or RTCP (RFC 7983).
 pub struct Datagram {
@@ -28,12 +30,27 @@ pub struct Options {
     pub bind: str[] = []
     /// Whether the interface addresses include loopback addresses. Used only when `bind` is empty.
     pub loopback: bool = false
+    /// The TLS settings of the connections to `Tls` TURN servers, such as `roots`. `server_name` is replaced by each server's `turn.Config.server_name`, or the text of its IP address when that is empty, so the certificate name is always checked while `verify` is on.
+    pub tls: tls.Config = tls.Config {}
+    /// The milliseconds a connection to a `Tcp` or `Tls` TURN server may take to connect and finish its TLS handshake before it counts as lost. The default is 10000.
+    pub connect_timeout: i64 = 10000
 }
 
 struct Inbound {
     local: net.Addr
     from: net.Addr
     data: u8[]
+    transport: turn.Transport = turn.Transport.Udp
+    serial: i64 = 0
+    ended: bool = false
+}
+
+struct Link {
+    local: net.Addr
+    server: net.Addr
+    transport: turn.Transport
+    serial: i64
+    outgoing: chan[u8[]]
 }
 
 enum Command {
@@ -62,6 +79,9 @@ struct Core {
     agent: *ice.Agent
     sockets: net.SocketHandle[]
     bound: net.Addr[]
+    options: Options
+    links: Link[]
+    serial: i64
     commands: chan[Command]
     inbound: chan[Inbound]
     incoming: chan[Datagram]
@@ -154,6 +174,9 @@ pub fn open(options: Options) -> Session ! io.Error {
         agent: ice.agent(config)
         sockets
         bound
+        options
+        links: []
+        serial: 0
         commands: chan[Command](64)
         inbound: chan[Inbound](256)
         incoming: chan[Datagram](256)
@@ -176,14 +199,75 @@ fn socket_for(c: *Core, local: net.Addr) -> net.SocketHandle? {
     none
 }
 
+fn link_for(c: *Core, local: net.Addr, server: net.Addr, transport: turn.Transport) -> i64 {
+    for i, l in c.links {
+        if l.transport == transport && same_addr(l.local, local) && same_addr(l.server, server) {
+            return i
+        }
+    }
+    -1
+}
+
+fn server_name(c: *Core, server: net.Addr, transport: turn.Transport) -> str {
+    for t in c.options.config.turn_servers {
+        if t.transport == transport && same_addr(t.server, server) && t.server_name.len > 0 {
+            return t.server_name
+        }
+    }
+    net.format_ip(server.ip)
+}
+
+fn open_link(c: *Core, local: net.Addr, server: net.Addr, transport: turn.Transport) -> Link {
+    c.serial += 1
+    let link = Link { local, server, transport, serial: c.serial, outgoing: chan[u8[]](256) }
+    c.links.push(link)
+    var config = c.options.tls
+    config.server_name = server_name(c, server, transport)
+    spawn connect_link(link, config, c.options.connect_timeout, c.inbound, c.gone)
+    link
+}
+
+fn send_stream(c: *Core, t: ice.Transmit) {
+    let at = link_for(c, t.local, t.to, t.transport)
+    let link = if at >= 0 { c.links[at] } else { open_link(c, t.local, t.to, t.transport) }
+    select {
+        link.outgoing <- t.data => {}
+        else => {}
+    }
+}
+
+fn end_link(c: *Core, at: i64) {
+    close(c.links[at].outgoing)
+    var kept: Link[] = []
+    for i, l in c.links {
+        if i != at {
+            kept.push(l)
+        }
+    }
+    c.links = kept
+}
+
 fn flush(c: *Core) {
     for {
         let t = ice.poll_transmit(c.agent) ?? break
+        if t.transport != turn.Transport.Udp {
+            send_stream(c, t)
+            continue
+        }
         match socket_for(c, t.local) {
             some(h) => {
                 net.send_to_on(h, t.data, t.to) or 0
             }
             none => {}
+        }
+    }
+    for {
+        let d = ice.poll_delivery(c.agent) ?? break
+        if ice.knows_remote(c.agent, d.from) {
+            select {
+                c.incoming <- Datagram { data: d.data, from: d.from } => {}
+                else => {}
+            }
         }
     }
     for {
@@ -195,11 +279,28 @@ fn flush(c: *Core) {
     }
 }
 
+fn from_link(c: *Core, p: Inbound, now: i64) {
+    let at = link_for(c, p.local, p.from, p.transport)
+    if at < 0 || c.links[at].serial != p.serial {
+        return
+    }
+    if p.ended {
+        end_link(c, at)
+        ice.relay_lost(c.agent, p.local, p.from, p.transport)
+        return
+    }
+    ice.receive_relay(c.agent, p.local, p.from, p.transport, p.data, now)
+}
+
 fn dispatch(c: *Core, p: Inbound, now: i64) {
+    if p.transport != turn.Transport.Udp {
+        from_link(c, p, now)
+        return
+    }
     if p.data.len == 0 {
         return
     }
-    if p.data[0] < 4 {
+    if p.data[0] < 4 || ice.is_relay_server(c.agent, p.local, p.from) {
         ice.receive(c.agent, p.local, p.from, p.data, now)
         return
     }
@@ -213,11 +314,15 @@ fn dispatch(c: *Core, p: Inbound, now: i64) {
 
 fn send_selected(c: *Core, data: u8[]) -> io.Error? {
     let s = ice.selected(c.agent) ?? return io.Error.NotConnected
-    let h = socket_for(c, s.base) ?? return io.Error.NotConnected
+    let sent_at = clock()
+    let h = socket_for(c, s.base) ?? {
+        ice.send_from(c.agent, s.base, s.remote.addr, data, sent_at)
+        flush(c)
+        return none
+    }
     net.send_to_on(h, data, s.remote.addr) catch {
         e => return e
     }
-    let sent_at = clock()
     ice.note_sent(c.agent, sent_at)
     none
 }
@@ -301,6 +406,9 @@ fn run(c: *Core) {
     }
     ice.close(c.agent)
     flush(c)
+    for l in c.links {
+        close(l.outgoing)
+    }
     for h in c.sockets {
         net.close_socket_on(h)
     }
@@ -427,4 +535,69 @@ pub fn state(s: Handle) -> ice.State ! io.Error {
 /// Closes the session: the agent stops, the sockets close and `incoming` and `events` close.
 pub fn close_session(s: Handle) {
     shutdown(s.core)
+}
+
+fn deliver(inbound: chan[Inbound], gone: chan[bool], p: Inbound) -> bool {
+    select {
+        inbound <- p => true
+        <-gone => false
+    }
+}
+
+fn watch(h: net.ConnHandle, done: chan[bool], millis: i64) {
+    select {
+        <-done => {}
+        after(millis) => net.close_on(h)
+    }
+}
+
+fn dial_link(link: Link, config: tls.Config, millis: i64) -> io.Stream ! io.Error {
+    using var conn = net.connect_within(link.server, millis)?
+    if link.transport == turn.Transport.Tcp {
+        let h = net.detach(mut conn)
+        return net.stream_on(h)
+    }
+    let done = chan[bool](1)
+    spawn watch(conn.handle, done, millis)
+    let session = tls.client_handle(net.stream(conn), config) catch {
+        e => {
+            done <- true
+            fail e
+        }
+    }
+    done <- true
+    net.detach(mut conn)
+    tls.stream_on(session)
+}
+
+fn write_link(stream: io.Stream, outgoing: chan[u8[]]) {
+    for {
+        let message = (<-outgoing) ?? break
+        io.write_all(stream, message) or break
+    }
+    stream.close()
+}
+
+fn connect_link(link: Link, config: tls.Config, millis: i64, inbound: chan[Inbound], gone: chan[bool]) {
+    let ended = Inbound { local: link.local, from: link.server, data: [], transport: link.transport, serial: link.serial, ended: true }
+    let stream = dial_link(link, config, millis) or {
+        deliver(inbound, gone, ended)
+        return
+    }
+    spawn write_link(stream, link.outgoing)
+    let f = turn.framer()
+    let buf = io.buffer(65536)
+    for {
+        let n = stream.read(buf) or 0
+        if n == 0 {
+            break
+        }
+        let messages = turn.feed(f, buf[..n]) or break
+        for m in messages {
+            if !deliver(inbound, gone, Inbound { local: link.local, from: link.server, data: m, transport: link.transport, serial: link.serial }) {
+                return
+            }
+        }
+    }
+    deliver(inbound, gone, ended)
 }

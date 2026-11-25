@@ -1,0 +1,314 @@
+import std/datachannel
+import std/io
+import std/os
+import std/process
+import std/rtp
+import std/sdp
+import std/slices
+import std/testing
+import std/text
+
+const peer_source = "testdata/webrtc/pion"
+
+fn missing_tool() -> str {
+    for name in ["go", "timeout"] {
+        if process.find(name) == none {
+            return name
+        }
+    }
+    ""
+}
+
+fn go(args: str[]) -> process.Output {
+    var command = process.command("go", args)
+    command.dir = peer_source
+    process.run(command, []) or panic("go {args[0]}")
+}
+
+fn build_peer(t: *testing.T) -> str? {
+    let absent = missing_tool()
+    if absent.len > 0 {
+        testing.skip(t, "{absent} is not installed")
+        return none
+    }
+    let fetched = go(["mod", "download"])
+    if !process.success(fetched.status) {
+        testing.skip(t, "the pion/webrtc modules cannot be downloaded: {str(fetched.stderr)}")
+        return none
+    }
+    let binary = "{os.temp_dir_path()}/low-webrtc-pionpeer-{os.pid()}"
+    let built = go(["build", "-o", binary, "."])
+    if !process.success(built.status) {
+        testing.fatal(t, "go build: {str(built.stderr)}")
+        return none
+    }
+    binary
+}
+
+struct Lines {
+    stream: io.Stream
+    pending: str
+}
+
+fn read_line(l: *Lines) -> str {
+    let buf = io.buffer(65536)
+    for {
+        let at = text.index_byte(l.pending, '\n')
+        if at >= 0 {
+            let line = l.pending[..at]
+            l.pending = l.pending[at + 1..]
+            return line
+        }
+        let n = l.stream.read(buf) or 0
+        if n == 0 {
+            panic("the pion peer ended before writing a description")
+        }
+        l.pending = "{l.pending}{str(buf[..n])}"
+    }
+}
+
+fn write_description(stream: io.Stream, s: sdp.Session) {
+    stream.write(bytes("{text.encode_hex(bytes(sdp.format(s)))}\n")) or panic("write description")
+}
+
+fn read_description(l: *Lines) -> sdp.Session {
+    let raw = text.decode_hex(read_line(l)) or panic("hex")
+    sdp.parse(str(raw)) or panic("the pion description does not parse")
+}
+
+fn write_command(stream: io.Stream, command: str, s: sdp.Session) {
+    stream.write(bytes("{command} {text.encode_hex(bytes(sdp.format(s)))}\n")) or panic("write {command}")
+}
+
+fn watch(h: Handle, tracks: chan[RemoteTrack], selected: chan[bool]) {
+    for {
+        let e = (<-h.events) ?? break
+        match e {
+            Track(t) => {
+                tracks <- t
+            }
+            Selected(_, _) => {
+                selected <- true
+            }
+            _ => {}
+        }
+    }
+}
+
+fn next_track(tracks: chan[RemoteTrack]) -> RemoteTrack? {
+    select {
+        r = <-tracks => r
+        after(10000) => none
+    }
+}
+
+fn echoes(t: *testing.T, track: Track, remote: RemoteTrack, first: i64, size: i64) -> i64 {
+    let payload_type = (codecs(track) or panic("codecs"))[0].payload_type
+    for i in 0..5 {
+        send_rtp(track, rtp.Packet { payload_type, sequence: first + i, timestamp: 960 * i, ssrc: 0, payload: pattern(size, i) }) or panic("send rtp")
+    }
+    var echoed = 0
+    for echoed < 5 {
+        let next: rtp.Packet? = select {
+            p = <-remote.packets => p
+            after(5000) => none
+        }
+        let p = next ?? break
+        if p.sequence < first {
+            continue
+        }
+        testing.error_if(t, p.ssrc != remote.ssrc || !slices.equal(p.payload, pattern(size, p.sequence - first)), "echoed packet {p.sequence}")
+        echoed += 1
+    }
+    echoed
+}
+
+fn ping(t: *testing.T, channel: datachannel.Channel, message: str) {
+    datachannel.send_text(channel, message) or panic("send {message}")
+    let pong: datachannel.Message? = select {
+        m = <-channel.messages => m
+        after(10000) => none
+    }
+    let got = pong ?? {
+        testing.error(t, "no echo of {message}")
+        return
+    }
+    testing.error_if(t, str(got.data) != "echo: {message}", "echo {str(got.data)}")
+}
+
+fn ufrag(s: sdp.Session) -> str {
+    sdp.ice_ufrag(s, s.media[0]) ?? ""
+}
+
+fn pattern(n: i64, seed: i64) -> u8[] {
+    var out: u8[] = []
+    for i in 0..n {
+        out.push(u8((i * 13 + seed) % 256))
+    }
+    out
+}
+
+fn exchange(t: *testing.T, binary: str, low_offers: bool) {
+    let command = process.Command {
+        program: "timeout"
+        args: ["60", binary, if low_offers { "answer" } else { "offer" }]
+        stdin: process.Stdio.Piped
+        stdout: process.Stdio.Piped
+        stderr: process.Stdio.Null
+    }
+    using child = process.start(command) or panic("start the pion peer")
+    let stdin = child.handle.stdin ?? panic("no stdin")
+    let lines = new(Lines { stream: child.handle.stdout ?? panic("no stdout"), pending: "" })
+    using peer = open(Config { bind: ["127.0.0.1"] }) or panic("open")
+    let microphone = add_track(peer.handle, Kind.Audio, [opus()]) or panic("track")
+    let tracks = chan[RemoteTrack](4)
+    let selected = chan[bool](16)
+    spawn watch(peer.handle, tracks, selected)
+    var local_ufrag = ""
+    var remote_ufrag = ""
+    if low_offers {
+        let offer = create_offer(peer.handle) or panic("offer")
+        write_description(stdin, offer)
+        let answer = read_description(lines)
+        apply_answer(peer.handle, answer) or panic("apply the pion answer")
+        local_ufrag = ufrag(offer)
+        remote_ufrag = ufrag(answer)
+    } else {
+        let offer = read_description(lines)
+        let answer = create_answer(peer.handle, offer) or panic("answer the pion offer")
+        write_description(stdin, answer)
+        local_ufrag = ufrag(answer)
+        remote_ufrag = ufrag(offer)
+    }
+    wait_connected(peer.handle) or panic("connect")
+
+    let opened: datachannel.Channel? = select {
+        c = <-peer.handle.channels => c
+        after(10000) => none
+    }
+    let theirs = opened ?? panic("pion opened no channel")
+    let hello = datachannel.receive(theirs) or panic("receive hello")
+    testing.error_if(t, theirs.label != "pion" || str(hello.data) != "hello from pion", "pion channel {theirs.label}")
+    let ours = create_data_channel(peer.handle, datachannel.Options { label: "low" }) or panic("channel")
+    ping(t, ours, "ping")
+    let block = pattern(30000, 1)
+    datachannel.send_binary(ours, block) or panic("send binary")
+    let returned = datachannel.receive(ours) or panic("receive binary echo")
+    testing.error_if(t, returned.text || !slices.equal(returned.data, block), "binary echo of {returned.data.len} bytes")
+
+    let remote = next_track(tracks) ?? panic("pion announced no track")
+    testing.error_if(t, remote.kind != Kind.Audio || remote.ssrc == 0, "remote track {remote.ssrc}")
+    let echoed = echoes(t, microphone, remote, 100, 120)
+    testing.error_if(t, echoed != 5, "{echoed} of 5 packets echoed")
+
+    let camera = add_track(peer.handle, Kind.Video, [vp8()]) or panic("video track")
+    let with_video = create_offer(peer.handle) or panic("offer video")
+    write_command(stdin, "offer", with_video)
+    let video_answer = read_description(lines)
+    apply_answer(peer.handle, video_answer) or panic("apply the video answer")
+    testing.error_if(t, sdp.mid(video_answer.media[2]) != some("2") || sdp.direction(video_answer, video_answer.media[2]) != sdp.Direction.RecvOnly, "pion answered the video section {sdp.format(video_answer)}")
+    let video_echoed = echoes(t, camera, remote, 200, 700)
+    testing.error_if(t, video_echoed != 5, "{video_echoed} of 5 video packets echoed")
+    ping(t, ours, "after adding video")
+
+    stdin.write(bytes("add-video\n")) or panic("ask pion for video")
+    let pion_video = read_description(lines)
+    let video_back = create_answer(peer.handle, pion_video) or panic("answer the pion video offer")
+    write_command(stdin, "answer", video_back)
+    let added = pion_video.media.len - 1
+    testing.error_if(t, sdp.mid(pion_video.media[2]) != some("2") || sdp.direction(video_back, video_back.media[added]) == sdp.Direction.Inactive, "pion's video offer {sdp.format(pion_video)}")
+    let seen = next_track(tracks) ?? panic("pion's video track was not announced")
+    testing.error_if(t, seen.kind != Kind.Video, "pion's new track is {kind_name(seen.kind)}")
+    let frame: rtp.Packet? = select {
+        p = <-seen.packets => p
+        after(10000) => none
+    }
+    testing.error_if(t, frame == none, "no packet on pion's video track")
+    ping(t, ours, "after pion added video")
+
+    for {
+        select {
+            _ = <-selected => {}
+            else => break
+        }
+    }
+    if low_offers {
+        restart_ice(peer.handle) or panic("restart ice")
+        let restart = create_offer(peer.handle) or panic("restart offer")
+        write_command(stdin, "offer", restart)
+        ping(t, ours, "during the restart")
+        let restarted = read_description(lines)
+        apply_answer(peer.handle, restarted) or panic("apply the restart answer")
+        testing.error_if(t, ufrag(restart) == local_ufrag || ufrag(restarted) == remote_ufrag, "credentials kept across the restart")
+    } else {
+        stdin.write(bytes("restart\n")) or panic("ask pion to restart")
+        let restart = read_description(lines)
+        let restarted = create_answer(peer.handle, restart) or panic("answer the restart")
+        write_command(stdin, "answer", restarted)
+        ping(t, ours, "during the restart")
+        testing.error_if(t, ufrag(restart) == remote_ufrag || ufrag(restarted) == local_ufrag, "credentials kept across the restart")
+    }
+    let reselected: bool? = select {
+        s = <-selected => s
+        after(15000) => none
+    }
+    testing.error_if(t, reselected == none, "no pair selected after the ICE restart")
+    ping(t, ours, "after the restart")
+    let after_restart = echoes(t, microphone, remote, 300, 80)
+    testing.error_if(t, after_restart != 5, "{after_restart} of 5 packets echoed after the restart")
+    stdin.close()
+}
+
+fn refuses_channel(h: Handle) -> bool {
+    let opened = create_data_channel(h, datachannel.Options { label: "refused" }) catch {
+        _ => return true
+    }
+    datachannel.close_channel(opened)
+    false
+}
+
+fn test_data_channel_section_added_later(t: *testing.T) {
+    let binary = build_peer(t) ?? return
+    let command = process.Command {
+        program: "timeout"
+        args: ["60", binary, "offer-media"]
+        stdin: process.Stdio.Piped
+        stdout: process.Stdio.Piped
+        stderr: process.Stdio.Null
+    }
+    using child = process.start(command) or panic("start the pion peer")
+    let stdin = child.handle.stdin ?? panic("no stdin")
+    let lines = new(Lines { stream: child.handle.stdout ?? panic("no stdout"), pending: "" })
+    using peer = open(Config { bind: ["127.0.0.1"] }) or panic("open")
+    add_track(peer.handle, Kind.Audio, [opus()]) or panic("track")
+    let answer = create_answer(peer.handle, read_description(lines)) or panic("answer the pion offer")
+    write_description(stdin, answer)
+    testing.error_if(t, answer.media.len != 1, "the first answer has {answer.media.len} sections")
+    wait_connected(peer.handle) or panic("connect")
+    testing.error_if(t, !refuses_channel(peer.handle), "a data channel opened without a data channel section")
+    let offer = create_offer(peer.handle) or panic("offer the data channel section")
+    testing.error_if(t, offer.media.len != 2 || !sdp.is_data_channel(offer.media[1]), "the offer is {sdp.format(offer)}")
+    write_command(stdin, "offer", offer)
+    apply_answer(peer.handle, read_description(lines)) or panic("apply the pion answer")
+    let ours = create_data_channel(peer.handle, datachannel.Options { label: "low" }) or panic("channel after the data channel section")
+    ping(t, ours, "over the added section")
+    stop_section(peer.handle, "1") or panic("stop the data channel section")
+    write_command(stdin, "offer", create_offer(peer.handle) or panic("offer without the data channel section"))
+    apply_answer(peer.handle, read_description(lines)) or panic("apply the answer without the data channel section")
+    let ended: bool = select {
+        m = <-ours.messages => m == none
+        after(3000) => false
+    }
+    testing.error_if(t, !ended, "the channel did not end within 3 seconds of the section stopping")
+    stdin.close()
+}
+
+fn test_low_offers_and_pion_answers(t: *testing.T) {
+    let binary = build_peer(t) ?? return
+    exchange(t, binary, true)
+}
+
+fn test_pion_offers_and_low_answers(t: *testing.T) {
+    let binary = build_peer(t) ?? return
+    exchange(t, binary, false)
+}

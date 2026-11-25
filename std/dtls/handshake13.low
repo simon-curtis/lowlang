@@ -1,0 +1,1035 @@
+import std/crypto
+import std/crypto/hash
+import std/crypto/x509
+import std/io
+import std/slices
+import std/tls
+
+const msg_new_session_ticket = 4
+const msg_encrypted_extensions = 8
+const msg_key_update = 24
+
+const ext_supported_versions = 43
+const ext_cookie = 44
+const ext_key_share = 51
+
+const alert_missing_extension = 109
+const alert_certificate_required = 116
+
+const max_heard = 64
+
+struct Sent {
+    epoch: i64
+    seq: i64
+    item: i64
+    offset: i64
+    size: i64
+}
+
+struct Retry {
+    suite: i64
+    group: i64
+    share_requested: bool
+    first_hash: u8[]
+}
+
+fn tls_form(kind: i64, body: u8[]) -> u8[] {
+    var out: u8[] = [u8(kind)]
+    io.put_be24(mut out, body.len)
+    io.append(mut out, body)
+    out
+}
+
+fn offers12(c: *Conn) -> bool {
+    c.config.min_version != dtls13
+}
+
+fn offers13(c: *Conn) -> bool {
+    c.config.max_version == dtls13 && suites13(c).len > 0
+}
+
+fn suites13(c: *Conn) -> i64[] {
+    var out: i64[] = []
+    for code in c.config.cipher_suites {
+        if tls.suite13_of(code) != none {
+            out.push(code)
+        }
+    }
+    out
+}
+
+fn groups13(c: *Conn) -> i64[] {
+    var out: i64[] = []
+    for g in c.config.groups {
+        if g != tls.x25519_mlkem768 {
+            out.push(g)
+        }
+    }
+    out
+}
+
+fn versions_offered(exts: Extension[]) -> i64[] {
+    let body = find(exts, ext_supported_versions) ?? return []
+    let at = cursor(body)
+    let list = vector8(at) or return []
+    if list.len % 2 != 0 {
+        return []
+    }
+    var out: i64[] = []
+    for i in 0..list.len / 2 {
+        out.push(io.be16(list, 2 * i))
+    }
+    out
+}
+
+struct ShareEntry {
+    group: i64
+    key: u8[]
+}
+
+fn client_shares(exts: Extension[]) -> ShareEntry[] ! io.Error {
+    let body = find(exts, ext_key_share) ?? return []
+    let at = cursor(body)
+    let block = vector16(at)?
+    end(at)?
+    let list = cursor(block)
+    var out: ShareEntry[] = []
+    for left(list) > 0 {
+        let group = u16_of(list)?
+        let key = vector16(list)?
+        out.push(ShareEntry { group, key })
+    }
+    out
+}
+
+fn put_versions(mut exts: u8[], c: *Conn) {
+    var listed: u8[] = []
+    io.put_be16(mut listed, dtls13)
+    if offers12(c) {
+        io.put_be16(mut listed, dtls12)
+    }
+    var body: u8[] = []
+    put_vector8(mut body, listed)
+    put_extension(mut exts, ext_supported_versions, body)
+}
+
+fn share_entry(share: tls.Share) -> u8[] {
+    var entry: u8[] = []
+    io.put_be16(mut entry, share.group)
+    put_vector16(mut entry, share.public)
+    entry
+}
+
+fn client_hello13_extensions(c: *Conn, mut exts: u8[]) ! io.Error {
+    put_versions(mut exts, c)
+    let share = match c.share {
+        some(s) => s
+        none => {
+            let groups = groups13(c)
+            if groups.len == 0 {
+                fail Unsupported
+            }
+            let made = tls.ephemeral_share(groups[0])?
+            c.share = made
+            made
+        }
+    }
+    var shares: u8[] = []
+    put_vector16(mut shares, share_entry(share))
+    put_extension(mut exts, ext_key_share, shares)
+    if c.retry_cookie.len > 0 {
+        var cookie: u8[] = []
+        put_vector16(mut cookie, c.retry_cookie)
+        put_extension(mut exts, ext_cookie, cookie)
+    }
+}
+
+fn certificate13_body(context: u8[], certificate: u8[]) -> u8[] {
+    var list: u8[] = []
+    put_vector24(mut list, certificate)
+    put_vector16(mut list, [])
+    var out: u8[] = []
+    put_vector8(mut out, context)
+    put_vector24(mut out, list)
+    out
+}
+
+fn parse_certificates13(body: u8[]) -> u8[][] ! io.Error {
+    let c = cursor(body)
+    vector8(c)?
+    let block = vector24(c)?
+    end(c)?
+    let list = cursor(block)
+    var out: u8[][] = []
+    for left(list) > 0 {
+        let entry = vector24(list)?
+        vector16(list)?
+        if entry.len == 0 {
+            fail Malformed
+        }
+        out.push(entry)
+    }
+    out
+}
+
+fn absorb13(c: *Conn, kind: i64, body: u8[]) {
+    let whole = tls_form(kind, body)
+    io.append(mut c.transcript, whole)
+}
+
+fn queue13(c: *Conn, kind: i64, body: u8[], epoch: i64) {
+    let seq = c.send_seq
+    c.send_seq += 1
+    c.flight.push(Item { kind: type_handshake, epoch, msg: kind, seq, body, acked: io.buffer(body.len) })
+    if c.stage != Stage.Established {
+        absorb13(c, kind, body)
+    }
+}
+
+fn schedule13(c: *Conn) -> *tls.KeySchedule {
+    c.schedule ?? tls.key_schedule(c.suite, label_prefix, [], [])
+}
+
+fn add_writer(c: *Conn, secret: u8[], epoch: i64) ! io.Error {
+    let keys = keys13(c.suite, secret, epoch)?
+    c.writers.push(new(Sender { keys, seq: 0 }))
+    if c.writers.len > 3 {
+        c.writers = c.writers[c.writers.len - 3..]
+    }
+}
+
+fn add_reader(c: *Conn, secret: u8[], epoch: i64) ! io.Error {
+    let keys = keys13(c.suite, secret, epoch)?
+    push_reader(c, keys)
+}
+
+fn push_reader(c: *Conn, keys: Keys13) {
+    var kept: *Reader[] = []
+    for r in c.readers {
+        if r.keys.epoch & 3 != keys.epoch & 3 {
+            kept.push(r)
+        }
+    }
+    kept.push(new(Reader { keys, window: window() }))
+    c.readers = kept
+}
+
+fn install(c: *Conn, write: u8[], read: u8[], epoch: i64) -> bool {
+    add_writer(c, write, epoch) or {
+        fatal(c, alert_handshake_failure, "key derivation failed")
+        return false
+    }
+    add_reader(c, read, epoch) or {
+        fatal(c, alert_handshake_failure, "key derivation failed")
+        return false
+    }
+    true
+}
+
+fn writer_of(c: *Conn, epoch: i64) -> *Sender? {
+    for s in c.writers {
+        if s.keys.epoch == epoch {
+            return s
+        }
+    }
+    none
+}
+
+fn reader_for(c: *Conn, bits: i64) -> *Reader? {
+    var best: *Reader? = none
+    for r in c.readers {
+        if r.keys.epoch & 3 == bits {
+            best = r
+        }
+    }
+    best
+}
+
+fn newest_reader(c: *Conn) -> *Reader? {
+    var best: *Reader? = none
+    var top = -1
+    for r in c.readers {
+        if r.keys.epoch > top {
+            top = r.keys.epoch
+            best = r
+        }
+    }
+    best
+}
+
+fn seal_epoch(c: *Conn, kind: i64, epoch: i64, plain: u8[]) -> u8[]? {
+    if epoch == 0 {
+        return seal_plain(c, kind, 0, plain)
+    }
+    let s = writer_of(c, epoch) ?? return none
+    seal13(s, kind, plain)
+}
+
+fn next_number(c: *Conn, epoch: i64) -> i64 {
+    if epoch == 0 {
+        return c.seq0
+    }
+    match writer_of(c, epoch) {
+        some(s) => s.seq
+        none => -1
+    }
+}
+
+fn room13(c: *Conn, epoch: i64) -> i64 {
+    let framing = if epoch == 0 { record_header } else { sealed_overhead }
+    c.config.mtu - framing - handshake_header
+}
+
+fn transmit_piece(c: *Conn, index: i64, item: Item, offset: i64, size: i64, mut records: u8[][]) {
+    let seq = next_number(c, item.epoch)
+    var plain: u8[] = [u8(item.msg)]
+    io.put_be24(mut plain, item.body.len)
+    io.put_be16(mut plain, item.seq)
+    io.put_be24(mut plain, offset)
+    io.put_be24(mut plain, size)
+    io.append(mut plain, item.body[offset..offset + size])
+    let record = seal_epoch(c, type_handshake, item.epoch, plain) ?? return
+    records.push(record)
+    c.sent.push(Sent { epoch: item.epoch, seq, item: index, offset, size })
+}
+
+fn transmit_item(c: *Conn, index: i64, item: Item, mut records: u8[][]) {
+    let room = room13(c, item.epoch)
+    var offset = 0
+    for offset < item.body.len {
+        if item.acked[offset] != 0 {
+            offset += 1
+            continue
+        }
+        var stop = offset
+        for stop < item.body.len && item.acked[stop] == 0 && stop - offset < room {
+            stop += 1
+        }
+        transmit_piece(c, index, item, offset, stop - offset, mut records)
+        offset = stop
+    }
+}
+
+fn item_acked(item: Item) -> bool {
+    for b in item.acked {
+        if b == 0 {
+            return false
+        }
+    }
+    true
+}
+
+fn transmit_flight13(c: *Conn) {
+    c.sent = []
+    var records: u8[][] = []
+    for i, item in c.flight {
+        transmit_item(c, i, item, mut records)
+    }
+    pack(c, records)
+}
+
+fn flight_acked(c: *Conn) -> bool {
+    for item in c.flight {
+        if !item_acked(item) {
+            return false
+        }
+    }
+    true
+}
+
+fn mark_acked(c: *Conn, s: Sent) {
+    let acked = c.flight[s.item].acked
+    for i in s.offset..s.offset + s.size {
+        acked[i] = 1
+    }
+}
+
+fn finish_flight(c: *Conn) {
+    c.flight = []
+    c.sent = []
+    if c.stage == Stage.Established {
+        c.timer = false
+    }
+    if c.updating {
+        c.updating = false
+        let current = writer_of(c, c.write_epoch) ?? return
+        let next = next_keys13(current.keys) or return
+        c.writers.push(new(Sender { keys: next, seq: 0 }))
+        if c.writers.len > 3 {
+            c.writers = c.writers[c.writers.len - 3..]
+        }
+        c.write_epoch = next.epoch
+    }
+}
+
+fn on_ack(c: *Conn, body: u8[]) {
+    let numbers = parse_ack(body) or return
+    if c.flight.len == 0 {
+        return
+    }
+    for n in numbers {
+        for s in c.sent {
+            if s.epoch == n.epoch && s.seq == n.seq {
+                mark_acked(c, s)
+            }
+        }
+    }
+    if flight_acked(c) {
+        finish_flight(c)
+    }
+}
+
+fn send_ack(c: *Conn, numbers: RecordNumber[]) {
+    if numbers.len == 0 || c.write_epoch == 0 {
+        return
+    }
+    let fit = (c.config.mtu - sealed_overhead - 2) / 16
+    let listed = if numbers.len > fit { numbers[numbers.len - fit..] } else { numbers }
+    let record = seal_epoch(c, type_ack, c.write_epoch, ack_body(listed)) ?? return
+    c.outbox.push(record)
+}
+
+fn acknowledge_flight(c: *Conn) {
+    send_ack(c, c.heard)
+    c.last_ack = c.heard
+    c.heard = []
+}
+
+fn hear(c: *Conn, epoch: i64, seq: i64) {
+    if c.heard.len < max_heard {
+        c.heard.push(RecordNumber { epoch, seq })
+    }
+}
+
+fn verify_signature13(c: *Conn, body: u8[], client: bool) -> bool {
+    let at = cursor(body)
+    let scheme = u16_of(at) or return false
+    let signature = vector16(at) or return false
+    end(at) or return false
+    let leaf = x509.parse(c.peer_certificate) or return false
+    let h = tls.suite_hash(c.suite)
+    let content = tls.verify_content(h, c.transcript, client)
+    slices.contains(offered_schemes(), scheme) && x509.verify_signature(leaf.public_key, scheme, content, signature, x509.SignatureRules.Tls13)
+}
+
+fn sign13(c: *Conn, scheme: i64, client: bool) -> u8[]? {
+    let h = tls.suite_hash(c.suite)
+    let content = tls.verify_content(h, c.transcript, client)
+    let signature = x509.sign(c.config.identity.key, scheme, content, x509.SignatureRules.Tls13) or return none
+    signature_body(scheme, signature)
+}
+
+fn retry_cookie_for(c: *Conn, r: Retry) -> u8[] {
+    var data: u8[] = []
+    io.put_be16(mut data, r.suite)
+    io.put_be16(mut data, r.group)
+    data.push(if r.share_requested { 1 } else { 0 })
+    put_vector8(mut data, r.first_hash)
+    let mac = hash.hmac(hash.sha256(), c.cookie_secret, data)
+    io.append(mut data, mac)
+    data
+}
+
+fn parse_retry_cookie(c: *Conn, cookie: u8[]) -> Retry? {
+    if cookie.len < 32 {
+        return none
+    }
+    let data = cookie[..cookie.len - 32]
+    let mac = hash.hmac(hash.sha256(), c.cookie_secret, data)
+    if !hash.equal(mac, cookie[cookie.len - 32..]) {
+        return none
+    }
+    let at = cursor(data)
+    let suite = u16_of(at) or return none
+    let group = u16_of(at) or return none
+    let flag = u8_of(at) or return none
+    let first_hash = vector8(at) or return none
+    end(at) or return none
+    Retry { suite, group, share_requested: flag == 1, first_hash }
+}
+
+fn retry_body(session_id: u8[], r: Retry, cookie: u8[]) -> u8[] {
+    var body: u8[] = []
+    io.put_be16(mut body, dtls12)
+    io.append(mut body, tls.retry_random())
+    put_vector8(mut body, session_id)
+    io.put_be16(mut body, r.suite)
+    body.push(0)
+    var exts: u8[] = []
+    var version: u8[] = []
+    io.put_be16(mut version, dtls13)
+    put_extension(mut exts, ext_supported_versions, version)
+    if r.share_requested {
+        var group: u8[] = []
+        io.put_be16(mut group, r.group)
+        put_extension(mut exts, ext_key_share, group)
+    }
+    var wrapped: u8[] = []
+    put_vector16(mut wrapped, cookie)
+    put_extension(mut exts, ext_cookie, wrapped)
+    put_vector16(mut body, exts)
+    body
+}
+
+fn retry_prefix(h: hash.Algorithm, first_hash: u8[], hrr: u8[]) -> u8[] {
+    var out: u8[] = [254, 0, 0, u8(h.size)]
+    io.append(mut out, first_hash)
+    let whole = tls_form(msg_server_hello, hrr)
+    io.append(mut out, whole)
+    out
+}
+
+fn pick_suite13(c: *Conn, offered: i64[]) -> i64 {
+    for code in suites13(c) {
+        if slices.contains(offered, code) {
+            return code
+        }
+    }
+    -1
+}
+
+fn pick_group13(c: *Conn, offered: i64[]) -> i64 {
+    for g in groups13(c) {
+        if slices.contains(offered, g) {
+            return g
+        }
+    }
+    -1
+}
+
+fn share_of(shares: ShareEntry[], group: i64) -> u8[]? {
+    for s in shares {
+        if s.group == group {
+            return s.key
+        }
+    }
+    none
+}
+
+fn send_retry(c: *Conn, hello: ClientHello, body: u8[], seq: i64, r: Retry) {
+    let cookie = retry_cookie_for(c, r)
+    let reply = retry_body(hello.session_id, r, cookie)
+    var plain: u8[] = [u8(msg_server_hello)]
+    io.put_be24(mut plain, reply.len)
+    io.put_be16(mut plain, seq)
+    io.put_be24(mut plain, 0)
+    io.put_be24(mut plain, reply.len)
+    io.append(mut plain, reply)
+    let record = seal_plain(c, type_handshake, 0, plain)
+    c.outbox.push(record)
+}
+
+fn on_client_hello13(c: *Conn, seq: i64, hello: ClientHello, body: u8[], now: i64) {
+    let shares = client_shares(hello.exts) or return
+    if hello.cookie.len != 0 {
+        fatal(c, alert_illegal_parameter, "a DTLS 1.3 ClientHello with a legacy_cookie")
+        return
+    }
+    var code = pick_suite13(c, hello.suites)
+    var group = pick_group13(c, offered_groups(hello.exts))
+    let schemes = u16_list(find(hello.exts, ext_schemes) ?? []) or []
+    let scheme = choose_scheme(c.config.identity.key, schemes)
+    if code < 0 || group < 0 || scheme < 0 {
+        fatal(c, alert_handshake_failure, "no acceptable parameters")
+        return
+    }
+    var prefix: u8[] = []
+    match find(hello.exts, ext_cookie) {
+        some(raw) => {
+            let at = cursor(raw)
+            let cookie = vector16(at) or return
+            let r = parse_retry_cookie(c, cookie) ?? return
+            code = r.suite
+            group = r.group
+            let h = tls.suite_hash(tls.suite13_of(code) ?? tls.Suite.Aes128Gcm)
+            prefix = retry_prefix(h, r.first_hash, retry_body(hello.session_id, r, cookie))
+        }
+        none => {
+            let missing = share_of(shares, group) == none
+            if c.config.cookies || missing {
+                let h = tls.suite_hash(tls.suite13_of(code) ?? tls.Suite.Aes128Gcm)
+                let first = tls_form(msg_client_hello, body)
+                send_retry(c, hello, body, seq, Retry { suite: code, group, share_requested: missing, first_hash: hash.sum(h, first) })
+                return
+            }
+        }
+    }
+    let key = share_of(shares, group) ?? {
+        fatal(c, alert_illegal_parameter, "no key share for the selected group")
+        return
+    }
+    c.version = dtls13
+    c.started = now
+    c.suite_code = code
+    c.suite = tls.suite13_of(code) ?? tls.Suite.Aes128Gcm
+    c.group = group
+    c.client_random = hello.random
+    c.server_random = crypto.random(32)
+    c.srtp = pick_srtp(c, hello)
+    c.transcript = prefix
+    absorb13(c, msg_client_hello, body)
+    c.send_seq = seq
+    c.flight = []
+    c.heard = []
+    let share = tls.ephemeral_share(group) or {
+        fatal(c, alert_handshake_failure, "key share failed")
+        return
+    }
+    let shared = tls.shared_secret(share, key) or {
+        fatal(c, alert_illegal_parameter, "invalid client key share")
+        return
+    }
+    var reply: u8[] = []
+    io.put_be16(mut reply, dtls12)
+    io.append(mut reply, c.server_random)
+    put_vector8(mut reply, hello.session_id)
+    io.put_be16(mut reply, code)
+    reply.push(0)
+    var exts: u8[] = []
+    var version: u8[] = []
+    io.put_be16(mut version, dtls13)
+    put_extension(mut exts, ext_supported_versions, version)
+    put_extension(mut exts, ext_key_share, share_entry(share))
+    put_vector16(mut reply, exts)
+    queue13(c, msg_server_hello, reply, 0)
+    let k = tls.key_schedule(c.suite, label_prefix, shared, c.transcript)
+    c.schedule = k
+    if !install(c, k.server_handshake, k.client_handshake, 2) {
+        return
+    }
+    c.write_epoch = 2
+    var encrypted: u8[] = []
+    if c.srtp != 0 {
+        var chosen: u8[] = []
+        put_u16_list(mut chosen, [c.srtp])
+        put_vector8(mut chosen, [])
+        put_extension(mut encrypted, ext_srtp, chosen)
+    }
+    var extensions_body: u8[] = []
+    put_vector16(mut extensions_body, encrypted)
+    queue13(c, msg_encrypted_extensions, extensions_body, 2)
+    if c.config.require_certificate {
+        var request: u8[] = []
+        put_vector8(mut request, [])
+        var request_exts: u8[] = []
+        var listed: u8[] = []
+        put_u16_list(mut listed, offered_schemes())
+        put_extension(mut request_exts, ext_schemes, listed)
+        put_vector16(mut request, request_exts)
+        queue13(c, msg_certificate_request, request, 2)
+    }
+    let own = certificate13_body([], c.config.identity.certificate)
+    queue13(c, msg_certificate, own, 2)
+    let proof = sign13(c, scheme, false) ?? {
+        fatal(c, alert_handshake_failure, "signing failed")
+        return
+    }
+    queue13(c, msg_certificate_verify, proof, 2)
+    let verify = tls.finished_mac(k, k.server_handshake, c.transcript)
+    queue13(c, msg_finished, verify, 2)
+    let server_app = tls.derive_secret(k, k.master, "s ap traffic", c.transcript)
+    c.client_app = tls.derive_secret(k, k.master, "c ap traffic", c.transcript)
+    c.exporter = tls.derive_secret(k, k.master, "exp master", c.transcript)
+    add_writer(c, server_app, 3) or {
+        fatal(c, alert_handshake_failure, "key derivation failed")
+        return
+    }
+    c.stage = if c.config.require_certificate { Stage.ClientCertificate13 } else { Stage.ClientFinished13 }
+    start_flight(c, now)
+}
+
+fn on_client_certificate13(c: *Conn, kind: i64, body: u8[]) {
+    if kind != msg_certificate {
+        fatal(c, alert_unexpected_message, "expected Certificate")
+        return
+    }
+    let chain = parse_certificates13(body) or {
+        fatal(c, alert_decode_error, "malformed Certificate")
+        return
+    }
+    if chain.len == 0 {
+        fatal(c, alert_certificate_required, "the client sent no certificate")
+        return
+    }
+    if !accept_certificate(c, chain[0]) {
+        return
+    }
+    absorb13(c, kind, body)
+    c.stage = Stage.ClientVerify13
+}
+
+fn accept_certificate(c: *Conn, certificate: u8[]) -> bool {
+    if !trusts(c, certificate) {
+        fatal(c, alert_bad_certificate, "peer certificate does not match a fingerprint")
+        return false
+    }
+    let _ = x509.parse(certificate) or {
+        fatal(c, alert_bad_certificate, "peer certificate is not valid")
+        return false
+    }
+    c.peer_certificate = certificate
+    true
+}
+
+fn on_client_verify13(c: *Conn, kind: i64, body: u8[]) {
+    if kind != msg_certificate_verify {
+        fatal(c, alert_unexpected_message, "expected CertificateVerify")
+        return
+    }
+    if !verify_signature13(c, body, true) {
+        fatal(c, alert_decrypt_error, "bad CertificateVerify signature")
+        return
+    }
+    absorb13(c, kind, body)
+    c.stage = Stage.ClientFinished13
+}
+
+fn on_client_finished13(c: *Conn, kind: i64, body: u8[]) {
+    if kind != msg_finished {
+        fatal(c, alert_unexpected_message, "expected Finished")
+        return
+    }
+    let k = schedule13(c)
+    let expected = tls.finished_mac(k, k.client_handshake, c.transcript)
+    if !hash.equal(body, expected) {
+        fatal(c, alert_decrypt_error, "bad client Finished")
+        return
+    }
+    add_reader(c, c.client_app, 3) or {
+        fatal(c, alert_handshake_failure, "key derivation failed")
+        return
+    }
+    c.flight = []
+    c.sent = []
+    c.write_epoch = 3
+    establish(c)
+    acknowledge_flight(c)
+}
+
+fn on_server_hello13(c: *Conn, hello: ServerHello, body: u8[], now: i64) {
+    if !offers13(c) || versions_selected(hello.exts) != dtls13 {
+        fatal(c, alert_illegal_parameter, "unoffered protocol version")
+        return
+    }
+    let suite = tls.suite13_of(hello.suite) ?? {
+        fatal(c, alert_illegal_parameter, "unoffered cipher suite")
+        return
+    }
+    if !slices.contains(c.config.cipher_suites, hello.suite) || hello.compression != 0 || hello.session_id.len != 0 {
+        fatal(c, alert_illegal_parameter, "unoffered cipher suite")
+        return
+    }
+    if c.retried && hello.suite != c.suite_code {
+        fatal(c, alert_illegal_parameter, "the cipher suite changed after HelloRetryRequest")
+        return
+    }
+    if hash.equal(hello.random, tls.retry_random()) {
+        on_retry(c, hello, suite, body, now)
+        return
+    }
+    for e in hello.exts {
+        if e.kind != ext_supported_versions && e.kind != ext_key_share {
+            fatal(c, alert_unsupported_extension, "unexpected ServerHello extension")
+            return
+        }
+    }
+    let share = c.share ?? return
+    let raw = find(hello.exts, ext_key_share) ?? {
+        fatal(c, alert_missing_extension, "the ServerHello has no key share")
+        return
+    }
+    let at = cursor(raw)
+    let group = u16_of(at) or 0
+    let key = vector16(at) or []
+    if group != share.group || key.len == 0 {
+        fatal(c, alert_illegal_parameter, "unoffered key share")
+        return
+    }
+    let shared = tls.shared_secret(share, key) or {
+        fatal(c, alert_illegal_parameter, "invalid server key share")
+        return
+    }
+    c.version = dtls13
+    c.suite = suite
+    c.suite_code = hello.suite
+    c.server_random = hello.random
+    c.transcript = c.retry_prefix
+    absorb13(c, msg_client_hello, c.hello)
+    absorb13(c, msg_server_hello, body)
+    let k = tls.key_schedule(suite, label_prefix, shared, c.transcript)
+    c.schedule = k
+    if !install(c, k.client_handshake, k.server_handshake, 2) {
+        return
+    }
+    c.write_epoch = 2
+    c.flight = []
+    c.sent = []
+    c.stage = Stage.Encrypted
+}
+
+fn versions_selected(exts: Extension[]) -> i64 {
+    let body = find(exts, ext_supported_versions) ?? return 0
+    if body.len != 2 {
+        return 0
+    }
+    io.be16(body, 0)
+}
+
+fn on_retry(c: *Conn, hello: ServerHello, suite: tls.Suite, body: u8[], now: i64) {
+    if c.retried {
+        fatal(c, alert_unexpected_message, "a second HelloRetryRequest")
+        return
+    }
+    var cookie: u8[] = []
+    var group = -1
+    for e in hello.exts {
+        if e.kind == ext_cookie {
+            let at = cursor(e.body)
+            cookie = vector16(at) or []
+        } else if e.kind == ext_key_share {
+            if e.body.len != 2 {
+                fatal(c, alert_decode_error, "malformed HelloRetryRequest")
+                return
+            }
+            group = io.be16(e.body, 0)
+        } else if e.kind != ext_supported_versions {
+            fatal(c, alert_unsupported_extension, "unexpected HelloRetryRequest extension")
+            return
+        }
+    }
+    let share = c.share ?? return
+    if group >= 0 {
+        if group == share.group || !slices.contains(groups13(c), group) {
+            fatal(c, alert_illegal_parameter, "unoffered group in HelloRetryRequest")
+            return
+        }
+        c.share = tls.ephemeral_share(group) or {
+            fatal(c, alert_illegal_parameter, "unsupported group")
+            return
+        }
+    } else if cookie.len == 0 {
+        fatal(c, alert_illegal_parameter, "a HelloRetryRequest that changes nothing")
+        return
+    }
+    let h = tls.suite_hash(suite)
+    let first = tls_form(msg_client_hello, c.hello)
+    c.retry_prefix = retry_prefix(h, hash.sum(h, first), body)
+    c.retry_cookie = cookie
+    c.retried = true
+    c.suite_code = hello.suite
+    send_client_hello(c, now)
+}
+
+fn on_encrypted_extensions(c: *Conn, kind: i64, body: u8[]) {
+    if kind != msg_encrypted_extensions {
+        fatal(c, alert_unexpected_message, "expected EncryptedExtensions")
+        return
+    }
+    let at = cursor(body)
+    let exts = extensions(at) or {
+        fatal(c, alert_decode_error, "malformed EncryptedExtensions")
+        return
+    }
+    for e in exts {
+        if e.kind != ext_srtp && e.kind != ext_groups {
+            fatal(c, alert_unsupported_extension, "unexpected EncryptedExtensions extension")
+            return
+        }
+    }
+    match find(exts, ext_srtp) {
+        some(raw) => {
+            let chosen = parse_srtp_extension(raw) or {
+                fatal(c, alert_decode_error, "malformed use_srtp")
+                return
+            }
+            if chosen.len != 1 || !slices.contains(c.config.srtp_profiles, chosen[0]) {
+                fatal(c, alert_illegal_parameter, "unoffered SRTP profile")
+                return
+            }
+            c.srtp = chosen[0]
+        }
+        none => {}
+    }
+    absorb13(c, kind, body)
+    c.stage = Stage.ServerCertificate13
+}
+
+fn on_server_certificate13(c: *Conn, kind: i64, body: u8[]) {
+    if kind == msg_certificate_request && !c.certificate_requested {
+        let at = cursor(body)
+        let context = vector8(at) or []
+        let exts = extensions(at) or {
+            fatal(c, alert_decode_error, "malformed CertificateRequest")
+            return
+        }
+        let schemes = u16_list(find(exts, ext_schemes) ?? []) or []
+        if schemes.len == 0 {
+            fatal(c, alert_missing_extension, "a CertificateRequest without signature_algorithms")
+            return
+        }
+        c.peer_schemes = schemes
+        c.request_context = context
+        c.certificate_requested = true
+        absorb13(c, kind, body)
+        return
+    }
+    if kind != msg_certificate {
+        fatal(c, alert_unexpected_message, "expected Certificate")
+        return
+    }
+    let chain = parse_certificates13(body) or {
+        fatal(c, alert_decode_error, "malformed Certificate")
+        return
+    }
+    if chain.len == 0 {
+        fatal(c, alert_decode_error, "the server sent no certificate")
+        return
+    }
+    if !accept_certificate(c, chain[0]) {
+        return
+    }
+    absorb13(c, kind, body)
+    c.stage = Stage.ServerVerify13
+}
+
+fn on_server_verify13(c: *Conn, kind: i64, body: u8[]) {
+    if kind != msg_certificate_verify {
+        fatal(c, alert_unexpected_message, "expected CertificateVerify")
+        return
+    }
+    if !verify_signature13(c, body, false) {
+        fatal(c, alert_decrypt_error, "bad CertificateVerify signature")
+        return
+    }
+    absorb13(c, kind, body)
+    c.stage = Stage.ServerFinished13
+}
+
+fn on_server_finished13(c: *Conn, kind: i64, body: u8[], now: i64) {
+    if kind != msg_finished {
+        fatal(c, alert_unexpected_message, "expected Finished")
+        return
+    }
+    let k = schedule13(c)
+    if !hash.equal(body, tls.finished_mac(k, k.server_handshake, c.transcript)) {
+        fatal(c, alert_decrypt_error, "bad server Finished")
+        return
+    }
+    absorb13(c, kind, body)
+    let server_app = tls.derive_secret(k, k.master, "s ap traffic", c.transcript)
+    let client_app = tls.derive_secret(k, k.master, "c ap traffic", c.transcript)
+    c.exporter = tls.derive_secret(k, k.master, "exp master", c.transcript)
+    c.flight = []
+    c.heard = []
+    if c.certificate_requested {
+        let own = certificate13_body(c.request_context, c.config.identity.certificate)
+        queue13(c, msg_certificate, own, 2)
+        let scheme = choose_scheme(c.config.identity.key, c.peer_schemes)
+        if scheme < 0 {
+            fatal(c, alert_handshake_failure, "no common signature scheme")
+            return
+        }
+        let proof = sign13(c, scheme, true) ?? {
+            fatal(c, alert_handshake_failure, "signing failed")
+            return
+        }
+        queue13(c, msg_certificate_verify, proof, 2)
+    }
+    let verify = tls.finished_mac(k, k.client_handshake, c.transcript)
+    queue13(c, msg_finished, verify, 2)
+    if !install(c, client_app, server_app, 3) {
+        return
+    }
+    c.write_epoch = 3
+    establish(c)
+    start_flight(c, now)
+}
+
+fn on_post_handshake(c: *Conn, kind: i64, body: u8[]) {
+    if kind == msg_new_session_ticket {
+        acknowledge_flight(c)
+        return
+    }
+    if kind != msg_key_update || body.len != 1 || body[0] > 1 {
+        fatal(c, alert_unexpected_message, "unexpected post-handshake message")
+        return
+    }
+    let newest = newest_reader(c) ?? return
+    let next = next_keys13(newest.keys) or return
+    push_reader(c, next)
+    acknowledge_flight(c)
+    if body[0] == 1 && !c.updating && c.flight.len == 0 {
+        begin_update(c, false, c.deadline)
+    }
+}
+
+fn begin_update(c: *Conn, request_peer: bool, now: i64) {
+    queue13(c, msg_key_update, [if request_peer { 1 } else { 0 }], c.write_epoch)
+    c.updating = true
+    c.flight_started = now
+    c.timer = true
+    c.rto = c.config.retransmit_initial
+    c.deadline = now + c.rto
+    transmit_flight13(c)
+}
+
+fn on_fragment13(c: *Conn, kind: i64, length: i64, seq: i64, offset: i64, fragment: u8[], epoch: i64, now: i64) {
+    let hello = kind == msg_client_hello || kind == msg_server_hello
+    if hello != (epoch == 0) {
+        return
+    }
+    if seq < c.recv_next {
+        if c.stage == Stage.Established && !c.config.client {
+            send_ack(c, c.last_ack)
+        } else if c.flight.len > 0 {
+            c.replay_flight = true
+        }
+        return
+    }
+    if c.stage == Stage.Established && epoch < 3 {
+        return
+    }
+    assemble(c, kind, length, seq, offset, fragment, now)
+}
+
+fn on_unified(c: *Conn, r: Raw, now: i64) {
+    if c.version != dtls13 {
+        return
+    }
+    let reader = reader_for(c, r.epoch) ?? return
+    let opened = open13(reader, r) ?? return
+    let epoch = reader.keys.epoch
+    if opened.kind == type_handshake {
+        hear(c, epoch, opened.seq)
+        on_handshake(c, opened.plain, epoch, now)
+    } else if opened.kind == type_ack {
+        on_ack(c, opened.plain)
+    } else if opened.kind == type_alert {
+        on_alert(c, opened.plain)
+    } else if opened.kind == type_application && epoch >= 3 && c.stage == Stage.Established {
+        if c.config.client && c.flight.len > 0 && !c.updating {
+            finish_flight(c)
+        }
+        c.received.push(opened.plain)
+    }
+}
+
+fn on_plain13(c: *Conn, r: Raw, now: i64) {
+    if r.epoch != 0 {
+        return
+    }
+    if r.kind == type_handshake {
+        on_handshake(c, r.body, 0, now)
+    } else if r.kind == type_alert && c.readers.len == 0 {
+        on_alert(c, r.body)
+    }
+}
+
+fn gap(c: *Conn) -> bool {
+    for seq, a in c.assemblies {
+        if a.touched && seq > c.recv_next {
+            return true
+        }
+    }
+    false
+}

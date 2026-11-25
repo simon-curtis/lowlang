@@ -32,6 +32,7 @@ fn wrap(index: i64, length: i64) -> i64 {
 fn evaluate_rows(f: *nistec.Field, e: Expr, fixed: u64[][][], advice: u64[][][], instance: u64[][][], row: i64, shift: i64) -> u64[] {
     match e {
         Constant(v) => v
+        Selected(_) => panic("keygen replaces every selector")
         Fixed(q) => fixed[q.column][wrap(row + q.rotation * shift, fixed[q.column].len)]
         Advice(q) => advice[q.column][wrap(row + q.rotation * shift, advice[q.column].len)]
         Instance(q) => instance[q.column][wrap(row + q.rotation * shift, instance[q.column].len)]
@@ -244,15 +245,26 @@ fn at(values: u64[][], index: i64, rotation: i64, ratio: i64) -> u64[] {
 
 struct Cosets {
     fixed: u64[][][]
-    advice: u64[][][]
-    instance: u64[][][]
     l0: u64[][]
     l_blind: u64[][]
     l_last: u64[][]
     points: u64[][]
 }
 
-fn quotient_at(d: Domain, pk: *ProvingKey, c: Cosets, sets: Committed[], lookups: LookupWork[], beta: u64[], gamma: u64[], y: u64[], i: i64) -> u64[] {
+struct Single {
+    instance_values: u64[][][]
+    instance_polys: u64[][][]
+    instance_cosets: u64[][][]
+    advice: Committed[]
+    advice_values: u64[][][]
+    advice_cosets: u64[][][]
+    lookups: LookupWork[]
+    sets: Committed[]
+}
+
+fn single_terms(d: Domain, pk: *ProvingKey, c: Cosets, s: Single, beta: u64[], gamma: u64[], i: i64) -> u64[][] {
+    let sets = s.sets
+    let lookups = s.lookups
     let f = d.f
     let cs = pk.vk.cs
     let ratio = 1 << (d.extended_k - d.k)
@@ -262,28 +274,28 @@ fn quotient_at(d: Domain, pk: *ProvingKey, c: Cosets, sets: Committed[], lookups
     let active = diff(f, one(f), sum(f, l_last, c.l_blind[i]))
     var terms: u64[][] = []
     for g in cs.gates {
-        terms.push(evaluate_rows(f, g, c.fixed, c.advice, c.instance, i, ratio))
+        terms.push(evaluate_rows(f, g, c.fixed, s.advice_cosets, s.instance_cosets, i, ratio))
     }
     if sets.len > 0 {
         terms.push(prod(f, diff(f, one(f), sets[0].coset[i]), l0))
         let last = sets[sets.len - 1].coset[i]
         terms.push(prod(f, diff(f, square(f, last), last), l_last))
-        for s in 1..sets.len {
-            terms.push(prod(f, diff(f, sets[s].coset[i], at(sets[s - 1].coset, i, -(bf + 1), ratio)), l0))
+        for k in 1..sets.len {
+            terms.push(prod(f, diff(f, sets[k].coset[i], at(sets[k - 1].coset, i, -(bf + 1), ratio)), l0))
         }
         let chunk_len = degree(cs) - 2
-        for s in 0..sets.len {
-            let from = s * chunk_len
+        for k in 0..sets.len {
+            let from = k * chunk_len
             var to = from + chunk_len
             if to > cs.permutation.len {
                 to = cs.permutation.len
             }
-            var left = at(sets[s].coset, i, 1, ratio)
-            var right = sets[s].coset[i]
+            var left = at(sets[k].coset, i, 1, ratio)
+            var right = sets[k].coset[i]
             var current_delta = prod(f, beta, power(f, d.delta, from))
             for j in from..to {
                 let column = cs.permutation[j]
-                let value = column_values(column.kind, c.fixed, c.advice, c.instance)[column.index][i]
+                let value = column_values(column.kind, c.fixed, s.advice_cosets, s.instance_cosets)[column.index][i]
                 left = prod(f, left, sum(f, sum(f, value, prod(f, beta, pk.permutation_cosets[j][i])), gamma))
                 right = prod(f, right, sum(f, sum(f, value, prod(f, current_delta, c.points[i])), gamma))
                 current_delta = prod(f, current_delta, d.delta)
@@ -303,9 +315,16 @@ fn quotient_at(d: Domain, pk: *ProvingKey, c: Cosets, sets: Committed[], lookups
         terms.push(prod(f, l0, gap))
         terms.push(prod(f, prod(f, gap, diff(f, l.input.coset[i], at(l.input.coset, i, -1, ratio))), active))
     }
+    terms
+}
+
+fn quotient_at(d: Domain, pk: *ProvingKey, c: Cosets, singles: Single[], beta: u64[], gamma: u64[], y: u64[], i: i64) -> u64[] {
+    let f = d.f
     var h = zero(f)
-    for v in terms {
-        h = sum(f, prod(f, h, y), v)
+    for s in singles {
+        for v in single_terms(d, pk, c, s, beta, gamma, i) {
+            h = sum(f, prod(f, h, y), v)
+        }
     }
     h
 }
@@ -343,98 +362,179 @@ fn chunked(f: *nistec.Field, coeffs: u64[][], n: i64, pieces: i64) -> u64[][][] 
     out
 }
 
-/// Returns a proof that the witness `advice`, with the public inputs `instances`, satisfies the circuit of `pk`. `advice` holds the values of each advice column from row 0, at most as many as there are usable rows, and `instances` those of each instance column. `random` returns the number of random bytes it is asked for and must be unpredictable to anyone but the prover: the blinding of the commitments and of the opening, and so the zero knowledge of the proof, rest on it.
-/// Fails with `Instance` or `Circuit` when the columns do not fit the circuit, and with `Unsatisfied` when a gate, an equality or a lookup does not hold for the witness.
-pub fn prove(p: *Params, pk: *ProvingKey, advice: u64[][][], instances: u64[][][], random: fn(i64) -> u8[]) -> u8[] ! Error {
-    let vk = pk.vk
-    let c = p.curve
-    let f = c.scalar
-    let d = vk.domain
-    let cs = vk.cs
-    if p.k != d.k || advice.len != cs.advice_columns {
-        fail Circuit
-    }
-    if instances.len != cs.instance_columns {
+fn check_shapes(d: Domain, cs: *ConstraintSystem, circuits: Assignment[], instances: u64[][][][]) ! Error {
+    let usable = usable_rows(d, cs)
+    if circuits.len != instances.len {
         fail Instance
     }
-    let usable = usable_rows(d, cs)
-    let blinding = blinding_factors(cs)
-    let ratio = 1 << (d.extended_k - d.k)
-    for column in instances {
-        if column.len > usable {
+    for columns in instances {
+        if columns.len != cs.instance_columns {
             fail Instance
         }
+        for column in columns {
+            if column.len > usable {
+                fail Instance
+            }
+        }
     }
-    for column in advice {
-        if column.len > usable {
+    for circuit in circuits {
+        if circuit.advice.len != cs.advice_columns {
             fail Circuit
         }
+        for column in circuit.advice {
+            if column.len > usable {
+                fail Circuit
+            }
+        }
     }
-    let t = writer(c)
-    common_scalar(t, vk.representative)
+}
 
-    var instance_values: u64[][][] = []
-    var instance_polys: u64[][][] = []
-    var instance_cosets: u64[][][] = []
-    for column in instances {
+fn public_columns(p: *Params, d: Domain, t: *Transcript, columns: u64[][][]) -> Single ! Error {
+    let f = d.f
+    var s = Single { instance_values: [], instance_polys: [], instance_cosets: [], advice: [], advice_values: [], advice_cosets: [], lookups: [], sets: [] }
+    for column in columns {
         let values = padded(f, column, d.n)
         common_point(t, commit_lagrange(p, values, one(f)))?
-        instance_values.push(values)
+        s.instance_values.push(values)
         let poly = lagrange_to_coeff(d, values)
-        instance_polys.push(poly)
-        instance_cosets.push(coeff_to_extended(d, poly))
+        s.instance_polys.push(poly)
+        s.instance_cosets.push(coeff_to_extended(d, poly))
     }
+    s
+}
 
-    var advice_values: u64[][][] = []
+fn commit_advice(p: *Params, d: Domain, cs: *ConstraintSystem, t: *Transcript, s: *Single, advice: u64[][][], random: fn(i64) -> u8[]) ! Error {
+    let f = d.f
+    let usable = usable_rows(d, cs)
     for column in advice {
         var values = padded(f, column, usable)
-        for _ in 0..blinding + 1 {
+        for _ in 0..blinding_factors(cs) + 1 {
             values.push(random_scalar(f, random))
         }
-        advice_values.push(values)
+        s.advice_values.push(values)
     }
-    var advice_columns: Committed[] = []
-    for values in advice_values {
-        advice_columns.push(committed(d, values, random_scalar(f, random)))
+    for values in s.advice_values {
+        s.advice.push(committed(d, values, random_scalar(f, random)))
     }
-    var advice_polys: u64[][][] = []
-    var advice_cosets: u64[][][] = []
-    for column in advice_columns {
+    for column in s.advice {
         write_commitment(p, t, column)?
-        advice_polys.push(column.poly)
-        advice_cosets.push(column.coset)
+        s.advice_cosets.push(column.coset)
     }
-    check_gates(d, cs, pk.fixed_values, advice_values, instance_values)?
+}
 
-    let theta = squeeze(t)
-    var lookups: LookupWork[] = []
+fn commit_permuted(p: *Params, d: Domain, pk: *ProvingKey, t: *Transcript, s: *Single, theta: u64[], random: fn(i64) -> u8[]) ! Error {
+    let f = d.f
+    let cs = pk.vk.cs
+    let ratio = 1 << (d.extended_k - d.k)
     for l in cs.lookups {
-        let compressed_input = compress_rows(f, l.input, theta, pk.fixed_values, advice_values, instance_values, d.n, 1)
-        let compressed_table = compress_rows(f, l.table, theta, pk.fixed_values, advice_values, instance_values, d.n, 1)
-        let pair = permute_pair(f, compressed_input, compressed_table, usable, blinding, random)?
+        let compressed_input = compress_rows(f, l.input, theta, pk.fixed_values, s.advice_values, s.instance_values, d.n, 1)
+        let compressed_table = compress_rows(f, l.table, theta, pk.fixed_values, s.advice_values, s.instance_values, d.n, 1)
+        let pair = permute_pair(f, compressed_input, compressed_table, usable_rows(d, cs), blinding_factors(cs), random)?
         let input = committed(d, pair.input, random_scalar(f, random))
         let table = committed(d, pair.table, random_scalar(f, random))
         write_commitment(p, t, input)?
         write_commitment(p, t, table)?
-        lookups.push(LookupWork {
+        s.lookups.push(LookupWork {
             input,
             table,
             product: input,
             compressed_input,
             compressed_table,
-            compressed_input_coset: compress_rows(f, l.input, theta, pk.fixed_cosets, advice_cosets, instance_cosets, extended_len(d), ratio),
-            compressed_table_coset: compress_rows(f, l.table, theta, pk.fixed_cosets, advice_cosets, instance_cosets, extended_len(d), ratio),
+            compressed_input_coset: compress_rows(f, l.input, theta, pk.fixed_cosets, s.advice_cosets, s.instance_cosets, extended_len(d), ratio),
+            compressed_table_coset: compress_rows(f, l.table, theta, pk.fixed_cosets, s.advice_cosets, s.instance_cosets, extended_len(d), ratio),
         })
+    }
+}
+
+fn open_single(d: Domain, cs: *ConstraintSystem, pool: *Pool, s: Single, x: u64[]) {
+    let f = d.f
+    var instance_ids: i64[] = []
+    for poly in s.instance_polys {
+        instance_ids.push(add_poly(pool, poly, one(f)))
+    }
+    for q in cs.instance_queries {
+        open_poly(pool, instance_ids[q.column], rotate_omega(d, x, q.rotation))
+    }
+    var advice_ids: i64[] = []
+    for column in s.advice {
+        advice_ids.push(add_poly(pool, column.poly, column.blind))
+    }
+    for q in cs.advice_queries {
+        open_poly(pool, advice_ids[q.column], rotate_omega(d, x, q.rotation))
+    }
+    let x_next = rotate_omega(d, x, 1)
+    var set_ids: i64[] = []
+    for set in s.sets {
+        let id = add_poly(pool, set.poly, set.blind)
+        set_ids.push(id)
+        open_poly(pool, id, x)
+        open_poly(pool, id, x_next)
+    }
+    let x_last = rotate_omega(d, x, -(blinding_factors(cs) + 1))
+    var r = s.sets.len - 2
+    for r >= 0 {
+        open_poly(pool, set_ids[r], x_last)
+        r -= 1
+    }
+    let x_inv = rotate_omega(d, x, -1)
+    for l in s.lookups {
+        let product = add_poly(pool, l.product.poly, l.product.blind)
+        let input = add_poly(pool, l.input.poly, l.input.blind)
+        let table = add_poly(pool, l.table.poly, l.table.blind)
+        open_poly(pool, product, x)
+        open_poly(pool, input, x)
+        open_poly(pool, table, x)
+        open_poly(pool, input, x_inv)
+        open_poly(pool, product, x_next)
+    }
+}
+
+/// Returns one proof that each assignment of `circuits`, with the public inputs of the same position in `instances`, satisfies the circuit of `pk`, as `create_proof` of `halo2_proofs` 0.3.0 makes for several circuits. An assignment's `advice` holds the values of each advice column from row 0, at most as many as there are usable rows, and is all `prove` reads of it; `instances` holds, for each circuit, the values of each instance column. `random` returns the number of random bytes it is asked for and must be unpredictable to anyone but the prover: the blinding of the commitments and of the opening, and so the zero knowledge of the proof, rest on it.
+/// Fails with `Instance` when `instances` do not fit the circuit or there is not one list for each assignment, `Circuit` when the advice columns do not fit, and `Unsatisfied` when a gate, an equality or a lookup does not hold for a witness.
+pub fn prove(p: *Params, pk: *ProvingKey, circuits: Assignment[], instances: u64[][][][], random: fn(i64) -> u8[]) -> u8[] ! Error {
+    let vk = pk.vk
+    let c = p.curve
+    let f = c.scalar
+    let d = vk.domain
+    let cs = vk.cs
+    if p.k != d.k {
+        fail Circuit
+    }
+    check_shapes(d, cs, circuits, instances)?
+    let blinding = blinding_factors(cs)
+    let t = writer(c)
+    common_scalar(t, vk.representative)
+
+    var singles: Single[] = []
+    for columns in instances {
+        singles.push(public_columns(p, d, t, columns)?)
+    }
+    for k in 0..singles.len {
+        let s = new(singles[k])
+        commit_advice(p, d, cs, t, s, circuits[k].advice, random)?
+        check_gates(d, cs, pk.fixed_values, s.advice_values, s.instance_values)?
+        singles[k] = *s
+    }
+
+    let theta = squeeze(t)
+    for k in 0..singles.len {
+        let s = new(singles[k])
+        commit_permuted(p, d, pk, t, s, theta, random)?
+        singles[k] = *s
     }
     let beta = squeeze(t)
     let gamma = squeeze(t)
-    let sets = permutation_sets(d, pk, advice_values, instance_values, beta, gamma, random)?
-    for s in sets {
-        write_commitment(p, t, s)?
+    for k in 0..singles.len {
+        singles[k].sets = permutation_sets(d, pk, singles[k].advice_values, singles[k].instance_values, beta, gamma, random)?
+        for set in singles[k].sets {
+            write_commitment(p, t, set)?
+        }
     }
-    for k in 0..lookups.len {
-        lookups[k].product = lookup_product(d, cs, lookups[k], beta, gamma, random)
-        write_commitment(p, t, lookups[k].product)?
+    for k in 0..singles.len {
+        for m in 0..singles[k].lookups.len {
+            singles[k].lookups[m].product = lookup_product(d, cs, singles[k].lookups[m], beta, gamma, random)
+            write_commitment(p, t, singles[k].lookups[m].product)?
+        }
     }
 
     let random_poly = random_values(f, random, d.n)
@@ -444,8 +544,6 @@ pub fn prove(p: *Params, pk: *ProvingKey, advice: u64[][][], instances: u64[][][
 
     let cosets = Cosets {
         fixed: pk.fixed_cosets,
-        advice: advice_cosets,
-        instance: instance_cosets,
         l0: pk.l0,
         l_blind: pk.l_blind,
         l_last: pk.l_last,
@@ -453,7 +551,7 @@ pub fn prove(p: *Params, pk: *ProvingKey, advice: u64[][][], instances: u64[][][
     }
     var quotient: u64[][] = []
     for i in 0..extended_len(d) {
-        quotient.push(quotient_at(d, pk, cosets, sets, lookups, beta, gamma, y, i))
+        quotient.push(quotient_at(d, pk, cosets, singles, beta, gamma, y, i))
     }
     let h_coeffs = extended_to_coeff(d, divide_by_vanishing(d, quotient))
     let h_pieces = chunked(f, h_coeffs, d.n, d.quotient_degree)
@@ -466,20 +564,15 @@ pub fn prove(p: *Params, pk: *ProvingKey, advice: u64[][][], instances: u64[][][
 
     let x = squeeze(t)
     let xn = power(f, x, d.n)
-    let pool = new(Pool { polys: [], blinds: [], ids: [], points: [] })
-    var instance_ids: i64[] = []
-    for poly in instance_polys {
-        instance_ids.push(add_poly(pool, poly, one(f)))
+    for s in singles {
+        for q in cs.instance_queries {
+            write_scalar(t, evaluate(f, s.instance_polys[q.column], rotate_omega(d, x, q.rotation)))
+        }
     }
-    var advice_ids: i64[] = []
-    for column in advice_columns {
-        advice_ids.push(add_poly(pool, column.poly, column.blind))
-    }
-    for q in cs.instance_queries {
-        write_scalar(t, evaluate(f, instance_polys[q.column], rotate_omega(d, x, q.rotation)))
-    }
-    for q in cs.advice_queries {
-        write_scalar(t, evaluate(f, advice_polys[q.column], rotate_omega(d, x, q.rotation)))
+    for s in singles {
+        for q in cs.advice_queries {
+            write_scalar(t, evaluate(f, s.advice[q.column].poly, rotate_omega(d, x, q.rotation)))
+        }
     }
     for q in cs.fixed_queries {
         write_scalar(t, evaluate(f, pk.fixed_coeffs[q.column], rotate_omega(d, x, q.rotation)))
@@ -491,31 +584,38 @@ pub fn prove(p: *Params, pk: *ProvingKey, advice: u64[][][], instances: u64[][][
     let x_next = rotate_omega(d, x, 1)
     let x_last = rotate_omega(d, x, -(blinding + 1))
     let x_inv = rotate_omega(d, x, -1)
-    var set_ids: i64[] = []
-    for s in 0..sets.len {
-        set_ids.push(add_poly(pool, sets[s].poly, sets[s].blind))
-        write_scalar(t, evaluate(f, sets[s].poly, x))
-        write_scalar(t, evaluate(f, sets[s].poly, x_next))
-        if s != sets.len - 1 {
-            write_scalar(t, evaluate(f, sets[s].poly, x_last))
+    for s in singles {
+        for k in 0..s.sets.len {
+            write_scalar(t, evaluate(f, s.sets[k].poly, x))
+            write_scalar(t, evaluate(f, s.sets[k].poly, x_next))
+            if k != s.sets.len - 1 {
+                write_scalar(t, evaluate(f, s.sets[k].poly, x_last))
+            }
         }
     }
-    var lookup_ids: i64[][] = []
-    for l in lookups {
-        lookup_ids.push([add_poly(pool, l.product.poly, l.product.blind), add_poly(pool, l.input.poly, l.input.blind), add_poly(pool, l.table.poly, l.table.blind)])
-        write_scalar(t, evaluate(f, l.product.poly, x))
-        write_scalar(t, evaluate(f, l.product.poly, x_next))
-        write_scalar(t, evaluate(f, l.input.poly, x))
-        write_scalar(t, evaluate(f, l.input.poly, x_inv))
-        write_scalar(t, evaluate(f, l.table.poly, x))
+    for s in singles {
+        for l in s.lookups {
+            write_scalar(t, evaluate(f, l.product.poly, x))
+            write_scalar(t, evaluate(f, l.product.poly, x_next))
+            write_scalar(t, evaluate(f, l.input.poly, x))
+            write_scalar(t, evaluate(f, l.input.poly, x_inv))
+            write_scalar(t, evaluate(f, l.table.poly, x))
+        }
+    }
+
+    let pool = new(Pool { polys: [], blinds: [], ids: [], points: [] })
+    for s in singles {
+        open_single(d, cs, pool, s, x)
     }
     var fixed_ids: i64[] = []
     for poly in pk.fixed_coeffs {
         fixed_ids.push(add_poly(pool, poly, one(f)))
     }
-    var permutation_ids: i64[] = []
+    for q in cs.fixed_queries {
+        open_poly(pool, fixed_ids[q.column], rotate_omega(d, x, q.rotation))
+    }
     for poly in pk.permutation_coeffs {
-        permutation_ids.push(add_poly(pool, poly, one(f)))
+        open_poly(pool, add_poly(pool, poly, one(f)), x)
     }
     var h_poly = zeros(f, d.n)
     var h_blind = zero(f)
@@ -525,39 +625,8 @@ pub fn prove(p: *Params, pk: *ProvingKey, advice: u64[][][], instances: u64[][][
         h_blind = sum(f, prod(f, h_blind, xn), h_blinds[i])
         i -= 1
     }
-    let h_id = add_poly(pool, h_poly, h_blind)
-    let random_id = add_poly(pool, random_poly, random_blind)
-
-    for q in cs.instance_queries {
-        open_poly(pool, instance_ids[q.column], rotate_omega(d, x, q.rotation))
-    }
-    for q in cs.advice_queries {
-        open_poly(pool, advice_ids[q.column], rotate_omega(d, x, q.rotation))
-    }
-    for s in 0..sets.len {
-        open_poly(pool, set_ids[s], x)
-        open_poly(pool, set_ids[s], x_next)
-    }
-    var r = sets.len - 2
-    for r >= 0 {
-        open_poly(pool, set_ids[r], x_last)
-        r -= 1
-    }
-    for ids in lookup_ids {
-        open_poly(pool, ids[0], x)
-        open_poly(pool, ids[1], x)
-        open_poly(pool, ids[2], x)
-        open_poly(pool, ids[1], x_inv)
-        open_poly(pool, ids[0], x_next)
-    }
-    for q in cs.fixed_queries {
-        open_poly(pool, fixed_ids[q.column], rotate_omega(d, x, q.rotation))
-    }
-    for id in permutation_ids {
-        open_poly(pool, id, x)
-    }
-    open_poly(pool, h_id, x)
-    open_poly(pool, random_id, x)
+    open_poly(pool, add_poly(pool, h_poly, h_blind), x)
+    open_poly(pool, add_poly(pool, random_poly, random_blind), x)
 
     prove_openings(p, pool, t, random)?
     t.output

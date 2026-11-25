@@ -1,9 +1,288 @@
-const unsupported = "sampling is supported on Windows only"
+import compiler
+import std/file
+import std/filepath
+import std/io
+import std/perf
+import std/process
+import std/slices
+import std/text
+import std/time
+import std/time/duration
 
-fn require_host() ! Error {
-    fail Failed(unsupported)
+struct Kind {
+    name: str
+    unit: Unit
+    source: perf.Source
+    period: i64 = 0
 }
 
-fn record(pid: i64, interval_ms: i64, depth: i64, code: Span) -> Recording ! Error {
-    fail Failed(unsupported)
+fn kinds() -> []Kind {
+    [
+        Kind { name: "cycles", unit: Unit { name: "cycles", suffix: "G", scale: 1000000000.0 }, source: perf.cycles() }
+        Kind { name: "instructions", unit: Unit { name: "instructions", suffix: "G", scale: 1000000000.0 }, source: perf.instructions() }
+        Kind { name: "cache-misses", unit: Unit { name: "cache misses", suffix: "M", scale: 1000000.0 }, source: perf.cache_misses() }
+        Kind { name: "branch-misses", unit: Unit { name: "branch misses", suffix: "M", scale: 1000000.0 }, source: perf.branch_misses() }
+        Kind { name: "cpu-clock", unit: Unit { name: "cpu", suffix: "s", scale: 1000000000.0 }, source: perf.cpu_clock() }
+        Kind { name: "faults", unit: Unit { name: "faults", suffix: "k", scale: 1000.0 }, source: perf.faults(), period: 16 }
+        Kind { name: "switches", unit: Unit { name: "switches", suffix: "k", scale: 1000.0 }, source: perf.switches(), period: 1 }
+    ]
+}
+
+fn kind_named(name: str) -> Kind ! Error {
+    for k in kinds() {
+        if k.name == name {
+            return k
+        }
+    }
+    fail Failed("unknown event {name}")
+}
+
+fn chosen(config: Config) -> Kind ! Error {
+    let k = kind_named(config.event)?
+    perf.available(k.source) catch {
+        failure => return fallback(config, k, failure)
+    }
+    k
+}
+
+fn fallback(config: Config, k: Kind, failure: io.Error) -> Kind ! Error {
+    match failure {
+        Unsupported => {
+            if k.name != "cycles" {
+                fail refusal(failure, k)
+            }
+        }
+        _ => fail refusal(failure, k)
+    }
+    let note = config.note
+    note("this machine does not count cycles; sampling cpu-clock")
+    let clock = kind_named("cpu-clock")?
+    perf.available(clock.source) catch {
+        e => fail refusal(e, clock)
+    }
+    clock
+}
+
+fn pace(k: Kind, interval_ms: i64) -> perf.Pace {
+    if k.period > 0 {
+        return Events(k.period)
+    }
+    let hertz = 1000 / interval_ms
+    Hertz(if hertz < 1 { 1 } else { hertz })
+}
+
+struct Placed {
+    start: i64
+    size: i64
+    offset: i64
+    image: *Image
+}
+
+struct Change {
+    at: i64
+    record: perf.Record
+}
+
+struct Session {
+    images: [str: *Image]
+    hits: []perf.Hit
+    changes: []Change
+    lost: i64
+}
+
+fn refusal(e: io.Error, kind: Kind) -> Error {
+    match e {
+        Denied => Failed("the system refuses to sample; lower /proc/sys/kernel/perf_event_paranoid to 2 or raise the locked memory limit")
+        Unsupported => Failed("this machine does not count {kind.name}")
+        _ => Failed("cannot sample {kind.name}: {compiler.reason(e)}")
+    }
+}
+
+pub const needs_map = false
+
+fn capture(config: Config) -> Recording ! Error {
+    if config.map != "" {
+        fail Failed("--map names the symbols of a Windows program; a Linux program carries its own")
+    }
+    let kind = chosen(config)?
+    let program = config.command[0]
+    let c = perf.held(process.command(program, config.command[1..])) catch {
+        e => fail Failed("{program}: {compiler.reason(e)}")
+    }
+    let handle = process.start_handle(c) catch {
+        e => fail Failed("{program}: {compiler.reason(e)}")
+    }
+    using child = process.adopt(handle)
+    perf.await_held(handle.pid) catch {
+        e => fail Failed("{program} did not start: {compiler.reason(e)}")
+    }
+    let sampler = perf.sampler(handle.pid, kind.source, kind.pace(config.interval_ms), config.depth) catch {
+        e => fail refusal(e, kind)
+    }
+    let counted = counters(handle.pid)
+    let s = new(Session { images: [:], hits: [], changes: [], lost: 0 })
+    let take = fn(r: perf.Record) {
+        s.take(r)
+    }
+    let start = time.monotonic()
+    perf.release(handle.pid) catch {
+        e => fail Failed("{program}: {compiler.reason(e)}")
+    }
+    for !perf.exited(handle.pid) {
+        perf.drain(sampler, take)
+        time.sleep_for(duration.milliseconds(1))
+    }
+    let wall = time.monotonic() - start
+    perf.drain(sampler, take)
+    perf.close(sampler)
+    var facts: []str = []
+    match perf.usage(handle.pid) {
+        some(u) => {
+            facts.push("wall {seconds(wall)} s, cpu {seconds(u.user + u.kernel)} s ({seconds(u.user)} user, {seconds(u.kernel)} kernel), peak resident {u.peak_resident / 1048576} MB")
+            facts.push("faults {u.faults}, context switches {u.switches}")
+        }
+        none => {}
+    }
+    let exit = process.wait(child) catch {
+        e => fail Failed("{program}: {compiler.reason(e)}")
+    }
+    if !process.success(exit) {
+        let note = config.note
+        note("{program} failed; the profile covers the run up to its exit")
+    }
+    facts.push(counted.fact())
+    let samples = s.resolve()
+    let kernel = if sampler.kernel { "" } else { ", kernel excluded" }
+    let lost = if s.lost > 0 { ", {s.lost} lost" } else { "" }
+    facts.push("{samples.len} samples of {kind.name}{kernel}{lost}")
+    Recording { samples, unit: kind.unit, facts }
+}
+
+struct Counters {
+    cycles: perf.Counter?
+    instructions: perf.Counter?
+}
+
+fn counters(pid: i64) -> Counters {
+    var found = Counters { cycles: none, instructions: none }
+    found.cycles = perf.counter(pid, perf.cycles()) or return found
+    found.instructions = perf.counter(pid, perf.instructions()) or return found
+    found
+}
+
+fn fact(c: Counters) -> str {
+    let cycles = perf.count(c.cycles ?? return "cycles and instructions are not counted here") or 0
+    let instructions = perf.count(c.instructions ?? return "cycles {seconds(cycles)} G") or 0
+    if cycles == 0 {
+        return "cycles {seconds(cycles)} G, instructions {seconds(instructions)} G"
+    }
+    "cycles {seconds(cycles)} G, instructions {seconds(instructions)} G, {text.fixed(f64(instructions) / f64(cycles), 2)} per cycle"
+}
+
+fn seconds(nanos: i64) -> str {
+    text.fixed(f64(nanos) / 1000000000.0, 3)
+}
+
+fn take(s: *Session, r: perf.Record) {
+    match r {
+        Sampled(hit) => s.hits.push(hit)
+        Mapped(m) => {
+            s.image(m.path)
+            s.changes.push(Change { at: m.at, record: r })
+        }
+        Forked(_, _, at) => s.changes.push(Change { at, record: r })
+        Executed(_, at) => s.changes.push(Change { at, record: r })
+        Lost(count) => {
+            s.lost += count
+        }
+        Other => {}
+    }
+}
+
+fn label(path: str) -> str {
+    if text.starts_with(path, "[") {
+        return path
+    }
+    if text.starts_with(path, "//") {
+        return "[anonymous]"
+    }
+    "[{filepath.base(path)}]"
+}
+
+fn image(s: *Session, path: str) -> *Image {
+    match s.images[path] {
+        some(found) => return found
+        none => {}
+    }
+    var bytes: []u8 = []
+    if filepath.is_absolute(path) {
+        bytes = file.read_file(path) or bytes
+    }
+    let loaded = read_image(label(path), bytes)
+    s.images[path] = loaded
+    loaded
+}
+
+fn resolve(s: *Session) -> []Sample {
+    slices.sort_by(mut s.hits, fn(x, y) x.at < y.at)
+    slices.sort_by(mut s.changes, fn(x, y) x.at < y.at)
+    var spaces: [i64: []Placed] = [:]
+    var samples: []Sample = []
+    var next = 0
+    for hit in s.hits {
+        for next < s.changes.len && s.changes[next].at <= hit.at {
+            s.apply(mut spaces, s.changes[next].record)
+            next += 1
+        }
+        let space = spaces[hit.pid] ?? []
+        samples.push(Sample { weight: hit.weight, frames: chain(space, hit.frames) })
+    }
+    samples
+}
+
+fn apply(s: *Session, mut spaces: [i64: []Placed], r: perf.Record) {
+    match r {
+        Mapped(m) => {
+            var space = spaces[m.pid] ?? []
+            space.push(Placed { start: m.start, size: m.size, offset: m.offset, image: s.image(m.path) })
+            spaces[m.pid] = space
+        }
+        Forked(pid, parent, _) => {
+            if pid != parent {
+                spaces[pid] = slices.clone(spaces[parent] ?? [])
+            }
+        }
+        Executed(pid, _) => {
+            spaces[pid] = []
+        }
+        _ => {}
+    }
+}
+
+const unmapped = "[unmapped]"
+
+fn chain(space: []Placed, addresses: []i64) -> []str {
+    var frames: []str = []
+    for address in addresses {
+        let name = name_of(space, address)
+        if frames.len == 0 || name != unmapped {
+            frames.push(name)
+        }
+    }
+    frames
+}
+
+fn name_of(space: []Placed, ip: i64) -> str {
+    if perf.kernel_address(ip) {
+        return "[kernel]"
+    }
+    var i = space.len - 1
+    for i >= 0 {
+        let p = space[i]
+        if ip >= p.start && ip < p.start + p.size {
+            return p.image.symbol_at(ip - p.start + p.offset)
+        }
+        i -= 1
+    }
+    unmapped
 }

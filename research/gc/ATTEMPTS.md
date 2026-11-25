@@ -310,7 +310,7 @@ Mark (counted L3 misses in mark symbols per second of summed `mark_us`):
 
 Counted misses per CPU microsecond of marking fall from 101 with one worker to 42 with twelve: each worker gets half the memory throughput once the channel fills, while mark CPU doubles (399 to 796 ms) for the same work.
 
-gcpause marks with one worker whatever `LOW_GCWORKERS` says: the worker count is capped by the OS threads the program has (`rt_nm`), and gcpause never spawns. This is known: issue 267, with a fix on `fix/issue-267-mark-workers` (2e63dc5e) that starts OS threads up to the CPU count after a collection leaving 8 MB live. It also means A4's single-worker arms and Low's own bench programs run in the regime that fix removes.
+gcpause marks with one worker whatever `LOW_GCWORKERS` says: the worker count is capped by the OS threads the program has (`rt_nm`), and gcpause never spawns. A10 measures starting OS threads for such programs.
 
 Stall attribution (`a5measure.py` and `a5events.py`; `cycle_activity` events attributed to the mark symbols; `a5-out/stalls.txt`, `a5-out/stall-kinds.txt`):
 
@@ -342,7 +342,7 @@ Lessons:
 
 ## A6 A4 and A5 rerun with the issue 267 fix (pre-registered before building)
 
-Change: the worktree gains the runtime and fixture parts of 2e63dc5e (`fix/issue-267-mark-workers`): after a collection that leaves `PAR_MIN` live words, `rt_gcw_recruit` starts OS threads until min(CPUs, 16) are awake, so single-threaded programs mark with every worker. A4's minor collection is unchanged: its hashing and dirty-page scan stay single-threaded.
+Change: the worktree gains the runtime and fixture parts of 2e63dc5e, the unconditional form of A10's recruitment: after a collection that leaves `PAR_MIN` live words, `rt_gcw_recruit` starts OS threads until min(CPUs, 16) are awake, so single-threaded programs mark with every worker. A4's minor collection is unchanged: its hashing and dirty-page scan stay single-threaded.
 
 A6a, A4 under parallel marking (default workers; arms off, minor `LOW_GCMINOR=200`, and a larger heap without minors matched to minor mode's peak RSS):
 - Prediction: minor mode's mark-time win on gcpause and shuffle shrinks from 9.4x and 3.3x (one worker) to under 2x, because full marks now run on up to 12 workers while hashing stays on one; on gcpause, minor mode's summed mark time is no lower than the memory-matched larger heap.
@@ -392,7 +392,7 @@ A5b result (`a6-out/a5b/`):
 Calibration checks run after the sweep:
 - Counted lines are not useful lines for shuffle. The marked heap is 2.26 GB over 37 collections, which is 35 M to 85 M lines depending on how many lines each 40-byte node touches, while the counter attributes 362 M lines to the mark at 1 worker and 269 M at 12. Start- and mark-bitmap lookups (rt_find) and prefetch account for the rest, in a ratio that moves with worker count, so the "share of saturated traffic" column cannot be read as channel occupancy.
 - Counter-free check (`a6-cochase.sh`, `a6-out/cochase.txt`): a 16-chain pointer chase on core 5 runs at 150 M lines/s alone, 137 M beside a 1-worker shuffle and 107 M to 121 M beside a 4-worker shuffle on cores 0 to 3. When 4 chase threads saturate the channel, each gets 98 M; a fifth thread on a channel already full would get about 80 M. The 4-worker mark leaves the channel headroom.
-- Same binary without perf (`a6-out/same-binary.txt`, the research worktree, which is the issue 267 fix plus instrumentation, not the `fix/issue-267-mark-workers` branch itself): gcpause marks in 2830 ms with 1 worker, 3260 ms with 2, 3290 ms with default workers (16% slower than 1); wall 4.26 s against 4.69 s (10%); max pause 22.8 ms against 32.7 ms.
+- Same binary without perf (`a6-out/same-binary.txt`, the research worktree, which is 2e63dc5e plus instrumentation): gcpause marks in 2830 ms with 1 worker, 3260 ms with 2, 3290 ms with default workers (16% slower than 1); wall 4.26 s against 4.69 s (10%); max pause 22.8 ms against 32.7 ms.
 
 Against the pre-registration:
 1. shuffle at least 80% of saturated traffic by 6 workers, and under 1.2x speedup from 6 to 12: as measured, the first part narrowly fails (76% unpinned, 79% on distinct cores) and the second passes (1.01x). The metric is uncalibrated for shuffle (above), so neither reading supports the bandwidth-bound hypothesis the prediction stood for.
@@ -410,7 +410,6 @@ Lessons:
 - A plateau with rising stalls is not by itself evidence of saturation; on this machine it came with a channel that had headroom.
 
 Engineering follow-ups for Low (not novel; production collectors size GC worker counts dynamically, for example HotSpot's UseDynamicNumberOfGCThreads):
-- Keep the mark loop in the single-worker form until a second worker takes work, so chain-shaped heaps pay nothing for recruited threads.
 - Measure the idle share of shuffle's workers (steal attempts, sleep time per collection) to split the plateau between work starvation and per-core miss capacity.
 
 ## A7 Returning free heap pages on Windows (pre-registered before building)
@@ -594,3 +593,118 @@ Against the pre-registration: wall within 3% on every workload fails on lint by 
 Unexplained: shuffle's peak working set is 6% higher under RET2 in this run and equal in the SPAN+RET2 arm.
 What RET2 gives up against RET: sort (50 MB) and maps (85 MB) keep their default peaks, because what they could return is inside the budget.
 Standing: a working port for Windows. A long-running program that spikes ends at 22 MB instead of 339 MB, and the compiler's peak falls by a fifth, for wall time inside the noise.
+
+## A10 Starting mark workers for programs with few OS threads (issue 267)
+
+Idea: the parallel mark only uses OS threads that already exist, so a program with one busy job, or none, marks a large heap with one to four workers. After a collection that leaves a large heap live, start OS threads up to min(CPUs, 16) so the next collection marks with all of them.
+Method: `a10meas.py` runs base (`origin/main`) and a variant alternately, pair by pair, reading wall, user+sys CPU and peak RSS from `wait4` and pauses from `LOW_GCTRACE`; before each pair it waits up to 90 s for fewer than 3 busy CPUs. `a10summ.py` reports medians, a paired sign test and the median paired ratio. Programs: `a10-repro.low` (the issue's repro, a 2 ms frame every 16 ms beside a job that allocates about 60 MB of small pointer objects; it prints frame-work percentiles), the `bench/` programs that keep data live, `low build compiler/low` with each compiler, and `testdata/run/gc_mark_chain` in its `warm` mode (24 green threads run first, then one 1.2 M-node list). 6-core, 12-thread machine; another job held the 1-minute load at 6 to 29 for the first variants and 1 to 4 for the last. Outputs in `a10-out/`: no suffix is the first variant, `_t` the second, `_d` and `_f` the third.
+
+Variants:
+1. Recruit after any collection leaving 8 MB live, and narrow to one worker after a parallel mark in which no worker took a pool batch (every 64th collection probes with two workers; a doubling of the live size restores every worker).
+2. As 1 with a 16 MB threshold.
+3. As 2, and a mark recruits only if it showed work for more workers: a parallel mark in which a worker took a pool batch, or a mark that ran alone whose stack held at least 32 entries at one of the checks made every 4096 marked objects. The pool-take condition was added after the measurements below: a program that sleeps once has a second OS thread, so its marks run in parallel and skipped the stack check; with it, such a program holding a 1.2 M-node list keeps 2 threads where the stack-only form started 12. It changes nothing for the programs measured (same worker counts), and a recheck at load 4 to 10 (`_f` files) agrees: binarytrees wall 0.81 in `low abbench`, jsonpar 1.01 (no difference), gcpause and the repro as below within the noise of that load.
+
+What each variant showed:
+- Variant 1 made jsonpar 8% slower in wall time and 21% in CPU (13 of 15 pairs). Its live size touches 8.5 MB once; after that every collection of its 5 MB heap woke 10 to 12 workers where base woke 5 to 6. Variant 2 removes that (wall ratio 1.005).
+- Variants 1 and 2 raised gcpause's longest pause from 9.7 to 11.6 ms (+20%, measured at load 2 to 6): the first parallel collection and each two-worker probe mark the list 30% slower than one worker does. maps' longest pause doubled (0.15 to 0.29 ms) for the same reason. Variant 3 never recruits for either: a list keeps the solo mark stack at 0 to 5 entries, binarytrees reaches 129 to 173.
+
+Result, variant 3 against base (load 1 to 4; medians, paired ratio, branch lower in n of N pairs):
+
+| program | metric | base | variant 3 | ratio | lower |
+|---|---|---|---|---|---|
+| issue repro (18 pairs) | pause mean | 7.47 ms | 6.08 ms | 0.81 | 18/18 |
+| | pause p99 | 12.4 ms | 13.6 ms | 1.06 | 6/18 (p = 0.24) |
+| | pause max | 18.6 ms | 20.0 ms | 1.06 | 8/18 (p = 0.81) |
+| | frame work p99 | 11.1 ms | 10.4 ms | 0.93 | 17/18 |
+| | user+sys | 12.6 s | 20.1 s | 1.58 | 0/18 |
+| | peak RSS | 152 MB | 162 MB | 1.06 | 0/18 |
+| binarytrees (12) | wall | 1.30 s | 1.05 s | 0.82 | 12/12 |
+| | pause mean / max | 3.73 / 5.70 ms | 1.81 / 3.66 ms | 0.49 / 0.63 | 12/12, 10/12 |
+| | user+sys | 1.29 s | 2.71 s | 2.10 | 0/12 |
+| gcpause (12) | wall / pause max | 2.62 s / 9.75 ms | 2.59 s / 9.35 ms | 0.99 / 0.94 | 11/12, 8/12 (one worker in both; no mechanism for the 1%) |
+| gc_mark_chain warm (10) | wall / pause mean | 0.351 s / 9.97 ms | 0.286 s / 6.77 ms | 0.82 / 0.68 | 10/10 |
+| jsonpar, maps, sort, strings (15 each) | wall, pauses | | | 0.98 to 1.03 | no difference |
+| `low build compiler/low` (15) | wall, user+sys, RSS, pauses | 0.855 s, 5.55 s, 136 MB, 6.31 ms max | 0.861 s, 5.57 s, 136 MB, 6.37 ms max | 1.00 to 1.01 | no difference |
+
+`low abbench` agrees on wall: binarytrees 0.81 (0.809 to 0.820), jsonpar 1.01 (1.00 to 1.02, no difference), gcpause 0.99 (0.976 to 1.000).
+
+Standing: variant 3 is the runtime's rule. A single-threaded program with a tree-shaped live heap above 16 MB gets a parallel mark: about half the pause and a fifth less wall time on binarytrees, for twice the CPU. In the issue's repro the mean pause falls 19% and frame work p99 6%, for 58% more CPU and 7% more memory; pause p99 and max are not distinguishable from base at 18 pairs (higher in 12 and 10 of them), so a 60 MB heap still pauses for longer than a frame. Chain-shaped and noscan heaps, small heaps and the compiler are unchanged. A program that already has threads and a chain-shaped heap marks it alone once a parallel mark finds no pool work.
+Remaining: mark scales weakly with workers past 4 (A5b); the tail pauses in the repro come from sweep spikes of 7 to 13 ms that both base and variant show; concurrent marking is what brings such a heap under one frame.
+
+## A11 Parallelising A4's dirty-page scan (issue 267, measured before building)
+
+Idea: A4's minor collection runs its dirty-page scan and its hashing on one thread. Parallelise the scan, and make `LOW_GCMINOR` the default if the issue's repro gains.
+Method: the A4 worktree (ee9052b1 with `runtime-instrumentation.patch`) runs `a10-repro.low` under `LOW_GCTRACE=1`, once with default workers and once with `LOW_GCWORKERS=1`, and the trace's `minor`, `dirty` and `hash_us` fields split each collection's mark. `a12meas.py` then runs `LOW_GCMINOR=200` against the same binary without it, alternately, waiting before each pair for a 1-minute load of 6 or less; `a12summ.py` reports medians, ranges, the paired ratio and the sign test. Outputs in `a12-out/a11_*.jsonl`.
+
+Where a minor collection's time goes in the repro:
+
+| run | collections | full mark | minor: mark after the hash | minor: hash | live after a collection | dirty pages per minor |
+|---|---|---|---|---|---|---|
+| default workers | 381 off, 130 minor | 6.8 ms | 6.9 ms | 20.7 ms | 60 MB off, 118 MB minor | 0.9 |
+| one worker | | 11.7 ms (62 MB live) | 11.2 ms | 20.2 ms | 116 MB minor | |
+
+- The dirty-page scan visits under one page per minor collection, so parallelising it removes nothing.
+- The repro's objects outlive the cycle that allocates them, so the trace a minor collection still runs (6.9 ms) costs as much as a full mark of the smaller live set, and sticky marks double the live size.
+- Hashing costs 0.17 ms per MB of sticky live data and a full mark 0.19 ms per MB of live data, so a minor collection pays a full mark's cost in hashing alone before it traces anything young. Spread over 12 workers the hash would still leave a minor collection no cheaper than a full one.
+
+Gated pairs, `LOW_GCMINOR=200` against off (12 pairs; each pair starts at a load of 6 or less, and the runs saw 2.3 to 8.3; medians):
+
+| metric | off | minor | ratio | minor lower |
+|---|---|---|---|---|
+| pause mean | 6.28 ms | 23.0 ms | 3.39 | 0/12 |
+| pause p99 | 10.0 ms | 43.2 ms | 4.15 | 0/12 |
+| pause max | 18.9 ms | 60.5 ms | 3.29 | 1/12 |
+| frame work p99 | 10.8 ms | 34.2 ms | 2.98 | 2/12 |
+| user+sys | 20.1 s | 16.2 s | 0.81 | 11/12 |
+| peak RSS | 162 MB | 352 MB | 2.18 | 0/12 |
+| collections | 371 | 168 | 0.46 | |
+
+An arm without minors whose `LOW_GCRATIO` matches minor mode's collection count (300 gives 134 collections against minor mode's 130) was calibrated but not measured in pairs.
+
+Standing: not built. Minor collections make the repro's pauses three to four times longer and double its memory, and the part the change would parallelise takes no measurable time. `LOW_GCMINOR` stays in the A4 patch and the runtime marks fully every collection.
+
+## A12 Returning free pages after the world restarts (issue 267)
+
+Idea: a collection's pause holds the mark, the sweep and the return of free pages to the operating system. Find the sweep's share of the pause and move what need not stop the world out of it.
+Method: `a12-probe.patch` adds `stop_us`, `sweepw_us`, `combine_us`, `release_us` and `restart_us` to the trace, and `LOW_GCPROBE` switches off the return of pages in the sweep workers (2) or everywhere (1). One run of `a10-repro.low` on the probe build at load 18 splits the pause. The change is then measured against `origin/main` with `a12meas.py` and `a12summ.py`: base and change run alternately, 12 pairs per program, each pair starting at a 1-minute load of 6 or less. Data in `a12-out/a12_*.jsonl`.
+
+Where the repro's sweep goes (probe):
+- The pause averages 7.4 ms: 5.4 ms of mark and 2.0 ms of sweep. Sweep p99 is 5.6 ms and its maximum 8.7 ms. The pause without its sweep has a p99 of 18.9 ms and a maximum of 31 ms, so the mark makes the tail.
+- Inside the sweep, the walk that returns the pages of dirty free chunks averages 0.64 ms of a 1.9 ms sweep, and 2.4 to 3.1 ms in the largest sweeps, the ones right after a large structure dies. With no return at all the sweep averages 0.9 ms.
+
+Change:
+- The sweep workers file every free chunk, dirty or clean, and return nothing.
+- After `rt_world_start` the collecting thread walks the dirty bins and returns each chunk of at least the release floor with `madvise(MADV_DONTNEED)`. It takes the chunk out of its bin under the heap lock, releases the lock for the system call and takes it again to file the chunk in its clean bin. The walk stops when another collection has run since it began, because that collection's thread walks the bins it rebuilt.
+- The chunk in flight is written to its thread's `M_RETURNING`, and every collection sets that chunk's mark bit before marking. A collection that runs during the system call therefore keeps the chunk out of the free lists it rebuilds. A pin made once, by one mark bit, does not survive: the next sweep clears it, and the collection after that frees a chunk the walk still holds, which zeroes live objects.
+- The trace gains `return_us`, the time from the restart to the end of the walk.
+- `testdata/run/gc_return_after_restart` frees 128 MB and checks that its largest return takes longer than the pause of the same collection. Base prints no `return_us` and fails it.
+
+Result against base (12 pairs each, load 1.3 to 6; medians, ratio of medians of paired runs, change lower in n of 12):
+
+| program | metric | base | change | ratio | lower |
+|---|---|---|---|---|---|
+| issue repro | sweep mean | 1.93 ms | 1.02 ms | 0.53 | 12/12 |
+| | sweep p99 / max | 5.07 / 6.60 ms | 3.52 / 4.56 ms | 0.70 / 0.72 | 12/12, 11/12 |
+| | pause mean | 6.68 ms | 6.07 ms | 0.91 | 12/12 |
+| | pause p99 / max | 16.4 / 19.0 ms | 16.0 / 19.4 ms | 0.99 / 1.01 | 8/12, 4/12 (no difference) |
+| | frame work p99 / max | 9.85 / 17.5 ms | 9.38 / 20.3 ms | 0.90 / 1.03 | 11/12, 6/12 |
+| | wall / user+sys / peak RSS | 9.63 s / 17.3 s / 197 MB | 9.63 s / 16.6 s / 194 MB | 1.00 / 0.97 / 0.98 | 5/12, 10/12, 10/12 |
+| binarytrees | pause mean / sweep mean | 1.86 / 0.34 ms | 1.54 / 0.09 ms | 0.84 / 0.27 | 11/12, 12/12 |
+| | wall | 1.03 s | 1.01 s | 0.99 | 9/12 (no difference) |
+| gcpause | pause mean / max | 8.08 / 10.3 ms | 7.13 / 9.02 ms | 0.89 / 0.88 | 12/12, 11/12 |
+| | wall | 1.648 s | 1.640 s | 0.995 | 10/12 (within base's spread) |
+| jsonpar | pause mean / wall | 0.50 ms / 0.469 s | 0.33 ms / 0.451 s | 0.66 / 0.96 | 12/12, 12/12 |
+| maps | pause max / wall | 0.216 ms / 0.125 s | 0.027 ms / 0.126 s | 0.13 / 1.00 | 12/12, 8/12 |
+| strings | pause max / wall | 0.44 ms / 0.070 s | 0.29 ms / 0.070 s | 0.68 / 1.00 | 12/12, 5/12 |
+| sort | pause max / wall | 0.060 ms / 0.236 s | 0.022 ms / 0.234 s | 0.36 / 0.99 | 12/12, 12/12 |
+| `low build compiler/low` | pause mean / max | 2.24 / 6.38 ms | 1.95 / 6.18 ms | 0.88 / 0.96 | 11/12, 7/12 |
+| | wall | 0.754 s | 0.761 s | 1.01 | 1/12, within base's range of 0.749 to 0.797 s |
+| | user+sys / peak RSS | 4.63 s / 161 MB | 4.60 s / 157 MB | 0.99 / 0.97 | 9/12, 12/12 |
+| wrap_gc_trees, `LOW_GC=stress` (7 pairs) | wall / user+sys | 1.63 s / 5.30 s | 1.70 s / 5.66 s | 1.02 / 1.06 | 1/7, 1/7 |
+
+`low abbench` on `low build compiler/low` (20 runs each) gives wall 1.011 (0.999 to 1.024, no difference), cycles 0.997 and peak memory 0.964.
+
+The self-build's collecting threads spend 18 ms in all on the walk outside the pause, against 61 ms of pauses. That walk runs on one thread where the sweep workers shared it before, which is the likely source of the 1% wall time the paired runs lean towards. Under `LOW_GC=stress` every collection walks the bins, and the per-chunk lock hand-off costs 2 to 6%.
+
+Standing: this is the runtime's rule. The sweep falls by half on the repro and by two to ten times on the bench programs. Their mean pauses fall 9 to 34%, maximum pauses where the sweep set them (maps, strings, sort, gcpause) fall 12 to 87%, and memory falls up to 4%. The repro's pause p99 and maximum are unchanged, because its mark sets them: 12 to 14 ms of mark at p99.
+Remaining: the repro's tail is mark time. The trace shows the first collections of its job (19 to 86 MB live, 8 to 18 ms) marking alone. Reading the narrowing rule (A10) suggests why, though it has not been tested: the locked UI thread counts as a worker but never joins, so the mark finds no pool takes and narrows. After that only concurrent marking removes the mark from the pause.

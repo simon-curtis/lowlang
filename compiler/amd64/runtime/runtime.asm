@@ -161,6 +161,12 @@ rt_gcw_ticket:
 	.zero 8
 rt_gcw_limit:
 	.zero 8
+rt_gcw_narrow:
+	.zero 8
+rt_gcw_takes:
+	.zero 8
+rt_gcw_depth:
+	.zero 8
 rt_gcw_joined:
 	.zero 8
 rt_gcw_gindex:
@@ -792,15 +798,6 @@ rt_link_chunk:
 	mov r10d, BIN_CLEAN
 2:
 	call rt_bin_of
-	test r10, r10
-	jnz 6f
-	cmp rax, [rip+rt_release_bin]
-	jb 6f
-	lea rcx, [rip+rt_bins]
-	cmp r11, rcx
-	je 6f
-	call rt_release_chunk
-6:
 	add rax, r10
 	mov rcx, r11
 	mov rdx, [rcx+8*rax]
@@ -1568,6 +1565,7 @@ rt_gc:
 	call rt_gc_stamp
 	call rt_alloc_retire_all
 	call rt_region_hits_clear
+	call rt_mark_returning
 	call rt_gcw_start_mark
 	lea rdi, [rip+rt_pins]
 	mov rsi, [rip+rt_pin_count]
@@ -1590,12 +1588,15 @@ rt_gc:
 	call rt_region_reclaim
 	call rt_region_pending_queue
 	call rt_sweep
-	call rt_heap_release
 	mov edi, TICK_SWEPT
 	call rt_gc_stamp
 	call rt_world_start
 	mov edi, TICK_RESUMED
 	call rt_gc_stamp
+	call rt_heap_release
+	mov edi, TICK_RETURNED
+	call rt_gc_stamp
+	call rt_gcw_recruit
 	inc qword ptr [rip+rt_gc_count]
 	cmp byte ptr [rip+rt_gc_trace], 0
 	je 12f
@@ -1616,6 +1617,8 @@ rt_gcw_start_mark:
 	mov [rip+rt_gcw_rindex], rax
 	mov [rip+rt_gcw_lock], rax
 	mov [rip+rt_gcw_count], rax
+	mov [rip+rt_gcw_takes], rax
+	mov [rip+rt_gcw_depth], rax
 	mov [rip+rt_gcw_done], rax
 	mov [rip+rt_gcw_idle], rax
 	mov qword ptr [rip+rt_gcw_busy], 1
@@ -1630,6 +1633,22 @@ rt_gcw_start_mark:
 	mov rcx, [rip+rt_nm]
 	cmp rax, rcx
 	cmova rax, rcx
+	mov rdx, [rip+rt_gcw_narrow]
+	test rdx, rdx
+	jz 2f
+	add rdx, rdx
+	cmp rdx, [rip+rt_live_words]
+	jbe 3f
+	mov ecx, 1
+	mov edx, 2
+	test byte ptr [rip+rt_gc_count], PROBE_MASK
+	cmovz rcx, rdx
+	cmp rax, rcx
+	cmova rax, rcx
+	jmp 2f
+3:
+	mov qword ptr [rip+rt_gcw_narrow], 0
+2:
 	mov ecx, 1
 	test rax, rax
 	cmovz rax, rcx
@@ -1643,6 +1662,62 @@ rt_gcw_start_mark:
 	mov edi, GCW_MARK
 	call rt_gcw_publish
 2:
+	ret
+
+rt_mark_returning:
+	mov r8, [rip+rt_heap_start]
+	mov r9, [rip+rt_mark_bits]
+	lea r10, [rip+rt_allm]
+	xor ecx, ecx
+1:
+	cmp rcx, [rip+rt_nm]
+	jae 2f
+	mov rax, [r10+8*rcx]
+	inc rcx
+	mov rdx, [rax+M_RETURNING]
+	test rdx, rdx
+	jz 1b
+	sub rdx, r8
+	shr rdx, 3
+	lock bts qword ptr [r9], rdx
+	jmp 1b
+2:
+	ret
+
+rt_gcw_recruit:
+	cmp qword ptr [rip+rt_live_words], RECRUIT_MIN
+	jb 3f
+	cmp qword ptr [rip+rt_gcw_limit], 1
+	jbe 4f
+	cmp qword ptr [rip+rt_gcw_takes], 0
+	je 3f
+	jmp 5f
+4:
+	cmp qword ptr [rip+rt_gcw_depth], RECRUIT_DEPTH
+	jb 3f
+5:
+	mov rax, [rip+rt_ncpu]
+	cmp rax, 1
+	jbe 3f
+	push rbx
+	mov ebx, MAXW
+	cmp rbx, rax
+	cmova rbx, rax
+1:
+	lea rdi, [rip+rt_sched_lock]
+	call rt_spin_lock
+	call rt_m_awake
+	cmp rdx, rbx
+	jae 2f
+	cmp rcx, MAXM
+	jae 2f
+	call rt_newm
+	jmp 1b
+2:
+	lea rdi, [rip+rt_sched_lock]
+	call rt_spin_unlock
+	pop rbx
+3:
 	ret
 
 rt_gcw_publish:
@@ -1708,6 +1783,17 @@ rt_gcw_end_mark:
 	jmp 1b
 2:
 	mov [rip+rt_live_words], rax
+	cmp qword ptr [rip+rt_gcw_limit], 1
+	jbe 4f
+	cmp qword ptr [rip+rt_gcw_takes], 0
+	jne 3f
+	cmp rax, RECRUIT_MIN
+	jb 4f
+	mov [rip+rt_gcw_narrow], rax
+	ret
+3:
+	mov qword ptr [rip+rt_gcw_narrow], 0
+4:
 	ret
 
 rt_gcw_enter:
@@ -1789,6 +1875,7 @@ rt_gcw_lock_acquire:
 	ret
 
 rt_gcw_take_locked:
+	inc qword ptr [rip+rt_gcw_takes]
 	mov rdx, [rip+rt_gcw_count]
 	mov ecx, POOL_TAKE
 	cmp rdx, rcx
@@ -1942,11 +2029,23 @@ rt_gcw_donate:
 	mov [rcx+8*rax], rdi
 	mov rdi, rdx
 	inc rbx
+.if \solo
+	test ebx, DEPTH_SAMPLE
+	jz 24f
+25:
+.endif
 	test rdi, rdi
 	jz 7b
 	MARK_CANDIDATE \solo
 	jmp 7b
 .if \solo
+24:
+	mov rax, r15
+	sub rax, [rbp+W_LO]
+	cmp rax, [rip+rt_gcw_depth]
+	jbe 25b
+	mov [rip+rt_gcw_depth], rax
+	jmp 25b
 .else
 20:
 	cmp qword ptr [rip+rt_gcw_count], 0
