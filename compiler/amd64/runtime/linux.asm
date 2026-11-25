@@ -228,64 +228,37 @@ rt_prefault:
 1:
 	ret
 
-rt_release_chunk:
-	push rdi
-	push rsi
-	push rax
-	push r11
-	lea r8, [rdi+8*rsi]
-	and r8, -4096
-	lea rdi, [rdi+16+4095]
-	and rdi, -4096
-	mov rsi, r8
-	sub rsi, rdi
-	push r8
-	mov edx, 4
-	mov eax, 28
-	syscall
-	pop r8
-	xor r10d, r10d
-	test rax, rax
-	jnz 1f
-	mov rcx, [rip+rt_heap_start]
-	sub rdi, rcx
-	shr rdi, PAGE_SHIFT
-	sub r8, rcx
-	shr r8, PAGE_SHIFT
-	dec r8
-	mov rsi, r8
-	call rt_page_clear
-	mov r10d, BIN_CLEAN
-1:
-	pop r11
-	pop rax
-	pop rsi
-	pop rdi
-	ret
-
 rt_heap_release:
 	push rbx
 	push r12
 	push r13
+	push r14
+	push r15
+	push r15
+	TLS_GET r14, TLS_M
+	mov r15, [rip+rt_gc_count]
 	call rt_release_floor
 	mov rbx, [rip+rt_release_bin]
 1:
+	cmp r15, [rip+rt_gc_count]
+	jne 9f
 	mov rdi, rbx
 	lea rsi, [rip+rt_bin_bits]
 	call rt_bits_next
 	cmp rax, -1
 	je 9f
 	mov rbx, rax
-2:
 	lea rcx, [rip+rt_bins]
 	mov r12, [rcx+8*rbx]
 	mov rax, [r12+8]
 	mov [rcx+8*rbx], rax
 	test rax, rax
-	jnz 3f
+	jnz 2f
 	lea rcx, [rip+rt_bin_bits]
 	btr qword ptr [rcx], rbx
-3:
+2:
+	mov [r14+M_RETURNING], r12
+	mov qword ptr [rip+rt_heap_lock], 0
 	mov rax, [r12]
 	shr rax, 3
 	lea r13, [r12+8*rax]
@@ -297,6 +270,8 @@ rt_heap_release:
 	mov edx, 4
 	mov eax, 28
 	syscall
+	test rax, rax
+	jnz 3f
 	mov rcx, [rip+rt_heap_start]
 	sub rdi, rcx
 	shr rdi, PAGE_SHIFT
@@ -304,10 +279,10 @@ rt_heap_release:
 	shr r13, PAGE_SHIFT
 	dec r13
 	mov rsi, r13
-	test rax, rax
-	jnz 4f
 	call rt_page_clear
-4:
+3:
+	call rt_heap_acquire
+	mov qword ptr [r14+M_RETURNING], 0
 	lea rdx, [rbx+BIN_CLEAN]
 	lea rcx, [rip+rt_bins]
 	mov rax, [rcx+8*rdx]
@@ -315,11 +290,11 @@ rt_heap_release:
 	mov [rcx+8*rdx], r12
 	lea rcx, [rip+rt_bin_bits]
 	bts qword ptr [rcx], rdx
-	lea rcx, [rip+rt_bins]
-	cmp qword ptr [rcx+8*rbx], 0
-	jne 2b
 	jmp 1b
 9:
+	pop r15
+	pop r15
+	pop r14
 	pop r13
 	pop r12
 	pop rbx
