@@ -14,6 +14,7 @@ rt_trace_labels:
 	.asciz " slow_allocs="
 	.asciz " refills="
 	.asciz " workers="
+	.asciz " return_us="
 
 	.bss
 	.p2align 3
@@ -24,9 +25,9 @@ rt_gc_trace:
 rt_gc_count:
 	.zero 8
 rt_gc_ticks:
-	.zero 8*5
+	.zero 8*6
 rt_trace_values:
-	.zero 8*8
+	.zero 8*9
 rt_stat_slow:
 	.zero 8
 rt_stat_refills:
@@ -866,6 +867,9 @@ rt_gc_trace_print:
 	mov rax, [rcx+8*TICK_SWEPT]
 	sub rax, [rcx+8*TICK_MARKED]
 	mov [rdx+16], rax
+	mov rax, [rcx+8*TICK_RETURNED]
+	sub rax, [rcx+8*TICK_RESUMED]
+	mov [rdx+64], rax
 	mov ecx, 1000
 	xor r8d, r8d
 1:
@@ -878,6 +882,12 @@ rt_gc_trace_print:
 	inc r8d
 	cmp r8d, 3
 	jb 1b
+	mov rax, [rdx+64]
+	push rdx
+	xor edx, edx
+	div rcx
+	pop rdx
+	mov [rdx+64], rax
 	mov rax, [rip+rt_live_words]
 	shl rax, 3
 	shr rax, 10
@@ -906,7 +916,7 @@ rt_gc_trace_print:
 	call rt_append_u64
 	pop rcx
 	inc ecx
-	cmp ecx, 8
+	cmp ecx, 9
 	jb 2b
 	mov byte ptr [rdi], 10
 	inc rdi

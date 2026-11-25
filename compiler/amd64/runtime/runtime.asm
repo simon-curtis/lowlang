@@ -798,15 +798,6 @@ rt_link_chunk:
 	mov r10d, BIN_CLEAN
 2:
 	call rt_bin_of
-	test r10, r10
-	jnz 6f
-	cmp rax, [rip+rt_release_bin]
-	jb 6f
-	lea rcx, [rip+rt_bins]
-	cmp r11, rcx
-	je 6f
-	call rt_release_chunk
-6:
 	add rax, r10
 	mov rcx, r11
 	mov rdx, [rcx+8*rax]
@@ -1594,6 +1585,7 @@ rt_gc:
 	call rt_gc_stamp
 	call rt_alloc_retire_all
 	call rt_region_hits_clear
+	call rt_mark_returning
 	call rt_gcw_start_mark
 	lea rdi, [rip+rt_pins]
 	mov rsi, [rip+rt_pin_count]
@@ -1616,11 +1608,13 @@ rt_gc:
 	call rt_region_reclaim
 	call rt_region_pending_queue
 	call rt_sweep
-	call rt_heap_release
 	mov edi, TICK_SWEPT
 	call rt_gc_stamp
 	call rt_world_start
 	mov edi, TICK_RESUMED
+	call rt_gc_stamp
+	call rt_heap_release
+	mov edi, TICK_RETURNED
 	call rt_gc_stamp
 	call rt_gcw_recruit
 	inc qword ptr [rip+rt_gc_count]
@@ -1687,6 +1681,26 @@ rt_gcw_start_mark:
 	jbe 2f
 	mov edi, GCW_MARK
 	call rt_gcw_publish
+2:
+	ret
+
+rt_mark_returning:
+	mov r8, [rip+rt_heap_start]
+	mov r9, [rip+rt_mark_bits]
+	lea r10, [rip+rt_allm]
+	xor ecx, ecx
+1:
+	cmp rcx, [rip+rt_nm]
+	jae 2f
+	mov rax, [r10+8*rcx]
+	inc rcx
+	mov rdx, [rax+M_RETURNING]
+	test rdx, rdx
+	jz 1b
+	sub rdx, r8
+	shr rdx, 3
+	lock bts qword ptr [r9], rdx
+	jmp 1b
 2:
 	ret
 
