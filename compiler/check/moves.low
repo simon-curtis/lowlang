@@ -18,25 +18,116 @@ struct MoveLoop {
     continues: [][*ast.Local: i64] = []
 }
 
+struct Dropping {
+    c: *Checker
+    known: [*types.Type: bool] = [:]
+}
+
 struct Mover {
     c: *Checker
+    dropping: *Dropping
     ret: *types.Type?
     state: [*ast.Local: i64]
     dead: bool = false
     loops: []*MoveLoop = []
 }
 
-fn check_moves(c: *Checker, f: *ast.Func) ! diag.Error {
-    let m = new(Mover { c, ret: f.ret_type, state: [:] })
+fn check_moves(d: *Dropping, f: *ast.Func) ! diag.Error {
+    let m = new(Mover { c: d.c, dropping: d, ret: f.ret_type, state: [:] })
     let body = f.body ?? panic("function {f.name} has no body")
     move_block(m, body, move_context(m, f.ret_type))?
+}
+
+fn owns(d: *Dropping, target: *types.Type?) -> bool {
+    let t = target ?? return false
+    if t.kind == ResultKind {
+        return drops(d, t.ok_of())
+    }
+    drops(d, t)
+}
+
+fn drops(d: *Dropping, t: *types.Type) -> bool {
+    if t.kind != StructKind {
+        return false
+    }
+    match d.known[t] {
+        some(known) => return known
+        none => {}
+    }
+    d.known[t] = false
+    var result = d.c.drops[t] != none
+    for f in t.fields {
+        if drops(d, f.type) {
+            result = true
+        }
+    }
+    d.known[t] = result
+    result
+}
+
+struct Failure {
+    error: diag.Error? = none
+}
+
+const settle_batch = 64
+
+fn settle_in_order(c: *Checker) ! diag.Error {
+    let d = new(Dropping { c })
+    for f in c.moving {
+        check_moves(d, f)?
+    }
+}
+
+fn moves_failure(c: *Checker, funcs: []*ast.Func) -> Failure {
+    let d = new(Dropping { c })
+    for f in funcs {
+        check_moves(d, f) catch {
+            e => return Failure { error: e }
+        }
+    }
+    Failure {}
+}
+
+fn settle(c: *Checker, each: fn(i64, fn(i64))) ! diag.Error {
+    let moving = c.moving
+    let marking = c.marking
+    let move_jobs = (moving.len + settle_batch - 1) / settle_batch
+    let mark_jobs = (marking.len + settle_batch - 1) / settle_batch
+    var failures: []Failure = []
+    for _ in 0..move_jobs {
+        failures.push(Failure {})
+    }
+    each(move_jobs + mark_jobs, fn(k: i64) {
+        if k < move_jobs {
+            failures[k] = moves_failure(c, batch_of(moving, k))
+            return
+        }
+        for f in batch_of(marking, k - move_jobs) {
+            mark_read_only(f)
+        }
+    })
+    for failure in failures {
+        match failure.error {
+            some(e) => fail e
+            none => {}
+        }
+    }
+}
+
+fn batch_of(funcs: []*ast.Func, k: i64) -> []*ast.Func {
+    let start = k * settle_batch
+    var end = start + settle_batch
+    if end > funcs.len {
+        end = funcs.len
+    }
+    funcs[start..end]
 }
 
 fn move_context(m: *Mover, t: *types.Type?) -> MoveContext {
     if t == m.c.universe.void {
         return MoveContext.Discard
     }
-    if owns(m.c, t) {
+    if owns(m.dropping, t) {
         return MoveContext.Take
     }
     MoveContext.Borrow
@@ -356,11 +447,11 @@ fn move_expr(m: *Mover, e: ast.Expr, ctx: MoveContext) ! diag.Error {
         Take => true
         _ => false
     }
-    if discarding && owns(m.c, found) && producer(e) && !branching(e) {
+    if discarding && owns(m.dropping, found) && producer(e) && !branching(e) {
         let t = found ?? panic("discarded value has no type")
         fail At(ast.position(e), "{t.text()} has drop; bind it with using")
     }
-    let owned = taking && owns(m.c, found)
+    let owned = taking && owns(m.dropping, found)
     match e {
         Ident(id) => {
             let l = id.ident_local() ?? return
@@ -577,7 +668,7 @@ fn move_call(m: *Mover, e: *ast.Call) ! diag.Error {
             _ => {}
         }
         let found = ast.type_of(arg)
-        if !is_ref && owns(m.c, found) && producer(arg) {
+        if !is_ref && owns(m.dropping, found) && producer(arg) {
             let t = found ?? panic("argument has no type")
             fail At(ast.position(arg), "{t.text()} has drop; bind it with using before passing it")
         }
