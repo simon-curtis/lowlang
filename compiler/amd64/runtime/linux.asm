@@ -168,12 +168,6 @@ rt_region_stash:
 	syscall
 	ret
 
-rt_region_trim:
-	mov edx, 4
-	mov eax, 28
-	syscall
-	ret
-
 rt_region_decommit:
 	push rdi
 	push rsi
