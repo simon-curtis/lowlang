@@ -327,7 +327,7 @@ print(xs.len)
 - `[]` after a type applies to everything before it, as `?` does: `*Node[]` is a slice of pointers, `u8[][]` a slice of slices and `fn() -> i64[]` a function returning a slice.
 - `[]T` is the prefix spelling of `T[]`. The compiler's own source uses it, because the release in `bootstrap.txt` reads only that form.
 - Slice builtins are called as methods: `xs.push(v)`, not `push(mut xs, v)`.
-- `[a, b]` builds a slice; an empty `[]` needs an expected type.
+- `[a, b]` builds a slice; an empty `[]` needs an expected type. In an `if` expression with no expected type, a branch that is an empty `[]` takes the type of the other branch.
 - `xs[i]` reads or writes an element and panics when `i` is outside `0..xs.len`. Any integer type indexes.
 - `xs.len` is the length as `i64`.
 - `xs[a..b]`, `xs[..b]` and `xs[a..]` share the elements in that range. The result's capacity equals its length, so `push` onto it always copies and never overwrites the parent.
@@ -359,7 +359,7 @@ for name in ages { print(name) }
 
 - `[K: V]` maps keys of an integer type, `bool`, `str` or a pointer type to values of any type.
 - A map is a pointer to a table on the garbage-collected heap, so assigning or passing it shares the table, and `m[k] = v` works through any binding.
-- `[k: v, ...]` builds a map; `[:]` is an empty one and needs an expected type.
+- `[k: v, ...]` builds a map; `[:]` is an empty one and needs an expected type, which an `if` branch takes from the other branch as an empty `[]` does.
 - `m[k]` returns `V?`. `m[k] = v` inserts or replaces. A compound assignment such as `m[k] += 1` starts from a zero value when `k` is missing.
 - `m.delete(k)` removes a key; removing a missing key does nothing.
 - `m.len` is the number of entries.
@@ -687,7 +687,7 @@ fn first(xs: i64[]) -> i64? {
 }
 
 let index = find(xs, 7) ?? -1
-let head = (xs[0] when xs.len > 0) ?? 0
+let head = xs[0] when xs.len > 0 else 0
 match find(xs, 4) {
     some(i) => print("at {i}")
     none => print("missing")
@@ -704,6 +704,7 @@ struct Node {
 - `x ?? fallback` gives the value inside `x`, or evaluates `fallback` when `x` is `none`.
   - The fallback may itself be a `T?`, making the result a `T?`.
   - The fallback may leave instead, as in `let line = read_line() ?? break`.
+  - An expected type `T` reaches `x` as `T?`, so in `let n: u8 = (200 when ready) ?? 0` the literal is a `u8`.
   - `??` binds tighter than comparisons and looser than arithmetic, and groups to the right: `a ?? b ?? 0` tries `a`, then `b`.
 - `value when cond` gives `value` when the `bool` `cond` is true and `none` otherwise.
   - `cond` is evaluated first, and `value` only when `cond` is true.
@@ -711,6 +712,10 @@ struct Node {
   - `when` binds looser than every binary operator, `|>` included, and does not chain: `a + b when c && d` is `(a + b) when (c && d)`, and a second `when` needs parentheses.
   - `return v when c` returns `v when c`, and an expression-bodied closure `fn(n) n * 2 when n > 1` has the whole `when` as its body.
   - `when` is a contextual keyword: it is an ordinary identifier everywhere except directly after an expression on the same line.
+- `value when cond else fallback` gives `value` when `cond` is true and `fallback` otherwise, as `(value when cond) ?? fallback` does.
+  - `fallback` is checked against the type of `value`, so `spans(tab) when ready else []` is a slice of the type `spans` returns, and an empty `[]` or `[:]` as `value` takes the type of `fallback`.
+  - `fallback` is evaluated only when `cond` is false or `value` is a `none`. It may be a `T?`, making the result a `T?`, and may leave, as in `let n = next() when more else break`.
+  - `else` binds as loosely as `when`, and a second `when` in `fallback` needs parentheses.
 - `match` unwraps an optional with `some(v)` and `none` arms and must cover both.
 - `?` after a type binds to everything before it: `*Node?` is an optional pointer, `i64[]?` an optional slice and `*Node[]?` an optional slice of pointers.
 - Parentheses group a type: `(fn() -> i64)[]` is a slice of functions, `*(i64[])` a pointer to a slice and `(str?)?` an optional optional. `str??` means the same as `(str?)?`; at the end of a line, where `??` would continue the expression, it is an error and the parenthesised form is needed.
