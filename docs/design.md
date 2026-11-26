@@ -91,7 +91,7 @@ $ low run -c debug app/ -v
 - Options come before the program. Every argument after the program goes to the program, so the `-v` above goes to `app`.
 - With none named, a directory that holds no `.low` file runs the one program its project declares (see [Projects](#projects)).
 - `--target browser/wasm32` runs it as WebAssembly under `node`.
-- `-c` and `--trace` work as they do for [`low build`](#low-build).
+- `-c`, `--trace` and `--json` work as they do for [`low build`](#low-build). `--json` covers the compilation, not the program's output.
 
 ### low test
 
@@ -110,6 +110,7 @@ Writes a native binary, or a WebAssembly module for `browser/wasm32`, from a fil
 | `--subsystem console\|gui` | Picks the PE subsystem of a Windows executable. |
 | `--trace file.json` | Writes a Chrome trace of the compilation. |
 | `--map file` | Writes the address of every symbol. |
+| `--json` | Writes each error and warning to standard error as one JSON object per line (see [JSON diagnostics](#json-diagnostics)). |
 
 **Which program is built.** With no program named, the current directory is built when it holds `.low` files. Otherwise the one program the project declares is built, an error naming them when there are several.
 
@@ -159,11 +160,11 @@ Runs the program and patches changed functions into it on save. Changing `main`,
 
 ### low ir and low asm
 
-`low ir` prints the optimised SSA form. `low asm` prints the generated assembly.
+`low ir` prints the optimised SSA form. `low asm` prints the generated assembly. Both take `--json` as [`low build`](#low-build) does.
 
 ### low lint
 
-Type-checks a program or a library module and prints its warnings.
+Type-checks a program or a library module and prints its warnings. `--json` writes them as [JSON diagnostics](#json-diagnostics).
 
 ### low doc
 
@@ -2003,11 +2004,27 @@ The time is the span from the module's first test start to its last test end. `<
 | `event` | Members |
 | --- | --- |
 | `shuffle` | `seed`, written first when `--shuffle` is given. |
+| `diagnostic` | One per error of a module whose build failed, before its `build` event, as in [JSON diagnostics](#json-diagnostics) with `module` added. |
 | `build` | `module`, `ok`, `cached` (`true` when the program was reused), and `error` when the build or the listing failed. Not written for a module with no test files. |
 | `test` | `module`, `test`, `file`, `line`, `result` (`pass`, `fail`, `skip`, `crash`, `timeout` or `not_run`), `cached` (`true` for a test replayed from the cache), `detail` for a crash or timeout, `output` (the child's standard output then standard error) and `elapsed_ns`. |
 | `module` | `module`, `result` (`ok`, `fail`, `build_failed` or `no_test_files`), the counts `failed`, `crashed`, `timed_out`, `build_failed`, `passed`, `skipped`, `not_run` and `cached`, and `elapsed_ns`. |
 | `summary` | `result` (`pass` or `fail`), the same counts and `elapsed_ns`. |
 | `list` | `module`, `test`, `file` and `line`, written instead of the others by `--list`. |
+
+#### JSON diagnostics
+
+`--json` on `low build`, `low run`, `low asm`, `low ir` and `low lint` writes each error and warning to standard error as one JSON object on its own line, sorted by file, line and column, in place of the text lines. A build that fails exits with status 1. `low test --json` writes the same objects as `diagnostic` events in its report.
+
+| Member | Value |
+| --- | --- |
+| `event` | `diagnostic`. |
+| `code` | The code, a row of [Diagnostic codes](#diagnostic-codes). |
+| `severity` | `error` or `warning`. |
+| `file`, `line`, `column` | Where the diagnostic starts. Lines and columns count from 1, and a column counts bytes. |
+| `end_line`, `end_column` | The position just past the token at the start: a name, a string literal or one character. |
+| `message` | The text the text line shows between the position and the code. |
+| `related` | Other places the diagnostic names, each with `label`, `file`, `line` and `column`. |
+| `fixes` | Each fix's `title`, `safe` (`true` when `low fix` applies it) and `edits`, each edit with `file`, `line`, `column`, `end_line`, `end_column` and the replacement `text`. |
 
 #### Test files in the language server
 
@@ -9640,7 +9657,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
 - The `run` and `examples` suites compile every `testdata/run` program and std example for Linux. They run each one with a one-minute limit. They compare stdout with `.out` and stderr with `.err`. They apply `.maxrss`, `.maxtime`, `.needed` and `.tags`. These suites skip on a Windows host.
 - The `windows` suite builds every `testdata/run` program and std example that has a Windows build, and every `testdata/windows` program, for Windows. It compares stdout, stderr and `.maxtime` the same way. It runs a program with a `.maxtime` or `.maxrss` on its own. It runs only on a Windows host.
 - The `fail` and `lint` suites check every `testdata/fail` and `testdata/lint` program against its sidecar.
-- The `test` suite runs `low test --notime --nocache` on every `testdata/test` directory. It compares stdout, stderr and the exit status with the directory's sidecars. It runs on both hosts. A test build cannot be expressed in a `testdata/fail` program, so the rejected test shapes are fixtures here. The fixtures also cover these cases: a crashing test, a test that times out, skipped tests, `--run` on a subtest, `--skip`, `--failfast`, `--count`, `--shuffle`, `--json`, `--list`, selection by `file:line`, a test file for each operating system that defines the same test, a `...` walk that leaves out `testdata`, `examples`, dot and underscore directories while another module fails to build, a module with no test files and a test that reads a file beside its module. `testdata/run/test_files_left_out` holds a test file that does not compile, which shows that `low build` and `low run` leave test files out.
+- The `test` suite runs `low test --notime --nocache` on every `testdata/test` directory. It compares stdout, stderr and the exit status with the directory's sidecars. It runs on both hosts. A test build cannot be expressed in a `testdata/fail` program, so the rejected test shapes are fixtures here. The fixtures also cover these cases: a crashing test, a test that times out, skipped tests, `--run` on a subtest, `--skip`, `--failfast`, `--count`, `--shuffle`, `--json` on a passing module and on one that fails to build, `--list`, selection by `file:line`, a test file for each operating system that defines the same test, a `...` walk that leaves out `testdata`, `examples`, dot and underscore directories while another module fails to build, a module with no test files and a test that reads a file beside its module. `testdata/run/test_files_left_out` holds a test file that does not compile, which shows that `low build` and `low run` leave test files out.
 - `low test std/...` runs the unit tests in the `_test.low` files of the standard library modules, built against the standard library embedded in `low`. Each file tests one module through its private code, so it uses the module's names without an import. Each file covers one area of its module:
   - `std/testing`: `selected` for each `/` level of a filter, `settings_from` for every flag and each flag error, the failure message of each assertion that returns, and `sub`, `table` and `table_of` against a `T` the test builds.
   - `std/path`: `clean`, `join`, `base`, `dir`, `ext`, `stem`, `is_absolute` and `matches` over empty paths, `.`, `..`, repeated and trailing separators and the root.
