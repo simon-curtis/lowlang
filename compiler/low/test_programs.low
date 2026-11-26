@@ -1,0 +1,274 @@
+import compiler
+import target
+import std/file
+import std/io
+import std/json
+import std/os
+import std/path
+import std/slices
+import std/sync
+import std/text
+import std/time
+
+const program_format = "low-test-program 1"
+const manifest_name = "manifest"
+const place_name = "place"
+const compiler_name = "compiler"
+
+struct Programs {
+    disk: compiler.Disk
+    root: str
+    running: str
+    cwd: str
+    compiler: str = ""
+    swept: bool = false
+}
+
+struct Remembered {
+    location: str
+    digest: str
+    warnings: str
+}
+
+struct Seen {
+    lock: sync.Mutex
+    disk: compiler.Disk
+    cwd: str
+    inputs: []Input
+    prints: [str: str]
+    unrepeatable: bool
+}
+
+fn open_programs(options: TestOptions, disk: compiler.Disk, cwd: str) -> *Programs? {
+    if options.nocache || disk.cache == "" {
+        return none
+    }
+    let running = os.executable() or return none
+    let root = path.join([disk.cache, "test", "programs"])
+    new(Programs { disk, root, running, cwd })
+}
+
+fn compiler_digest(programs: *Programs) -> str {
+    if programs.compiler != "" {
+        return programs.compiler
+    }
+    let info = file.stat(programs.running) or return ""
+    let identity = "{programs.running}\0{info.size}\0{info.modified}\0"
+    let memo = path.join([programs.root, compiler_name])
+    let held = file.read_file(memo) or []
+    let remembered = str(held)
+    if text.starts_with(remembered, identity) && remembered.len > identity.len {
+        programs.compiler = remembered[identity.len..]
+        return programs.compiler
+    }
+    programs.compiler = digest_binary(programs.running)
+    if programs.compiler != "" && info.modified + settle_seconds <= time.now() {
+        file.mkdir_all(programs.root) or return programs.compiler
+        write_atomic(memo, "{identity}{programs.compiler}") or {}
+    }
+    programs.compiler
+}
+
+fn tested_place(tested: Module) -> str {
+    if tested.dir == "" {
+        return tested.place
+    }
+    tested.dir
+}
+
+fn program_slot(programs: *Programs, tested: Module, platform: target.OS) -> str {
+    let key = key_of([program_format, "{platform.index}", tested_place(tested), programs.cwd])
+    path.join([programs.root, key[..2], key])
+}
+
+fn recall(programs: *Programs, slot: str) -> Remembered? {
+    let data = file.read_file(path.join([slot, manifest_name])) or return none
+    let doc = json.parse(data) or return none
+    let compiler = json.field_text(doc, "compiler") ?? return none
+    let digest = json.field_text(doc, "digest") ?? return none
+    let warnings = json.field_text(doc, "warnings") ?? return none
+    let inputs = parse_inputs(json.field(doc, "inputs")) ?? return none
+    if compiler != programs.compiler_digest() || digest == "" || !inputs_unchanged(inputs) {
+        return none
+    }
+    Remembered { location: path.join([slot, digest]), digest, warnings }
+}
+
+fn place_program(from: str, to: str) -> bool {
+    file.link(from, to) or {
+        file.copy(from, to) or return false
+    }
+    true
+}
+
+fn remember_program(programs: *Programs, slot: str, tested: Module, binary: str, digest: str, warnings: str, seen: *Seen) {
+    if seen.unrepeatable || digest == "" || programs.compiler_digest() == "" {
+        return
+    }
+    programs.sweep()
+    file.mkdir_all(slot) or return
+    write_atomic(path.join([slot, place_name]), tested_place(tested)) or return
+    let target = path.join([slot, digest])
+    if !file.exists(target) {
+        let staged = "{target}.tmp-{os.pid()}"
+        if !place_program(binary, staged) {
+            return
+        }
+        file.rename(staged, target) or {
+            file.remove(staged) or {}
+            return
+        }
+    }
+    write_atomic(path.join([slot, manifest_name]), programs.manifest_text(digest, warnings, seen.inputs)) or return
+    prune_slot(slot, digest)
+}
+
+fn prune_slot(slot: str, digest: str) {
+    let names = file.list(slot) or return
+    for name in names {
+        if name != digest && name != manifest_name && name != place_name && !text.contains(name, ".tmp-") {
+            file.remove(path.join([slot, name])) or {}
+        }
+    }
+}
+
+fn sweep(programs: *Programs) {
+    if programs.swept {
+        return
+    }
+    programs.swept = true
+    let shards = file.list(programs.root) or return
+    for shard in shards {
+        let held = path.join([programs.root, shard])
+        let entries = file.list(held) or continue
+        for entry in entries {
+            sweep_entry(path.join([held, entry]))
+        }
+    }
+}
+
+fn sweep_entry(slot: str) {
+    let data = file.read_file(path.join([slot, place_name])) or return
+    let place = str(data)
+    if !text.starts_with(place, "std/") && !file.exists(place) {
+        file.remove_all(slot) or {}
+    }
+}
+
+fn manifest_text(programs: *Programs, digest: str, warnings: str, inputs: []Input) -> str {
+    let writer = json.writer(0)
+    json.start_object(writer)
+    writer.json_text("compiler", programs.compiler)
+    writer.json_text("digest", digest)
+    writer.json_text("warnings", warnings)
+    json.property(writer, "inputs")
+    json.start_array(writer)
+    for input in inputs {
+        writer.json_input(input)
+    }
+    json.end_array(writer)
+    json.end_object(writer)
+    json.written_text(writer)
+}
+
+fn new_seen(disk: compiler.Disk, cwd: str) -> *Seen {
+    new(Seen { lock: sync.mutex(), disk, cwd, inputs: [], prints: [:], unrepeatable: false })
+}
+
+fn saw(seen: *Seen, op: str, name: str, fingerprint: str) {
+    let absolute = compiler.absolute(seen.disk, seen.cwd, name)
+    let identity = "{op}\0{absolute}"
+    sync.lock(seen.lock)
+    match seen.prints[identity] {
+        some(earlier) => {
+            if earlier != fingerprint {
+                seen.unrepeatable = true
+            }
+        }
+        none => {
+            seen.prints[identity] = fingerprint
+            seen.inputs.push(Input { op, name: absolute, fingerprint })
+        }
+    }
+    sync.unlock(seen.lock)
+}
+
+fn mark_unrepeatable(seen: *Seen) {
+    sync.lock(seen.lock)
+    seen.unrepeatable = true
+    sync.unlock(seen.lock)
+}
+
+fn info_print(info: compiler.Info) -> str {
+    if info.dir {
+        return "dir"
+    }
+    if info.regular {
+        return "file {info.size}"
+    }
+    "other"
+}
+
+fn entries_print(entries: []compiler.Entry) -> str {
+    var names: []str = []
+    for entry in entries {
+        names.push(entry.name)
+    }
+    slices.sort(mut names)
+    "entries\0{text.join(names, "\0")}"
+}
+
+fn recording(seen: *Seen) -> compiler.Disk {
+    let disk = seen.disk
+    let read = disk.read
+    let stat = disk.stat
+    let list = disk.list
+    let real = disk.real
+    let stamp = disk.stamp
+    var recorded = disk
+    recorded.read = fn(name: str) -> []u8 ! io.Error {
+        let data = read(name) catch {
+            failure => {
+                seen.saw("open", name, missing_print(failure))
+                fail failure
+            }
+        }
+        seen.saw("open", name, "file {sha256_hex(data)}")
+        data
+    }
+    recorded.stat = fn(name: str) -> compiler.Info ! io.Error {
+        let info = stat(name) catch {
+            failure => {
+                seen.saw("stat", name, missing_print(failure))
+                fail failure
+            }
+        }
+        seen.saw("stat", name, info_print(info))
+        info
+    }
+    recorded.list = fn(name: str) -> []compiler.Entry ! io.Error {
+        let entries = list(name) catch {
+            failure => {
+                seen.saw("list", name, missing_print(failure))
+                fail failure
+            }
+        }
+        seen.saw("list", name, entries_print(entries))
+        entries
+    }
+    recorded.real = fn(name: str) -> str ! io.Error {
+        let resolved = real(name) catch {
+            failure => {
+                seen.saw("real", name, missing_print(failure))
+                fail failure
+            }
+        }
+        seen.saw("real", name, "real {resolved}")
+        resolved
+    }
+    recorded.stamp = fn(root: str) -> compiler.Stamp {
+        seen.mark_unrepeatable()
+        stamp(root)
+    }
+    recorded
+}
