@@ -89,8 +89,9 @@ pub extern struct PolychromeSprite {
     pub grayscale: f32 = 0.0
     /// The factor the image's alpha is multiplied by.
     pub opacity: f32 = 1.0
-    spare_0: f32 = 0.0
-    spare_1: f32 = 0.0
+    /// The mip level the image is sampled at: `0` is the atlas itself and each level up halves it, so a sprite drawn at half the tile's size reads level 1 and its picture pixels average instead of aliasing. A fraction blends the two levels either side. The atlas must hold every level up to the whole number at or above it (`add_levels`, `reduce`). At each level the sprite clamps its samples to the tile, so linear filtering reads the tile's own edge, not a neighbour.
+    pub level: f32 = 0.0
+    spare: f32 = 0.0
 }
 
 /// How the sprite shaders turn the atlas's coverage into blending weights: the four coefficients of the gamma correction, the contrast boost for grey and for subpixel text, and whether the stripes run blue first. All zero leaves the coverage as the atlas holds it.
@@ -603,11 +604,64 @@ pub struct Atlas {
     pub dirty_top: i64
     /// One past the last row changed since `clean`, or `0` when none has.
     pub dirty_bottom: i64
+    /// The mip levels from 1 up, each half the size of the one below, rounded down, in the layout of `pixels`. Level `k` changed in the rows `dirty_top >> k` up to `dirty_bottom` divided by `2^k` and rounded up.
+    pub levels: u8[][] = []
 }
 
-/// Returns a clear atlas of `size` by `size` pixels, all of it marked changed.
+/// Returns a clear atlas of `size` by `size` pixels, all of it marked changed, with no mip levels.
 pub fn atlas(size: i64) -> Atlas {
     Atlas { size, pixels: __make(size * size * 4), dirty_top: 0, dirty_bottom: size }
+}
+
+/// Returns the width and height of mip level `level` of `a`, where level 0 is `pixels`.
+pub fn level_size(a: Atlas, level: i64) -> i64 {
+    a.size >> level
+}
+
+/// Gives `a` at least `count` mip levels above `pixels`, each clear, stopping at the first level whose size does not halve the one below exactly, so a level `k` texel always covers `2^k` by `2^k` pixels. The levels it already holds keep their pixels.
+pub fn add_levels(mut a: Atlas, count: i64) {
+    for a.levels.len < count && a.size % (2 << a.levels.len) == 0 {
+        let side = level_size(a, a.levels.len + 1)
+        a.levels.push(__make(side * side * 4))
+    }
+}
+
+/// Rebuilds mip levels 1 to `count` over the `width` by `height` block at `x`, `y`, each texel from the two by two texels below it, and marks the block's rows changed. The block's corners must be multiples of `2^count` and `a` must hold `count` levels, so every texel rebuilt lies inside the block. A texel's alpha is the mean of the four, and its colour the mean weighted by their alpha, so a transparent pixel's colour does not darken an opaque neighbour; four transparent texels take the plain mean.
+pub fn reduce(mut a: Atlas, x: i64, y: i64, width: i64, height: i64, count: i64) {
+    for level in 1..count + 1 {
+        let from = if level == 1 { a.pixels } else { a.levels[level - 2] }
+        let to = a.levels[level - 1]
+        let from_side = level_size(a, level - 1)
+        let to_side = level_size(a, level)
+        for row in y >> level..(y + height) >> level {
+            for col in x >> level..(x + width) >> level {
+                average_texel(from, from_side, col * 2, row * 2, to, (row * to_side + col) * 4)
+            }
+        }
+    }
+    mark_rows(mut a, y, height)
+}
+
+fn average_texel(from: u8[], side: i64, x: i64, y: i64, to: u8[], at: i64) {
+    let p0 = (y * side + x) * 4
+    let p1 = p0 + 4
+    let p2 = p0 + side * 4
+    let p3 = p2 + 4
+    let a0 = i64(from[p0 + 3])
+    let a1 = i64(from[p1 + 3])
+    let a2 = i64(from[p2 + 3])
+    let a3 = i64(from[p3 + 3])
+    let alpha = a0 + a1 + a2 + a3
+    for c in 0..3 {
+        let sum = if alpha == 0 {
+            i64(from[p0 + c]) + i64(from[p1 + c]) + i64(from[p2 + c]) + i64(from[p3 + c])
+        } else {
+            i64(from[p0 + c]) * a0 + i64(from[p1 + c]) * a1 + i64(from[p2 + c]) * a2 + i64(from[p3 + c]) * a3
+        }
+        let weight = if alpha == 0 { 4 } else { alpha }
+        to[at + c] = u8((sum + weight / 2) / weight)
+    }
+    to[at + 3] = u8((alpha + 2) / 4)
 }
 
 /// Copies `coverage`, `width` by `height` bytes in rows, into the atlas with its top-left pixel at `x`, `y`, and marks those rows changed. Only the first byte of each pixel is written.
@@ -648,19 +702,19 @@ pub fn write_colors(mut a: Atlas, x: i64, y: i64, width: i64, height: i64, color
     mark_rows(mut a, y, height)
 }
 
-/// Copies the outermost pixels of the `width` by `height` tile at `x`, `y` into the one-pixel border around it, corners included, and marks those rows changed, so linear filtering at the tile's edge reads the tile's own edge as the sampler's clamp to edge does.
-pub fn extend_edges(mut a: Atlas, x: i64, y: i64, width: i64, height: i64) {
-    let right = x + width - 1
-    let bottom = y + height - 1
-    for row in y..bottom + 1 {
-        copy_pixel(mut a, x, row, x - 1, row)
-        copy_pixel(mut a, right, row, right + 1, row)
+/// Grows the `width` by `height` tile at `x`, `y` to `to_width` by `to_height` by repeating its last column to the right and then its last row down, and marks those rows changed, so a mip level texel that straddles the tile's right or bottom edge averages the tile's own edge.
+pub fn extend_edges(mut a: Atlas, x: i64, y: i64, width: i64, height: i64, to_width: i64, to_height: i64) {
+    for row in y..y + height {
+        for col in x + width..x + to_width {
+            copy_pixel(mut a, x + width - 1, row, col, row)
+        }
     }
-    for col in x - 1..right + 2 {
-        copy_pixel(mut a, col, y, col, y - 1)
-        copy_pixel(mut a, col, bottom, col, bottom + 1)
+    for row in y + height..y + to_height {
+        for col in x..x + to_width {
+            copy_pixel(mut a, col, y + height - 1, col, row)
+        }
     }
-    mark_rows(mut a, y - 1, height + 2)
+    mark_rows(mut a, y, to_height)
 }
 
 fn copy_pixel(mut a: Atlas, from_x: i64, from_y: i64, to_x: i64, to_y: i64) {
@@ -680,10 +734,15 @@ fn mark_rows(mut a: Atlas, y: i64, height: i64) {
     }
 }
 
-/// Zeroes every pixel and marks the whole atlas changed.
+/// Zeroes every pixel of every level and marks the whole atlas changed.
 pub fn clear(mut a: Atlas) {
     for i in 0..a.pixels.len {
         a.pixels[i] = 0
+    }
+    for level in a.levels {
+        for i in 0..level.len {
+            level[i] = 0
+        }
     }
     a.dirty_top = 0
     a.dirty_bottom = a.size

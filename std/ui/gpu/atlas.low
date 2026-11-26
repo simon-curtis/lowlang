@@ -6,6 +6,9 @@ struct Texture {
 }
 
 struct Band {
+    texture: i64
+    level: i64
+    side: i64
     top: i64
     bottom: i64
     offset: i64
@@ -31,8 +34,8 @@ fn ensure_textures(s: *DeviceState, atlases: scene.Atlas[]) ! Error {
     }
     drop_textures_after(s, atlases.len)?
     for i, a in atlases {
-        if i >= s.textures.len || s.textures[i].image.width != a.size {
-            replace_texture(s, i, a.size)?
+        if i >= s.textures.len || s.textures[i].image.width != a.size || s.textures[i].image.levels != a.levels.len + 1 {
+            replace_texture(s, i, a.size, a.levels.len + 1)?
         }
     }
 }
@@ -49,10 +52,10 @@ fn drop_textures_after(s: *DeviceState, keep: i64) ! Error {
     s.textures = s.textures[..keep]
 }
 
-fn replace_texture(s: *DeviceState, index: i64, size: i64) ! Error {
+fn replace_texture(s: *DeviceState, index: i64, size: i64, levels: i64) ! Error {
     let d = s.device
     let usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-    let image = create_image(d, VK_FORMAT_R8G8B8A8_UNORM, size, size, VK_SAMPLE_COUNT_1_BIT, usage)?
+    let image = create_image(d, VK_FORMAT_R8G8B8A8_UNORM, size, size, levels, VK_SAMPLE_COUNT_1_BIT, usage)?
     check(vkDeviceWaitIdle(d.handle), "vkDeviceWaitIdle") catch {
         e => {
             destroy_image(d, image)
@@ -88,69 +91,90 @@ fn atlas_bands(s: *DeviceState, atlases: scene.Atlas[]) -> Band[] {
     var bands: Band[] = []
     var offset = 0
     for i, a in atlases {
-        let band = atlas_band(s.textures[i], a, offset)
-        offset += (band.bottom - band.top) * a.size * 4
-        bands.push(band)
+        for level in 0..a.levels.len + 1 {
+            let band = atlas_band(s.textures[i], a, i, level, offset)
+            offset += (band.bottom - band.top) * band.side * 4
+            bands.push(band)
+        }
     }
     bands
 }
 
-fn atlas_band(t: Texture, a: scene.Atlas, offset: i64) -> Band {
+fn atlas_band(t: Texture, a: scene.Atlas, texture: i64, level: i64, offset: i64) -> Band {
+    let side = scene.level_size(a, level)
+    let whole = Band { texture, level, side, top: 0, bottom: side, offset }
     if !t.ready {
-        return Band { top: 0, bottom: a.size, offset }
+        return whole
     }
     if !scene.dirty(a) {
-        return Band { top: 0, bottom: 0, offset }
+        return Band { texture, level, side, top: 0, bottom: 0, offset }
     }
-    let top = if a.dirty_top > 0 { a.dirty_top } else { 0 }
-    let bottom = if a.dirty_bottom < a.size { a.dirty_bottom } else { a.size }
-    Band { top, bottom, offset }
+    let step = 1 << level
+    let top = if a.dirty_top > 0 { a.dirty_top / step } else { 0 }
+    let bottom = (a.dirty_bottom + step - 1) / step
+    Band { texture, level, side, top, bottom: if bottom < side { bottom } else { side }, offset }
 }
 
 fn stage_atlases(s: *DeviceState, f: *Frame, atlases: scene.Atlas[], bands: Band[]) ! Error {
     var bytes = 0
-    for i, band in bands {
-        bytes += (band.bottom - band.top) * atlases[i].size * 4
+    for band in bands {
+        bytes += (band.bottom - band.top) * band.side * 4
     }
     if bytes == 0 {
         return
     }
     ensure_buffer(s.device, mut f.staging, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)?
-    for i, band in bands {
-        stage_rows(f, atlases[i], band)
+    for band in bands {
+        stage_rows(f, level_pixels(atlases[band.texture], band.level), band)
     }
 }
 
-fn stage_rows(f: *Frame, a: scene.Atlas, band: Band) {
+fn level_pixels(a: scene.Atlas, level: i64) -> u8[] {
+    if level == 0 { a.pixels } else { a.levels[level - 1] }
+}
+
+fn stage_rows(f: *Frame, pixels: u8[], band: Band) {
     if band.bottom <= band.top {
         return
     }
-    let rows = (band.bottom - band.top) * a.size * 4
+    let rows = (band.bottom - band.top) * band.side * 4
     let base: ptr[u8] = f.staging.mapped
     let staged = view(base, f.staging.size)
-    __memmove(staged[band.offset..band.offset + rows], a.pixels[band.top * a.size * 4..band.bottom * a.size * 4])
+    __memmove(staged[band.offset..band.offset + rows], pixels[band.top * band.side * 4..band.bottom * band.side * 4])
 }
 
 fn record_atlas_uploads(mut pins: Pins, cmd: VkCommandBuffer, s: *DeviceState, f: *Frame, atlases: scene.Atlas[], bands: Band[]) {
-    for i, band in bands {
-        record_atlas_upload(mut pins, cmd, s.textures[i], f, atlases[i], band)
+    for i in 0..atlases.len {
+        record_atlas_upload(mut pins, cmd, s.textures[i], f, bands_of(bands, i))
     }
 }
 
-fn record_atlas_upload(mut pins: Pins, cmd: VkCommandBuffer, t: Texture, f: *Frame, a: scene.Atlas, band: Band) {
-    if band.bottom <= band.top {
+fn bands_of(bands: Band[], texture: i64) -> Band[] {
+    var out: Band[] = []
+    for band in bands {
+        if band.texture == texture && band.bottom > band.top {
+            out.push(band)
+        }
+    }
+    out
+}
+
+fn record_atlas_upload(mut pins: Pins, cmd: VkCommandBuffer, t: Texture, f: *Frame, bands: Band[]) {
+    if bands.len == 0 {
         return
     }
     let from = if t.ready { VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } else { VK_IMAGE_LAYOUT_UNDEFINED }
     image_barrier(mut pins, cmd, t.image.handle, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT)
-    let layers = VkImageSubresourceLayers { aspectMask: VK_IMAGE_ASPECT_COLOR_BIT, layerCount: 1 }
-    let offset = VkOffset3D { x: 0, y: i32(band.top), z: 0 }
-    let extent = VkExtent3D { width: u32(a.size), height: u32(band.bottom - band.top), depth: 1 }
-    let copy = VkBufferImageCopy { bufferOffset: band.offset, imageSubresource: layers, imageOffset: offset, imageExtent: extent }
-    let regions = pins.hold(copy)
-    vkCmdCopyBufferToImage(cmd, f.staging.handle, t.image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, regions)
+    for band in bands {
+        let layers = VkImageSubresourceLayers { aspectMask: VK_IMAGE_ASPECT_COLOR_BIT, mipLevel: u32(band.level), layerCount: 1 }
+        let offset = VkOffset3D { x: 0, y: i32(band.top), z: 0 }
+        let extent = VkExtent3D { width: u32(band.side), height: u32(band.bottom - band.top), depth: 1 }
+        let copy = VkBufferImageCopy { bufferOffset: band.offset, imageSubresource: layers, imageOffset: offset, imageExtent: extent }
+        let regions = pins.hold(copy)
+        vkCmdCopyBufferToImage(cmd, f.staging.handle, t.image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, regions)
+    }
     image_barrier(mut pins, cmd, t.image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)

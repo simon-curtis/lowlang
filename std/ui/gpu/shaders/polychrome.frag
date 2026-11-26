@@ -12,9 +12,22 @@ layout(location = 0) out vec4 color;
 
 const vec3 grayscale_factors = vec3(0.2126, 0.7152, 0.0722);
 
+vec4 sample_level(vec4 tile, float level) {
+    vec2 half_texel = 0.5 * exp2(level) / vec2(textureSize(atlas, 0));
+    vec2 centre = tile.xy + 0.5 * tile.zw;
+    vec2 low = min(tile.xy + half_texel, centre);
+    vec2 high = max(tile.xy + tile.zw - half_texel, centre);
+    return textureLod(atlas, clamp(uv, low, high), level);
+}
+
 void main() {
     PolychromeSprite sprite = polychrome_sprites[sprite_index];
-    vec4 sampled = texture(atlas, uv);
+    float lower = floor(sprite.effects.z);
+    float blend = sprite.effects.z - lower;
+    vec4 sampled = sample_level(sprite.tile, lower);
+    if (blend > 0.0) {
+        sampled = mix(sampled, sample_level(sprite.tile, lower + 1.0), blend);
+    }
     float distance = quad_sdf(gl_FragCoord.xy, sprite.bounds, sprite.corner_radii);
     vec4 shaded = sampled;
     if (sprite.effects.x != 0.0) {

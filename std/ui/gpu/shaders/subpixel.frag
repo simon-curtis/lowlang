@@ -14,7 +14,7 @@ layout(location = 0, index = 1) out vec4 stripe_coverage;
 
 void main() {
     Sprite sprite = sprites[sprite_index];
-    vec3 sampled = texture(atlas, uv).rgb;
+    vec3 sampled = textureLod(atlas, uv, 0.0).rgb;
     if (viewport.is_bgr != 0u) {
         sampled = sampled.bgr;
     }
