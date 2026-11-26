@@ -2472,7 +2472,7 @@ The garbage collector is a non-moving mark-sweep collector in the runtime:
   - Goroutine stacks and regions are claimed by atomic index. Pins and `rt_cells` are scanned by the collecting thread.
   - Sweeping splits the heap bitmap into ranges of 8192 bitmap words (4 MB of heap), claimed by atomic index. Each range builds its own bins and small lists with their tails, records its first start if that object is dead, its first marked object and the start of a free run left open at its end. The collector then walks the ranges in address order, completes the runs that cross a range boundary and prepends each range's lists, so the free lists are the ones a sequential sweep builds whatever the thread timing.
 - Roots come from stack maps.
-  - At every call the code generator records the frame words that may hold a heap pointer at that point: the saved callee-saved registers, spill slots of values that may be pointers and are live across the call, and every frame slot. The maps form a table sorted by return address.
+  - At every call the code generator records the frame words that may hold a heap pointer at that point: the saved callee-saved registers, spill slots of values that may be pointers and are live across the call, and every frame slot. The frame slots are contiguous, so a map lists them as one range of frame words that the collector scans with `rt_scan_range`. The maps form a table sorted by return address.
   - A value passed to a C call that may be a pointer is live until the call returns, so a collection during the call keeps memory whose last use is that argument.
   - The words of `rt_cells`, one per hoisted literal, are scanned as roots in every collection.
 - Green-thread stacks:
@@ -2508,7 +2508,8 @@ The derivations are generated as source:
   - Instances are made on demand, checked from a work list, and limited to 1000 per template.
   - Symbols escape every character outside `A-Za-z0-9_.` as `.` and its hex code, so `max[i64]` is `fn_max.5bi64.5d`.
 - SSA is built directly from the checked tree with Braun et al.'s algorithm: variables are read and written per block, phis are created lazily and sealed once a block's predecessors are known, and trivial phis are removed.
-- Every value is one 64-bit word. A struct, enum or result of n words is n SSA values, so aggregates live in registers with no frame temporaries.
+- Every value is one 64-bit word. A struct, enum or result of n words is n SSA values.
+- A parameter or result type of at least `ir.by_reference_words` (64) words that is neither a vector nor holds a C struct passes by reference. The parameter is one pointer word to memory the callee only reads, and the result is written through a pointer the caller passes as the last parameter word. Callbacks and `main` keep the word convention. The caller passes the memory an argument already lives in when its words are one unchanged run read from a by-reference parameter, a call's result or an immutable local, and otherwise stores the words into a fresh frame slot. An immutable local of such a type lives in memory the same way, and a run of at least 8 words read from one such place is copied with one `rt_memmove`.
 - Narrow integers are kept sign-extended (`i32`) or zero-extended (`u32`, `u16`, `u8`) in their word. Floats are kept as their bit pattern, `f32` zero-extended. Arithmetic, conversion and comparison values carry their type.
 - Frame slots and SSA variables:
   - A variable passed as `mut` to a function, captured by a closure, or of a C or vector type lives in a frame slot (or a heap box when captured) and is accessed with loads and stores. Every other variable is pure SSA.
@@ -2583,6 +2584,8 @@ The derivations are generated as source:
 Frame-slot promotion:
 
 - A frame slot is promoted to SSA values by the optimiser when its address is used only by word-sized loads and stores at word offsets inside it, and is never passed to a call, stored, compared with another address or reached through arithmetic with a variable. Its stores disappear, each load becomes the value stored on every path that reaches it, and phis join the paths. A slot read before any store reads an undefined value.
+- An `rt_memmove` of a constant whole number of words between two slots counts as word loads and stores: when either slot is promotable the copy becomes one load and store per word first.
+- A call returning by reference whose result slot is used only by the call and by one copy of the whole result into another frame slot, or into the function's own result pointer, writes its result there directly, when no argument of the call points into that memory and nothing reads it between the call and the copy.
 - A slot of a C or vector type, a `select` box, a lock array and a slot with more than one address value stay in memory.
 - After inlining, a `mut` argument whose callee is inlined therefore lives in registers.
 - Loads and stores carry the flags raw (a narrow or tail access of a C struct, or `load` and `store`) and trap (`load`, which is never discarded).
@@ -2767,7 +2770,7 @@ Optimiser:
 Calling convention:
 
 - The first six argument words go in `rdi`, `rsi`, `rdx`, `rcx`, `r8` and `r9`. The rest go in an outgoing area at the bottom of the caller's frame, so `rsp` does not move inside a function.
-- Up to two result words return in `rax` and `rdx`. Wider results are written to the outgoing area after the stack arguments.
+- Up to two result words return in `rax` and `rdx`. Wider results are written to the outgoing area after the stack arguments. A result passed by reference returns no words.
 - Argument and parameter registers, general and `xmm`, are filled with a parallel move that breaks cycles through `r11`.
 
 ### Vectors
