@@ -2442,6 +2442,39 @@ While an entry is open `add`, `begin_entry` and `finish` fail with `Invalid`.
 
 `extract` works over the filesystem. Encrypted entries and other methods fail with `Unsupported`.
 
+## std/git
+
+A repository is a `.git` directory, a bare directory or a linked worktree whose `.git` file names its directory and whose `commondir` names the shared one. `discover` makes its argument absolute and looks there and in each directory above. Repository format versions 0 and 1 with SHA-1 objects are read; another object format or format version fails with `Unsupported`.
+
+Objects are read from loose files first and then from the packs under `objects/pack`, through version 2 indexes. Packs are read with offset and reference deltas, and a pack added since the last read is found on a miss. Up to 256 delta bases are kept per repository.
+
+`add_pack` takes a pack as `fetch` receives it. It checks the trailer, resolves every delta, and completes a thin pack by appending the bases the repository already holds. It then writes the `.pack` and its index under the name of its trailer. `write_pack` stores each object of a list whole. `missing_objects` lists what a set of wanted commits, trees and tags reaches and a callback does not have. Loose objects are written at zlib level 1 through a temporary file and a rename.
+
+`refs` lists loose references and `packed-refs` together, sorted by name, with a loose reference winning. An annotated tag's `peeled` comes from the `^` line of `packed-refs` or is computed. `HEAD` and references outside `refs/`, and `refs/bisect`, `refs/worktree` and `refs/rewritten`, belong to the worktree. Every other reference belongs to the shared directory. `resolve` takes a full id or a reference name with an optional `^{kind}` or `^{}` suffix. It has no abbreviated ids and no `~` or `^n` ancestry.
+
+`user_config` reads the system, global and command-line levels as Git does: `GIT_CONFIG_SYSTEM` or `/etc/gitconfig` unless `GIT_CONFIG_NOSYSTEM` is set, `GIT_CONFIG_GLOBAL` or the XDG file and `~/.gitconfig`, then `GIT_CONFIG_COUNT`. `include.path` is followed up to ten deep; `includeIf` is ignored.
+
+`export` and `export_entries` read only the `.gitattributes` files of the tree, not `info/attributes` or `core.attributesFile`. A path that sets `export-ignore` is left out with everything below it. Attributes that rewrite content (`export-subst`, `ident`, `working-tree-encoding`, `eol=crlf`) fail with `Unsupported`, so an exported tree always holds the bytes the commit holds.
+
+`testdata/git` holds what `testdata/git/make.sh` writes with git: a pack with offset deltas, a thin pack whose reference deltas have their bases in the first, a `packed-refs` file, and the objects, references and revisions git lists for them. `git_test.low` indexes both packs and requires the same listings. The tests that compare written objects with `git fsck` and `git write-tree`, and `export` with `git archive`, skip without `git`.
+
+## std/git/remote
+
+A URL is first rewritten by the longest matching `url.<base>.insteadOf` in `Options.config`, which `defaults` reads with `git.user_config`.
+
+| URL | Transport |
+| --- | --- |
+| `http://`, `https://` | Smart HTTP, with `http.proxy` or the proxy environment variables. A `401` asks `Options.credentials` once; `defaults` asks `git credential fill`. |
+| `ssh://`, `git+ssh://`, `user@host:path` | `std/ssh` running `git-upload-pack` on the host. `~/.ssh/config` supplies `HostName`, `User`, `Port` and `IdentityFile`. Keys come from the agent and then the identity files without a passphrase. The host key must be in `~/.ssh/known_hosts` or `/etc/ssh/ssh_known_hosts`. A host or path starting with `-` is refused. |
+| `git://` | The Git daemon protocol over TCP. |
+| `file://`, a path | The repository is read directly, and `fetch` copies the missing objects as one pack. |
+
+Protocol version 2 is asked for and version 0 is spoken when the server offers only it. `fetch` sends the ids `r`'s references point to as haves and indexes the pack with `git.add_pack`. Shallow and partial clones, push, `http.extraHeader`, `http.sslCAInfo` and per-remote settings are not implemented. TLS checks the server against the system roots.
+
+`http_handler` answers `GET info/refs?service=git-upload-pack` and `POST git-upload-pack` with protocol version 2 under any path prefix. A fetch is answered with every object the wanted ids reach that the client's haves and their root trees do not, each stored whole.
+
+`remote_test.low` fetches from `http_handler` over HTTP, clones from it with `git clone`, and fetches from `git daemon` over `git://`. The last two skip without `git`.
+
 ## std/testing
 
 Assertions `equal`, `not_equal`, `equal_slice`, `is_true`, `is_false`, `is_some`, `is_none`, `contains`, `contains_item`, `close_to`, `unexpected`, `must` and `expect_error` render values of any type. `table` and `table_of`.
