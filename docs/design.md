@@ -2569,7 +2569,12 @@ enum ParseError {
 
 fn parse(s: str) -> i64 ! ParseError {
     if s.len == 0 { fail Empty }
-    ...
+    var n = 0
+    for i, c in s {
+        if c < '0' || c > '9' { fail BadDigit(i) }
+        n = n * 10 + i64(c - '0')
+    }
+    n
 }
 
 fn total(a: str, b: str) -> i64 ! ParseError {
@@ -2604,6 +2609,7 @@ fn main() ! ParseError {
     let m = parse("") or -1
     let o: i64? = parse("") or none
     validate(n)?
+    print("{n} {m} {o ?? 0}")
 }
 ```
 
