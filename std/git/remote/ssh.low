@@ -1,0 +1,209 @@
+import std/file
+import std/os
+import std/path
+import std/ssh
+import std/ssh/agent
+import std/ssh/key
+import std/text
+
+struct SshTarget {
+    user: str
+    host: str
+    port: i64
+    path: str
+}
+
+fn ssh_target(url: str) -> SshTarget ! Error {
+    var rest = ""
+    match text.strip_prefix(url, "ssh://") {
+        some(r) => {
+            rest = r
+        }
+        none => {
+            rest = text.strip_prefix(url, "git+ssh://") ?? ""
+        }
+    }
+    if rest != "" {
+        let slash = text.index_byte(rest, '/')
+        if slash < 0 {
+            fail Unsupported("SSH URL {url} without a path")
+        }
+        var authority = rest[..slash]
+        var repo_path = rest[slash..]
+        var user = ""
+        let at = text.last_index_byte(authority, '@')
+        if at >= 0 {
+            user = authority[..at]
+            authority = authority[at + 1..]
+        }
+        var port = 22
+        let colon = text.last_index_byte(authority, ':')
+        if colon >= 0 && text.index_byte(authority, ']') < colon {
+            port = text.parse_int(authority[colon + 1..]) or fail Unsupported("SSH URL {url} with port {authority[colon + 1..]}")
+            authority = authority[..colon]
+        }
+        authority = text.trim_suffix(text.trim_prefix(authority, "["), "]")
+        if text.starts_with(repo_path, "/~") {
+            repo_path = repo_path[1..]
+        }
+        return checked_target(url, SshTarget { user, host: authority, port, path: repo_path })
+    }
+    let colon = text.index_byte(url, ':')
+    if colon < 0 {
+        fail Unsupported("SSH location {url} without a path")
+    }
+    var host = url[..colon]
+    var user = ""
+    let at = text.last_index_byte(host, '@')
+    if at >= 0 {
+        user = host[..at]
+        host = host[at + 1..]
+    }
+    checked_target(url, SshTarget { user, host: text.trim_suffix(text.trim_prefix(host, "["), "]"), port: 22, path: url[colon + 1..] })
+}
+
+fn checked_target(url: str, t: SshTarget) -> SshTarget ! Error {
+    if t.host == "" || t.path == "" || text.starts_with(t.host, "-") || text.starts_with(t.path, "-") {
+        fail Unsupported("SSH location {url}")
+    }
+    t
+}
+
+fn shell_quote(s: str) -> str {
+    "'{text.replace(s, "'", "'\\''")}'"
+}
+
+struct HostConfig {
+    host: str
+    user: str
+    port: i64
+    identities: str[]
+}
+
+fn ssh_dir() -> str {
+    path.join([os.env("HOME") ?? os.home_dir() ?? "", ".ssh"])
+}
+
+fn host_config(t: SshTarget) -> HostConfig {
+    var out = HostConfig { host: t.host, user: t.user, port: t.port, identities: [] }
+    let data = file.read_text(path.join([ssh_dir(), "config"])) or return out
+    var applies = true
+    var seen: [str: bool] = [:]
+    for raw in text.lines(data) {
+        let line = text.trim(raw)
+        if line.len == 0 || line[0] == '#' {
+            continue
+        }
+        var fields = text.fields(text.replace(line, "=", " "))
+        if fields.len < 2 {
+            continue
+        }
+        let keyword = text.lower(fields[0])
+        if keyword == "host" {
+            applies = false
+            for pattern in fields[1..] {
+                if pattern[0] != '!' && path.matches(pattern, t.host) {
+                    applies = true
+                }
+            }
+            continue
+        }
+        if keyword == "match" {
+            applies = false
+            continue
+        }
+        if !applies || seen[keyword] != none && keyword != "identityfile" {
+            continue
+        }
+        seen[keyword] = true
+        match keyword {
+            "hostname" => {
+                out.host = fields[1]
+            }
+            "user" => {
+                if out.user == "" {
+                    out.user = fields[1]
+                }
+            }
+            "port" => {
+                if t.port == 22 {
+                    out.port = text.parse_int(fields[1]) or 22
+                }
+            }
+            "identityfile" => out.identities.push(expand_tilde(fields[1]))
+            _ => {}
+        }
+    }
+    out
+}
+
+fn expand_tilde(p: str) -> str {
+    let rest = text.strip_prefix(p, "~/") ?? return p
+    path.join([os.env("HOME") ?? os.home_dir() ?? "", rest])
+}
+
+fn file_signers(identities: str[]) -> key.Signer[] {
+    var out: key.Signer[] = []
+    var files = identities
+    if files.len == 0 {
+        for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+            files.push(path.join([ssh_dir(), name]))
+        }
+    }
+    for location in files {
+        let private = key.load_private_key(location, "") or continue
+        let s = key.signer(private) or continue
+        out.push(s)
+    }
+    out
+}
+
+fn known_hosts_check(host: str, port: i64) -> fn(key.PublicKey) -> bool {
+    var entries: key.KnownHost[] = []
+    for location in [path.join([ssh_dir(), "known_hosts"]), "/etc/ssh/ssh_known_hosts"] {
+        let data = file.read_text(location) or continue
+        for e in key.parse_known_hosts(data) or [] {
+            entries.push(e)
+        }
+    }
+    key.known_hosts_verifier(entries, host, port)
+}
+
+fn ssh_session(url: str, work: fn(Session) ! Error) ! Error {
+    let t = ssh_target(url)?
+    let c = host_config(t)
+    let files = file_signers(c.identities)
+    using a = agent.connect_any() or {
+        dial_ssh(url, t, c, files, work)?
+        return
+    }
+    var all = agent.signers(a) or []
+    for s in files {
+        all.push(s)
+    }
+    dial_ssh(url, t, c, all, work)?
+}
+
+fn dial_ssh(url: str, t: SshTarget, c: HostConfig, signers: key.Signer[], work: fn(Session) ! Error) ! Error {
+    let user = if c.user != "" { c.user } else { os.user_name() ?? "git" }
+    var methods: ssh.AuthMethod[] = []
+    for s in signers {
+        methods.push(ssh.AuthMethod.PublicKey(s))
+    }
+    let config = ssh.ClientConfig { user, verify_host_key: known_hosts_check(c.host, c.port), auth: methods, handshake_timeout: 30000 }
+    using conn = ssh.dial(c.host, c.port, config) catch {
+        e => match e {
+            HostKeyRejected => fail HostKey(c.host)
+            AuthFailed => fail Auth(url)
+            _ => fail Connect(url, "{e}")
+        }
+    }
+    using ch = ssh.open_session(conn) catch {
+        e => fail Connect(url, "{e}")
+    }
+    ssh.env_on(ch.handle, "GIT_PROTOCOL", "version=2") or {}
+    ssh.exec_on(ch.handle, "git-upload-pack {shell_quote(t.path)}") catch {
+        e => fail Connect(url, "the server refused git-upload-pack: {e}")
+    }
+    work(stream_session(ssh.stream(ch))?)?
+}

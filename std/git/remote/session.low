@@ -1,0 +1,337 @@
+import std/git
+import std/io
+import std/text
+
+struct Session {
+    version: i64
+    advertisement: u8[]
+    call: fn(u8[]) -> u8[] ! Error
+}
+
+struct Listed {
+    refs: git.Ref[]
+    head: str
+}
+
+fn opening(data: u8[]) -> Session ! Error {
+    let p = pkt_reader(data)
+    var start = 0
+    if p.more() {
+        match p.next_packet()? {
+            Data(b) => {
+                check_err(b)?
+                if text.starts_with(str(b), "# service=") {
+                    match p.next_packet()? {
+                        Flush => {}
+                        _ => fail Protocol("a service line not followed by a flush")
+                    }
+                    start = p.at
+                }
+            }
+            _ => {}
+        }
+    }
+    let rest = data[start..]
+    let q = pkt_reader(rest)
+    var version = 0
+    if q.more() {
+        match q.next_packet()? {
+            Data(b) => {
+                if line_of(b) == "version 2" {
+                    version = 2
+                }
+            }
+            _ => {}
+        }
+    }
+    Session { version, advertisement: rest, call: fn(request: u8[]) -> u8[] ! Error { fail Protocol("no request channel") } }
+}
+
+fn capabilities_v2(s: Session) -> [str: str] ! Error {
+    var caps: [str: str] = [:]
+    let p = pkt_reader(s.advertisement)
+    for p.more() {
+        match p.next_packet()? {
+            Data(b) => {
+                let line = line_of(b)
+                let eq = text.index_byte(line, '=')
+                if eq < 0 {
+                    caps[line] = ""
+                } else {
+                    caps[line[..eq]] = line[eq + 1..]
+                }
+            }
+            Flush => break
+            _ => {}
+        }
+    }
+    caps
+}
+
+fn agent_line() -> str {
+    "agent=git/low"
+}
+
+fn list_refs(s: Session, prefixes: str[]) -> Listed ! Error {
+    if s.version == 2 {
+        return ls_refs(s, prefixes)
+    }
+    v0_listing(s, prefixes)
+}
+
+fn ls_refs(s: Session, prefixes: str[]) -> Listed ! Error {
+    var req: u8[] = []
+    io.append(mut req, pkt_line("command=ls-refs\n"))
+    io.append(mut req, pkt_line("{agent_line()}\n"))
+    io.append(mut req, delim_pkt())
+    io.append(mut req, pkt_line("peel\n"))
+    io.append(mut req, pkt_line("symrefs\n"))
+    io.append(mut req, pkt_line("ref-prefix HEAD\n"))
+    for prefix in prefixes {
+        io.append(mut req, pkt_line("ref-prefix {prefix}\n"))
+    }
+    io.append(mut req, flush_pkt())
+    let answer = s.call(req)?
+    var refs: git.Ref[] = []
+    var head = ""
+    let p = pkt_reader(answer)
+    for p.more() {
+        match p.next_packet()? {
+            Data(b) => {
+                check_err(b)?
+                let fields = text.split(line_of(b), ' ')
+                if fields.len < 2 || !git.valid_id(fields[0]) && fields[0] != "unborn" {
+                    fail Protocol("an ls-refs line {line_of(b)}")
+                }
+                var peeled = ""
+                for attr in fields[2..] {
+                    match text.strip_prefix(attr, "peeled:") {
+                        some(v) => {
+                            peeled = v
+                        }
+                        none => {}
+                    }
+                    match text.strip_prefix(attr, "symref-target:") {
+                        some(v) => {
+                            if fields[1] == "HEAD" {
+                                head = v
+                            }
+                        }
+                        none => {}
+                    }
+                }
+                if fields[0] != "unborn" && wanted_name(fields[1], prefixes) {
+                    refs.push(git.Ref { name: fields[1], id: fields[0], peeled })
+                }
+            }
+            Flush => break
+            _ => {}
+        }
+    }
+    Listed { refs, head }
+}
+
+fn wanted_name(name: str, prefixes: str[]) -> bool {
+    if prefixes.len == 0 {
+        return true
+    }
+    for prefix in prefixes {
+        if text.starts_with(name, prefix) {
+            return true
+        }
+    }
+    false
+}
+
+struct Advertised {
+    refs: git.Ref[]
+    caps: str[]
+    head: str
+}
+
+fn v0_advertised(s: Session) -> Advertised ! Error {
+    var refs: git.Ref[] = []
+    var caps: str[] = []
+    var head = ""
+    let p = pkt_reader(s.advertisement)
+    var first = true
+    for p.more() {
+        match p.next_packet()? {
+            Data(b) => {
+                check_err(b)?
+                var line = line_of(b)
+                if first && line == "version 1" {
+                    continue
+                }
+                let nul = text.index_byte(line, 0)
+                if nul >= 0 {
+                    caps = text.fields(line[nul + 1..])
+                    line = line[..nul]
+                    for cap in caps {
+                        match text.strip_prefix(cap, "symref=HEAD:") {
+                            some(target) => {
+                                head = target
+                            }
+                            none => {}
+                        }
+                    }
+                }
+                first = false
+                let space = text.index_byte(line, ' ')
+                if space != 40 {
+                    fail Protocol("a reference line {line}")
+                }
+                let id = line[..40]
+                let name = line[41..]
+                if name == "capabilities^{{}}" {
+                    continue
+                }
+                match text.strip_suffix(name, "^{{}}") {
+                    some(base) => {
+                        if refs.len > 0 && refs[refs.len - 1].name == base {
+                            let last = refs.pop() ?? break
+                            refs.push(git.Ref { name: last.name, id: last.id, peeled: id })
+                        }
+                    }
+                    none => refs.push(git.Ref { name, id })
+                }
+            }
+            Flush => break
+            _ => {}
+        }
+    }
+    Advertised { refs, caps, head }
+}
+
+fn v0_listing(s: Session, prefixes: str[]) -> Listed ! Error {
+    let a = v0_advertised(s)?
+    var refs: git.Ref[] = []
+    for r in a.refs {
+        if wanted_name(r.name, prefixes) {
+            refs.push(r)
+        }
+    }
+    Listed { refs, head: a.head }
+}
+
+fn fetch_pack(s: Session, wants: str[], haves: str[]) -> u8[] ! Error {
+    if s.version == 2 {
+        return fetch_v2(s, wants, haves)
+    }
+    fetch_v0(s, wants, haves)
+}
+
+fn fetch_v2(s: Session, wants: str[], haves: str[]) -> u8[] ! Error {
+    let caps = capabilities_v2(s)?
+    if caps["fetch"] == none {
+        fail Unsupported("server without the fetch command")
+    }
+    var req: u8[] = []
+    io.append(mut req, pkt_line("command=fetch\n"))
+    io.append(mut req, pkt_line("{agent_line()}\n"))
+    io.append(mut req, delim_pkt())
+    io.append(mut req, pkt_line("ofs-delta\n"))
+    io.append(mut req, pkt_line("no-progress\n"))
+    for id in wants {
+        io.append(mut req, pkt_line("want {id}\n"))
+    }
+    for id in haves {
+        io.append(mut req, pkt_line("have {id}\n"))
+    }
+    io.append(mut req, pkt_line("done\n"))
+    io.append(mut req, flush_pkt())
+    let answer = s.call(req)?
+    var pack: u8[] = []
+    var section = ""
+    let p = pkt_reader(answer)
+    for p.more() {
+        match p.next_packet()? {
+            Data(b) => {
+                if section == "packfile" {
+                    sideband(b, mut pack)?
+                    continue
+                }
+                check_err(b)?
+                section = line_of(b)
+            }
+            Delim => {
+                section = ""
+            }
+            Flush => break
+            End => break
+        }
+    }
+    if pack.len == 0 {
+        fail Protocol("a fetch response without a pack")
+    }
+    pack
+}
+
+fn fetch_v0(s: Session, wants: str[], haves: str[]) -> u8[] ! Error {
+    let a = v0_advertised(s)?
+    var offered: [str: bool] = [:]
+    for cap in a.caps {
+        offered[cap] = true
+    }
+    var caps: str[] = []
+    var band = false
+    if offered["side-band-64k"] != none {
+        caps.push("side-band-64k")
+        band = true
+    } else if offered["side-band"] != none {
+        caps.push("side-band")
+        band = true
+    }
+    for cap in ["ofs-delta", "no-progress"] {
+        if offered[cap] != none {
+            caps.push(cap)
+        }
+    }
+    caps.push(agent_line())
+    var req: u8[] = []
+    for i in 0..wants.len {
+        if i == 0 {
+            io.append(mut req, pkt_line("want {wants[i]} {text.join(caps, " ")}\n"))
+        } else {
+            io.append(mut req, pkt_line("want {wants[i]}\n"))
+        }
+    }
+    io.append(mut req, flush_pkt())
+    for id in haves {
+        io.append(mut req, pkt_line("have {id}\n"))
+    }
+    io.append(mut req, pkt_line("done\n"))
+    let answer = s.call(req)?
+    let p = pkt_reader(answer)
+    var pack: u8[] = []
+    var acked = false
+    for p.more() {
+        if !acked {
+            match p.next_packet()? {
+                Data(b) => {
+                    check_err(b)?
+                    let line = line_of(b)
+                    if line == "NAK" || text.starts_with(line, "ACK ") {
+                        acked = true
+                        continue
+                    }
+                    fail Protocol("a fetch answer {line}")
+                }
+                _ => continue
+            }
+        }
+        if !band {
+            io.append(mut pack, answer[p.at..])
+            break
+        }
+        match p.next_packet()? {
+            Data(b) => sideband(b, mut pack)?
+            Flush => break
+            _ => {}
+        }
+    }
+    if pack.len == 0 {
+        fail Protocol("a fetch response without a pack")
+    }
+    pack
+}
