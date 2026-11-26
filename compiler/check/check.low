@@ -2,10 +2,8 @@ import ast
 import builtin
 import diag
 import lexer
-import prelude
 import targets = target
 import types
-import std/builder
 import paths = std/path
 import std/slices
 import std/text
@@ -64,6 +62,10 @@ pub struct Checker {
     stopped: bool = false
     failed: [*ast.Func: bool] = [:]
     poisoned: [*ast.Local: bool] = [:]
+    used_imports: [*ast.Import: bool] = [:]
+    bindings: []Bound = []
+    spawned: [*ast.Closure: bool] = [:]
+    reported_at: [str: bool] = [:]
 }
 
 pub struct Embedded {
@@ -114,6 +116,9 @@ pub fn check_with(files: []*ast.File, platform: targets.OS, main_required: bool,
         e => { fatal = e }
     }
     settle(c, each)
+    if fatal == none {
+        c.unused(files)
+    }
     let warnings = finish(c, fatal)?
     Outcome { universe: u, warnings }
 }
@@ -157,12 +162,12 @@ fn qualified(module: str, name: str) -> str {
 }
 
 fn imported_scope(c: *Checker, alias: str, pos: diag.Pos) -> *Scope ! diag.Error {
-    let path = c.ctx.file.imported(alias) ?? fail At(pos, "unknown-module", "unknown module {alias}")
+    let path = c.module_path(alias) ?? fail At(pos, "unknown-module", "unknown module {alias}")
     scope(c, path)
 }
 
 fn is_module(c: *Checker, name: str) -> bool {
-    c.ctx.file.imported(name) != none && find(c, name) == none
+    find(c, name) == none && c.module_path(name) != none
 }
 
 fn imported_type(c: *Checker, alias: str, name: str, pos: diag.Pos) -> *types.Type ! diag.Error {
@@ -833,12 +838,6 @@ fn captures(c: *Checker, name: str, method: bool) -> bool {
     !method || t.kind == FuncKind
 }
 
-fn lookup(c: *Checker, name: str, pos: diag.Pos) -> *ast.Local ! diag.Error {
-    let l = find(c, name) ?? fail At(pos, "unknown-name", "undefined: {name}")
-    capture(c, l, pos)?
-    l
-}
-
 fn capture(c: *Checker, l: *ast.Local, pos: diag.Pos) ! diag.Error {
     if c.poisoned[l] != none {
         fail reported()
@@ -1031,7 +1030,10 @@ fn bind_fields(c: *Checker, p: *ast.StructPattern, base: ast.Expr, mutable: bool
             fail At(bind.pos, "bound-twice", "{bind.name} is bound twice in this pattern")
         }
         bound[bind.name] = true
-        bind.local = declare(c, bind.name, field.type, mutable)
+        rebound(c, bind.name, bind.pos)
+        let l = declare(c, bind.name, field.type, mutable)
+        bind.local = l
+        c.binding(l, bind.pos)
     }
 }
 
@@ -1078,13 +1080,22 @@ fn bind(c: *Checker, s: *ast.Let) -> *types.Type ! diag.Error {
         }
         none => {}
     }
-    s.local = declare(c, s.name, t, s.mutable)
+    rebound(c, s.name, s.pos)
+    let l = declare(c, s.name, t, s.mutable)
+    s.local = l
+    if !s.is_using {
+        c.binding(l, s.pos)
+    }
     t
 }
 
 fn assign(c: *Checker, s: *ast.Assign) ! diag.Error {
+    let overwritten = c.overwritten(s)
     let t = assign_target(c, s)?
     let op = lexer.operator(s.op)
+    if op == lexer.Kind.Assign {
+        c.forget_read(overwritten)
+    }
     if op != lexer.Kind.Assign {
         require_operator(c, op, t, s.pos)?
     }
@@ -1122,6 +1133,7 @@ fn assign_target(c: *Checker, s: *ast.Assign) -> *types.Type ! diag.Error {
         Index(entry) => {
             let m = plain(c, entry.x, none)?
             if m.kind == MapKind {
+                c.spawn_write_root(entry.x, s.pos)
                 expect_type(c, entry.index, m.key_of())?
                 entry.type = c.universe.optional(m.elem_of())?
                 s.entry = entry
@@ -1173,6 +1185,7 @@ fn place(c: *Checker, e: ast.Expr, pos: diag.Pos, action: str, invalid: str) -> 
     match found.root.local {
         some(l) => {
             mutable(c, l, pos, action)?
+            spawn_write(c, l, pos)
             l.assigned = true
         }
         none => {}
@@ -1263,7 +1276,7 @@ fn for_stmt(c: *Checker, s: *ast.For) -> bool ! diag.Error {
         none => {}
     }
     let l = enter_loop(c, s.label, s.pos)?
-    block(c, s.body, none)?
+    let _ = block(c, s.body, none)?
     exit_loop(c, l, s.pos)?
     s.cond == none && !l.broken
 }
@@ -1287,7 +1300,7 @@ fn for_in(c: *Checker, s: *ast.ForIn) ! diag.Error {
         none => { s.value_local = declare(c, s.value, it.value, false) }
     }
     let l = enter_loop(c, s.label, s.pos)?
-    block(c, s.body, none)?
+    let _ = block(c, s.body, none)?
     exit_loop(c, l, s.pos)?
     pop_scope(c)
 }
@@ -1573,6 +1586,7 @@ fn ident(c: *Checker, e: *ast.Ident, want: *types.Type?) ! diag.Error {
     match find(c, e.name) {
         some(l) => {
             capture(c, l, e.pos)?
+            l.read = true
             e.to = ast.Target.ToLocal(l)
             e.type = l.type
             return
@@ -1982,14 +1996,6 @@ fn unwrap(want: *types.Type?) -> *types.Type? {
     t
 }
 
-fn numeric(want: *types.Type?) -> *types.Type? {
-    let t = unwrap(want) ?? return none
-    if t.is_number() {
-        return t
-    }
-    none
-}
-
 fn literal(e: ast.Expr) -> bool {
     match e {
         IntLit(n) => true
@@ -2002,7 +2008,7 @@ fn coalesce(c: *Checker, e: *ast.Binary, want: *types.Type?, settled: *types.Typ
     let hint = optional_hint(c, want)?
     if settled == none && hint == none && empty_when(e.x) {
         let y = plain(c, e.y, none)?
-        plain(c, e.x, optional_hint(c, y)?)?
+        let _ = plain(c, e.x, optional_hint(c, y)?)?
         e.type = y
         return
     }
@@ -2351,6 +2357,7 @@ fn receiver_func(c: *Checker, t: *types.Type, name: str) -> *ast.Func? ! diag.Er
     if !f.exported {
         return none
     }
+    c.use_module(home.module)
     f
 }
 
@@ -2363,6 +2370,7 @@ fn imported_receiver_func(c: *Checker, t: *types.Type, name: str, pos: diag.Pos)
                 if f.exported && takes_first(f, t) {
                     found.push(f)
                     modules.push("{imp.alias}.{name}")
+                    c.used_imports[imp] = true
                 }
             }
             none => {}
@@ -2510,7 +2518,7 @@ fn pop_call(c: *Checker, b: *Builtin, e: *ast.Call) ! diag.Error {
 }
 
 fn truncate_call(c: *Checker, b: *Builtin, e: *ast.Call) ! diag.Error {
-    mut_slice(c, b, e)?
+    let _ = mut_slice(c, b, e)?
     integer(c, e.args[1])?
     e.type = c.universe.void
 }
