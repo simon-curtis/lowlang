@@ -302,7 +302,7 @@ module.exports = grammar({
     for_in_statement: $ => seq(
       optional($.label),
       'for',
-      optional(seq(field('key', $.identifier), ',')),
+      optional(seq(optional(seq(field('position', $.identifier), ',')), field('key', $.identifier), ',')),
       field('value', choice($.identifier, $.struct_pattern)),
       'in',
       field('iterable', $._expression),

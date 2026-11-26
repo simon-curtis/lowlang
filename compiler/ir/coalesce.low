@@ -1,0 +1,396 @@
+import std/math
+import types
+
+struct CopyRun {
+    start: i64
+    len: i64
+    to: *Value
+    from: *Value
+    to_offset: i64
+    from_offset: i64
+    first_load: i64
+}
+
+struct Sources {
+    f: *Func
+    reference: []bool
+    writes: [i64: i64] = [:]
+    writer: [i64: *Value] = [:]
+    writer_at: [i64: i64] = [:]
+    load_at: [i64: i64] = [:]
+    escaped: [i64: bool] = [:]
+    looped: bool = false
+    doms: *Dominators? = none
+}
+
+struct CopyScan {
+    f: *Func
+    src: *Sources
+    loaded_at: [i64: i64] = [:]
+    written_at: [i64: i64] = [:]
+    written: []*Value = []
+    unknown_at: i64 = -1
+    runs: []CopyRun = []
+    out: []*Value = []
+}
+
+pub fn settle_copies(f: *Func) {
+    let src = new(Sources { f, reference: reference_params(f) })
+    src.find_writes()
+    var coalesced = false
+    for b in f.blocks {
+        let cs = new(CopyScan { f, src })
+        cs.scan_copies(b)
+        if cs.runs.len > 0 {
+            cs.splice_copies(b)
+            coalesced = true
+        }
+    }
+    if coalesced {
+        remove_dead_values(f)
+        count_uses(f)
+    }
+}
+
+fn reference_params(f: *Func) -> []bool {
+    var marks: []bool = []
+    for _ in 0..f.param_words {
+        marks.push(false)
+    }
+    if f.callback {
+        return marks
+    }
+    var at = f.param_words
+    if returns_by_reference(f) {
+        at -= 1
+    }
+    var i = f.params.len - 1
+    for i >= 0 {
+        let p = f.params[i]
+        if p.mutable {
+            at -= 1
+        } else if by_reference(p.type) {
+            at -= 1
+            if at >= 0 {
+                marks[at] = true
+            }
+        } else {
+            at -= types.size(p.type)
+        }
+        i -= 1
+    }
+    marks
+}
+
+fn scan_copies(cs: *CopyScan, b: *Block) {
+    var at = 0
+    for at < b.values.len {
+        let v = b.values[at]
+        if v.op == OpLoad {
+            cs.loaded_at[v.id] = at
+            at += 1
+            continue
+        }
+        let end = cs.run_from(b, at)
+        if end > 0 {
+            cs.wrote(b.values[at], at)
+            at = end
+            continue
+        }
+        if writes_memory(v.op) {
+            cs.wrote(v, at)
+        }
+        at += 1
+    }
+}
+
+fn wrote(cs: *CopyScan, v: *Value, at: i64) {
+    match written_root(v) {
+        some(root) => {
+            if cs.written_at[root.id] == none {
+                cs.written.push(root)
+            }
+            cs.written_at[root.id] = at
+        }
+        none => { cs.unknown_at = at }
+    }
+}
+
+fn written_root(v: *Value) -> *Value? {
+    if v.op == OpStore || copy_bytes(v) > 0 {
+        return base(resolve(v.args[0])).root
+    }
+    none
+}
+
+fn run_from(cs: *CopyScan, b: *Block, at: i64) -> i64 {
+    let first = b.values[at]
+    let load = cs.copied_load(first) ?? return 0
+    var run = CopyRun { start: at, len: 0, to: resolve(first.args[0]), from: resolve(load.args[0]), to_offset: first.aux, from_offset: load.aux, first_load: cs.loaded_at[load.id] ?? at }
+    var stores = 1
+    var end = at + 1
+    var i = at + 1
+    for i < b.values.len {
+        let v = b.values[i]
+        if v.op != OpStore {
+            if v.op == OpLoad || writes_memory(v.op) {
+                break
+            }
+            i += 1
+            continue
+        }
+        let next = cs.copied_load(v) ?? break
+        if resolve(v.args[0]) != run.to || resolve(next.args[0]) != run.from || v.aux != run.to_offset + 8 * stores || next.aux != run.from_offset + 8 * stores {
+            break
+        }
+        run.first_load = math.min(run.first_load, cs.loaded_at[next.id] ?? at)
+        stores += 1
+        i += 1
+        end = i
+    }
+    if stores < min_copy_words || !cs.unchanged_since(run.from, run.first_load, load) {
+        return 0
+    }
+    run.len = end - at
+    cs.runs.push(run)
+    end
+}
+
+fn copied_load(cs: *CopyScan, st: *Value) -> *Value? {
+    if st.op != OpStore || st.args.len != 2 || st.type != none || st.mem != 0 {
+        return none
+    }
+    let load = resolve(st.args[1])
+    if load.op != OpLoad || load.args.len != 1 || load.type != none || load.mem != 0 {
+        return none
+    }
+    if cs.loaded_at[load.id] == none && !cs.src.settled(load) {
+        return none
+    }
+    load
+}
+
+fn unchanged_since(cs: *CopyScan, from: *Value, at: i64, load: *Value) -> bool {
+    if cs.src.settled(load) {
+        return true
+    }
+    if cs.unknown_at > at {
+        return false
+    }
+    let source = base(from).root
+    for root in cs.written {
+        let last = cs.written_at[root.id] ?? continue
+        if last > at && !cs.disjoint(root, source) {
+            return false
+        }
+    }
+    true
+}
+
+fn disjoint(cs: *CopyScan, a: *Value, b: *Value) -> bool {
+    if a == b {
+        return false
+    }
+    if a.op == OpSlot && b.op == OpSlot {
+        return a.aux != b.aux
+    }
+    if a.op == OpSlot || b.op == OpSlot {
+        return a.op == OpParam || b.op == OpParam
+    }
+    if a.op != OpParam || b.op != OpParam {
+        return false
+    }
+    (cs.result_param(a) && cs.reference_param(b)) || (cs.result_param(b) && cs.reference_param(a))
+}
+
+fn result_param(cs: *CopyScan, p: *Value) -> bool {
+    returns_by_reference(cs.f) && p.aux == cs.f.param_words - 1
+}
+
+fn reference_param(cs: *CopyScan, p: *Value) -> bool {
+    cs.src.reference_word(p)
+}
+
+fn splice_copies(cs: *CopyScan, b: *Block) {
+    var next = 0
+    for i, v in b.values {
+        if next < cs.runs.len && i == cs.runs[next].start {
+            cs.copy_run(b, cs.runs[next])
+        }
+        if next < cs.runs.len && i >= cs.runs[next].start && i < cs.runs[next].start + cs.runs[next].len {
+            if v.op != OpStore {
+                cs.out.push(v)
+            }
+            if i == cs.runs[next].start + cs.runs[next].len - 1 {
+                next += 1
+            }
+            continue
+        }
+        cs.out.push(v)
+    }
+    b.values = cs.out
+}
+
+fn copy_run(cs: *CopyScan, b: *Block, run: CopyRun) {
+    let to = cs.address_at(b, run.to, run.to_offset)
+    let from = cs.address_at(b, run.from, run.from_offset)
+    var stores = 0
+    for i in run.start..run.start + run.len {
+        if b.values[i].op == OpStore {
+            stores += 1
+        }
+    }
+    let bytes = cs.word_constant(b, 8 * stores)
+    let call = new_value(cs.f, b, OpRuntime, [to, from, bytes])
+    call.runtime = RtMemmove
+    cs.out.push(call)
+}
+
+fn address_at(cs: *CopyScan, b: *Block, at: *Value, offset: i64) -> *Value {
+    if offset == 0 {
+        return at
+    }
+    let by = cs.word_constant(b, offset)
+    let sum = new_value(cs.f, b, OpAdd, [at, by])
+    cs.out.push(sum)
+    sum
+}
+
+fn word_constant(cs: *CopyScan, b: *Block, n: i64) -> *Value {
+    let c = new_value(cs.f, b, OpConst, [])
+    c.aux = n
+    c.scalar = true
+    cs.out.push(c)
+    c
+}
+
+fn reference_word(src: *Sources, p: *Value) -> bool {
+    p.op == OpParam && p.aux >= 0 && p.aux < src.reference.len && src.reference[p.aux]
+}
+
+fn settled(src: *Sources, load: *Value) -> bool {
+    let root = base(resolve(load.args[0])).root
+    if src.reference_word(root) {
+        return true
+    }
+    if root.op != OpSlot || src.looped || src.escaped[root.aux] != none || src.writes[root.aux] != 1 {
+        return false
+    }
+    let w = src.writer[root.aux] ?? return false
+    if w.block == load.block {
+        let wrote = src.writer_at[root.aux] ?? return false
+        let read = src.load_at[load.id] ?? return false
+        return wrote < read
+    }
+    let d = src.dominators()
+    let from = d.index[w.block] ?? return false
+    let to = d.index[load.block] ?? return false
+    dominates(d, from, to)
+}
+
+fn dominators(src: *Sources) -> *Dominators {
+    match src.doms {
+        some(d) => d
+        none => {
+            let d = func_dominators(src.f)
+            src.doms = d
+            d
+        }
+    }
+}
+
+fn find_writes(src: *Sources) {
+    for b in src.f.blocks {
+        if b.poll {
+            src.looped = true
+            return
+        }
+    }
+    for b in src.f.blocks {
+        for h in b.heads {
+            src.leak_args(h)
+        }
+        for at, v in b.values {
+            src.note_use(v, at)
+        }
+        match b.control {
+            some(c) => { src.leak(c) }
+            none => {}
+        }
+        for r in b.results {
+            src.leak(r)
+        }
+    }
+}
+
+fn leak_args(src: *Sources, v: *Value) {
+    for a in v.args {
+        src.leak(a)
+    }
+}
+
+fn leak(src: *Sources, v: *Value) {
+    let root = base(resolve(v)).root
+    if root.op == OpSlot {
+        src.escaped[root.aux] = true
+    }
+}
+
+fn note_use(src: *Sources, v: *Value, at: i64) {
+    if v.op == OpSlot {
+        return
+    }
+    if v.op == OpAdd && constant_offset(v) {
+        src.leak(v.args[1])
+        return
+    }
+    if v.op == OpLoad {
+        let root = base(resolve(v.args[0])).root
+        if root.op == OpSlot {
+            src.load_at[v.id] = at
+        }
+        return
+    }
+    if v.op == OpStore {
+        src.slot_written(v.args[0], v, at)
+        for i in 1..v.args.len {
+            src.leak(v.args[i])
+        }
+        return
+    }
+    if copy_bytes(v) > 0 {
+        src.slot_written(v.args[0], v, at)
+        src.leak(v.args[2])
+        return
+    }
+    if v.op == OpCall && v.target != none {
+        src.call_args(v, at)
+        return
+    }
+    src.leak_args(v)
+}
+
+fn call_args(src: *Sources, v: *Value, at: i64) {
+    let sig = call_signature(v)
+    let reference = reference_params(sig)
+    let result = returns_by_reference(sig)
+    for i, a in v.args {
+        if result && i == v.args.len - 1 {
+            src.slot_written(a, v, at)
+        } else if i < reference.len && reference[i] {
+            continue
+        } else {
+            src.leak(a)
+        }
+    }
+}
+
+fn slot_written(src: *Sources, addr: *Value, v: *Value, at: i64) {
+    let root = base(resolve(addr)).root
+    if root.op != OpSlot {
+        return
+    }
+    src.writes[root.aux] = (src.writes[root.aux] ?? 0) + 1
+    src.writer[root.aux] = v
+    src.writer_at[root.aux] = at
+}

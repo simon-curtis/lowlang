@@ -92,7 +92,11 @@ fn instruction(a: *Assembler, name: str) ! Error {
         }
     }
     a.ops.truncate(0)
-    if !at_end(s) {
+    var plain = false
+    if prefix == 0 && mnemonic == "mov" && a.plain_operands(rest(s)) {
+        s.pos = s.text.len
+        plain = true
+    } else if !at_end(s) {
         for {
             if a.ops.len == max_operands {
                 fail failure(a, "{mnemonic} has too many operands")
@@ -112,7 +116,13 @@ fn instruction(a: *Assembler, name: str) ! Error {
     if !exec(a.cur) {
         fail failure(a, "instruction {mnemonic} in non-executable section {a.cur.sec.name}")
     }
-    let placed = assemble_instruction(a, mnemonic, prefix, a.ops)?
+    var placed: *Assembled? = none
+    if plain {
+        placed = a.direct_move()
+    }
+    if placed == none {
+        placed = assemble_instruction(a, mnemonic, prefix, a.ops)?
+    }
     if a.disp32 {
         fail failure(a, "{{disp32}} applies to a branch")
     }
@@ -128,6 +138,176 @@ fn instruction(a: *Assembler, name: str) ! Error {
         none => {}
     }
     end_statement(a)
+}
+
+fn direct_move(a: *Assembler) -> *Assembled? {
+    let enc = move_encoding(a.ops) ?? return none
+    let m = new(Assembled { enc, branch: false, fusion: fuse_none, operands: true })
+    place(a, m)
+    m
+}
+
+fn move_encoding(ops: []Operand) -> *Encoding? {
+    if ops.len != 2 {
+        return none
+    }
+    let dst = ops[0]
+    let src = ops[1]
+    if dst.kind == OpReg && src.kind == OpReg {
+        if reg_class(dst.reg) != class_gp64 || reg_class(src.reg) != class_gp64 {
+            return none
+        }
+        let d = reg_num(dst.reg)
+        let r = reg_num(src.reg)
+        let e = new(Encoding { prefixes: 1 })
+        put(e, 0x48 | ((r >> 3) << 2) | (d >> 3))
+        put(e, 0x89)
+        put(e, 0xC0 | ((r & 7) << 3) | (d & 7))
+        return e
+    }
+    if dst.kind == OpReg && src.kind == OpMem {
+        return memory_move(0x8B, dst.reg, src)
+    }
+    if dst.kind == OpMem && src.kind == OpReg {
+        return memory_move(0x89, src.reg, dst)
+    }
+    none
+}
+
+fn memory_move(opcode: i64, reg: i64, m: Operand) -> *Encoding? {
+    let disp = m.value.add
+    if m.size != 8 || reg_class(reg) != class_gp64 || disp < -2147483648 || disp > 2147483647 {
+        return none
+    }
+    let r = reg_num(reg)
+    let b = reg_num(m.base)
+    let e = new(Encoding { prefixes: 1 })
+    put(e, 0x48 | ((r >> 3) << 2) | (b >> 3))
+    put(e, opcode)
+    var width = 4
+    if disp == 0 && (b & 7) != 5 {
+        width = 0
+    } else if disp >= -128 && disp <= 127 {
+        width = 1
+    }
+    let mode = match width {
+        0 => 0x00
+        1 => 0x40
+        _ => 0x80
+    }
+    put(e, mode | ((r & 7) << 3) | (b & 7))
+    if (b & 7) == 4 {
+        put(e, 0x24)
+    }
+    put_int(e, width, disp)
+    e
+}
+
+fn plain_operands(a: *Assembler, operands: str) -> bool {
+    if operands.len < 2 || operands[0] != ' ' {
+        return false
+    }
+    var at = 1
+    for {
+        let op = a.plain_operand(operands, mut at) ?? {
+            a.ops.truncate(0)
+            return false
+        }
+        a.ops.push(op)
+        if at == operands.len {
+            return true
+        }
+        if at + 2 > operands.len || operands[at] != ',' || operands[at + 1] != ' ' || a.ops.len == 2 {
+            a.ops.truncate(0)
+            return false
+        }
+        at += 2
+    }
+    false
+}
+
+fn plain_operand(a: *Assembler, text: str, mut at: i64) -> Operand? {
+    let start = at
+    if at < text.len && (text[at] == '-' || is_digit(text[at])) {
+        let value = plain_decimal(text, mut at) ?? return none
+        if at < text.len && text[at] != ',' {
+            return none
+        }
+        return Operand { kind: OpImm, value: Value { add: value } }
+    }
+    let word = plain_word(text, mut at)
+    if word == "" {
+        return none
+    }
+    let size = match word {
+        "qword" => 8
+        "dword" => 4
+        _ => {
+            let reg = lookup_reg(a, word)
+            if reg == reg_none || reg_class(reg) == class_segment || reg_class(reg) == class_k {
+                return none
+            }
+            return Operand { kind: OpReg, reg }
+        }
+    }
+    if at + 6 > text.len || text[at..at + 6] != " ptr [" {
+        at = start
+        return none
+    }
+    at += 6
+    let base = lookup_reg(a, plain_word(text, mut at))
+    if base == reg_none || reg_class(base) != class_gp64 || at >= text.len {
+        return none
+    }
+    var value = 0
+    if text[at] == '+' || text[at] == '-' {
+        let negative = text[at] == '-'
+        at += 1
+        if at >= text.len || !is_digit(text[at]) {
+            return none
+        }
+        value = plain_decimal(text, mut at) ?? return none
+        if negative {
+            value = -value
+        }
+    }
+    if at >= text.len || text[at] != ']' {
+        return none
+    }
+    at += 1
+    Operand { kind: OpMem, size, seg: reg_none, base, scale: 1, value: Value { add: value } }
+}
+
+fn plain_word(text: str, mut at: i64) -> str {
+    let start = at
+    for at < text.len && is_ident_char(text[at]) {
+        at += 1
+    }
+    text[start..at]
+}
+
+fn plain_decimal(text: str, mut at: i64) -> i64? {
+    var negative = false
+    if text[at] == '-' {
+        negative = true
+        at += 1
+    }
+    let start = at
+    var n = 0
+    for at < text.len && is_digit(text[at]) {
+        if at - start >= 18 {
+            return none
+        }
+        n = 10 * n + i64(text[at] - '0')
+        at += 1
+    }
+    if at == start || (text[start] == '0' && at - start > 1) {
+        return none
+    }
+    if negative {
+        return -n
+    }
+    n
 }
 
 fn end_statement(a: *Assembler) {

@@ -1,20 +1,36 @@
-import std/builder
+import std/math
 
 struct Available {
     value: *Value
     node: i64
+    place: MemoryPlace
+    next: i64
+}
+
+struct MemoryPlace {
+    addr: i64
+    aux: i64
+    type: i64
+    version: i64
 }
 
 struct LoadScan {
     doms: *Dominators
-    avail: [str: []Available] = [:]
+    keys: []i64
+    heads: []i64
+    mask: i64
+    offered: []Available = []
     exits: []i64 = []
     next: i64 = 0
     forwarded: bool = false
 }
 
 pub fn forward_loads(s: *Ssa, doms: *Dominators) -> bool {
-    let ls = new(LoadScan { doms })
+    var size = 16
+    for size < 2 * memory_accesses(doms) {
+        size *= 2
+    }
+    let ls = new(LoadScan { doms, keys: counts(size), heads: vacant(size), mask: size - 1 })
     for i, b in doms.nodes {
         ls.scan_block(i, b)
     }
@@ -24,8 +40,29 @@ pub fn forward_loads(s: *Ssa, doms: *Dominators) -> bool {
     ls.forwarded
 }
 
+fn memory_accesses(doms: *Dominators) -> i64 {
+    var n = 0
+    for b in doms.nodes {
+        for v in b.values {
+            if v.op == OpLoad || v.op == OpStore {
+                n += 1
+            }
+        }
+    }
+    n
+}
+
+fn vacant(n: i64) -> []i64 {
+    var words: []i64 = []
+    for _ in 0..n {
+        words.push(-2)
+    }
+    words
+}
+
 fn scan_block(ls: *LoadScan, node: i64, b: *Block) {
     var version = ls.entry_version(node, b)
+    var since = ls.offered.len
     for v in b.values {
         if v.op == OpLoad {
             ls.reuse_load(v, node, version)
@@ -34,15 +71,27 @@ fn scan_block(ls: *LoadScan, node: i64, b: *Block) {
         if !writes_memory(v.op) {
             continue
         }
+        ls.withdraw(since)
         version = ls.fresh()
         if v.op == OpStore {
             ls.offer_store(v, node, version)
         }
     }
     if b.poll {
+        ls.withdraw(since)
         version = ls.fresh()
     }
     ls.exits.push(version)
+}
+
+fn withdraw(ls: *LoadScan, since: i64) {
+    var i = ls.offered.len - 1
+    for i >= since {
+        let a = ls.offered[i]
+        ls.heads[ls.place_slot(place_key(a.place))] = a.next
+        i -= 1
+    }
+    ls.offered.truncate(since)
 }
 
 fn fresh(ls: *LoadScan) -> i64 {
@@ -78,16 +127,14 @@ fn reuse_load(ls: *LoadScan, v: *Value, node: i64, version: i64) {
     if v.args.len != 1 || v.mem & mem_trap != 0 {
         return
     }
-    let key = memory_key(v, version)
-    let found = ls.avail[key] ?? []
-    for a in found {
-        if a.value != v && interchangeable(v, a.value) && dominates(ls.doms, a.node, node) {
-            v.forward = a.value
+    let place = memory_place(v, version)
+    match ls.oldest_match(v, place, node) {
+        some(found) => {
+            v.forward = found
             ls.forwarded = true
-            return
         }
+        none => ls.offer(place, v, node)
     }
-    ls.offer(key, v, node)
 }
 
 fn offer_store(ls: *LoadScan, st: *Value, node: i64, version: i64) {
@@ -95,23 +142,46 @@ fn offer_store(ls: *LoadScan, st: *Value, node: i64, version: i64) {
         return
     }
     let stored = resolve(st.args[1])
-    ls.offer(memory_key(st, version), stored, node)
+    ls.offer(memory_place(st, version), stored, node)
 }
 
-fn offer(ls: *LoadScan, key: str, v: *Value, node: i64) {
-    var list = ls.avail[key] ?? []
-    list.push(Available { value: v, node })
-    ls.avail[key] = list
+fn oldest_match(ls: *LoadScan, v: *Value, place: MemoryPlace, node: i64) -> *Value? {
+    var found: *Value? = none
+    var at = ls.heads[ls.place_slot(place_key(place))]
+    for at >= 0 {
+        let a = ls.offered[at]
+        if a.place == place && a.value != v && interchangeable(v, a.value) && dominates(ls.doms, a.node, node) {
+            found = a.value
+        }
+        at = a.next
+    }
+    found
 }
 
-fn memory_key(v: *Value, version: i64) -> str {
-    let addr = resolve(v.args[0])
-    var k = builder.with_capacity(16)
-    put_word(mut k, addr.id)
-    put_word(mut k, v.aux)
-    put_word(mut k, type_id(v.type))
-    put_word(mut k, version)
-    k.to_str()
+fn offer(ls: *LoadScan, place: MemoryPlace, v: *Value, node: i64) {
+    let key = place_key(place)
+    let at = ls.place_slot(key)
+    let next = math.max(ls.heads[at], -1)
+    ls.keys[at] = key
+    ls.heads[at] = ls.offered.len
+    ls.offered.push(Available { value: v, node, place, next })
+}
+
+fn place_slot(ls: *LoadScan, key: i64) -> i64 {
+    let mixed = key * 0x2545F4914F6CDD1D
+    var at = (mixed ^ (mixed >> 29)) & ls.mask
+    for ls.heads[at] != -2 && ls.keys[at] != key {
+        at = (at + 1) & ls.mask
+    }
+    at
+}
+
+fn memory_place(v: *Value, version: i64) -> MemoryPlace {
+    MemoryPlace { addr: resolve(v.args[0]).id, aux: v.aux, type: type_id(v.type), version }
+}
+
+fn place_key(p: MemoryPlace) -> i64 {
+    ((p.addr * 1000003 + p.aux) * 1000003 + p.type) * 1000003 + p.version
 }
 
 fn interchangeable(v: *Value, found: *Value) -> bool {
