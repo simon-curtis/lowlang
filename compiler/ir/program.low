@@ -46,6 +46,8 @@ pub struct Builder {
     pub named: [str: *Func]
     pub slots: [*ast.Local: *Value] = [:]
     pub refs: [*ast.Local: *Value] = [:]
+    pub frozen: [i64: bool] = [:]
+    pub result_pointer: *Value? = none
     pub loops: []LoopTarget = []
     pub temps: i64 = 0
     pub defers: [][]ast.Stmt = []
@@ -119,7 +121,7 @@ pub fn lower_files(u: *types.Universe, files: []*ast.File, owned: bool, optimise
             p.funcs.push(adapter)
         }
         let module = declared_module(d)
-        if d.name == "main" && module == "" {
+        if symbol_name(d) == entry_name {
             p.main = f
             let ret = types.must(d.ret_type)
             if ret.kind == ResultKind {
@@ -331,6 +333,9 @@ fn param_words(d: *ast.Func) -> i64 {
     for i in 0..d.params.len {
         words += param_size(d, i)
     }
+    if !d.callback && symbol_name(d) != entry_name && by_reference(types.must(d.ret_type)) {
+        words += 1
+    }
     words
 }
 
@@ -368,6 +373,16 @@ pub fn function(b: *Builder) {
             continue
         }
         let t = local_type(local)
+        if param_size(b.decl, i) == 1 && by_reference(t) {
+            let pointer = b.freeze(param(b, word))
+            word += 1
+            if boxed(local) {
+                bind(b, local, load_words(b, Place { addr: pointer }, t))
+            } else {
+                b.slots[local] = pointer
+            }
+            continue
+        }
         var words: []*Value = []
         for k in 0..types.size(t) {
             let w = param(b, word + k)
@@ -377,6 +392,7 @@ pub fn function(b: *Builder) {
         bind(b, local, words)
         word += words.len
     }
+    b.take_result_pointer()
     let body_block = b.decl.body ?? panic("function without a body")
     let body = lower_block(b, body_block)
     ret(b, types.must(body_block.type), body)
@@ -410,6 +426,14 @@ fn adapter(b: *Builder, target: *Func) {
     var args: []*Value = []
     var word = 1
     for i, t in b.decl.param_types {
+        if !b.decl.params[i].mutable && param_size(b.decl, i) == 1 && by_reference(t) {
+            let pointer = b.freeze(param(b, word))
+            for w in load_words(b, Place { addr: pointer }, t) {
+                args.push(w)
+            }
+            word += 1
+            continue
+        }
         var words: []*Value = []
         for k in 0..param_size(b.decl, i) {
             let w = param(b, word + k)
@@ -423,8 +447,17 @@ fn adapter(b: *Builder, target: *Func) {
         }
         word += words.len
     }
+    b.take_result_pointer()
+    let results = invoke(b, target, args)
     b.cur.kind = Ret
-    b.cur.results = invoke(b, target, args)
+    b.cur.results = b.returned(results)
+}
+
+fn take_result_pointer(b: *Builder) {
+    let f = b.s.func
+    if returns_by_reference(f) {
+        b.result_pointer = param(b, f.param_words - 1)
+    }
 }
 
 pub fn param(b: *Builder, word: i64) -> *Value {
@@ -561,7 +594,7 @@ pub fn bind(b: *Builder, local: *ast.Local, words: []*Value) {
         return
     }
     if local.addressed || in_memory(t) {
-        b.slots[local] = spill(b, words)
+        b.bind_in_memory(local, words)
         return
     }
     store_words(b, Place { local }, words)
@@ -722,6 +755,15 @@ fn store_tail(b: *Builder, addr: *Value, offset: i64, tail: i64, w: *Value, mem:
 }
 
 pub fn store_words(b: *Builder, p: Place, words: []*Value) {
+    match p.addr {
+        some(addr) => {
+            if p.scalar == none && p.tail == 0 && p.mem == 0 {
+                b.store_plain(addr, p.offset, words)
+                return
+            }
+        }
+        none => {}
+    }
     for k, w in words {
         match p.addr {
             none => { write_var(b.s, VarKey { local: p.local, word: p.word + k }, b.cur, w) }
@@ -768,14 +810,14 @@ pub fn ret(b: *Builder, t: *types.Type, words: []*Value) {
         results = pad(b, [], types.size(result_type))
     }
     b.cur.kind = Ret
-    b.cur.results = results
+    b.cur.results = b.returned(results)
 }
 
 pub fn fail_words(b: *Builder, err_words: []*Value) {
     let tag = constant(b, 1)
     let results = slices.concat([tag], err_words)
     b.cur.kind = Ret
-    b.cur.results = pad(b, results, types.size(types.must(b.decl.ret_type)))
+    b.cur.results = b.returned(pad(b, results, types.size(types.must(b.decl.ret_type))))
 }
 
 pub fn lower_block(b: *Builder, blk: *ast.Block) -> []*Value {
@@ -1414,6 +1456,10 @@ pub fn arguments(b: *Builder, args: []ast.Expr, params_of: []*types.Type) -> Arg
             }
             _ => {
                 let vs = value(b, arg, params_of[i])
+                if by_reference(params_of[i]) {
+                    found.words.push(b.pass_by_reference(vs))
+                    continue
+                }
                 for w in vs {
                     found.words.push(w)
                 }
@@ -1438,11 +1484,19 @@ fn call_value(b: *Builder, e: *ast.Call) -> []*Value {
         return c_invoke(b, "", t.params, ret_type, callee, e.args)
     }
     let args = arguments(b, e.args, t.params)
+    var operands = slices.concat(callee, args.words)
     let signature = new(Func { name: t.name, param_words: 1 + args.words.len, ret: ret_type })
-    let operands = slices.concat(callee, args.words)
+    let held = b.result_slot(signature)
+    match held {
+        some(r) => {
+            operands.push(r)
+            signature.param_words += 1
+        }
+        none => {}
+    }
     let call = emit(b, OpCall, operands)
     call.signature = signature
-    let found = results(b, call, signature)
+    let found = b.results_in(call, signature, held)
     write_back(b, args.backs)
     found
 }
@@ -1515,18 +1569,32 @@ fn call_func(b: *Builder, e: *ast.Call) -> []*Value {
     }
     let args = arguments(b, e.args, target.param_types)
     let callee = b.funcs[target] ?? panic("call to an undeclared function {target.name}")
-    let found = invoke(b, callee, args.words)
+    let found = b.call_laid_out(callee, args.words)
     write_back(b, args.backs)
     found
 }
 
 pub fn invoke(b: *Builder, target: *Func, args: []*Value) -> []*Value {
-    let call = emit(b, OpCall, args)
-    call.target = target
-    results(b, call, target)
+    b.call_laid_out(target, b.layout_words(target, args))
 }
 
-pub fn results(b: *Builder, call: *Value, target: *Func) -> []*Value {
+fn call_laid_out(b: *Builder, target: *Func, args: []*Value) -> []*Value {
+    let held = b.result_slot(target)
+    var operands = args
+    match held {
+        some(r) => { operands = slices.concat(args, [r]) }
+        none => {}
+    }
+    let call = emit(b, OpCall, operands)
+    call.target = target
+    b.results_in(call, target, held)
+}
+
+fn results_in(b: *Builder, call: *Value, target: *Func, held: *Value?) -> []*Value {
+    match held {
+        some(r) => { return load_words(b, Place { addr: r }, target.ret) }
+        none => {}
+    }
     var found: []*Value = []
     for k in 0..result_words(target) {
         let r = emit_result(b, call, k)
