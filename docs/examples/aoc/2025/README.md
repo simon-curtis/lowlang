@@ -2,7 +2,7 @@
 
 Solutions to the twelve puzzles of [Advent of Code 2025](https://adventofcode.com/2025), one program per day.
 
-Each program embeds its puzzle input at compile time from `input/dayNN.txt` and prints `part 1: <answer>` and `part 2: <answer>`. Inputs are generated per account and are not redistributed, so `input/` is ignored by git: save your own input from `https://adventofcode.com/2025/day/N/input` as `input/dayNN.txt` (day 1 is `input/day01.txt`), then run
+Each program embeds its puzzle input at compile time from `input/dayNN.txt` and prints `part 1: <answer>` and `part 2: <answer>`. Inputs are generated per account and are not redistributed, so git ignores `input/`. Save your own input from `https://adventofcode.com/2025/day/N/input` as `input/dayNN.txt`. Day 1 is `input/day01.txt`. Then run
 
 ```
 low run docs/examples/aoc/2025/day01.low
