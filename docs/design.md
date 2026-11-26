@@ -240,14 +240,19 @@ Newlines terminate statements. Blocks are expressions. The last expression is th
 
 ### Bindings
 
+A binding gives a value a name. `let` is immutable, `var` is mutable.
+
 ```low
 let name = "lowlang"
 var count = 0
 count += 1
 ```
 
-- `let` is immutable, `var` is mutable.
-- Types are inferred and may be written as `let x: i64 = 1`.
+Types are inferred and may be written as `let x: i64 = 1`.
+
+#### Struct patterns
+
+A struct pattern binds several fields of one value at once.
 
 <!-- prelude
 struct Point {
@@ -269,14 +274,31 @@ var { x: max_x, y: max_y } = cells[0]
 let { min: { x: left }, max, label } = rect
 ```
 
-- A struct pattern `{ x, y } = value` binds each listed field to a local of the same name. `{ x: name }` binds field `x` to `name`, as in a struct literal. Commas or newlines separate entries.
-- A pattern lists only the fields it wants. These are errors: a field named twice, two entries binding one name, an empty `{}`, a field the struct lacks, and a value that is not a struct. A pointer counts as not a struct. A struct with `drop` cannot be destructured.
-- A field that is a struct nests a pattern: `{ min: { x, y }, max }`.
-- `var` makes every bound name mutable and `let` makes them immutable. A pattern takes no type annotation, and `using` binds one name.
-- The value is evaluated once, then each field is read from it.
-- `{` after `let` or `var` always starts a pattern.
+| Pattern | Binds |
+| --- | --- |
+| `{ x, y } = value` | Each listed field to a local of the same name. |
+| `{ x: name }` | Field `x` to `name`, as in a struct literal. |
+| `{ min: { x, y }, max }` | A field that is a struct nests a pattern. |
+
+Commas or newlines separate entries. A pattern lists only the fields it wants.
+
+`var` makes every bound name mutable and `let` makes them immutable. A pattern takes no type annotation, and `using` binds one name. `{` after `let` or `var` always starts a pattern.
+
+The value is evaluated once, then each field is read from it.
+
+These are errors:
+
+- a field named twice
+- two entries binding one name
+- an empty `{}`
+- a field the struct lacks
+- a value that is not a struct; a pointer counts as not a struct
+
+A struct with `drop` cannot be destructured.
 
 ### Module constants
+
+A constant is a named value the compiler works out at compile time. `const name: T = value` declares a constant at the top level of a module.
 
 ```low
 /// The width that stands for no limit.
@@ -296,14 +318,27 @@ fn status(code: i64) -> str {
 }
 ```
 
-- `const name: T = value` declares a constant at the top level of a module. Without a type, it takes the type `let` would infer. An integer literal is `i64` and a float literal is `f64`.
-- A constant is a number, a `bool` or a `str`. Its value is built from literals, other constants, unary and binary operators and numeric conversions such as `u8(x)`. The compiler evaluates it at compile time, with the wrapping, shifts, rounding and conversions of the same expression at run time. These are errors: division by zero, a constant that depends on itself, and a float out of the range of `u64` converted to `u64`.
-- Constants of a module may be declared in any order and in any of its files. Each use is the folded value.
-- `pub` exports a constant, read as `module.name`. A constant cannot share its name with a function, type or builtin of its module. A local of the same name hides it.
-- A constant cannot be assigned or passed as `mut`, and `const` inside a function body is an error.
-- In a `match` arm, a constant's name, or `module.name`, compares the subject with the constant instead of binding a new name.
+A constant is a number, a `bool` or a `str`. Without a type, it takes the type `let` would infer. An integer literal is `i64` and a float literal is `f64`.
+
+Its value is built from literals, other constants, unary and binary operators and numeric conversions such as `u8(x)`. The compiler evaluates it at compile time, with the wrapping, shifts, rounding and conversions of the same expression at run time.
+
+These are errors:
+
+- division by zero
+- a constant that depends on itself
+- a float out of the range of `u64` converted to `u64`
+- a constant that is assigned or passed as `mut`
+- `const` inside a function body
+
+Constants of a module may be declared in any order and in any of its files. Each use is the folded value.
+
+`pub` exports a constant, read as `module.name`. A constant cannot share its name with a function, type or builtin of its module. A local of the same name hides it.
+
+In a `match` arm, a constant's name, or `module.name`, compares the subject with the constant instead of binding a new name.
 
 ### Functions
+
+A function is declared with `fn`. Functions are also values: they can be stored, passed, returned and written in place as closures.
 
 <!-- prelude
 import std/slices
@@ -355,31 +390,73 @@ let shouted = "hi"
 let n = input |> parse()?
 ```
 
-- A function type is written `fn(i64, mut str) -> bool`, with `! E` for a result that can fail. Two function types are the same when their parameters, `mut` markers and results are.
-- A named function is a value of its function type. `fn(params) -> R { body }` is a closure. `fn(params) expr` is a closure whose body is one expression. That expression extends as far as an expression can. A closure that writes its result or error type takes a braced body, so `!` after the parameters always starts an error type.
-- A closure's parameter and result types may be omitted when the expected function type supplies them.
-  - The compiler checks an argument to a generic function after the arguments that are not closures. Its expected type therefore takes the type arguments they bind. `slices.map(words, fn(w) w.len)` gives `w` the element type of `words`.
-  - The result is the body's type, or the type of the first `return`'s value, in two cases. One is when the expected type leaves the result open, as `U` in `slices.map`. The other is when there is no expected type and the body is one expression. `?` and `fail` need a written result.
-  - A braced closure with no written result and no expected type returns nothing.
-- Values of function type can be stored in variables, fields, slices and maps, passed and returned, and called like functions. They cannot be compared or printed.
-- A closure captures the variables it names by reference, as Go does. It reads and assigns the variable itself. The variable lives as long as any closure holding it.
-  - Each loop iteration binds fresh variables, so closures made in different iterations see different ones.
-  - A `mut` parameter cannot be captured.
-  - If a variable is never assigned after its binding, never passed as `mut` and never modified by `push`, `pop`, `truncate` or `delete`, it cannot be told apart from a copy, so the closure holds its value directly.
-- `x.f(args)` calls `f(x, args)`, so calls chain left to right: `"ab".repeat(3).first()`.
-  - `f` is any function callable by its plain name: a function in the current module, a function value in scope, a generic function or a builtin. A local variable or parameter named `f` that is not a function value is skipped. So `fn sized(width: f32) -> Box { box().width(width) }` calls the function `width`.
-  - When no such name exists and `x` is a struct or enum, or a pointer to one, from another module, `f` is that module's public function. `url.authority()` calls `http.authority(url)`.
-  - Otherwise `f` is the public function of that name in an imported module. Its first parameter accepts `x`. If that parameter is generic, `x`'s type meets its constraints. `words.map(fn(w) w.len).sum()` calls `slices.sum(slices.map(words, ...))`. `"banana".count("an")` calls `text.count`. When more than one imported module has such a function, the call is an error naming them.
-  - A struct field of function type named `f` takes precedence, so `op.apply(v)` calls the stored function.
-  - When the first parameter is `mut`, `x` is passed as `mut` and must be a mutable place.
-- `x |> f(args)` calls `f(x, args)`, and `x |> f` calls `f(x)`.
-  - The right side is a call, a function name, a module function such as `text.repeat`, a closure, or a struct field holding a function. Any other expression is an error. `x |> ops.scale` calls the stored function, never a function named `scale`.
-  - `|>` has the lowest precedence of the binary operators and groups left to right. `a + b |> f()` is `f(a + b)`.
-  - A trailing `?`, `catch` or `or` applies to the call: `x |> parse()?` is `parse(x)?`.
-  - A `mut` first parameter receives `x` as `mut`, as with `x.f(args)`.
-- A line that starts with `|>` or `.` continues the expression on the line before it.
+#### Function types
+
+A function type is written `fn(i64, mut str) -> bool`, with `! E` for a result that can fail. Two function types are the same when their parameters, `mut` markers and results are.
+
+Values of function type can be stored in variables, fields, slices and maps, passed and returned, and called like functions. They cannot be compared or printed.
+
+#### Closures
+
+A named function is a value of its function type. A closure is a function written as an expression.
+
+| Form | Meaning |
+| --- | --- |
+| `fn(params) -> R { body }` | A closure. |
+| `fn(params) expr` | A closure whose body is one expression. That expression extends as far as an expression can. |
+
+A closure that writes its result or error type takes a braced body, so `!` after the parameters always starts an error type.
+
+A closure's parameter and result types may be omitted when the expected function type supplies them.
+
+The compiler checks an argument to a generic function after the arguments that are not closures. Its expected type therefore takes the type arguments they bind. `slices.map(words, fn(w) w.len)` gives `w` the element type of `words`.
+
+The result is the body's type, or the type of the first `return`'s value, in two cases:
+
+- when the expected type leaves the result open, as `U` in `slices.map`
+- when there is no expected type and the body is one expression
+
+`?` and `fail` need a written result. A braced closure with no written result and no expected type returns nothing.
+
+#### Captured variables
+
+A closure captures the variables it names by reference, as Go does. It reads and assigns the variable itself. The variable lives as long as any closure holding it.
+
+- Each loop iteration binds fresh variables, so closures made in different iterations see different ones.
+- A `mut` parameter cannot be captured.
+
+If a variable is never assigned after its binding, never passed as `mut` and never modified by `push`, `pop`, `truncate` or `delete`, it cannot be told apart from a copy, so the closure holds its value directly.
+
+#### Method call syntax
+
+`x.f(args)` calls `f(x, args)`, so calls chain left to right: `"ab".repeat(3).first()`.
+
+The compiler looks for `f` in this order:
+
+1. A struct field of function type named `f` takes precedence, so `op.apply(v)` calls the stored function.
+2. `f` is any function callable by its plain name: a function in the current module, a function value in scope, a generic function or a builtin. A local variable or parameter named `f` that is not a function value is skipped. So `fn sized(width: f32) -> Box { box().width(width) }` calls the function `width`.
+3. When no such name exists and `x` is a struct or enum, or a pointer to one, from another module, `f` is that module's public function. `url.authority()` calls `http.authority(url)`.
+4. Otherwise `f` is the public function of that name in an imported module. Its first parameter accepts `x`. If that parameter is generic, `x`'s type meets its constraints.
+
+Two examples of the last step: `words.map(fn(w) w.len).sum()` calls `slices.sum(slices.map(words, ...))`, and `"banana".count("an")` calls `text.count`. When more than one imported module has such a function, the call is an error naming them.
+
+When the first parameter is `mut`, `x` is passed as `mut` and must be a mutable place.
+
+#### The pipe operator
+
+`x |> f(args)` calls `f(x, args)`, and `x |> f` calls `f(x)`.
+
+The right side is a call, a function name, a module function such as `text.repeat`, a closure, or a struct field holding a function. Any other expression is an error. `x |> ops.scale` calls the stored function, never a function named `scale`.
+
+- `|>` has the lowest precedence of the binary operators and groups left to right. `a + b |> f()` is `f(a + b)`.
+- A trailing `?`, `catch` or `or` applies to the call: `x |> parse()?` is `parse(x)?`.
+- A `mut` first parameter receives `x` as `mut`, as with `x.f(args)`.
+
+A line that starts with `|>` or `.` continues the expression on the line before it.
 
 ### Top-level statements
+
+Statements may stand at the top level of a file, among its declarations. In source order they form the body of the program's `main`, which takes no parameters.
 
 ```low
 import std/text
@@ -401,15 +478,25 @@ let n = checked(text.parse_int("12") or 0)?
 print(n)
 ```
 
-- Statements may stand at the top level of a file, among its declarations. In source order they form the body of the program's `main`, which takes no parameters.
-- Only the entry module may have them, in one of its files. That module cannot also declare `fn main`. Under `low test` the tested project root may have them too. Its tests can call that `main`.
-- A top-level `let` or `var` is a local of `main`, so the module's functions cannot see it. A value the functions share is a `const` or a function.
-- Each top-level statement ends at a newline. `fn` followed by `(` starts a closure expression. Any other `fn` starts a declaration. `pub` and `///` apply only to declarations.
-- The first `?`, `fail` or `catch M` among the statements, outside closures, gives `main` its error type. Every later one must use the same enum. Without one, `main` returns nothing. That first `fail` or `catch M` has no error type to check against, so it names the enum, as in `fail Problem.Negative(n)`.
-- Neither the statements nor a drop or field default can call or name `main`.
-- A final expression statement is the tail of `main`, as in any block, and its value is discarded.
+Only the entry module may have them, in one of its files. That module cannot also declare `fn main`. Under `low test` the tested project root may have them too. Its tests can call that `main`.
+
+A top-level `let` or `var` is a local of `main`, so the module's functions cannot see it. A value the functions share is a `const` or a function.
+
+Each top-level statement ends at a newline. `fn` followed by `(` starts a closure expression. Any other `fn` starts a declaration. `pub` and `///` apply only to declarations.
+
+A final expression statement is the tail of `main`, as in any block, and its value is discarded.
+
+Neither the statements nor a drop or field default can call or name `main`.
+
+#### The error type of main
+
+The first `?`, `fail` or `catch M` among the statements, outside closures, gives `main` its error type. Every later one must use the same enum. Without one, `main` returns nothing.
+
+That first `fail` or `catch M` has no error type to check against, so it names the enum, as in `fail Problem.Negative(n)`.
 
 ### Control flow
+
+`if` chooses between branches and `for` loops.
 
 <!-- prelude
 var n = 3
@@ -440,14 +527,29 @@ rows: for row, cells in grid {
 }
 ```
 
-- `for i in a..b` counts from `a` up to but not including `b`. The bounds are integers of one type.
-- `for x in xs` visits each element of a slice. `for i, x in xs` also binds the index as `i64`.
-- Loop variables are immutable.
-- `for { x, y } in points` and `for i, { x, y } in points` destructure each element with a struct pattern, as in `### Bindings`. The names it binds are immutable. In `for`, `{` starts a pattern only when its closing `}` is followed by `in`, so `for { break }` is still an infinite loop.
-- `break`, `continue`, `return` and `fail` are expressions of type never, so they can stand wherever a value is expected: after `??`, in an arm, or as a branch of `if`.
-- `name:` before `for` labels a loop. `break name` and `continue name` act on that loop from inside nested loops. They run the deferred statements and drops of every block they leave. A label must be used. It cannot repeat the label of an enclosing loop. It is not visible inside closures.
+| Loop | Does |
+| --- | --- |
+| `for i in a..b` | Counts from `a` up to but not including `b`. The bounds are integers of one type. |
+| `for x in xs` | Visits each element of a slice. |
+| `for i, x in xs` | Also binds the index as `i64`. |
+| `for { x, y } in points` | Destructures each element with a struct pattern, as in `### Bindings`. |
+| `for i, { x, y } in points` | Binds the index and destructures the element. |
+
+Loop variables are immutable, and so are the names a pattern binds. In `for`, `{` starts a pattern only when its closing `}` is followed by `in`, so `for { break }` is still an infinite loop.
+
+`break`, `continue`, `return` and `fail` are expressions of type never, so they can stand wherever a value is expected: after `??`, in an arm, or as a branch of `if`.
+
+#### Loop labels
+
+`name:` before `for` labels a loop. `break name` and `continue name` act on that loop from inside nested loops. They run the deferred statements and drops of every block they leave.
+
+- A label must be used.
+- It cannot repeat the label of an enclosing loop.
+- It is not visible inside closures.
 
 ### Numbers
+
+Low has six integer types and two float types. Conversions between them are always written out.
 
 ```low
 let mask: u32 = 0xFF00
@@ -461,19 +563,47 @@ let whole = i64(floor(length))
 let byte = u8(300)
 ```
 
-- Integer types are `i64`, `i32`, `u64`, `u32`, `u16` and `u8`; float types are `f64` and `f32`.
-- Integer literals are decimal, or hexadecimal, binary and octal with `0x`, `0b` and `0o`. Float literals may have an exponent. In any number literal `_` may separate two digits, as in `1_000_000.0` or `0xFF_FF`. An `_` anywhere else is an error.
-- An integer literal takes the type the context expects, including the other operand of a binary operator, and must fit it; otherwise it is `i64`. A literal above the `i64` range is accepted only as a `u64`. In an `if` expression with no expected type, an integer literal branch takes the type of the other branch.
-- A float literal is `f64` unless an `f32` is expected.
-- Integer arithmetic wraps at the type's width. Division by zero panics.
-- Operands of a binary operator have the same type. Conversions are explicit calls such as `u8(x)`, `f64(n)` and `i64(f)`. Integer conversions truncate or extend. A float to integer conversion truncates toward zero.
-- `&`, `|`, `^`, `~`, `<<` and `>>` work on integers. `>>` is arithmetic on signed types and logical on unsigned ones. The shift count may be any integer type. A count of 64 or more, or a negative one, gives 0, or the sign fill for `>>` on a negative signed value.
-- Binary operators bind as in Go, from tightest to loosest: `*`, `/`, `%`, `<<`, `>>`, `&`; then `+`, `-`, `|`, `^`; then `??`; then comparisons; then `&&`; then `||`. So `a - b >> 1` is `a - (b >> 1)` and `x | y - z` is `(x | y) - z`.
-- `%` is integer only. Floats follow IEEE 754. Division by zero gives an infinity. Comparisons with NaN are false except `!=`.
-- `sqrt`, `floor` and `exp` take and return `f32` or `f64`.
-- `print` accepts any integer or float type.
+| Kind | Types |
+| --- | --- |
+| Integer | `i64`, `i32`, `u64`, `u32`, `u16` and `u8` |
+| Float | `f64` and `f32` |
+
+#### Number literals
+
+Integer literals are decimal, or hexadecimal, binary and octal with `0x`, `0b` and `0o`. Float literals may have an exponent. In any number literal `_` may separate two digits, as in `1_000_000.0` or `0xFF_FF`. An `_` anywhere else is an error.
+
+An integer literal takes the type the context expects, including the other operand of a binary operator, and must fit it; otherwise it is `i64`. A literal above the `i64` range is accepted only as a `u64`. In an `if` expression with no expected type, an integer literal branch takes the type of the other branch.
+
+A float literal is `f64` unless an `f32` is expected.
+
+#### Arithmetic and conversions
+
+Operands of a binary operator have the same type. Conversions are explicit calls such as `u8(x)`, `f64(n)` and `i64(f)`. Integer conversions truncate or extend. A float to integer conversion truncates toward zero.
+
+| | Integers | Floats |
+| --- | --- | --- |
+| Arithmetic | Wraps at the type's width. | Follows IEEE 754. |
+| Division by zero | Panics. | Gives an infinity. |
+
+`%` is integer only. Comparisons with NaN are false except `!=`.
+
+`sqrt`, `floor` and `exp` take and return `f32` or `f64`. `print` accepts any integer or float type.
+
+#### Bit operators
+
+`&`, `|`, `^`, `~`, `<<` and `>>` work on integers. `>>` is arithmetic on signed types and logical on unsigned ones.
+
+The shift count may be any integer type. A count of 64 or more, or a negative one, gives 0, or the sign fill for `>>` on a negative signed value.
+
+#### Operator precedence
+
+Binary operators bind as in Go, from tightest to loosest: `*`, `/`, `%`, `<<`, `>>`, `&`; then `+`, `-`, `|`, `^`; then `??`; then comparisons; then `&&`; then `||`.
+
+So `a - b >> 1` is `a - (b >> 1)` and `x | y - z` is `(x | y) - z`.
 
 ### Vectors
+
+A vector holds several numbers of one lane type, and its operators work on every lane at once.
 
 ```low
 import std/bits
@@ -494,15 +624,53 @@ fn find(data: u8[], c: u8) -> i64 {
 }
 ```
 
-- Vector types are 128, 256 or 512 bits of one lane type: `u8x16`, `u8x32`, `u8x64`, `u16x8`, `u16x16`, `u16x32`, `i32x4`, `i32x8`, `i32x16`, `u32x4`, `u32x8`, `u32x16`, `i64x2`, `i64x4`, `i64x8`, `u64x2`, `u64x4`, `u64x8`, `f32x4`, `f32x8`, `f32x16`, `f64x2`, `f64x4` and `f64x8`. Every type works on every CPU. Where the AVX-512 version is not selected, a 512-bit vector runs as two 256-bit or four 128-bit halves.
-- `+`, `-`, `*`, `&`, `|`, `^`, `~` and unary `-` work lane by lane. `/` works on float lanes. `<<` and `>>` work on integer lanes by a scalar count, arithmetic on signed lanes, and follow the scalar rule on every lane type. A count of the lane width or more, or a negative one, gives 0, or the sign fill for `>>` on a negative signed lane. Compound assignments work the same way.
-- Comparisons work lane by lane and give a vector of the same type whose lanes are all ones or all zeros. Unsigned lanes compare unsigned.
-- A scalar operand of the lane type is broadcast, so `chunk == '"'` compares every lane.
-- `u8x32(v)` reinterprets a vector of the same width.
-- `std/simd` provides `read` and `write` between a vector and a slice at an element index, `read_str`, `splat`, `mask` (one bit per lane from its top bit), `any` and `all` (whether some or every lane has its top bit set), `blend`, `min`, `max`, `lane`, `with_lane`, `shuffle16`, `shuffle` and `shuffle64` (a byte table lookup within each 16-byte quarter of a `u8x16`, `u8x32` or `u8x64`, zero where the index has its top bit set), `find_byte` and `find_byte_str`. Reads and writes are bounds-checked.
-- Vectors are values. They can be passed, returned, stored in fields and slices, and compared lane by lane. They cannot be compared with `==` as a whole. They print as `<1, 2, 3, 4>`.
+Vector types are 128, 256 or 512 bits of one lane type.
+
+| Lane type | 128 bits | 256 bits | 512 bits |
+| --- | --- | --- | --- |
+| `u8` | `u8x16` | `u8x32` | `u8x64` |
+| `u16` | `u16x8` | `u16x16` | `u16x32` |
+| `i32` | `i32x4` | `i32x8` | `i32x16` |
+| `u32` | `u32x4` | `u32x8` | `u32x16` |
+| `i64` | `i64x2` | `i64x4` | `i64x8` |
+| `u64` | `u64x2` | `u64x4` | `u64x8` |
+| `f32` | `f32x4` | `f32x8` | `f32x16` |
+| `f64` | `f64x2` | `f64x4` | `f64x8` |
+
+Every type works on every CPU. Where the AVX-512 version is not selected, a 512-bit vector runs as two 256-bit or four 128-bit halves.
+
+Vectors are values. They can be passed, returned, stored in fields and slices, and compared lane by lane. They cannot be compared with `==` as a whole. They print as `<1, 2, 3, 4>`.
+
+#### Vector operators
+
+`+`, `-`, `*`, `&`, `|`, `^`, `~` and unary `-` work lane by lane. `/` works on float lanes.
+
+`<<` and `>>` work on integer lanes by a scalar count, arithmetic on signed lanes, and follow the scalar rule on every lane type. A count of the lane width or more, or a negative one, gives 0, or the sign fill for `>>` on a negative signed lane.
+
+Compound assignments work the same way.
+
+Comparisons work lane by lane and give a vector of the same type whose lanes are all ones or all zeros. Unsigned lanes compare unsigned.
+
+A scalar operand of the lane type is broadcast, so `chunk == '"'` compares every lane.
+
+`u8x32(v)` reinterprets a vector of the same width.
+
+#### The simd module
+
+`std/simd` provides the functions that work on vectors. Reads and writes are bounds-checked.
+
+| Function | Does |
+| --- | --- |
+| `read` and `write` | Move between a vector and a slice at an element index. |
+| `mask` | One bit per lane from its top bit. |
+| `any` and `all` | Whether some or every lane has its top bit set. |
+| `shuffle16`, `shuffle` and `shuffle64` | A byte table lookup within each 16-byte quarter of a `u8x16`, `u8x32` or `u8x64`, zero where the index has its top bit set. |
+
+It also provides `read_str`, `splat`, `blend`, `min`, `max`, `lane`, `with_lane`, `find_byte` and `find_byte_str`.
 
 ### Slices
+
+A slice is a growable sequence of values of one type. `T[]` is a pointer, a length and a capacity over garbage-collected memory. Assigning or passing a slice shares its elements.
 
 ```low
 let xs = [3, 1, 4]
@@ -513,28 +681,64 @@ xs[0] = 10
 print(xs.len)
 ```
 
-- `T[]` is a pointer, a length and a capacity over garbage-collected memory. Assigning or passing a slice shares its elements.
-- `[]` after a type applies to everything before it, as `?` does. `*Node[]` is a slice of pointers. `u8[][]` is a slice of slices. `fn() -> i64[]` is a function returning a slice.
-- `[]T` is the prefix spelling of `T[]`. The compiler's own source uses it, because the release in `bootstrap.txt` reads only that form.
-- Slice builtins are called as methods: `xs.push(v)`, not `push(mut xs, v)`.
-- `[a, b]` builds a slice. An empty `[]` needs an expected type. In an `if` expression with no expected type, a branch that is an empty `[]` takes the type of the other branch.
-- `xs[i]` reads or writes an element and panics when `i` is outside `0..xs.len`. Any integer type indexes.
-- `xs.len` is the length as `i64`.
-- `xs[a..b]`, `xs[..b]` and `xs[a..]` share the elements in that range. The result's capacity equals its length, so `push` onto it always copies and never overwrites the parent.
-- `xs.push(v)` appends, growing the capacity to twice plus four when full.
-- `xs.pop()` removes the last element and returns it as `T?`, or `none` when `xs` is empty.
-- `xs.truncate(n)` sets the length to `n` and panics unless `0 <= n <= xs.len`.
-- `pop` and `truncate` keep the capacity, so a later `push` reuses the freed space.
-  - They change only the binding they are given. A slice that shares its elements with another binding sees a later `push` overwrite the freed elements, as after any `push` that finds spare capacity. A reslice such as `xs = xs[..n]` is the form that copies on the next `push`.
-  - Elements past the length stay in the array, and keep what they point to alive, until a `push` overwrites them.
-- A function in the program named `pop` or `truncate` takes precedence over the builtin.
-- A slice literal or map literal whose elements are all constants is built once per program, at its first evaluation. It is reused.
-  - A literal is used in place when it is bound with `let` and the binding is only indexed, iterated or asked for `.len`, or when it is indexed, iterated or measured directly.
-  - Any other use gets a copy, because `push`, a slice of it, an argument, a return value, a field or an assignment through it would otherwise mutate the shared value.
-  - A slice literal under 1024 bytes and a map literal under 4 entries are rebuilt for those uses, since copying them costs more than building them.
-- Elements of `u8`, `u16`, `u32`, `i32` and `f32` are packed at their natural width; other elements take a word each.
+#### Slice types
+
+`[]` after a type applies to everything before it, as `?` does.
+
+| Type | Is |
+| --- | --- |
+| `*Node[]` | A slice of pointers. |
+| `u8[][]` | A slice of slices. |
+| `fn() -> i64[]` | A function returning a slice. |
+
+`[]T` is the prefix spelling of `T[]`. The compiler's own source uses it, because the release in `bootstrap.txt` reads only that form.
+
+Elements of `u8`, `u16`, `u32`, `i32` and `f32` are packed at their natural width; other elements take a word each.
+
+#### Slice operations
+
+| Form | Does |
+| --- | --- |
+| `[a, b]` | Builds a slice. |
+| `[]` | An empty slice. It needs an expected type. |
+| `xs[i]` | Reads or writes an element and panics when `i` is outside `0..xs.len`. Any integer type indexes. |
+| `xs.len` | The length as `i64`. |
+| `xs[a..b]`, `xs[..b]` and `xs[a..]` | Share the elements in that range. |
+| `xs.push(v)` | Appends, growing the capacity to twice plus four when full. |
+| `xs.pop()` | Removes the last element and returns it as `T?`, or `none` when `xs` is empty. |
+| `xs.truncate(n)` | Sets the length to `n` and panics unless `0 <= n <= xs.len`. |
+
+Slice builtins are called as methods: `xs.push(v)`, not `push(mut xs, v)`. A function in the program named `pop` or `truncate` takes precedence over the builtin.
+
+In an `if` expression with no expected type, a branch that is an empty `[]` takes the type of the other branch.
+
+#### Slice capacity
+
+A range such as `xs[a..b]` gives a result whose capacity equals its length, so `push` onto it always copies and never overwrites the parent.
+
+`pop` and `truncate` keep the capacity, so a later `push` reuses the freed space.
+
+- They change only the binding they are given. A slice that shares its elements with another binding sees a later `push` overwrite the freed elements, as after any `push` that finds spare capacity.
+- A reslice such as `xs = xs[..n]` is the form that copies on the next `push`.
+- Elements past the length stay in the array, and keep what they point to alive, until a `push` overwrites them.
+
+#### Constant slice and map literals
+
+A slice literal or map literal whose elements are all constants is built once per program, at its first evaluation. It is reused.
+
+| Use of the literal | Gets |
+| --- | --- |
+| Bound with `let`, when the binding is only indexed, iterated or asked for `.len` | The literal in place. |
+| Indexed, iterated or measured directly | The literal in place. |
+| Any other use | A copy. |
+
+Any other use gets a copy because `push`, a slice of it, an argument, a return value, a field or an assignment through it would otherwise mutate the shared value.
+
+A slice literal under 1024 bytes and a map literal under 4 entries are rebuilt for those uses, since copying them costs more than building them.
 
 ### Maps
+
+A map looks a value up by its key. `[K: V]` maps keys of an integer type, `bool`, `str` or a pointer type to values of any type.
 
 ```low
 let ages = ["ada": 36, "alan": 41]
@@ -547,30 +751,92 @@ for name, age in ages { print("{name} {age}") }
 for name in ages { print(name) }
 ```
 
-- `[K: V]` maps keys of an integer type, `bool`, `str` or a pointer type to values of any type.
-- A map is a pointer to a table on the garbage-collected heap, so assigning or passing it shares the table. `m[k] = v` works through any binding.
-- `[k: v, ...]` builds a map. `[:]` is an empty one and needs an expected type. An `if` branch takes that type from the other branch, as an empty `[]` does.
-- `m[k]` returns `V?`. `m[k] = v` inserts or replaces. A compound assignment such as `m[k] += 1` starts from a zero value when `k` is missing.
-- `m.delete(k)` removes a key; removing a missing key does nothing.
-- `m.len` is the number of entries.
-- `for k, v in m` and `for k in m` visit entries in insertion order. An overwritten value keeps its key's position. A deleted and re-inserted key moves to the end. Inserting new keys while iterating may skip or repeat entries.
-- A map literal of constants is built once per program in a release build. A use that only indexes, iterates or measures it shares the built table. Any other use gets a copy from the prelude's `__map_clone`. That function copies the entry array and the index. A literal of fewer than 4 entries is rebuilt for those uses, because the copy costs as much as the build.
-- A map is an array of entries in insertion order plus an open-addressed index of one word per slot.
-  - A slot is 0 when empty and -1 when its entry was deleted. Otherwise it holds the upper 32 bits of the key's 63-bit hash above the entry number plus one. A probe skips empty slots and slots of other keys without reading the entries.
-  - Iteration reads the entries, never the index, so the hash function never shows in the order. No program output depends on a hash value.
-  - The map code reads the low bits of the hash as the position and the upper 32 bits as the tag.
-- Hashes are seeded per process, so no key set can be built to collide without the seed. Start-up fills `rt_hash_seed` with 128 random bits and forces the second word odd.
-  - On Linux the bits are the 16 bytes at `AT_RANDOM`, or `getrandom` when the auxiliary vector has none, or the fallback when that fails. On Windows they come from `ProcessPrng`, with the same fallback.
-  - The fallback derives each word through its own SplitMix64 finalizer. `s0` comes from one RDTSC read, the stack address and one RDRAND word. `s1` comes from a second RDTSC read taken after a `cpuid`, a rotated stack address and a second RDRAND word. RDRAND contributes only when CPUID reports it and the instruction succeeds within 10 tries.
-- In the hash function, `s0` and `s1` are the two seed words. `mum(a, b)` is the high 64 bits of the 128-bit product of `a` and `b` xor its low 64 bits. The cases are:
-  - An integer, `bool` or pointer key `k` hashes to `fold(mum(k ^ s0, s1))`.
-  - A `str` of 16 bytes or fewer reads two words `a` and `b`. 8 to 16 bytes give the first and last eight. 4 to 7 give the first and last four packed into `a` with `b` zero. 1 to 3 give the first, middle and last byte. The empty string gives zero.
-  - Every `str` starts from `acc = mum(s1 ^ length, s0 | 1)`, so the length reaches the hash only through a product with seed words.
-  - A longer string folds every 16-byte block while more than 16 bytes remain. Each fold computes `acc = mum(w0 ^ s0, w1 ^ acc)`. The hash then reads its last 16 bytes as the two words.
-  - A `str` hashes to `fold(mum(a ^ s0, b ^ acc))`. `fold(h)` is `x = h ^ h >> 32` followed by `(x ^ x >> 16) >> 1`, which keeps 63 bits.
-- Two strings of different lengths whose input words differ by a chosen xor do not collide under every seed, because cancelling the length term needs `mum(s1 ^ n, s0 | 1) ^ mum(s1 ^ n', s0 | 1)`, which depends on the seed. Collisions between distinct strings remain possible with probability about 2^-63 per pair. The hash gives no protection once `s0` and `s1` are known.
+A map is a pointer to a table on the garbage-collected heap, so assigning or passing it shares the table. `m[k] = v` works through any binding.
+
+| Form | Does |
+| --- | --- |
+| `[k: v, ...]` | Builds a map. |
+| `[:]` | An empty map. It needs an expected type. |
+| `m[k]` | Returns `V?`. |
+| `m[k] = v` | Inserts or replaces. |
+| `m[k] += 1` | A compound assignment starts from a zero value when `k` is missing. |
+| `m.delete(k)` | Removes a key; removing a missing key does nothing. |
+| `m.len` | The number of entries. |
+| `for k, v in m` and `for k in m` | Visit entries in insertion order. |
+
+For `[:]`, an `if` branch takes that type from the other branch, as an empty `[]` does.
+
+#### Map iteration order
+
+Iteration follows insertion order:
+
+- An overwritten value keeps its key's position.
+- A deleted and re-inserted key moves to the end.
+- Inserting new keys while iterating may skip or repeat entries.
+
+#### Constant map literals
+
+A map literal of constants is built once per program in a release build. A use that only indexes, iterates or measures it shares the built table. Any other use gets a copy from the prelude's `__map_clone`. That function copies the entry array and the index.
+
+A literal of fewer than 4 entries is rebuilt for those uses, because the copy costs as much as the build.
+
+#### Map layout
+
+A map is an array of entries in insertion order plus an open-addressed index of one word per slot.
+
+| Slot | Means |
+| --- | --- |
+| 0 | Empty. |
+| -1 | Its entry was deleted. |
+| Otherwise | The upper 32 bits of the key's 63-bit hash above the entry number plus one. |
+
+A probe skips empty slots and slots of other keys without reading the entries. The map code reads the low bits of the hash as the position and the upper 32 bits as the tag.
+
+Iteration reads the entries, never the index, so the hash function never shows in the order. No program output depends on a hash value.
+
+#### Hash seed
+
+Hashes are seeded per process, so no key set can be built to collide without the seed. Start-up fills `rt_hash_seed` with 128 random bits and forces the second word odd.
+
+| System | Source of the bits |
+| --- | --- |
+| Linux | The 16 bytes at `AT_RANDOM`, or `getrandom` when the auxiliary vector has none, or the fallback when that fails. |
+| Windows | `ProcessPrng`, with the same fallback. |
+
+The fallback derives each word through its own SplitMix64 finalizer.
+
+| Word | Comes from |
+| --- | --- |
+| `s0` | One RDTSC read, the stack address and one RDRAND word. |
+| `s1` | A second RDTSC read taken after a `cpuid`, a rotated stack address and a second RDRAND word. |
+
+RDRAND contributes only when CPUID reports it and the instruction succeeds within 10 tries.
+
+#### Hash function
+
+In the hash function, `s0` and `s1` are the two seed words. `mum(a, b)` is the high 64 bits of the 128-bit product of `a` and `b` xor its low 64 bits. `fold(h)` is `x = h ^ h >> 32` followed by `(x ^ x >> 16) >> 1`, which keeps 63 bits.
+
+An integer, `bool` or pointer key `k` hashes to `fold(mum(k ^ s0, s1))`.
+
+A `str` is hashed in these steps:
+
+1. Every `str` starts from `acc = mum(s1 ^ length, s0 | 1)`, so the length reaches the hash only through a product with seed words.
+2. A string longer than 16 bytes folds every 16-byte block while more than 16 bytes remain. Each fold computes `acc = mum(w0 ^ s0, w1 ^ acc)`. The hash then reads its last 16 bytes as the two words.
+3. A `str` of 16 bytes or fewer reads two words `a` and `b`, as the table below sets out.
+4. A `str` hashes to `fold(mum(a ^ s0, b ^ acc))`.
+
+| Length in bytes | `a` and `b` |
+| --- | --- |
+| 8 to 16 | The first and last eight. |
+| 4 to 7 | The first and last four packed into `a` with `b` zero. |
+| 1 to 3 | The first, middle and last byte. |
+| The empty string | Zero. |
+
+Two strings of different lengths whose input words differ by a chosen xor do not collide under every seed, because cancelling the length term needs `mum(s1 ^ n, s0 | 1) ^ mum(s1 ^ n', s0 | 1)`, which depends on the seed. Collisions between distinct strings remain possible with probability about 2^-63 per pair. The hash gives no protection once `s0` and `s1` are known.
 
 ### Strings
+
+A `str` is an immutable pointer and length over UTF-8 bytes. Strings are built with interpolation and `+`, and read by byte or by code point.
 
 <!-- prelude
 let age = 36
@@ -586,50 +852,143 @@ let first: u8 = name[0]
 let copy = str(bytes(name))
 ```
 
-- `str` is an immutable pointer and length over UTF-8 bytes.
-- `s.len` is the length in bytes, `s[i]` reads a byte as `u8`, and `s[a..b]` shares a byte range.
-- `for c in s` visits code points as `u32`. `for i, c in s` also binds each code point's byte offset. Invalid UTF-8 yields U+FFFD for one byte.
-- `"{expr}"` interpolates a value of any type. `{{` and `}}` are literal braces. `print(expr)` writes the same text followed by a newline.
-- String and character literals take the escapes `\n`, `\t`, `\r`, `\0`, `\\`, `\"` and `\'`. Four more name a value by its hex digits, which may be upper or lower case:
-  - `\xhh` is one byte. In a string it may make bytes that are not UTF-8, as `"\xff"` does. In a character literal it is the code point `0` to `0xff`.
-  - `\uhhhh`, `\Uhhhhhhhh` and `\u{h...}` are one code point. In a string it is written as its UTF-8 bytes, so `"é"` is `"\u00e9"` and `"\u{e9}"`. `"😀"` is `"\U0001F600"` and `"\u{1F600}"`. A surrogate (`D800` to `DFFF`) or a value above `10FFFF` is an error.
-  - `\uhhhh` and `\Uhhhhhhhh` take exactly 4 and 8 digits. `\u{h...}` takes 1 to 6, so `'\u{2028}'` is the code point 8232 and `"\u{0}"` is one NUL byte. The `{` after `\u` belongs to the escape and never starts an interpolation, so `"{x}\u{2028}{y}"` interpolates twice. These are errors: an empty `\u{}`, a `\u{` with no closing `}` before the end of the literal or a non-hex character, and more than 6 digits.
-  - `text.unquote` reads the fixed-width spellings, and `std/regex` takes them in a pattern. `text.quote` writes `\xhh` for control characters and bytes that are not UTF-8.
-- `"{expr,width:format}"` aligns and formats the value, as in `"hello {name,13} your age is {age:##}"`, `"{price,10:f2}"`, `"{id:x8}"` and `"{n,-6}|"`. Both parts are optional. `{x,}` and `{x:}` are errors.
-  - The expression ends at the first `,` or `:` outside brackets, which is where the width starts. The width ends at the next `:` or at the closing brace. The format is all the text up to the closing brace, so it may contain `,` and `.`.
-  - A width is a non-zero decimal integer with an optional `-` and optional surrounding spaces. A positive width right-aligns and a negative one left-aligns, padding with spaces to that many code points. A longer text is never cut. A width applies to every type, including `str` and the default text of a struct.
-  - A format has no spaces and is checked at compile time. It applies to integers and floats. It is either a standard format, one letter with an optional precision of 0 to 99, or a picture. The compiler lowers it to prelude calls with constant parameters, so no format text is parsed at run time.
-- Standard formats, where `N` is the precision:
+| Expression | Gives |
+| --- | --- |
+| `s.len` | The length in bytes. |
+| `s[i]` | One byte, as `u8`. |
+| `s[a..b]` | A byte range that shares the bytes. |
+| `for c in s` | Each code point as `u32`. Invalid UTF-8 yields U+FFFD for one byte. |
+| `for i, c in s` | Each code point with its byte offset. Invalid UTF-8 yields U+FFFD for one byte. |
+| `'a'` | A code point of type `u32`, or `u8` where one is expected. |
+| `bytes(s)` | A copy of the string as a `u8[]`. |
+| `str(b)` | A copy of the bytes as a string. |
 
-  | Format | Types | Output |
-  |---|---|---|
-  | `dN` | integers | decimal with at least `N` digits, zero-padded after the sign: `{-5:d3}` is `-005` |
-  | `xN`, `XN` | integers | lower or upper case hex with at least `N` digits. A negative value is its two's complement at the width of its type: `{i32(-1):x}` is `ffffffff`, `{-1:x}` is `ffffffffffffffff` |
-  | `bN` | integers | binary, with the rules of `x` |
-  | `fN` | integers, floats | fixed point with `N` decimals, 2 by default: `{3.14159:f3}` is `3.142`, `{7:f1}` is `7.0` |
-  | `eN` | integers, floats | one digit, then `N` decimals (6 by default) and an exponent written like the default float text: `{12345.678:e2}` is `1.23e+4` |
-  | `nN` | integers, floats | like `f` with a `,` between every three integer digits; `N` is 0 for an integer and 2 for a float by default: `{1234567:n}` is `1,234,567` |
+#### String concatenation and comparison
 
-- A picture is a format of only `0`, `#`, `,` and `.`, with at least one `0` or `#` and at most one `.`.
-  - In the integer part each `0` is a digit that is always written and each `#` is a placeholder. A `,` between two placeholders groups the integer digits in threes. With no `0` in the integer part, a zero integer part is omitted. `{36:##}` is `36`, `{0:##}` is empty and `{0.5:#.##}` is `.5`, while `{0.5:0.##}` is `0.5`.
-  - In the fraction part the value is rounded to the number of `0`s plus `#`s. Trailing zeros are then dropped down to the number of `0`s. The `.` is dropped when no decimals remain. `{2.5:0.##}` is `2.5`, `{2:0.##}` is `2`, `{3.14159:0.00}` is `3.14`, `{1234567.891:#,##0.00}` is `1,234,567.89` and `{5:000}` is `005`.
-- Rounding is correct for the exact binary value of a float. It breaks ties to even, as glibc's `printf` does. `{0.125:f2}` is `0.12`, `{0.375:f2}` is `0.38`, `{2.675:f2}` is `2.67` because 2.675 lies just below the tie, and `{1e300:f2}` writes every digit. An `f32` formats its own exact value. Integers are exact up to the whole range of `u64` and `i64`. A negative value that rounds to zero keeps its sign, as in `-0.00`. `NaN`, `inf` and `-inf` ignore the format, and the width still applies.
-- A format on a value of a type other than an integer or float is an error: `cannot format a value of type str with "f2"`. These are errors too: `d`, `x`, `X` or `b` on a float, an unknown letter, a precision above 99, and a picture with other characters, two `.` or no `0` or `#`.
-- `a + b` concatenates, and `s += b` appends to a place. A chain such as `a + b + c + d`, with any interpolations inside it, is one operation that allocates the result once.
-- Floats are formatted as the shortest decimal that reads back to the same value. The text is positional for exponents from -6 to 20, and otherwise `1.5e-7` or `1e+21`. Infinities print as `inf` and `-inf`, NaN as `NaN`.
-- Every type has a default text, generated by the compiler with no annotation or constraint:
-  - Integers, floats and `bool` use the formats above and `true`/`false`. A `str` that is itself printed or interpolated is inserted unchanged. A `str` inside another value is quoted with `"`, with `"`, `\`, newline and tab escaped.
-  - A struct is `Point{x: 1, y: 2}`. It shows its name without module or type arguments, as in `Stack{items: [1]}`, and every field, private ones included.
-  - An enum variant is its name, `Leaf`; with positional fields `Node(a, b)`; with labelled fields `Move{x: 1, y: 2}`. An optional is `none` or its value.
-  - A slice is `[1, 2, 3]`, a map `{k: v, k2: v2}` in iteration order with keys rendered like any nested value, and a vector `<1, 2, 3, 4>`. A `u8[]` is `0x` and lowercase hex digits, `0x6869`.
-  - A pointer renders its target. A pointer met again while it is being rendered is `<cycle>`, so shared pointers render in full each time and only a cycle is cut.
-  - A function or channel is its type, `fn(i64) -> i64` or `chan[str]`. A `ptr[T]` is its type and address, `ptr[u8](0x7ffd1c2a)`, and a null one `ptr[u8](0x0)`.
-- `'a'` is a code point of type `u32`, or `u8` where one is expected.
-- `bytes(s)` copies a string into a `u8[]`; `str(b)` copies one back.
-- `==` and `!=` compare contents. `<`, `<=`, `>` and `>=` compare bytes in order, which for UTF-8 is code point order.
-- Equality checks the lengths, then the pointers, then compares eight bytes at a time with an overlapping final load.
+`a + b` concatenates, and `s += b` appends to a place. A chain such as `a + b + c + d`, with any interpolations inside it, is one operation that allocates the result once.
+
+`==` and `!=` compare contents. `<`, `<=`, `>` and `>=` compare bytes in order, which for UTF-8 is code point order.
+
+Equality checks the lengths, then the pointers, then compares eight bytes at a time with an overlapping final load.
+
+#### String interpolation
+
+`"{expr}"` interpolates a value of any type. `{{` and `}}` are literal braces. `print(expr)` writes the same text followed by a newline.
+
+`"{expr,width:format}"` aligns and formats the value, as in `"hello {name,13} your age is {age:##}"`, `"{price,10:f2}"`, `"{id:x8}"` and `"{n,-6}|"`. Both parts are optional. `{x,}` and `{x:}` are errors.
+
+The three parts are found in this order:
+
+1. The expression ends at the first `,` or `:` outside brackets, which is where the width starts.
+2. The width ends at the next `:` or at the closing brace.
+3. The format is all the text up to the closing brace, so it may contain `,` and `.`.
+
+**Width.** A width is a non-zero decimal integer with an optional `-` and optional surrounding spaces. A positive width right-aligns and a negative one left-aligns, padding with spaces to that many code points. A longer text is never cut. A width applies to every type, including `str` and the default text of a struct.
+
+**Format.** A format has no spaces and is checked at compile time. It applies to integers and floats. It is either a standard format, one letter with an optional precision of 0 to 99, or a picture. The compiler lowers it to prelude calls with constant parameters, so no format text is parsed at run time.
+
+#### Standard formats
+
+`N` is the precision.
+
+| Format | Types | Output |
+|---|---|---|
+| `dN` | integers | decimal with at least `N` digits, zero-padded after the sign: `{-5:d3}` is `-005` |
+| `xN`, `XN` | integers | lower or upper case hex with at least `N` digits. A negative value is its two's complement at the width of its type: `{i32(-1):x}` is `ffffffff`, `{-1:x}` is `ffffffffffffffff` |
+| `bN` | integers | binary, with the rules of `x` |
+| `fN` | integers, floats | fixed point with `N` decimals, 2 by default: `{3.14159:f3}` is `3.142`, `{7:f1}` is `7.0` |
+| `eN` | integers, floats | one digit, then `N` decimals (6 by default) and an exponent written like the default float text: `{12345.678:e2}` is `1.23e+4` |
+| `nN` | integers, floats | like `f` with a `,` between every three integer digits; `N` is 0 for an integer and 2 for a float by default: `{1234567:n}` is `1,234,567` |
+
+#### Picture formats
+
+A picture is a format of only `0`, `#`, `,` and `.`, with at least one `0` or `#` and at most one `.`.
+
+**Integer part.** Each `0` is a digit that is always written and each `#` is a placeholder. A `,` between two placeholders groups the integer digits in threes. With no `0` in the integer part, a zero integer part is omitted.
+
+**Fraction part.** The value is rounded to the number of `0`s plus `#`s. Trailing zeros are then dropped down to the number of `0`s. The `.` is dropped when no decimals remain.
+
+| Interpolation | Text |
+| --- | --- |
+| `{36:##}` | `36` |
+| `{0:##}` | empty |
+| `{0.5:#.##}` | `.5` |
+| `{0.5:0.##}` | `0.5` |
+| `{2.5:0.##}` | `2.5` |
+| `{2:0.##}` | `2` |
+| `{3.14159:0.00}` | `3.14` |
+| `{1234567.891:#,##0.00}` | `1,234,567.89` |
+| `{5:000}` | `005` |
+
+#### Rounding in formats
+
+Rounding is correct for the exact binary value of a float. It breaks ties to even, as glibc's `printf` does.
+
+| Interpolation | Text |
+| --- | --- |
+| `{0.125:f2}` | `0.12` |
+| `{0.375:f2}` | `0.38` |
+| `{2.675:f2}` | `2.67`, because 2.675 lies just below the tie. |
+
+- `{1e300:f2}` writes every digit.
+- An `f32` formats its own exact value.
+- Integers are exact up to the whole range of `u64` and `i64`.
+- A negative value that rounds to zero keeps its sign, as in `-0.00`.
+- `NaN`, `inf` and `-inf` ignore the format, and the width still applies.
+
+#### Format errors
+
+A format on a value of a type other than an integer or float is an error: `cannot format a value of type str with "f2"`. These are errors too:
+
+- `d`, `x`, `X` or `b` on a float
+- an unknown letter
+- a precision above 99
+- a picture with other characters, two `.` or no `0` or `#`
+
+#### String escapes
+
+String and character literals take the escapes `\n`, `\t`, `\r`, `\0`, `\\`, `\"` and `\'`. Four more name a value by its hex digits, which may be upper or lower case.
+
+| Escape | Digits | Value |
+| --- | --- | --- |
+| `\xhh` | 2 | One byte. |
+| `\uhhhh` | Exactly 4 | One code point. |
+| `\Uhhhhhhhh` | Exactly 8 | One code point. |
+| `\u{h...}` | 1 to 6 | One code point. |
+
+**`\xhh`.** In a string it may make bytes that are not UTF-8, as `"\xff"` does. In a character literal it is the code point `0` to `0xff`.
+
+**Code points.** `\uhhhh`, `\Uhhhhhhhh` and `\u{h...}` are one code point. In a string it is written as its UTF-8 bytes, so `"é"` is `"\u00e9"` and `"\u{e9}"`. `"😀"` is `"\U0001F600"` and `"\u{1F600}"`. A surrogate (`D800` to `DFFF`) or a value above `10FFFF` is an error.
+
+**Braced form.** `\uhhhh` and `\Uhhhhhhhh` take exactly 4 and 8 digits. `\u{h...}` takes 1 to 6, so `'\u{2028}'` is the code point 8232 and `"\u{0}"` is one NUL byte. The `{` after `\u` belongs to the escape and never starts an interpolation, so `"{x}\u{2028}{y}"` interpolates twice. These are errors: an empty `\u{}`, a `\u{` with no closing `}` before the end of the literal or a non-hex character, and more than 6 digits.
+
+**In the library.** `text.unquote` reads the fixed-width spellings, and `std/regex` takes them in a pattern. `text.quote` writes `\xhh` for control characters and bytes that are not UTF-8.
+
+#### Default text
+
+Every type has a default text, generated by the compiler with no annotation or constraint.
+
+| Type | Text |
+| --- | --- |
+| Integer, float | The formats above. |
+| `bool` | `true`/`false`. |
+| `str` | Inserted unchanged when it is itself printed or interpolated. Inside another value it is quoted with `"`, with `"`, `\`, newline and tab escaped. |
+| Struct | `Point{x: 1, y: 2}`. It shows its name without module or type arguments, as in `Stack{items: [1]}`, and every field, private ones included. |
+| Enum variant | Its name, `Leaf`; with positional fields `Node(a, b)`; with labelled fields `Move{x: 1, y: 2}`. |
+| Optional | `none` or its value. |
+| Slice | `[1, 2, 3]`. |
+| `u8[]` | `0x` and lowercase hex digits, `0x6869`. |
+| Map | `{k: v, k2: v2}` in iteration order with keys rendered like any nested value. |
+| Vector | `<1, 2, 3, 4>`. |
+| Pointer | Its target. A pointer met again while it is being rendered is `<cycle>`, so shared pointers render in full each time and only a cycle is cut. |
+| Function, channel | Its type, `fn(i64) -> i64` or `chan[str]`. |
+| `ptr[T]` | Its type and address, `ptr[u8](0x7ffd1c2a)`, and a null one `ptr[u8](0x0)`. |
+
+Floats are formatted as the shortest decimal that reads back to the same value. The text is positional for exponents from -6 to 20, and otherwise `1.5e-7` or `1e+21`. Infinities print as `inf` and `-inf`, NaN as `NaN`.
 
 ### Structs
+
+A struct groups named fields. Structs are values: assignment and argument passing copy them.
 
 <!-- prelude
 enum Align {
@@ -685,21 +1044,39 @@ let page = Div { padding: 8.0 } {
 }
 ```
 
-- A declaration's fields are separated by commas or newlines.
-- Literals name their fields, separated by commas or newlines. `x` alone means `x: x`. A field declared with `= expr` may be left out. Every other field must be given.
-- A field may carry a tag. A tag is a string literal without interpolation, after the field's type and before its default: `id: i32 "2,sint" = 0`. The checker keeps the text and does nothing else with it. `serde.schema` reports it in `Property.tag`, so a serialization format that needs more than the type holds, such as a field number, reads it there.
-- A default is any expression. It is checked once against the field's type, in the declaring module's scope, with no access to locals or other fields. It is evaluated at every literal that leaves the field out, after the written fields. A field with a default can be left out of a literal in another module even when it is private.
-- A brace block on the same line after a struct literal holds its children. The entries, one per line or separated by commas, become a slice literal for the struct's `children` field.
-- A brace block after a call becomes a slice literal passed as the last argument, so `fn button(label: str, children: Element[]) -> Element` takes children the same way.
-- A trailing block is not allowed where a struct literal is not.
-- A struct literal cannot appear directly in an `if`, `for` or `match` condition. Wrap it in parentheses.
-- Structs are values: assignment and argument passing copy them.
-- `==` and `!=` compare structs field by field when every field can be compared: numbers, `bool`, `str`, pointers, channels, and structs and enums made of them. Each field uses its own `==`, so strings compare by content, floats by value and pointers by identity.
-- Fields are assigned through a `var` binding or a `mut` parameter, at any depth: `r.max.x = 1`. Other parameters are immutable.
-- A struct cannot contain itself by value. It can hold a `*` pointer to its own type.
-- Fields are laid out in declaration order, one word per scalar, with no padding.
+#### Struct declarations
+
+A declaration's fields are separated by commas or newlines. Fields are laid out in declaration order, one word per scalar, with no padding.
+
+A struct cannot contain itself by value. It can hold a `*` pointer to its own type.
+
+**Defaults.** A default is any expression. It is checked once against the field's type, in the declaring module's scope, with no access to locals or other fields. It is evaluated at every literal that leaves the field out, after the written fields. A field with a default can be left out of a literal in another module even when it is private.
+
+**Tags.** A field may carry a tag. A tag is a string literal without interpolation, after the field's type and before its default: `id: i32 "2,sint" = 0`. The checker keeps the text and does nothing else with it. `serde.schema` reports it in `Property.tag`, so a serialization format that needs more than the type holds, such as a field number, reads it there.
+
+#### Struct literals
+
+Literals name their fields, separated by commas or newlines. `x` alone means `x: x`. A field declared with `= expr` may be left out. Every other field must be given.
+
+A struct literal cannot appear directly in an `if`, `for` or `match` condition. Wrap it in parentheses.
+
+#### Trailing blocks
+
+A brace block on the same line after a struct literal holds its children. The entries, one per line or separated by commas, become a slice literal for the struct's `children` field.
+
+A brace block after a call becomes a slice literal passed as the last argument, so `fn button(label: str, children: Element[]) -> Element` takes children the same way.
+
+A trailing block is not allowed where a struct literal is not.
+
+#### Struct fields and equality
+
+Fields are assigned through a `var` binding or a `mut` parameter, at any depth: `r.max.x = 1`. Other parameters are immutable.
+
+`==` and `!=` compare structs field by field when every field can be compared: numbers, `bool`, `str`, pointers, channels, and structs and enums made of them. Each field uses its own `==`, so strings compare by content, floats by value and pointers by identity.
 
 ### References
+
+A `mut` parameter refers to the caller's variable. Reads and writes go through to it. The call site writes `mut` before the argument.
 
 ```low
 fn swap(mut a: i64, mut b: i64) {
@@ -713,14 +1090,23 @@ var y = 2
 swap(mut x, mut y)
 ```
 
-- A `mut` parameter refers to the caller's variable. Reads and writes go through to it. The call site writes `mut` before the argument.
-- A `mut` argument must be a `var` binding, a `mut` parameter, a field or element of either, or a place through a dereferenced pointer.
-- One call cannot pass overlapping places as `mut`. `swap(mut p.x, mut p.x)` is rejected. `swap(mut p.x, mut p.y)` is allowed. Two `mut` parameters therefore never alias.
-- References exist only as parameters. They cannot be stored, returned or bound with `let`, so they never outlive the variable they refer to.
-- A `mut` parameter occupies one word holding the address of the place.
-- A place narrower than a word is copied into a word-sized frame slot before the call. Examples are an element of a packed slice like `u8[]` and a narrow `extern struct` field. The place is copied back at its own width after the call. The callee's word-sized reads and writes therefore never touch the neighbouring bytes. Code in the callee that reads the same element through another route, such as a pointer to the slice, sees the value from before the call until the callee returns.
+A `mut` argument must be a `var` binding, a `mut` parameter, a field or element of either, or a place through a dereferenced pointer.
+
+One call cannot pass overlapping places as `mut`. `swap(mut p.x, mut p.x)` is rejected. `swap(mut p.x, mut p.y)` is allowed. Two `mut` parameters therefore never alias.
+
+References exist only as parameters. They cannot be stored, returned or bound with `let`, so they never outlive the variable they refer to.
+
+#### How a reference is passed
+
+A `mut` parameter occupies one word holding the address of the place.
+
+A place narrower than a word is copied into a word-sized frame slot before the call. Examples are an element of a packed slice like `u8[]` and a narrow `extern struct` field. The place is copied back at its own width after the call. The callee's word-sized reads and writes therefore never touch the neighbouring bytes.
+
+Code in the callee that reads the same element through another route, such as a pointer to the slice, sees the value from before the call until the callee returns.
 
 ### Pointers
+
+`new(value)` copies a value onto the garbage-collected heap and returns a `*T`. Pointers are never null.
 
 <!-- prelude
 struct Counter {
@@ -745,13 +1131,18 @@ bump(mut *c)
 let copy = *c
 ```
 
-- `new(value)` copies a value onto the garbage-collected heap and returns a `*T`. Pointers are never null.
-- `p.field` reads and writes through the pointer. `*p` is the whole value, readable, assignable and passable as `mut`.
+| Expression | Meaning |
+| --- | --- |
+| `p.field` | Reads and writes through the pointer. |
+| `*p` | The whole value, readable, assignable and passable as `mut`. |
+
 - The object behind a pointer is mutable through any pointer to it, including one held by `let`.
 - `==` and `!=` on pointers compare identity.
 - `mut` arguments through pointers are not checked for overlap, since two pointers may refer to the same object.
 
 ### Regions
+
+`region { ... }` is an expression with the type and value of its block. While the block runs, every allocation of the green thread goes to a fresh region of memory: `new`, the growth of slices and maps, strings, interpolation, closure environments, derived code and the standard library. The region is freed when the block ends, so the garbage collector never sees that memory.
 
 ```low
 struct Report {
@@ -773,21 +1164,51 @@ fn summarise(rows: str[]) -> Report {
 }
 ```
 
-- `region { ... }` is an expression with the type and value of its block. While the block runs, every allocation of the green thread goes to a fresh region of memory: `new`, the growth of slices and maps, strings, interpolation, closure environments, derived code and the standard library. The region is freed when the block ends, so the garbage collector never sees that memory.
-- `region` is a contextual keyword. It is an ordinary identifier except where an expression begins and `{` follows, outside the head of an `if`, `for` or `match`.
-- Regions nest. An allocation goes to the innermost region, and a nested region's value is copied to the region around it.
-- The value of the block is deep-copied to the allocator that was current outside the block. This happens before the region is freed, so the result owns its memory:
-  - numbers and `bool` are values; a `str` is copied; slices keep their elements and order; maps keep their insertion order; structs, enums and optionals copy each field.
-  - A `*T` is copied to a new object each time it occurs, so two pointers to one object in the block become two objects in the result. A pointer that leads back to itself panics with `region: cycle through *T`.
-  - A result without pointers, strings, slices or maps is not copied.
-- The result type cannot contain a function, closure, channel, `ptr`, extern struct, droppable struct or error result. The checker rejects it with the offending type named.
-- `return`, `break`, `continue`, `fail`, `?`, `or return`, `or break` and `catch` mappings cannot leave the block. A loop or closure inside the block may use them for itself.
-- A pointer, slice or string that points into the region and is stored outside it dangles once the block ends. Storing it outside means keeping it in a variable, a heap object or a channel. In a `-c debug` build, reading it panics with `region: use of freed memory` until a later region on the same OS thread reuses that memory. After that it reads the later region's data. A release build keeps the first chunks of a freed region committed for the next region on the thread, so a read there gives the freed region's data or the later region's data. It panics only once the chunk has gone back to the operating system.
-- `spawn` inside a region starts a green thread whose allocations go to the garbage-collected heap. The call's closure environment is copied to the heap, but the values it holds that point into the region are freed with the region.
-- An allocation in a region does not count toward the collector's trigger, so allocation in regions alone does not start a collection.
-- A panic ends the process without freeing regions.
+`region` is a contextual keyword. It is an ordinary identifier except where an expression begins and `{` follows, outside the head of an `if`, `for` or `match`.
+
+Regions nest. An allocation goes to the innermost region, and a nested region's value is copied to the region around it.
+
+#### The value of a region
+
+The value of the block is deep-copied to the allocator that was current outside the block. This happens before the region is freed, so the result owns its memory.
+
+| In the result | Copied as |
+| --- | --- |
+| Numbers and `bool` | Values. |
+| `str` | A copy. |
+| Slices | Their elements, in order. |
+| Maps | Their entries, in insertion order. |
+| Structs, enums and optionals | Each field. |
+| `*T` | A new object each time it occurs, so two pointers to one object in the block become two objects in the result. |
+
+A pointer that leads back to itself panics with `region: cycle through *T`. A result without pointers, strings, slices or maps is not copied.
+
+The result type cannot contain a function, closure, channel, `ptr`, extern struct, droppable struct or error result. The checker rejects it with the offending type named.
+
+#### Leaving a region
+
+`return`, `break`, `continue`, `fail`, `?`, `or return`, `or break` and `catch` mappings cannot leave the block. A loop or closure inside the block may use them for itself.
+
+A panic ends the process without freeing regions.
+
+#### Memory that outlives a region
+
+A pointer, slice or string that points into the region and is stored outside it dangles once the block ends. Storing it outside means keeping it in a variable, a heap object or a channel.
+
+| Build | Reading the dangling value |
+| --- | --- |
+| `-c debug` | Panics with `region: use of freed memory` until a later region on the same OS thread reuses that memory. After that it reads the later region's data. |
+| Release | Gives the freed region's data or the later region's data, because a release build keeps the first chunks of a freed region committed for the next region on the thread. It panics only once the chunk has gone back to the operating system. |
+
+#### Regions, threads and the collector
+
+`spawn` inside a region starts a green thread whose allocations go to the garbage-collected heap. The call's closure environment is copied to the heap, but the values it holds that point into the region are freed with the region.
+
+An allocation in a region does not count toward the collector's trigger, so allocation in regions alone does not start a collection.
 
 ### Enums
+
+An enum is a set of variants, each of which may carry fields. A `match` takes a value apart by variant.
 
 ```low
 enum Shape {
@@ -805,15 +1226,32 @@ fn area(s: Shape) -> f64 {
 }
 ```
 
-- `match` must cover every variant, or end with `_` or a binding arm. Arms after `_` or a binding arm, and duplicate arms, are errors.
-  - A binding arm is a name starting with a lowercase letter that is not a variant, such as `other => describe(other)`. It matches anything and binds the whole subject.
-  - A capitalized name that is not a variant is an error, so a mistyped variant is never taken for a binding.
-- An arm that starts with a literal (`4`, `-1`, `'x'`, `"a"`, `true`), a parenthesised expression, `!` or `~`, or a name followed by `.` (`Mode.Fast`, `limits.max`) is a test arm. A test arm is an expression compared with `==`. `4 => ...` means `== 4 => ...` and `(base + 1) => ...` means `== base + 1 => ...`. A `match` with a test arm must end with `_`. A bare name is a variant or a binding, so write `(limit) => ...` to compare against a variable.
-- An arm that starts with a binary operator tests the subject. `% 3 == 0 => ...` means `subject % 3 == 0`. The subject is on the left, and ordinary precedence applies after it.
-  - The subject is evaluated once and arms are tried in order.
-  - Such tests work on a subject of any type, including enums (`== Empty`) and the error of a `catch`.
-  - A `match` that uses one, or whose subject is not an enum, must end with `_`.
-  - Arms are separated by newlines or commas.
+Variants are separated by commas or newlines. They are constructed as `Shape.Circle(2)`. Where the expected type is known, the bare name works, as in `let s: Shape = Empty`. The expected type is known in an annotated `let`, an argument, an assignment, a return and `fail`.
+
+An enum cannot contain itself by value; it can hold a `*` pointer to its own type.
+
+#### Match arms
+
+`match` must cover every variant, or end with `_` or a binding arm. Arms after `_` or a binding arm, and duplicate arms, are errors. Arms are separated by newlines or commas.
+
+An arm body is an expression, or `break`, `continue`, `return` or `fail`.
+
+| Arm | Starts with | Matches |
+| --- | --- | --- |
+| Variant | A variant name | That variant. Patterns bind fields by position; `_` ignores a field, and a bare variant name ignores all of them. |
+| Binding | A name starting with a lowercase letter that is not a variant, such as `other => describe(other)` | Anything. It binds the whole subject. |
+| Test | A literal (`4`, `-1`, `'x'`, `"a"`, `true`), a parenthesised expression, `!` or `~`, or a name followed by `.` (`Mode.Fast`, `limits.max`) | A subject equal to the expression. |
+| Operator | A binary operator | A subject for which the test holds. |
+
+A capitalized name that is not a variant is an error, so a mistyped variant is never taken for a binding.
+
+**Test arms.** A test arm is an expression compared with `==`. `4 => ...` means `== 4 => ...` and `(base + 1) => ...` means `== base + 1 => ...`. A `match` with a test arm must end with `_`. A bare name is a variant or a binding, so write `(limit) => ...` to compare against a variable.
+
+**Operator arms.** An arm that starts with a binary operator tests the subject. `% 3 == 0 => ...` means `subject % 3 == 0`. The subject is on the left, and ordinary precedence applies after it.
+
+- The subject is evaluated once and arms are tried in order.
+- Such tests work on a subject of any type, including enums (`== Empty`) and the error of a `catch`.
+- A `match` that uses one, or whose subject is not an enum, must end with `_`.
 
 ```low
 fn classify(n: i64) -> str {
@@ -826,10 +1264,9 @@ fn classify(n: i64) -> str {
 }
 ```
 
-- Patterns bind fields by position; `_` ignores a field, and a bare variant name ignores all of them.
-- An arm body is an expression, or `break`, `continue`, `return` or `fail`.
-- Variants are constructed as `Shape.Circle(2)`. Where the expected type is known, the bare name works, as in `let s: Shape = Empty`. The expected type is known in an annotated `let`, an argument, an assignment, a return and `fail`.
-- Variants are separated by commas or newlines.
+#### Variant indexes
+
+`= n` after a variant gives it an index.
 
 ```low
 enum Colour {
@@ -842,22 +1279,41 @@ enum Colour {
 let index = Colour.Red.index
 ```
 
-- `= n` after a variant gives it an index. The index is an integer literal that fits in an `i64`, with an optional leading `-`. When one variant has an index, every variant must have one. Variants may share an index.
-- A field of a variant takes a tag as a struct field does: `Sensor(id: i32 "sint") = 1`. `serde.schema` reports it in `Property.tag`.
-- `e.index` is the `i64` index of the variant `e` holds. It is an error on an enum whose variants have no indexes, and that includes an optional.
-- The index is a value the variant carries, not its tag: layout, `==` and `match` are the same with or without indexes.
-- `e.index` compiles to the tag plus a constant when every variant's index is its tag plus that constant. Otherwise it compiles to a switch on the tag, as for a `match`. The default of that switch is the index shared by the most variants.
-- Code generation for a `match` depends on its arms. The rules below apply when the arms before the last are all distinct variants of one enum, or all distinct integer or character literals of one type:
-  - A `match` with at least 12 such arms compiles to a `switch` block when their values span at most 4096 and at most three times the arm count. The backend emits a bounds check and an indirect jump through a table of 32-bit offsets.
-  - Without that density, 48 or more arms compile to a binary search over the values.
-  - Fewer arms keep the chain of comparisons.
-  - Duplicate values, test arms and arms with other expressions always keep the chain.
-  - A `switch` on a constant folds to its target.
-- An enum whose variants all have no payload is a single word. Otherwise an enum is a tag word followed by the largest variant's fields.
-- An enum cannot contain itself by value; it can hold a `*` pointer to its own type.
-- `==` and `!=` compare enums whose variant fields can all be compared. Equal values have the same variant and equal fields. Optionals compare the same way, so `x == none` and `x == 5` work on an `i64?`. `x == none` and `x != none` also work on every optional, whatever its payload. They test only whether a value is present. Comparing two optionals still needs a payload that can be compared.
+- The index is an integer literal that fits in an `i64`, with an optional leading `-`.
+- When one variant has an index, every variant must have one.
+- Variants may share an index.
+
+`e.index` is the `i64` index of the variant `e` holds. It is an error on an enum whose variants have no indexes, and that includes an optional.
+
+The index is a value the variant carries, not its tag: layout, `==` and `match` are the same with or without indexes.
+
+A field of a variant takes a tag as a struct field does: `Sensor(id: i32 "sint") = 1`. `serde.schema` reports it in `Property.tag`.
+
+#### Enum equality
+
+`==` and `!=` compare enums whose variant fields can all be compared. Equal values have the same variant and equal fields.
+
+Optionals compare the same way, so `x == none` and `x == 5` work on an `i64?`. `x == none` and `x != none` also work on every optional, whatever its payload. They test only whether a value is present. Comparing two optionals still needs a payload that can be compared.
+
+#### Enum layout and code generation
+
+An enum whose variants all have no payload is a single word. Otherwise an enum is a tag word followed by the largest variant's fields.
+
+`e.index` compiles to the tag plus a constant when every variant's index is its tag plus that constant. Otherwise it compiles to a switch on the tag, as for a `match`. The default of that switch is the index shared by the most variants.
+
+Code generation for a `match` depends on its arms. The rules below apply when the arms before the last are all distinct variants of one enum, or all distinct integer or character literals of one type.
+
+| Arms | Compiles to |
+| --- | --- |
+| At least 12, with values that span at most 4096 and at most three times the arm count | A `switch` block. The backend emits a bounds check and an indirect jump through a table of 32-bit offsets. |
+| 48 or more, without that density | A binary search over the values. |
+| Fewer | The chain of comparisons. |
+
+Duplicate values, test arms and arms with other expressions always keep the chain. A `switch` on a constant folds to its target.
 
 ### Optionals
+
+`T?` holds either `some(value)` or `none`.
 
 <!-- prelude
 let xs = [1, 7, 4]
@@ -889,27 +1345,61 @@ struct Node {
 }
 ```
 
-- `T?` holds either `some(value)` or `none`.
-- A `T` is accepted wherever a `T?` is expected: an annotated `let`, an assignment, an argument, a field, a return and either branch of an `if` or `match`. `none` and `some(v)` take their type from that expectation.
-- `x ?? fallback` gives the value inside `x`, or evaluates `fallback` when `x` is `none`.
-  - The fallback may itself be a `T?`, making the result a `T?`.
-  - The fallback may leave instead, as in `let line = read_line() ?? break`.
-  - An expected type `T` reaches `x` as `T?`, so in `let n: u8 = (200 when ready) ?? 0` the literal is a `u8`.
-  - `??` binds tighter than comparisons and looser than arithmetic. It groups to the right: `a ?? b ?? 0` tries `a`, then `b`.
-- `value when cond` gives `value` when the `bool` `cond` is true and `none` otherwise.
-  - `cond` is evaluated first, and `value` only when `cond` is true.
-  - The result is a `T?` for a `value` of type `T` or `T?`, so `find(xs, 7) when xs.len > 0` is an `i64?`. A `value` of no type, such as a call that returns nothing, is an error.
-  - `when` binds looser than every binary operator, `|>` included, and does not chain: `a + b when c && d` is `(a + b) when (c && d)`, and a second `when` needs parentheses.
-  - `return v when c` returns `v when c`, and an expression-bodied closure `fn(n) n * 2 when n > 1` has the whole `when` as its body.
-  - `when` is a contextual keyword: it is an ordinary identifier everywhere except directly after an expression on the same line.
-- `value when cond else fallback` gives `value` when `cond` is true and `fallback` otherwise, as `(value when cond) ?? fallback` does.
-  - `fallback` is checked against the type of `value`, so `spans(tab) when ready else []` is a slice of the type `spans` returns, and an empty `[]` or `[:]` as `value` takes the type of `fallback`.
-  - `fallback` is evaluated only when `cond` is false or `value` is a `none`. It may be a `T?`, which makes the result a `T?`. It may leave, as in `let n = next() when more else break`.
-  - `else` binds as loosely as `when`, and a second `when` in `fallback` needs parentheses.
-- `match` unwraps an optional with `some(v)` and `none` arms and must cover both.
-- `?` after a type binds to everything before it. `*Node?` is an optional pointer, `i64[]?` is an optional slice and `*Node[]?` is an optional slice of pointers.
-- Parentheses group a type. `(fn() -> i64)[]` is a slice of functions, `*(i64[])` is a pointer to a slice and `(str?)?` is an optional optional. `str??` means the same as `(str?)?`. At the end of a line, where `??` would continue the expression, it is an error and the parenthesised form is needed.
-- An optional is an enum with `none` as tag 0 and `some` as tag 1, so it takes one word more than its value.
+A `T` is accepted wherever a `T?` is expected: an annotated `let`, an assignment, an argument, a field, a return and either branch of an `if` or `match`. `none` and `some(v)` take their type from that expectation.
+
+| Form | Gives |
+| --- | --- |
+| `x ?? fallback` | The value inside `x`, or `fallback` when `x` is `none`. |
+| `value when cond` | `value` when the `bool` `cond` is true and `none` otherwise. |
+| `value when cond else fallback` | `value` when `cond` is true and `fallback` otherwise. |
+| `match` with `some(v)` and `none` arms | The unwrapped value in the `some(v)` arm. It must cover both. |
+
+An optional is an enum with `none` as tag 0 and `some` as tag 1, so it takes one word more than its value.
+
+#### The ?? operator
+
+`x ?? fallback` gives the value inside `x`, or evaluates `fallback` when `x` is `none`.
+
+- The fallback may itself be a `T?`, making the result a `T?`.
+- The fallback may leave instead, as in `let line = read_line() ?? break`.
+- An expected type `T` reaches `x` as `T?`, so in `let n: u8 = (200 when ready) ?? 0` the literal is a `u8`.
+- `??` binds tighter than comparisons and looser than arithmetic. It groups to the right: `a ?? b ?? 0` tries `a`, then `b`.
+
+#### The when expression
+
+`value when cond` gives `value` when the `bool` `cond` is true and `none` otherwise. `cond` is evaluated first, and `value` only when `cond` is true.
+
+The result is a `T?` for a `value` of type `T` or `T?`, so `find(xs, 7) when xs.len > 0` is an `i64?`. A `value` of no type, such as a call that returns nothing, is an error.
+
+`when` binds looser than every binary operator, `|>` included, and does not chain: `a + b when c && d` is `(a + b) when (c && d)`, and a second `when` needs parentheses.
+
+`return v when c` returns `v when c`, and an expression-bodied closure `fn(n) n * 2 when n > 1` has the whole `when` as its body.
+
+`when` is a contextual keyword: it is an ordinary identifier everywhere except directly after an expression on the same line.
+
+#### when with else
+
+`value when cond else fallback` gives `value` when `cond` is true and `fallback` otherwise, as `(value when cond) ?? fallback` does.
+
+- `fallback` is checked against the type of `value`, so `spans(tab) when ready else []` is a slice of the type `spans` returns, and an empty `[]` or `[:]` as `value` takes the type of `fallback`.
+- `fallback` is evaluated only when `cond` is false or `value` is a `none`.
+- `fallback` may be a `T?`, which makes the result a `T?`. It may leave, as in `let n = next() when more else break`.
+- `else` binds as loosely as `when`, and a second `when` in `fallback` needs parentheses.
+
+#### Optional types
+
+`?` after a type binds to everything before it. Parentheses group a type.
+
+| Type | Is |
+| --- | --- |
+| `*Node?` | An optional pointer. |
+| `i64[]?` | An optional slice. |
+| `*Node[]?` | An optional slice of pointers. |
+| `(fn() -> i64)[]` | A slice of functions. |
+| `*(i64[])` | A pointer to a slice. |
+| `(str?)?` | An optional optional. |
+
+`str??` means the same as `(str?)?`. At the end of a line, where `??` would continue the expression, it is an error and the parenthesised form is needed.
 
 ### Errors
 
@@ -961,19 +1451,48 @@ fn main() ! ParseError {
 }
 ```
 
-- `fail v` returns the error `v`. `v` is checked against the function's error type, so bare variant names work.
-- Postfix `?` returns the error to the caller, whose error type must be the same enum.
-- `catch` is for when the error matters:
-  - `catch { arms }` matches the error exhaustively. A binding arm such as `e => report(e)` receives the whole error.
-  - `catch M` returns the error to the caller after mapping it. The mapping uses `M`, a variant or a function written as a name or a qualified name. `parse(s) catch Port` is `parse(s) catch { e => fail Port(e) }`. `M(e)` must have the caller's error type, so `M` is a one-field variant of that enum or a function value of type `fn(E) -> F`. The mapping runs before the deferred statements.
-- `or value` is for when the error does not matter. It discards the error and evaluates `value` in its place. The value may leave instead, as in `or fail Missing`, `or return none` or `or break`.
-- Where an optional `T?` is expected, `or` and `catch { arms }` produce one, so the fallback or an arm may be `none`.
-- `fn f() ! E` fails or returns nothing.
-- A result cannot be discarded, bound or passed on without `?`, `catch` or `or`, except by returning it from a function with the same result type.
-- When `main` declares `! E`, or top-level statements give it one, and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2, as does `panic(message)`.
-- A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
+| Form | Does |
+| --- | --- |
+| `fail v` | Returns the error `v`. |
+| Postfix `?` | Returns the error to the caller. |
+| `catch { arms }` | Matches the error. |
+| `catch M` | Maps the error and returns it to the caller. |
+| `or value` | Discards the error and gives `value`. |
+
+`fn f() ! E` fails or returns nothing.
+
+A result cannot be discarded, bound or passed on without `?`, `catch` or `or`, except by returning it from a function with the same result type.
+
+#### Raising and passing on an error
+
+`fail v` returns the error `v`. `v` is checked against the function's error type, so bare variant names work.
+
+Postfix `?` returns the error to the caller, whose error type must be the same enum.
+
+#### Handling an error
+
+`catch` is for when the error matters.
+
+- `catch { arms }` matches the error exhaustively. A binding arm such as `e => report(e)` receives the whole error.
+- `catch M` returns the error to the caller after mapping it. The mapping uses `M`, a variant or a function written as a name or a qualified name.
+
+`parse(s) catch Port` is `parse(s) catch { e => fail Port(e) }`. `M(e)` must have the caller's error type, so `M` is a one-field variant of that enum or a function value of type `fn(E) -> F`. The mapping runs before the deferred statements.
+
+`or value` is for when the error does not matter. It discards the error and evaluates `value` in its place. The value may leave instead, as in `or fail Missing`, `or return none` or `or break`.
+
+Where an optional `T?` is expected, `or` and `catch { arms }` produce one, so the fallback or an arm may be `none`.
+
+#### Errors from main
+
+When `main` declares `! E`, or top-level statements give it one, and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2, as does `panic(message)`.
+
+#### Result layout
+
+A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
 
 ### Embedded data
+
+`embed("path")` is the contents of a file as a `str`, read at compile time. `embed_dir("path")` gives the regular files under a directory as a `[str: str]`.
 
 <!-- prelude shaders/quad.spv
 -->
@@ -985,11 +1504,22 @@ let font = embed("fonts/fallback.ttf")
 print(shader.len)
 ```
 
-- `embed("path")` is the contents of a file as a `str`, read at compile time. The path must be a string literal. It is relative to the directory of the file that calls `embed`, so a module carries its own assets.
-- The bytes live in the binary's read-only data, aligned to 16 bytes; nothing is copied at run time. Indexing, slicing, `.len` and `bytes(...)` work as on any string.
-- A missing file is a compile error. A path outside the tree of the fetched dependency whose module calls `embed` is a compile error (see `### Projects`). `low dev` watches embedded files. A change to one reloads the functions that embed it.
-- `embed_dir("path")` embeds every regular file under a directory, however deep. It gives a `[str: str]` from each file's path inside the directory to its contents, with `/` between segments. The entries are in byte order of those paths. Each call builds a new map. The contents are the same read-only bytes `embed` gives.
+The path must be a string literal. It is relative to the directory of the file that calls `embed`, so a module carries its own assets.
+
+The bytes live in the binary's read-only data, aligned to 16 bytes; nothing is copied at run time. Indexing, slicing, `.len` and `bytes(...)` work as on any string.
+
+| Case | Result |
+| --- | --- |
+| A missing file | A compile error. |
+| A path outside the tree of the fetched dependency whose module calls `embed` | A compile error (see `### Projects`). |
+
+`low dev` watches embedded files. A change to one reloads the functions that embed it.
+
+`embed_dir("path")` embeds every regular file under a directory, however deep. It gives a `[str: str]` from each file's path inside the directory to its contents, with `/` between segments. The entries are in byte order of those paths. Each call builds a new map. The contents are the same read-only bytes `embed` gives.
+
 ### C interop
+
+An `extern` block declares the functions of a C library. Pointers, C structs and callbacks have their own types.
 
 <!-- prelude
 struct Block[T] {
@@ -1020,25 +1550,61 @@ let n = strtol(cstr("123abc"), mut end, 10)
 let pixels = view(buf, 64)
 ```
 
-- `extern "name" { ... }` at the top level of a file names a C library and declares its functions without bodies. `"c"` is the C library itself.
+#### Declaring C functions
+
+`extern "name" { ... }` at the top level of a file names a C library and declares its functions without bodies. `"c"` is the C library itself.
+
 - A trailing `...` makes a function variadic.
-- `fn errno_location() -> ptr[i32] = "__errno_location"` gives a function a Low name different from its C symbol, for symbols that start with `__` or are Low keywords.
 - Declarations are private to their module unless marked `pub`.
-- A library is linked when code reachable from `main` calls or takes the address of one of its declared functions. Importing a module that declares C functions therefore costs nothing until one is used.
-- A program that uses no library is a static executable with no libc. A program that uses any is a dynamic executable linked against libc and each used library.
-- C signatures use C types: integers, floats, `bool`, `ptr`, `ptr[T]`, and `extern struct`s by value.
-- A `mut` parameter passes the address of a Low place for the duration of the call, as C# passes `ref`. C may read and write through it.
-- `ptr[T]` is a nullable pointer to C memory. `ptr` is `void*` and converts to and from any `ptr[T]`. `null` takes its type from context. `==` and `!=` compare addresses.
-- `ptr(n)` makes an address from an `i64` or `u64`, and `i64(p)` and `u64(p)` give a `ptr`'s address as a number, for C values that carry either, such as a Win32 `LPARAM`.
-- `view(p, n)` is a `T[]` over `n` elements at `p`, bounds-checked like any slice. `load(p)` and `store(p, v)` read and write one `T`.
-- `cstr(s)` is a NUL-terminated copy of a string. `str(p)` copies a NUL-terminated `ptr[u8]` back.
-- `extern struct` has C layout. Fields are in order at their natural alignment, and the size is rounded to the largest alignment. Its fields must have C types. It is used like any struct, and its fields are read and written at their own width.
-- Memory may be passed to C for the duration of a call. Memory C keeps after the call must be pinned. `pin(x)` returns the address of a pointer, slice, map or string's data and keeps it alive until `unpin(p)`.
-- Memory C allocates is never touched by the collector.
-- `extern fn(ptr[i64], ptr[i64]) -> i32` is a C function pointer. It is one word, like C#'s `delegate* unmanaged`. Its parameters and result must have C types. It is a C type, so it can be a parameter, a result or an `extern struct` field.
+- `fn errno_location() -> ptr[i32] = "__errno_location"` gives a function a Low name different from its C symbol, for symbols that start with `__` or are Low keywords.
+
+C signatures use C types: integers, floats, `bool`, `ptr`, `ptr[T]`, and `extern struct`s by value.
+
+A `mut` parameter passes the address of a Low place for the duration of the call, as C# passes `ref`. C may read and write through it.
+
+#### Linking C libraries
+
+A library is linked when code reachable from `main` calls or takes the address of one of its declared functions. Importing a module that declares C functions therefore costs nothing until one is used.
+
+| Program | Executable |
+| --- | --- |
+| Uses no library | A static executable with no libc. |
+| Uses any library | A dynamic executable linked against libc and each used library. |
+
+#### C pointers
+
+`ptr[T]` is a nullable pointer to C memory. `ptr` is `void*` and converts to and from any `ptr[T]`. `null` takes its type from context. `==` and `!=` compare addresses.
+
+| Builtin | Does |
+| --- | --- |
+| `ptr(n)` | Makes an address from an `i64` or `u64`. |
+| `i64(p)`, `u64(p)` | Give a `ptr`'s address as a number. |
+| `view(p, n)` | A `T[]` over `n` elements at `p`, bounds-checked like any slice. |
+| `load(p)`, `store(p, v)` | Read and write one `T`. |
+| `cstr(s)` | A NUL-terminated copy of a string. |
+| `str(p)` | Copies a NUL-terminated `ptr[u8]` back. |
+
+`ptr(n)`, `i64(p)` and `u64(p)` are for C values that carry either an address or a number, such as a Win32 `LPARAM`.
+
+#### C struct layout
+
+`extern struct` has C layout. Fields are in order at their natural alignment, and the size is rounded to the largest alignment. Its fields must have C types. It is used like any struct, and its fields are read and written at their own width.
+
+#### Memory shared with C
+
+Memory may be passed to C for the duration of a call. Memory C keeps after the call must be pinned. `pin(x)` returns the address of a pointer, slice, map or string's data and keeps it alive until `unpin(p)`.
+
+Memory C allocates is never touched by the collector.
+
+#### C callbacks
+
+`extern fn(ptr[i64], ptr[i64]) -> i32` is a C function pointer. It is one word, like C#'s `delegate* unmanaged`. Its parameters and result must have C types. It is a C type, so it can be a parameter, a result or an `extern struct` field.
+
 - A top-level Low function becomes a C callback where an `extern fn` is expected, if it takes and returns only numbers, `bool`, `ptr` or `extern fn`, with no `mut` parameters.
-- An `extern` function used as a value is its C address. Calling an `extern fn` value makes a C call.
-- A closure reaches C through a `ptr` user-data argument: pin a pointer to the state it needs and pass a top-level callback that loads it.
+- An `extern` function used as a value is its C address.
+- Calling an `extern fn` value makes a C call.
+
+A closure reaches C through a `ptr` user-data argument: pin a pointer to the state it needs and pass a top-level callback that loads it.
 
 <!-- prelude
 extern "c" {
@@ -1060,6 +1626,8 @@ qsort(data, n, 8, ascending)
 ```
 
 ### Defer
+
+`defer` runs a statement when its enclosing block exits.
 
 <!-- prelude
 enum IoError {
@@ -1084,12 +1652,19 @@ defer {
 }
 ```
 
-- `defer` runs a statement when its enclosing block exits: at the end of the block, on `return`, `fail` or a propagated `?`, and when `break` or `continue` leaves it.
-- Deferred statements of a block run last first.
-- The statement sees variables as they are at exit.
-- It cannot `return`, `fail`, use `?`, `break`, `continue` or contain another `defer`.
+The block exits, and the statement runs, in each of these cases:
+
+- at the end of the block
+- on `return`, `fail` or a propagated `?`
+- when `break` or `continue` leaves it
+
+Deferred statements of a block run last first. The statement sees variables as they are at exit.
+
+The statement cannot `return`, `fail`, use `?`, `break`, `continue` or contain another `defer`.
 
 ### Using
+
+A struct with a `drop` owns a resource, and `using` binds such a value so that it is released when its block exits.
 
 <!-- prelude
 enum IoError {
@@ -1137,24 +1712,63 @@ using var current = open_file("a")
 current = open_file("b")
 ```
 
-- `drop <stmt>` inside a struct body declares its cleanup, with the struct's fields in scope as borrowed values. Like `defer`, it takes one statement or a `{ }` block.
-- A struct has at most one `drop`, and `using` cannot appear in it.
-- A struct with a `drop` is droppable, and so is a struct with a droppable field, even without its own `drop`. Generic instances are droppable per instance: `Pair[File, i64]` is, `Pair[i64, i64]` is not.
-- Releasing a value runs its own `drop` first, then releases its droppable fields in declaration order.
-- `using x = expr` binds `x` and releases it when the enclosing block exits by any path: the end of the block, `return`, `fail`, `?`, `break` or `continue`. Releases and `defer`s run together, last first.
-- `using var x = expr` can be reassigned. Assignment releases the old value, and exit releases the value held then.
-- `using` cannot appear inside `defer`. Binding a non-droppable value with `using` is an error.
-- A droppable value cannot be bound with `let` or `var`: "File has drop; bind it with using". Results of droppable types are unwrapped with `?`, `catch` or `or` straight into a `using` binding.
-- Droppable values are move-only:
-  - `return x`, or a function body ending in `x`, moves a `using` binding out. The caller owns the value and must bind it with `using`.
-  - A struct literal field or an assignment to a field of a droppable value moves the value into it, and the outer value releases it. A field is assigned through a `using var` binding or a `mut` parameter, and the field's old value is released first.
-  - `using y = x` moves `x` into `y`.
-  - Passing a value as an argument borrows it: the callee cannot release it, store it or return it. A freshly produced value, such as a call result or a struct literal, must be bound with `using` before it is passed.
-  - Any other copy is an error: binding it with `let`, storing it in a slice, map, channel, optional, pointer or enum variant, moving a field out of its struct, discarding a call result, or capturing it in a closure.
-  - A struct with a droppable field is itself droppable, so it cannot be built with `new` or held by a pointer, and `spawn` cannot take one as an argument: "spawn cannot take File; it has drop". Code that shares a resource across closures, pointers or green threads passes a copyable view of it. It binds the owner where the resource has one home (see Resource ownership).
-  - Using a binding after it was moved is an error, as is using one that may have been moved on one branch or by an earlier loop iteration.
-- Generic code is checked under these rules for each instance whose type arguments are droppable, so `fn same[T](x: T) -> T { x }` cannot be instantiated with `File`.
-- Each `using` binding has a hidden flag that a move clears. The release at exit runs only while the flag is set, so a value moved on one branch is released exactly once.
+#### Declaring a drop
+
+`drop <stmt>` inside a struct body declares its cleanup, with the struct's fields in scope as borrowed values. Like `defer`, it takes one statement or a `{ }` block. A struct has at most one `drop`, and `using` cannot appear in it.
+
+A struct with a `drop` is droppable, and so is a struct with a droppable field, even without its own `drop`. Generic instances are droppable per instance: `Pair[File, i64]` is, `Pair[i64, i64]` is not.
+
+Releasing a value runs its own `drop` first, then releases its droppable fields in declaration order.
+
+#### Binding with using
+
+| Form | Meaning |
+| --- | --- |
+| `using x = expr` | Binds `x` and releases it when the enclosing block exits by any path: the end of the block, `return`, `fail`, `?`, `break` or `continue`. |
+| `using var x = expr` | A binding that can be reassigned. Assignment releases the old value, and exit releases the value held then. |
+| `using y = x` | Moves `x` into `y`. |
+
+Releases and `defer`s run together, last first.
+
+- `using` cannot appear inside `defer`.
+- Binding a non-droppable value with `using` is an error.
+- A droppable value cannot be bound with `let` or `var`: "File has drop; bind it with using".
+- Results of droppable types are unwrapped with `?`, `catch` or `or` straight into a `using` binding.
+
+Each `using` binding has a hidden flag that a move clears. The release at exit runs only while the flag is set, so a value moved on one branch is released exactly once.
+
+#### Moving a droppable value
+
+Droppable values are move-only. A value moves, or is borrowed, in these places:
+
+| Place | What happens |
+| --- | --- |
+| `return x`, or a function body ending in `x` | Moves a `using` binding out. The caller owns the value and must bind it with `using`. |
+| A struct literal field, or an assignment to a field of a droppable value | Moves the value into it, and the outer value releases it. |
+| `using y = x` | Moves `x` into `y`. |
+| An argument | Borrows the value: the callee cannot release it, store it or return it. |
+
+A field is assigned through a `using var` binding or a `mut` parameter, and the field's old value is released first.
+
+A freshly produced value, such as a call result or a struct literal, must be bound with `using` before it is passed.
+
+Using a binding after it was moved is an error, as is using one that may have been moved on one branch or by an earlier loop iteration.
+
+#### Copies that are errors
+
+Any other copy is an error:
+
+- binding it with `let`
+- storing it in a slice, map, channel, optional, pointer or enum variant
+- moving a field out of its struct
+- discarding a call result
+- capturing it in a closure
+
+A struct with a droppable field is itself droppable, so it cannot be built with `new` or held by a pointer, and `spawn` cannot take one as an argument: "spawn cannot take File; it has drop".
+
+Code that shares a resource across closures, pointers or green threads passes a copyable view of it. It binds the owner where the resource has one home (see Resource ownership).
+
+Generic code is checked under these rules for each instance whose type arguments are droppable, so `fn same[T](x: T) -> T { x }` cannot be instantiated with `File`.
 
 ### Modules
 
@@ -1198,87 +1812,438 @@ fn main() {
 }
 ```
 
-- A module is a directory. Every `.low` file in it shares one namespace, so files of a module need no imports between them.
-- A file whose name ends in `_linux.low`, `_windows.low` or `_browser.low` belongs to the module only when building for that operating system. A file ending in `_amd64.low` or `_wasm32.low` belongs to it only when building for that architecture. The standard library uses this to give `std/sys` and the operating-system parts of `std/os`, `std/process`, `std/net` and `std/crypto/x509` one implementation per target. A test requires every target to declare the same public items with the same doc comments. The test compares the browser on the modules that do not import `std/sys`, directly or through another module.
-- A file whose name, after removing `.low` or its operating system or architecture suffix, ends in `_test` is a test file: `split_test.low`, `split_test_linux.low` and `split_test_wasm32.low`. A test file belongs to its module only in a test build of that module. Every other build leaves it out, so `low build`, `low run`, `low dev`, `low asm`, `low ir`, `low lint`, `low doc` and `low names`, and every module that a tested module imports, never read it. The language server reads a test file only for its own analysis of that file.
-- The language server analyses an open test file with the test build of its module over the editor's unsaved text, so diagnostics, hover, go-to-definition, references, rename, completion, signature help, inlay hints and symbols answer in it as in any file, and reach the module's private items and the modules it imports. The two generated files have no path, so no answer names them. The build's diagnostics are published on the open test files of that directory. An error in a test file appears at its position. An error in any other file appears on the first line of an open test file, prefixed with that file's name, line and column. Warnings appear only for test files. The ordinary program's diagnostics for ordinary files do not change. A change to an ordinary file rebuilds every open test directory of its project. A change to a test file rebuilds its own directory. A test file under a standard library checkout is analysed as an ordinary directory of the project, not as the embedded module.
-- A test is a top-level `fn test_<name>(t: *testing.T)` in a test file. Here `testing` is the name the file imports `std/testing` under. Inside `std/testing` the parameter type is `*T`. A `test_` function in a test file is a compile error at the function if it has any other shape, with other parameters, type parameters, a result or error type, or nothing after the prefix. A `test_` function in any other file is an ordinary function. Tests run in the order of their file names, then of their declarations. A test's name is its function name without `test_`.
-- `low test [path]... [options]` builds the tests of each named module into a program and runs every test in its own process. Paths and options come in any order. `--` ends the options. The tested module keeps its import path, its directory below the project's modules directory (`src/lib` is `lib` when the `build.low` declares `modules("src")`), so a module that the test code imports is loaded once and a test reaches the module's private items. Two kinds of path are an error: a directory outside the modules directory that is not the project root, and the modules directory itself. The message is `<path>: outside the modules directory <dir>`. The project root loads as a module named `__root`, so its `main` is an ordinary function that tests can call.
-  - A path is one of:
-    - `dir`, the module in that directory, and `std/<module>`, a standard library module.
-    - `dir/...`, every module at or below `dir` that has a test file, in sorted path order. The walk leaves out directories named `testdata` or `examples` and directories whose name starts with `.` or `_`, below `dir`. `std/...` and `std/<dir>/...` give the standard library modules with a test file. A bare `...` is `./...`.
-    - `path/name_test.low:LINE`, the module of that file with the one test whose function is the last in the file to start at or before `LINE`. The test is found by comparing cleaned absolute paths with the `file` and `line` of `-list`. A line before the first test is a usage error.
-    - If a `dir`, `dir/...` or `path/name_test.low:LINE` names nothing below the current directory, it names the same path below the modules directory of the project that holds the current directory. It keeps the label it was written with. From the root of a project whose `build.low` declares `modules("src")`, `low test lib` tests `src/lib` and reports it as `lib`. A path that exists below the current directory and a `std/` path are never looked up there.
-    - Without a path, `./...`. A module named by a path that has no test file prints `?    <module> [no test files]` and does not fail. A path may be repeated and each occurrence is built and run on its own.
-  - A module's test program is built in process with the release profile for the host, into one temporary directory, one module after another. A module that fails to build prints its error to standard error and counts as a build failure. The other modules are still built and run. Warnings print as `low build` prints them. There is no `--target`, because a program for another operating system cannot run on the host. The temporary directory is removed when the command ends.
-  - `low test` runs each program with `-list` to learn its tests. Every selected test then runs through a pool of `--jobs` green threads, shared by all modules. A test runs as `<program> -one <name> -timeout 0`, plus `-run`, `-v`, `-notime` and `-update` when given. Its standard input comes from `/dev/null`, and its standard output and standard error are piped and captured. Its working directory is the module's directory (the current directory for a standard library module), so a test reads files beside its module as in Go. The child leads its own process group. The parent alone measures the timeout. It kills the group when the timeout expires, and kills the group again once the child has exited. A grandchild holding the pipes therefore cannot keep the parent waiting. A grandchild that leaves the group is not reached.
-  - Every `low test` on the machine shares two pools of slots: `test`, one per CPU, and `build`, one per four CPUs and at least one. A module's build holds a `build` slot. Each run of a test program, `-list` included, holds a `test` slot from just before the child starts until it has exited, so the wait does not count against `--timeout`. A replayed test and a reused program take no slot. `--jobs` still bounds one run. A test that `--failfast` stopped while it waited for its slot is not run. One green thread of a run polls for a slot at a time. It polls every 10 ms at first and every 50 ms after a few tries. Slot `n` of a pool is an exclusive `flock` (`LockFileEx` on Windows) on `<cache>/slots/<pool>/<n>`. The system releases the lock when the holder ends, so a killed run frees its slots. Runs under different cache roots do not share slots. Without a cache root there are no slots. A test that runs `low test` itself waits for a slot while it holds one, so such tests never finish when more of them run at once than there are slots.
-  - SIGINT and SIGTERM kill every running test's group, remove the temporary directory and end `low test` with status 128 plus the signal number, so an interrupt leaves no test process behind. A test process also ends when `low test` is killed, because a grouped child ends with its parent. A host without signal support has no such handling.
-  - A passing test is replayed from the cache when its inputs are unchanged. The cache is off under `--nocache`, `--update` and `--count` above `1`. It is off when `compiler.Disk.cache` (`LOW_CACHE`, or the platform default that holds fetched dependencies) is empty. The cache's entries live in `<cache>/test/<key[0..2]>/<key>`. The directory is created on the first store. A cache that cannot be created, read or written leaves the tests running as without it.
-    - The key is the SHA-256 of a format line, the SHA-256 of the built test program, the test name, the directory the child runs in (the current directory for a standard library module), the flags passed to the child, `--timeout` and every environment variable whose name starts with `LOW_`, except `LOW_CACHE`, sorted by name. The runtime reads some of them without `std/os`, so they are part of the key. A program built from the same sources is byte-identical whatever the temporary directory, `SOURCE_DATE_EPOCH` or module order, so the program's hash identifies it. The `-list` output has its own entry, keyed by the program's hash. A module whose program is unchanged is therefore not run for `-list` either.
-    - A test that is not replayed runs with `-inputs <file>` in the temporary directory, so `std/testing` makes `sys.record_inputs` log the files, directories, links, programs and environment variables the test reads. After a pass, `low test` stores the output, the elapsed time and the fingerprints of the inputs. It stores them only when the log is complete and well formed, has no `exec`, `chdir` or `redirect` line, and every path named by an `open` or `list` line that exists as a regular file or a directory has a modification time at least two whole seconds before the clock reading taken just before the child started, because a file changed during the run would be fingerprinted in a state the test never saw. A name is resolved against the child's directory. A name inside `low test`'s own temporary directory is left out. Each (operation, path) pair is kept once in first-seen order. Reads made inside a C library or a Windows API outside `std/sys` are not logged, except the database file `std/sql/sqlite` opens: the Windows certificate store `std/crypto/x509` reads, the DNS settings of `std/net` on Windows, the user locale of `std/ui/dwrite` and what the Wayland and xkb libraries read. A network peer, a pipe, the clock and random numbers are not inputs either, so a test that depends on them replays while its logged inputs are unchanged.
-    - A fingerprint is computed from the file system and the environment when it is stored and again before each replay. `open` is `file <SHA-256 of the content>` for a regular file, `dir` and the sorted entry names for a directory, `other` for anything else, `absent` or `error <kind>`. `stat` is `file <size>`, `dir`, `other` or `absent`. `list` is `entries` and the sorted names, or `absent`. `readlink` is `link <target>` or `absent`. `getenv` is `unset` or `set <value>`. `environ` is the SHA-256 of the sorted `name=value` pairs. A test is replayed only when every stored fingerprint equals the current one. A replayed test reports a pass with the stored output and elapsed time, counts as cached and starts no process.
-    - A failure, a crash, a timeout and a skip are never stored. An entry is written to a temporary file in its directory and moved over its name, so several `low test` processes can share the cache. `lowtest` passes `--nocache`, so the `testdata/test` sidecars compare the output of a run that executes every test.
-  - A module's test program is reused when nothing it was built from has changed. Its entry is `<cache>/test/programs/<key[0..2]>/<key>`. The key is the SHA-256 of a format line, the target, the module's directory (its name for a standard library module) and the current directory. The entry holds the last program built for that key, named by its SHA-256. It holds a `manifest` with the SHA-256 of the `low` executable that built it, the program's hash, the warnings the build printed and a fingerprint of each path the build passed to `compiler.Disk`: `read` as `open`, `stat`, `list`, and `real` as `real <resolved path>` or `absent`. Each fingerprint is taken from what the call returned, so a file edited during the build is fingerprinted as the build saw it. The running `low` is hashed once and remembered in `<cache>/test/programs/compiler` with its path, size and modification time, written only once the executable is two seconds old, so a later run with the same executable reads the hash instead of computing it. A program is reused when the running `low` hashes the same and every fingerprint equals the current one. It is hard-linked into the temporary directory, or copied where a link fails. Its warnings print again, and its `build` event has `cached` set. A build that takes the `std/buildinfo` stamp, or that sees one path give two answers, is not stored. A store places the program under a temporary name and renames it. It writes the manifest the same way and removes the entry's other programs, so the cache keeps one program per module and current directory. An entry also holds `place`, the module's directory. The first store of a run removes every entry whose directory is missing, so a deleted checkout or worktree leaves no programs behind. The program cache is off under `--nocache` and when `compiler.Disk.cache` is empty. The shared libraries the Linux linker reads are not fingerprinted.
-  - The child's exit status gives the outcome: `0` passed, `1` failed, `3` skipped (`std/testing`'s `skipped_status`), any other status or a signal is a crash, and a kill by the timeout is a timeout. A test that `--failfast` stopped before it started is not run.
-  - Options:
+A module is a directory. Every `.low` file in it shares one namespace, so files of a module need no imports between them.
 
-    | Option | Does |
-    | --- | --- |
-    | `--run text` | Runs the top-level tests for which `testing.selected(text, name)` holds, which compares each `/` separated level of the name by substring, and passes the filter to the child so that it filters subtests. |
-    | `--skip text` | Leaves out the top-level tests for which `testing.selected(text, name)` holds. Subtests are not skipped. |
-    | `--list` | Builds, then prints `<module> <test> <file>:<line>` for each selected test. `file` is relative to the current directory when it is inside it. It runs nothing. |
-    | `-v`, `--verbose` | Shows the output of every test and passes `-v` to the child. The `--- PASS: <name>` line of a replayed test ends with ` (cached)`. |
-    | `--notime` | Leaves every duration out, and passes `-notime` to the child. |
-    | `--count n` | Runs each selected test `n` times (default `1`), each in its own process. |
-    | `--shuffle seed` | Starts the tests in an order shuffled by `rand.seeded(seed)` and prints `shuffle seed <seed>` before anything else. The report order does not change. |
-    | `--failfast` | Starts no more tests after one failed, crashed or timed out. A test never started counts as `not run`. |
-    | `--json` | Writes one JSON object per line instead of the text report. |
-    | `--timeout ms` | Kills a test's process after `ms` milliseconds (default `30000`, `0` for no limit) and reports `timed out after <ms>ms`. The child always gets `-timeout 0`, so only the parent reports a timeout. |
-    | `-j n`, `--jobs n` | Runs at most `n` processes at once (default `os.cpu_count()`). |
-    | `--update` | Passes `-update` to the child, which rewrites golden files. |
-    | `--nocache` | Builds every program and runs every test instead of reusing cached programs and replaying cached passes, and stores nothing. |
-  - The text report is deterministic: modules in path order and tests in source order, each module printed once all its tests have finished.
-    - A failed test shows the child's standard output, which holds its `--- FAIL: <name>` header and notes, then its standard error indented by four spaces, then `    rerun: low test <module> --run <name>`. A crash or a timeout prints its own header, `--- FAIL: <name> (crashed: exit status <n>)`, `(crashed: signal <name>)` or `(timed out after <ms>ms)`, then the child's standard output and standard error indented by four spaces, then the rerun line. With `-v` or `--verbose` every test shows its output.
-    - Each module then has one line: `ok   <module> <counts> (<time>)`, `FAIL <module> <counts> (<time>)` for a module with a failed, crashed, timed out or not run test, `FAIL <module> [build failed]` or `?    <module> [no test files]`. The time is the span from the module's first test start to its last test end. `<module>` is the path as written, or the path relative to the current directory for a `...` expansion.
-    - The last line is `PASS` or `FAIL`, two spaces, the counts and the total time, such as `FAIL  2 failed, 1 crashed, 1 timed out, 1 build failed, 40 passed, 3 skipped, 5 not run (1.20s)`. Counts that are zero are left out except `passed`. `passed` reads `<n> passed (<m> cached)` when `m` of the passed tests were replayed from the cache, in a module line as in the last line. `--notime` leaves the times out.
-  - `--json` writes these events, in the order of the text report, each on one line, with `elapsed_ns` left out under `--notime`:
+#### Imports and visibility
 
-    | `event` | Members |
-    | --- | --- |
-    | `shuffle` | `seed`, written first when `--shuffle` is given. |
-    | `build` | `module`, `ok`, `cached` (`true` when the program was reused), and `error` when the build or the listing failed. Not written for a module with no test files. |
-    | `test` | `module`, `test`, `file`, `line`, `result` (`pass`, `fail`, `skip`, `crash`, `timeout` or `not_run`), `cached` (`true` for a test replayed from the cache), `detail` for a crash or timeout, `output` (the child's standard output then standard error) and `elapsed_ns`. |
-    | `module` | `module`, `result` (`ok`, `fail`, `build_failed` or `no_test_files`), the counts `failed`, `crashed`, `timed_out`, `build_failed`, `passed`, `skipped`, `not_run` and `cached`, and `elapsed_ns`. |
-    | `summary` | `result` (`pass` or `fail`), the same counts and `elapsed_ns`. |
-    | `list` | `module`, `test`, `file` and `line`, written instead of the others by `--list`. |
-  - The exit status is `2` for a usage error or any build failure. A usage error prints a message to standard error. Otherwise the status is `1` when any test failed, crashed, timed out or did not run. In every other case it is `0`.
-- The imports of test files and of the generated harness are left out of the import cycle check. A test file may import `std/testing` although `std/testing` imports the tested module, as `std/text` is tested. A test file may import a module that imports the tested module.
-- A directory named `examples` inside a module holds that module's examples. Each `.low` file in it is a whole program that imports the module, with its expected output in a `.out` file of the same name. An `examples` directory is never a module. Importing a path with an `examples` segment is an error.
-- The project root is the nearest directory, starting at the entry, that holds a `build.low` or a `low.mod` file. Without one it is the entry's directory. A `build.low` names the project's dependencies, programs and modules directory, as [Projects](#projects) describes. An empty `low.mod` marks a root with none.
-- `import ui/text` loads `ui/text/` under the project's modules directory, which is the root unless the `build.low` declares `modules`. A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
-- `low build dir` builds the directory as the entry module. `low build file.low` builds that one file as the entry module, without the other files beside it.
-- `low lint file.low` type-checks the program, or a library module whose entry directory has no `main`. It prints warnings for the program's own modules, not the standard library. It exits with status 1 if there were any. `low build`, `low run`, `low dev`, `low asm` and `low ir` report `missing function main` for such a module. `--target` picks the operating system whose files are checked and defaults to the host. `low build`, `low run`, `low asm` and `low ir` print the same warnings, except those only `low lint` applies, to stderr and continue. The language server reports those as warnings.
-  - `prefer-match` flags two shapes. In both, every condition compares one side-effect-free subject with `==`, `!=`, `<`, `<=`, `>` or `>=`. The subject is a variable, field, index or dereference. It is compared against an integer, character or string literal, a constant, an enum variant or another side-effect-free operand, with the subject on either side. The shapes are:
-    - an `if` / `else if` / `else` chain with at least two conditions;
-    - at least two consecutive guard clauses, `if` statements without `else` whose block is only `return value`, that end a function body before its tail value or final `return`. Earlier guards on another subject are left out.
-    - When both sides of a comparison are operands, the subject is the one every condition shares, taken from the left of the first condition when both are shared. A comparison of an operand with itself, such as the `x != x` test for `nan`, is not counted.
-    - It suggests `match subject { 4 => ..., < 0x80 => ..., (limit) => ..., > high => ..., _ => ... }`: an `==` test against a constant as the constant alone, an `==` test against another operand in parentheses, and any other as an operator arm.
-  - `use-std` flags a function whose body repeats a public function of the standard library. It suggests calling that function, through the file's import of that module when there is one. Both bodies are reduced to a list of tests and results, with the parameters numbered by position. Guard clauses, an `if` / `else if` / `else` chain and a `match` with test and operator arms give the same list. `>` and `>=` are turned into `<` and `<=` with the operands swapped. The operands of `==` and `!=` are put in order. The reduction accepts only literals, parameters, unary and binary operators, and needs at least one test. The parameter and result types must match those of the standard function. A type parameter matches any type that is the same at each of its uses. `prefer-match` does not report on a function that `use-std` reports. A module is not compared with its own functions. The standard functions come from `compiler/lint/std_index.low`. `compiler/tablegen stdindex std compiler/lint` writes it from every public function in `std/` whose parameter and result types are type parameters, numbers, `bool` or `str`. `std_index_matches_generator` in `compiler/tests/tablegen` fails when the committed index differs from the generator.
-  - `prefer-loop-label` flags a `break` out of an inner loop that sets a boolean flag to a literal. It does so when the statement right after that loop is `if flag { break }` or `if flag { continue }` (or `if !flag` for a flag set to `false`), with no `else`. It suggests labelling the loop that `if` acts on and jumping to it with `break name` or `continue name`, reusing the label the `if` already names. Breaks inside a nested loop, closure, `spawn` or `defer` are not counted.
-  - `one-letter-name` flags a name of one letter where it is bound. Names bound in these places are flagged: a parameter of a function or closure, a `let` or `var`, the key or value of a `for … in`, a name a `match` or `catch` arm binds, a name a destructuring pattern gives a field (`{ x: w }`) and the value a `select` case receives. `_` is not flagged, and neither is a type parameter, a struct field or the shorthand `{ x }` that binds a field under its own name. A parameter, an arm binding and a field bound under a new name are reported at the name. A `let`, `var`, `for` or `select` case is reported at its start. A `for` whose key and value are both one letter gets one warning that names both. Only `low lint` applies it.
-  - `receiver-call` flags a call that names a function of its own module, `send(stream, item)`, when that function changes its first argument. It suggests `stream.send(item)`. A function changes a parameter when its body assigns to it or through it. It does when the body passes the parameter or something reached through it as a `mut` argument. It does when the body passes a pointer reached through it to a function that changes that parameter, to a function value or to a function without a body. Building an enum variant around the pointer changes nothing, and neither does passing it to a builtin. A call through a module name, a call to a function without a body, a call already written on its first argument and a call whose first argument is a struct with a field of the function's name are not flagged. Only `low lint` applies it.
-  - `method-call` flags `push`, `pop`, `truncate` and `delete` called as `push(mut x, v)` rather than as `x.push(v)`.
-  - `prefer-const` flags a function that has no parameters or type parameters and returns a number, `bool` or `str`. The function must never be used as a value, and its body must be one expression that a constant can hold: literals, constants, operators and numeric conversions. It suggests `const name: T = ...`, with the `()` dropped where the function is called.
-- `low doc dir` prints, as JSON, every module under the directory. Each module has its imports, each with the name it is used through. It has its public structs, enums, constants and functions, each with its declaration as written, its file and its line. A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver. Each module lists its examples with their name, source and expected output. `low doc std` documents the standard library. The website builds its package pages from it with `--target linux/amd64`. `--target` picks the operating system whose files are documented and defaults to the host.
-- `low doc index` prints one JSON array. It holds a `source` and its `versions` for every package of the package index that `LOW_INDEX` names, in the order of the sources. Each version has its `tag`, `commit` and `hash` as the index holds them, `yanked`, and the `modules` of its tree as `low doc dir` prints them. Versions are listed newest first, and a yanked version is listed like any other. A source is a file of the index with a directory above it, so a file at the top of the checkout is not a package. Each version's tree comes from the module cache. It is fetched and checked against the index's hash when it is not there yet. A failure to fetch or parse a version fails the command. The modules are the ones an import reaches. These are the directories that hold `.low` files for `--target` other than tests, skipping `testdata`, `examples` and directories that start with `.` or `_`, inside the `modules` directory of the tree's `build.low`. A module's `path` is the path it is imported by: the source for the modules directory itself, and the source, `/` and the module's directory below it for a module below it. An unset or absent `LOW_INDEX`, or an index without packages, prints `[]`.
-- `low names file.low` type-checks the program and prints one JSON array of every name the file mentions. Each entry has its `line` and byte `column`, both counted from 1. It has its `name`, and the `hover` text and `doc` the language server shows for it. It has its `definition`, which holds `path`, `line`, `column`, and `local` when the definition is in the same file. It has `first`, the array index of the first name that resolves to the same definition. Names with the same `first` are one reference group. A field written in shorthand, as `x` in `Point { x }`, groups with the field. The group of the local it reads starts at the shorthand when that comes first. A key is absent when the name has no such fact. A program that does not check prints the error and exits with status 1. `--target` picks the operating system whose files are checked. It defaults to the host. The website build highlights and links every snippet from it.
-- Imports come before declarations and top-level statements and apply to their file.
-- A module is used through its last path segment, as in `text.shout(...)`, or through a name given with `import t = ui/text`. A path segment may hold `.` and `-` between identifiers, written without spaces, as in `import github.com/acme/ui`. When the last segment is not an identifier, the import needs a name: `import colors = color-names`.
-- Types are written `geometry.Shape` and built with `geometry.Point { ... }`. A variant can be named `geometry.Shape.Dot` or, where the type is expected, `Dot`.
-- Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public.
-- A struct with private fields without defaults cannot be built with a literal outside its module.
-- An import cycle is an error, except through the imports of test files. Importing two modules under one name is an error.
+Imports come before declarations and top-level statements and apply to their file.
+
+| Written | Means |
+| --- | --- |
+| `import ui/text` | Loads `ui/text/` under the project's modules directory, which is the root unless the `build.low` declares `modules`. |
+| `text.shout(...)` | A module is used through its last path segment. |
+| `import t = ui/text` | The module is used through the name given. |
+| `import github.com/acme/ui` | A path segment may hold `.` and `-` between identifiers, written without spaces. |
+| `import colors = color-names` | When the last segment is not an identifier, the import needs a name. |
+| `geometry.Shape` | A type of another module. |
+| `geometry.Point { ... }` | Builds a struct of another module. |
+| `geometry.Shape.Dot` | Names a variant. Where the type is expected, `Dot` is enough. |
+
+A path starting with `std/` names a module of the standard library, which is compiled into `low`, so a project directory named `std` cannot be imported.
+
+Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public. A struct with private fields without defaults cannot be built with a literal outside its module.
+
+Two things are errors:
+
+- An import cycle, except through the imports of test files.
+- Importing two modules under one name.
+
+#### The project root and the entry module
+
+The project root is the nearest directory, starting at the entry, that holds a `build.low` or a `low.mod` file. Without one it is the entry's directory. A `build.low` names the project's dependencies, programs and modules directory, as [Projects](#projects) describes. An empty `low.mod` marks a root with none.
+
+| Command | Entry module |
+| --- | --- |
+| `low build dir` | The directory. |
+| `low build file.low` | That one file, without the other files beside it. |
+
+#### Files for one target
+
+A file's name can limit it to one operating system or one architecture.
+
+| File name ends in | Belongs to the module only when building for |
+| --- | --- |
+| `_linux.low`, `_windows.low` or `_browser.low` | That operating system. |
+| `_amd64.low` or `_wasm32.low` | That architecture. |
+
+The standard library uses this to give `std/sys` and the operating-system parts of `std/os`, `std/process`, `std/net` and `std/crypto/x509` one implementation per target. A test requires every target to declare the same public items with the same doc comments. The test compares the browser on the modules that do not import `std/sys`, directly or through another module.
+
+#### Example programs
+
+A directory named `examples` inside a module holds that module's examples. Each `.low` file in it is a whole program that imports the module, with its expected output in a `.out` file of the same name.
+
+An `examples` directory is never a module. Importing a path with an `examples` segment is an error.
+
+#### Test files
+
+A file whose name, after removing `.low` or its operating system or architecture suffix, ends in `_test` is a test file: `split_test.low`, `split_test_linux.low` and `split_test_wasm32.low`.
+
+A test file belongs to its module only in a test build of that module. Every other build leaves it out, so `low build`, `low run`, `low dev`, `low asm`, `low ir`, `low lint`, `low doc` and `low names`, and every module that a tested module imports, never read it. The language server reads a test file only for its own analysis of that file.
+
+A test is a top-level `fn test_<name>(t: *testing.T)` in a test file. Here `testing` is the name the file imports `std/testing` under. Inside `std/testing` the parameter type is `*T`.
+
+- A `test_` function in a test file is a compile error at the function if it has any other shape, with other parameters, type parameters, a result or error type, or nothing after the prefix.
+- A `test_` function in any other file is an ordinary function.
+- Tests run in the order of their file names, then of their declarations.
+- A test's name is its function name without `test_`.
+
+The imports of test files and of the generated harness are left out of the import cycle check. A test file may import `std/testing` although `std/testing` imports the tested module, as `std/text` is tested. A test file may import a module that imports the tested module.
+
+#### Running tests
+
+`low test [path]... [options]` builds the tests of each named module into a program and runs every test in its own process. Paths and options come in any order. `--` ends the options.
+
+The tested module keeps its import path, its directory below the project's modules directory (`src/lib` is `lib` when the `build.low` declares `modules("src")`), so a module that the test code imports is loaded once and a test reaches the module's private items. The project root loads as a module named `__root`, so its `main` is an ordinary function that tests can call.
+
+Two kinds of path are an error: a directory outside the modules directory that is not the project root, and the modules directory itself. The message is `<path>: outside the modules directory <dir>`.
+
+#### Test paths
+
+A path names one module, a tree of modules or one test.
+
+| Path | Tests |
+| --- | --- |
+| `dir` | The module in that directory. |
+| `std/<module>` | A standard library module. |
+| `dir/...` | Every module at or below `dir` that has a test file, in sorted path order. |
+| `std/...`, `std/<dir>/...` | The standard library modules with a test file. |
+| `...` | A bare `...` is `./...`. |
+| `path/name_test.low:LINE` | The module of that file with the one test whose function is the last in the file to start at or before `LINE`. |
+| No path | `./...`. |
+
+- The walk of `dir/...` leaves out directories named `testdata` or `examples` and directories whose name starts with `.` or `_`, below `dir`.
+- For `path/name_test.low:LINE`, the test is found by comparing cleaned absolute paths with the `file` and `line` of `-list`. A line before the first test is a usage error.
+- A module named by a path that has no test file prints `?    <module> [no test files]` and does not fail.
+- A path may be repeated and each occurrence is built and run on its own.
+
+If a `dir`, `dir/...` or `path/name_test.low:LINE` names nothing below the current directory, it names the same path below the modules directory of the project that holds the current directory. It keeps the label it was written with. From the root of a project whose `build.low` declares `modules("src")`, `low test lib` tests `src/lib` and reports it as `lib`. A path that exists below the current directory and a `std/` path are never looked up there.
+
+#### Test options
+
+| Option | Does |
+| --- | --- |
+| `--run text` | Runs the top-level tests for which `testing.selected(text, name)` holds, which compares each `/` separated level of the name by substring, and passes the filter to the child so that it filters subtests. |
+| `--skip text` | Leaves out the top-level tests for which `testing.selected(text, name)` holds. Subtests are not skipped. |
+| `--list` | Builds, then prints `<module> <test> <file>:<line>` for each selected test. `file` is relative to the current directory when it is inside it. It runs nothing. |
+| `-v`, `--verbose` | Shows the output of every test and passes `-v` to the child. The `--- PASS: <name>` line of a replayed test ends with ` (cached)`. |
+| `--notime` | Leaves every duration out, and passes `-notime` to the child. |
+| `--count n` | Runs each selected test `n` times (default `1`), each in its own process. |
+| `--shuffle seed` | Starts the tests in an order shuffled by `rand.seeded(seed)` and prints `shuffle seed <seed>` before anything else. The report order does not change. |
+| `--failfast` | Starts no more tests after one failed, crashed or timed out. A test never started counts as `not run`. |
+| `--json` | Writes one JSON object per line instead of the text report. |
+| `--timeout ms` | Kills a test's process after `ms` milliseconds (default `30000`, `0` for no limit) and reports `timed out after <ms>ms`. The child always gets `-timeout 0`, so only the parent reports a timeout. |
+| `-j n`, `--jobs n` | Runs at most `n` processes at once (default `os.cpu_count()`). |
+| `--update` | Passes `-update` to the child, which rewrites golden files. |
+| `--nocache` | Builds every program and runs every test instead of reusing cached programs and replaying cached passes, and stores nothing. |
+
+#### How a test run builds and runs
+
+A module's test program is built in process with the release profile for the host, into one temporary directory, one module after another. The temporary directory is removed when the command ends.
+
+- A module that fails to build prints its error to standard error and counts as a build failure. The other modules are still built and run.
+- Warnings print as `low build` prints them.
+- There is no `--target`, because a program for another operating system cannot run on the host.
+
+`low test` runs each program with `-list` to learn its tests. Every selected test then runs through a pool of `--jobs` green threads, shared by all modules. A test runs as `<program> -one <name> -timeout 0`, plus `-run`, `-v`, `-notime` and `-update` when given.
+
+| Part of the child | Set to |
+| --- | --- |
+| Standard input | `/dev/null`. |
+| Standard output and standard error | Piped and captured. |
+| Working directory | The module's directory (the current directory for a standard library module), so a test reads files beside its module as in Go. |
+
+The child leads its own process group. The parent alone measures the timeout. It kills the group when the timeout expires, and kills the group again once the child has exited. A grandchild holding the pipes therefore cannot keep the parent waiting. A grandchild that leaves the group is not reached.
+
+SIGINT and SIGTERM kill every running test's group, remove the temporary directory and end `low test` with status 128 plus the signal number, so an interrupt leaves no test process behind. A test process also ends when `low test` is killed, because a grouped child ends with its parent. A host without signal support has no such handling.
+
+#### Test outcomes and exit status
+
+The child's exit status gives the outcome of a test.
+
+| Child ends with | Outcome |
+| --- | --- |
+| `0` | Passed. |
+| `1` | Failed. |
+| `3` | Skipped (`std/testing`'s `skipped_status`). |
+| Any other status or a signal | A crash. |
+| A kill by the timeout | A timeout. |
+
+A test that `--failfast` stopped before it started is not run.
+
+The exit status of `low test` follows from the outcomes.
+
+| Status | When |
+| --- | --- |
+| `2` | A usage error or any build failure. A usage error prints a message to standard error. |
+| `1` | Otherwise, when any test failed, crashed, timed out or did not run. |
+| `0` | In every other case. |
+
+#### Test slots shared across runs
+
+Every `low test` on the machine shares two pools of slots.
+
+| Pool | Slots | Held by |
+| --- | --- | --- |
+| `test` | One per CPU. | Each run of a test program, `-list` included, from just before the child starts until it has exited, so the wait does not count against `--timeout`. |
+| `build` | One per four CPUs and at least one. | A module's build. |
+
+- A replayed test and a reused program take no slot.
+- `--jobs` still bounds one run.
+- A test that `--failfast` stopped while it waited for its slot is not run.
+- One green thread of a run polls for a slot at a time. It polls every 10 ms at first and every 50 ms after a few tries.
+
+Slot `n` of a pool is an exclusive `flock` (`LockFileEx` on Windows) on `<cache>/slots/<pool>/<n>`. The system releases the lock when the holder ends, so a killed run frees its slots. Runs under different cache roots do not share slots. Without a cache root there are no slots.
+
+A test that runs `low test` itself waits for a slot while it holds one, so such tests never finish when more of them run at once than there are slots.
+
+#### The test result cache
+
+A passing test is replayed from the cache when its inputs are unchanged. A replayed test reports a pass with the stored output and elapsed time, counts as cached and starts no process.
+
+The cache is off in these cases:
+
+- under `--nocache`, `--update` and `--count` above `1`
+- when `compiler.Disk.cache` (`LOW_CACHE`, or the platform default that holds fetched dependencies) is empty
+
+The cache's entries live in `<cache>/test/<key[0..2]>/<key>`. The directory is created on the first store. A cache that cannot be created, read or written leaves the tests running as without it.
+
+**The key.** The key is the SHA-256 of these parts:
+
+- a format line
+- the SHA-256 of the built test program
+- the test name
+- the directory the child runs in (the current directory for a standard library module)
+- the flags passed to the child
+- `--timeout`
+- every environment variable whose name starts with `LOW_`, except `LOW_CACHE`, sorted by name
+
+The runtime reads some of those variables without `std/os`, so they are part of the key. A program built from the same sources is byte-identical whatever the temporary directory, `SOURCE_DATE_EPOCH` or module order, so the program's hash identifies it. The `-list` output has its own entry, keyed by the program's hash. A module whose program is unchanged is therefore not run for `-list` either.
+
+**Recording inputs.** A test that is not replayed runs with `-inputs <file>` in the temporary directory, so `std/testing` makes `sys.record_inputs` log the files, directories, links, programs and environment variables the test reads. A name is resolved against the child's directory. A name inside `low test`'s own temporary directory is left out. Each (operation, path) pair is kept once in first-seen order.
+
+**Storing a pass.** After a pass, `low test` stores the output, the elapsed time and the fingerprints of the inputs. It stores them only when all of these hold:
+
+1. The log is complete and well formed.
+2. The log has no `exec`, `chdir` or `redirect` line.
+3. Every path named by an `open` or `list` line that exists as a regular file or a directory has a modification time at least two whole seconds before the clock reading taken just before the child started, because a file changed during the run would be fingerprinted in a state the test never saw.
+
+A failure, a crash, a timeout and a skip are never stored. An entry is written to a temporary file in its directory and moved over its name, so several `low test` processes can share the cache. `lowtest` passes `--nocache`, so the `testdata/test` sidecars compare the output of a run that executes every test.
+
+**What is not an input.** Reads made inside a C library or a Windows API outside `std/sys` are not logged, except the database file `std/sql/sqlite` opens: the Windows certificate store `std/crypto/x509` reads, the DNS settings of `std/net` on Windows, the user locale of `std/ui/dwrite` and what the Wayland and xkb libraries read. A network peer, a pipe, the clock and random numbers are not inputs either, so a test that depends on them replays while its logged inputs are unchanged.
+
+**Fingerprints.** A fingerprint is computed from the file system and the environment when it is stored and again before each replay. A test is replayed only when every stored fingerprint equals the current one.
+
+| Operation | Fingerprint |
+| --- | --- |
+| `open` | `file <SHA-256 of the content>` for a regular file, `dir` and the sorted entry names for a directory, `other` for anything else, `absent` or `error <kind>`. |
+| `stat` | `file <size>`, `dir`, `other` or `absent`. |
+| `list` | `entries` and the sorted names, or `absent`. |
+| `readlink` | `link <target>` or `absent`. |
+| `getenv` | `unset` or `set <value>`. |
+| `environ` | The SHA-256 of the sorted `name=value` pairs. |
+
+#### The test program cache
+
+A module's test program is reused when nothing it was built from has changed. The program cache is off under `--nocache` and when `compiler.Disk.cache` is empty.
+
+A program's entry is `<cache>/test/programs/<key[0..2]>/<key>`. The key is the SHA-256 of a format line, the target, the module's directory (its name for a standard library module) and the current directory.
+
+| In the entry | Holds |
+| --- | --- |
+| The program | The last program built for that key, named by its SHA-256. |
+| `manifest` | The SHA-256 of the `low` executable that built it, the program's hash, the warnings the build printed and a fingerprint of each path the build passed to `compiler.Disk`. |
+| `place` | The module's directory. |
+
+The manifest's fingerprints are `read` as `open`, `stat`, `list`, and `real` as `real <resolved path>` or `absent`. Each fingerprint is taken from what the call returned, so a file edited during the build is fingerprinted as the build saw it. The shared libraries the Linux linker reads are not fingerprinted.
+
+The running `low` is hashed once and remembered in `<cache>/test/programs/compiler` with its path, size and modification time, written only once the executable is two seconds old, so a later run with the same executable reads the hash instead of computing it.
+
+**Reuse.** A program is reused when the running `low` hashes the same and every fingerprint equals the current one. It is hard-linked into the temporary directory, or copied where a link fails. Its warnings print again, and its `build` event has `cached` set.
+
+**Storing.** A build that takes the `std/buildinfo` stamp, or that sees one path give two answers, is not stored. A store places the program under a temporary name and renames it. It writes the manifest the same way and removes the entry's other programs, so the cache keeps one program per module and current directory. The first store of a run removes every entry whose directory is missing, so a deleted checkout or worktree leaves no programs behind.
+
+#### The text test report
+
+The text report is deterministic: modules in path order and tests in source order, each module printed once all its tests have finished. `--notime` leaves the times out.
+
+**Each test.** With `-v` or `--verbose` every test shows its output.
+
+| Test | Shows |
+| --- | --- |
+| Failed | The child's standard output, which holds its `--- FAIL: <name>` header and notes, then its standard error indented by four spaces, then `    rerun: low test <module> --run <name>`. |
+| Crashed or timed out | Its own header, `--- FAIL: <name> (crashed: exit status <n>)`, `(crashed: signal <name>)` or `(timed out after <ms>ms)`, then the child's standard output and standard error indented by four spaces, then the rerun line. |
+
+**Each module.** Each module then has one line.
+
+| Line | For |
+| --- | --- |
+| `ok   <module> <counts> (<time>)` | A module that none of the lines below describes. |
+| `FAIL <module> <counts> (<time>)` | A module with a failed, crashed, timed out or not run test. |
+| `FAIL <module> [build failed]` | A module that did not build. |
+| `?    <module> [no test files]` | A module without test files. |
+
+The time is the span from the module's first test start to its last test end. `<module>` is the path as written, or the path relative to the current directory for a `...` expansion.
+
+**The last line.** The last line is `PASS` or `FAIL`, two spaces, the counts and the total time, such as `FAIL  2 failed, 1 crashed, 1 timed out, 1 build failed, 40 passed, 3 skipped, 5 not run (1.20s)`. Counts that are zero are left out except `passed`. `passed` reads `<n> passed (<m> cached)` when `m` of the passed tests were replayed from the cache, in a module line as in the last line.
+
+#### The JSON test report
+
+`--json` writes these events, in the order of the text report, each on one line, with `elapsed_ns` left out under `--notime`:
+
+| `event` | Members |
+| --- | --- |
+| `shuffle` | `seed`, written first when `--shuffle` is given. |
+| `build` | `module`, `ok`, `cached` (`true` when the program was reused), and `error` when the build or the listing failed. Not written for a module with no test files. |
+| `test` | `module`, `test`, `file`, `line`, `result` (`pass`, `fail`, `skip`, `crash`, `timeout` or `not_run`), `cached` (`true` for a test replayed from the cache), `detail` for a crash or timeout, `output` (the child's standard output then standard error) and `elapsed_ns`. |
+| `module` | `module`, `result` (`ok`, `fail`, `build_failed` or `no_test_files`), the counts `failed`, `crashed`, `timed_out`, `build_failed`, `passed`, `skipped`, `not_run` and `cached`, and `elapsed_ns`. |
+| `summary` | `result` (`pass` or `fail`), the same counts and `elapsed_ns`. |
+| `list` | `module`, `test`, `file` and `line`, written instead of the others by `--list`. |
+
+#### Test files in the language server
+
+The language server analyses an open test file with the test build of its module over the editor's unsaved text, so diagnostics, hover, go-to-definition, references, rename, completion, signature help, inlay hints and symbols answer in it as in any file, and reach the module's private items and the modules it imports. The two generated files have no path, so no answer names them.
+
+The build's diagnostics are published on the open test files of that directory.
+
+| Diagnostic | Appears |
+| --- | --- |
+| An error in a test file | At its position. |
+| An error in any other file | On the first line of an open test file, prefixed with that file's name, line and column. |
+| A warning | Only for test files. |
+
+The ordinary program's diagnostics for ordinary files do not change.
+
+- A change to an ordinary file rebuilds every open test directory of its project.
+- A change to a test file rebuilds its own directory.
+- A test file under a standard library checkout is analysed as an ordinary directory of the project, not as the embedded module.
+
+#### Lint warnings
+
+`low lint file.low` type-checks the program, or a library module whose entry directory has no `main`. It prints warnings for the program's own modules, not the standard library. It exits with status 1 if there were any.
+
+- `--target` picks the operating system whose files are checked and defaults to the host.
+- `low build`, `low run`, `low dev`, `low asm` and `low ir` report `missing function main` for a library module whose entry directory has no `main`.
+- `low build`, `low run`, `low asm` and `low ir` print the same warnings, except those only `low lint` applies, to stderr and continue. The language server reports those as warnings.
+
+| Lint | Flags |
+| --- | --- |
+| `prefer-match` | An `if` chain or a run of guard clauses that compares one subject, which a `match` would say. |
+| `use-std` | A function whose body repeats a public function of the standard library. |
+| `prefer-loop-label` | A boolean flag set at a `break` out of an inner loop and tested right after that loop. |
+| `one-letter-name` | A name of one letter where it is bound. Only `low lint` applies it. |
+| `receiver-call` | A call to a function that changes its first argument, written with that argument in the parentheses. Only `low lint` applies it. |
+| `method-call` | `push`, `pop`, `truncate` and `delete` called as `push(mut x, v)` rather than as `x.push(v)`. |
+| `prefer-const` | A function that a constant could stand in for. |
+
+#### Lint: prefer-match
+
+`prefer-match` flags two shapes. In both, every condition compares one side-effect-free subject with `==`, `!=`, `<`, `<=`, `>` or `>=`. The subject is a variable, field, index or dereference. It is compared against an integer, character or string literal, a constant, an enum variant or another side-effect-free operand, with the subject on either side.
+
+The shapes are:
+
+- an `if` / `else if` / `else` chain with at least two conditions;
+- at least two consecutive guard clauses, `if` statements without `else` whose block is only `return value`, that end a function body before its tail value or final `return`. Earlier guards on another subject are left out.
+
+When both sides of a comparison are operands, the subject is the one every condition shares, taken from the left of the first condition when both are shared. A comparison of an operand with itself, such as the `x != x` test for `nan`, is not counted.
+
+It suggests `match subject { 4 => ..., < 0x80 => ..., (limit) => ..., > high => ..., _ => ... }`: an `==` test against a constant as the constant alone, an `==` test against another operand in parentheses, and any other as an operator arm.
+
+#### Lint: use-std
+
+`use-std` flags a function whose body repeats a public function of the standard library. It suggests calling that function, through the file's import of that module when there is one.
+
+Both bodies are reduced to a list of tests and results, with the parameters numbered by position:
+
+- Guard clauses, an `if` / `else if` / `else` chain and a `match` with test and operator arms give the same list.
+- `>` and `>=` are turned into `<` and `<=` with the operands swapped.
+- The operands of `==` and `!=` are put in order.
+- The reduction accepts only literals, parameters, unary and binary operators, and needs at least one test.
+
+The parameter and result types must match those of the standard function. A type parameter matches any type that is the same at each of its uses.
+
+`prefer-match` does not report on a function that `use-std` reports. A module is not compared with its own functions.
+
+The standard functions come from `compiler/lint/std_index.low`. `compiler/tablegen stdindex std compiler/lint` writes it from every public function in `std/` whose parameter and result types are type parameters, numbers, `bool` or `str`. `std_index_matches_generator` in `compiler/tests/tablegen` fails when the committed index differs from the generator.
+
+#### Lint: prefer-loop-label
+
+`prefer-loop-label` flags a `break` out of an inner loop that sets a boolean flag to a literal. It does so when the statement right after that loop is `if flag { break }` or `if flag { continue }` (or `if !flag` for a flag set to `false`), with no `else`.
+
+It suggests labelling the loop that `if` acts on and jumping to it with `break name` or `continue name`, reusing the label the `if` already names. Breaks inside a nested loop, closure, `spawn` or `defer` are not counted.
+
+#### Lint: one-letter-name
+
+`one-letter-name` flags a name of one letter where it is bound. Only `low lint` applies it.
+
+| Bound by | Reported at |
+| --- | --- |
+| A parameter of a function or closure | The name. |
+| A `let` or `var` | Its start. |
+| The key or value of a `for … in` | Its start. A `for` whose key and value are both one letter gets one warning that names both. |
+| A name a `match` or `catch` arm binds | The name. |
+| A name a destructuring pattern gives a field (`{ x: w }`) | The name. |
+| The value a `select` case receives | Its start. |
+
+`_` is not flagged, and neither is a type parameter, a struct field or the shorthand `{ x }` that binds a field under its own name.
+
+#### Lint: receiver-call
+
+`receiver-call` flags a call that names a function of its own module, `send(stream, item)`, when that function changes its first argument. It suggests `stream.send(item)`. Only `low lint` applies it.
+
+A function changes a parameter when its body does one of these:
+
+- assigns to it or through it
+- passes the parameter or something reached through it as a `mut` argument
+- passes a pointer reached through it to a function that changes that parameter, to a function value or to a function without a body
+
+Building an enum variant around the pointer changes nothing, and neither does passing it to a builtin.
+
+These calls are not flagged:
+
+- a call through a module name
+- a call to a function without a body
+- a call already written on its first argument
+- a call whose first argument is a struct with a field of the function's name
+
+#### Lint: prefer-const
+
+`prefer-const` flags a function that has no parameters or type parameters and returns a number, `bool` or `str`. The function must never be used as a value, and its body must be one expression that a constant can hold: literals, constants, operators and numeric conversions.
+
+It suggests `const name: T = ...`, with the `()` dropped where the function is called.
+
+#### low doc output
+
+`low doc dir` prints, as JSON, every module under the directory. `low doc std` documents the standard library. The website builds its package pages from it with `--target linux/amd64`. `--target` picks the operating system whose files are documented and defaults to the host.
+
+| Each module has | With |
+| --- | --- |
+| Its imports | Each with the name it is used through. |
+| Its public structs, enums, constants and functions | Each with its declaration as written, its file and its line. |
+| Its examples | Their name, source and expected output. |
+
+A struct shows its public fields, and `...` stands for its private ones. A function whose first parameter is a public type of its module, or a pointer to one, names that type as its receiver.
+
+#### low doc index output
+
+`low doc index` prints one JSON array. It holds a `source` and its `versions` for every package of the package index that `LOW_INDEX` names, in the order of the sources. An unset or absent `LOW_INDEX`, or an index without packages, prints `[]`.
+
+Each version has its `tag`, `commit` and `hash` as the index holds them, `yanked`, and the `modules` of its tree as `low doc dir` prints them. Versions are listed newest first, and a yanked version is listed like any other.
+
+A source is a file of the index with a directory above it, so a file at the top of the checkout is not a package.
+
+Each version's tree comes from the module cache. It is fetched and checked against the index's hash when it is not there yet. A failure to fetch or parse a version fails the command.
+
+The modules are the ones an import reaches. These are the directories that hold `.low` files for `--target` other than tests, skipping `testdata`, `examples` and directories that start with `.` or `_`, inside the `modules` directory of the tree's `build.low`.
+
+A module's `path` is the path it is imported by: the source for the modules directory itself, and the source, `/` and the module's directory below it for a module below it.
+
+#### low names output
+
+`low names file.low` type-checks the program and prints one JSON array of every name the file mentions. The website build highlights and links every snippet from it.
+
+| Key | Holds |
+| --- | --- |
+| `line`, `column` | The line and byte `column`, both counted from 1. |
+| `name` | The name. |
+| `hover`, `doc` | The `hover` text and `doc` the language server shows for it. |
+| `definition` | `path`, `line`, `column`, and `local` when the definition is in the same file. |
+| `first` | The array index of the first name that resolves to the same definition. |
+
+A key is absent when the name has no such fact.
+
+Names with the same `first` are one reference group. A field written in shorthand, as `x` in `Point { x }`, groups with the field. The group of the local it reads starts at the shorthand when that comes first.
+
+A program that does not check prints the error and exits with status 1. `--target` picks the operating system whose files are checked. It defaults to the host.
 
 ### Projects
 
@@ -1499,6 +2464,8 @@ Yanking withdraws a version from new resolutions and never deletes a line, so th
 
 ### Doc comments
 
+A line starting with `///` documents the declaration, struct field or enum variant directly below it.
+
 ```low
 /// A point on the plane.
 pub struct Point {
@@ -1513,11 +2480,19 @@ pub fn mirror(p: Point) -> Point {
 }
 ```
 
-- A line starting with `///` documents the declaration, struct field or enum variant directly below it. Consecutive `///` lines form one doc, written in Markdown. One space after `///` is dropped.
-- A `///` line anywhere else is an error. `////` starts an ordinary comment.
-- The language server shows a doc under the signature on hover, `low doc` prints it, and the website renders it on the package pages.
+Consecutive `///` lines form one doc, written in Markdown. One space after `///` is dropped.
+
+A `///` line anywhere else is an error. `////` starts an ordinary comment.
+
+| Tool | Use of a doc |
+| --- | --- |
+| The language server | Shows it under the signature on hover. |
+| `low doc` | Prints it. |
+| The website | Renders it on the package pages. |
 
 ### Generics
+
+Functions, structs and enums take type parameters in brackets after their name. A constraint on a parameter says what the code may do with a value of that type.
 
 <!-- prelude
 struct Pair[A, B] {
@@ -1557,23 +2532,43 @@ let t: Tree[i64] = Leaf
 let pick: fn(i64, i64) -> i64 = max
 ```
 
-- Functions, structs and enums take type parameters in brackets after their name. Generic types are written with arguments: `Stack[i64]`, `geometry.Labelled[str]`.
-- A constraint lists what a type parameter supports, joined with `+`:
-  - `Eq` allows `==` and `!=`. It is met by numbers, `bool`, `str`, pointers, channels, and structs and enums whose fields are all `Eq`.
-  - `Ord` adds `<`, `<=`, `>` and `>=`. It is met by numbers and `str`.
-  - `Hash` adds use as a map key. It is met by integers, `bool`, `str` and pointers.
-  - `Number` adds arithmetic, numeric literals, conversion with `T(x)` and the `f`, `e` and `n` formats and pictures of interpolation.
-  - `Integer` adds bitwise operators and shifts and the `d`, `x`, `X` and `b` formats. It implies `Hash`.
-  - `Float` is met by `f64` and `f32`.
-  - An unconstrained parameter can only be moved, stored, passed, printed and interpolated, with a width but no format, each instance rendering its own type. Anything else a generic function needs, such as an ordering of its elements, is passed in as a function value.
-- A generic body is checked once against its constraints, so a missing constraint is reported at the definition, not at a use.
-- Each generic function's type parameters are its own. Two functions may both name a parameter `T`, and a function type mentioning one is distinct from the same text mentioning the other.
-- Type arguments are inferred from the arguments, then from the expected type. They can be written explicitly: `max[u8](a, b)`, `Stack[str] { ... }`.
-- A generic struct literal or enum variant takes its arguments from the expected type or from its field values. A generic function used as a value takes them from the expected function type.
-- Each distinct set of type arguments compiles to its own copy, `max[i64]` and `max[f64]`, so generic code runs as fast as code written for one type.
-- Values of different kinds that share behaviour, such as the elements of a UI tree, are structs of function values whose closures capture each kind's state.
+Generic types are written with arguments: `Stack[i64]`, `geometry.Labelled[str]`.
+
+#### Type constraints
+
+A constraint lists what a type parameter supports, joined with `+`.
+
+| Constraint | Allows | Met by |
+| --- | --- | --- |
+| `Eq` | `==` and `!=`. | Numbers, `bool`, `str`, pointers, channels, and structs and enums whose fields are all `Eq`. |
+| `Ord` | Adds `<`, `<=`, `>` and `>=`. | Numbers and `str`. |
+| `Hash` | Adds use as a map key. | Integers, `bool`, `str` and pointers. |
+| `Number` | Adds arithmetic, numeric literals, conversion with `T(x)` and the `f`, `e` and `n` formats and pictures of interpolation. | |
+| `Integer` | Adds bitwise operators and shifts and the `d`, `x`, `X` and `b` formats. It implies `Hash`. | |
+| `Float` | | `f64` and `f32`. |
+
+An unconstrained parameter can only be moved, stored, passed, printed and interpolated, with a width but no format, each instance rendering its own type. Anything else a generic function needs, such as an ordering of its elements, is passed in as a function value.
+
+A generic body is checked once against its constraints, so a missing constraint is reported at the definition, not at a use.
+
+Each generic function's type parameters are its own. Two functions may both name a parameter `T`, and a function type mentioning one is distinct from the same text mentioning the other.
+
+#### Type arguments
+
+Type arguments are inferred from the arguments, then from the expected type. They can be written explicitly: `max[u8](a, b)`, `Stack[str] { ... }`.
+
+| Generic use | Takes its arguments from |
+| --- | --- |
+| A struct literal or enum variant | The expected type or its field values. |
+| A function used as a value | The expected function type. |
+
+Each distinct set of type arguments compiles to its own copy, `max[i64]` and `max[f64]`, so generic code runs as fast as code written for one type.
+
+Values of different kinds that share behaviour, such as the elements of a UI tree, are structs of function values whose closures capture each kind's state.
 
 ### Concurrency
+
+`spawn` starts a green thread, and green threads pass values to each other over channels.
 
 <!-- prelude
 let fd: i32 = 0
@@ -1601,23 +2596,56 @@ sleep(10)
 wait_readable(fd)
 ```
 
-- `spawn f(args)` starts a green thread running the call. The function value and the arguments are evaluated before it starts. `mut` arguments are not allowed. A function that can fail must have its error handled inside the spawned call.
-- `chan[T](n)` makes a channel holding up to `n` values. `chan[T]()` is unbuffered, so every send waits for a receiver. A channel is a reference: assigning or passing it shares it.
-- `c <- v` sends, waiting while the buffer is full.
-- `<-c` receives a `T?`, waiting while the channel is empty. It gives `none` once the channel is closed and drained.
-- `close(c)` wakes every waiter. Sending on or closing a closed channel panics.
-- `for v in c` receives until the channel is closed and drained.
-- `select` waits on several operations at once and runs the arm of the first that can proceed. It is an expression like `match`.
-  - Arms are `name = <-c`, `<-c`, `c <- v`, `after(ms)` and `else`. `after` is a contextual keyword. It is an ordinary identifier everywhere except at the start of a `select` arm followed by `(`.
-  - Channel and value expressions are evaluated first, in order.
-  - Ready arms are taken in order.
-  - `else` runs when nothing is ready. Without `else` the green thread waits.
-  - `after(ms)` fires once `ms` milliseconds pass.
-- `sleep(ms)` pauses the green thread.
-- `wait_readable(fd)` and `wait_writable(fd)` wait until a file descriptor is ready, using epoll on Linux. On Windows `fd` is a waitable handle and both wait until it is signalled. One green thread may wait on a descriptor at a time.
-- A program ends when `main` returns, whatever other green threads are doing.
-- When every green thread is waiting and nothing can wake one, the program panics with `every green thread is blocked forever`. A green thread that exhausts its stack panics with `stack overflow`.
+#### Green threads
 
+`spawn f(args)` starts a green thread running the call.
+
+- The function value and the arguments are evaluated before it starts.
+- `mut` arguments are not allowed.
+- A function that can fail must have its error handled inside the spawned call.
+
+A program ends when `main` returns, whatever other green threads are doing.
+
+| Condition | Panic |
+| --- | --- |
+| Every green thread is waiting and nothing can wake one | `every green thread is blocked forever` |
+| A green thread exhausts its stack | `stack overflow` |
+
+#### Channels
+
+A channel is a reference: assigning or passing it shares it.
+
+| Form | Does |
+| --- | --- |
+| `chan[T](n)` | Makes a channel holding up to `n` values. |
+| `chan[T]()` | Makes an unbuffered channel, so every send waits for a receiver. |
+| `c <- v` | Sends, waiting while the buffer is full. |
+| `<-c` | Receives a `T?`, waiting while the channel is empty. It gives `none` once the channel is closed and drained. |
+| `close(c)` | Wakes every waiter. |
+| `for v in c` | Receives until the channel is closed and drained. |
+
+Sending on or closing a closed channel panics.
+
+#### Select
+
+`select` waits on several operations at once and runs the arm of the first that can proceed. It is an expression like `match`.
+
+| Arm | Runs when |
+| --- | --- |
+| `name = <-c`, `<-c` | The receive can proceed. |
+| `c <- v` | The send can proceed. |
+| `after(ms)` | `ms` milliseconds pass. |
+| `else` | Nothing is ready. Without `else` the green thread waits. |
+
+Channel and value expressions are evaluated first, in order. Ready arms are taken in order.
+
+`after` is a contextual keyword. It is an ordinary identifier everywhere except at the start of a `select` arm followed by `(`.
+
+#### Sleeping and waiting on descriptors
+
+`sleep(ms)` pauses the green thread.
+
+`wait_readable(fd)` and `wait_writable(fd)` wait until a file descriptor is ready, using epoll on Linux. On Windows `fd` is a waitable handle and both wait until it is signalled. One green thread may wait on a descriptor at a time.
 ## Builtins
 
 Every module sees these names without an import. A function in the program named `pop`, `truncate`, `close`, `sleep`, `wait_readable` or `wait_writable` takes precedence over the builtin. `compiler/check/builtins.low` is the only table of builtin names, parameters, `mut` markers, receivers and handlers. `compiler/tests/check` requires an entry here for each public one.
