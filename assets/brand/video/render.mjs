@@ -99,7 +99,7 @@ function serve(request, response, compiled) {
     response.writeHead(200, headers);
     stream.pipe(response);
   });
-  stream.on("error", () => response.writeHead(404).end());
+  stream.on("error", () => response.headersSent ? response.destroy() : response.writeHead(404).end());
 }
 
 function listen(server) {
