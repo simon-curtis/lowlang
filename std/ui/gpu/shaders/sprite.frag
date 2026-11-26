@@ -13,7 +13,7 @@ layout(location = 0) out vec4 color;
 
 void main() {
     Sprite sprite = sprites[sprite_index];
-    float sampled = texture(atlas, uv).r;
+    float sampled = textureLod(atlas, uv, 0.0).r;
     float coverage = apply_contrast_and_gamma_correction(sampled, sprite.color.rgb, viewport.grayscale_enhanced_contrast, viewport.gamma_ratios);
     color = vec4(sprite.color.rgb, sprite.color.a * coverage * clip_alpha(pixel, sprite.clip));
 }
