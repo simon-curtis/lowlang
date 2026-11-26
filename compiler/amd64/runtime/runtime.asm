@@ -2301,6 +2301,16 @@ rt_scan_g:
 	call rt_mark
 	dec r12
 	jmp 3b
+5:
+	mov rdi, [rbx+8]
+	mov rsi, [rbx+16]
+	add rdi, r13
+	add rsi, r13
+	call rt_scan_range
+	lea r14, [r13+16]
+	mov r12, [r13+8]
+	mov r13, [r13]
+	jmp 2b
 4:
 	mov rdi, r14
 	mov rsi, r13
@@ -2315,11 +2325,6 @@ rt_scan_g:
 	mov rdi, r14
 	mov rsi, r13
 	call rt_scan_range
-	jmp 2b
-5:
-	lea r14, [r13+16]
-	mov r12, [r13+8]
-	mov r13, [r13]
 	jmp 2b
 6:
 	mov rdi, [r13-8]
