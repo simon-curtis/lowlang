@@ -1,3 +1,5 @@
+	.set IDLE_SPIN, 0
+
 	.macro TLS_GET reg, slot
 	mov \reg, qword ptr fs:[\slot]
 	.endm

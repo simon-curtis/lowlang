@@ -1305,6 +1305,45 @@ rt_schedule:
 	test rax, rax
 	jnz 9f
 10:
+.if IDLE_SPIN
+	cmp qword ptr [rip+rt_nfdwait], 0
+	jne 20f
+	cmp qword ptr [rbx+M_SPINNING], 0
+	jne 17f
+	mov qword ptr [rbx+M_SPINNING], 1
+	lock inc qword ptr [rip+rt_nspinning]
+17:
+	rdtsc
+	shl rdx, 32
+	or rax, rdx
+	cmp qword ptr [rbx+M_IDLESPIN], 0
+	jne 18f
+	add rax, IDLE_SPIN
+	mov [rbx+M_IDLESPIN], rax
+	jmp 19f
+18:
+	cmp rax, [rbx+M_IDLESPIN]
+	jae 20f
+19:
+	cmp dword ptr [rip+rt_stop], 0
+	jne 20f
+	call rt_queues_empty
+	test rax, rax
+	jz 1b
+	mov ecx, IDLE_SPIN_PAUSES
+21:
+	pause
+	dec ecx
+	jnz 21b
+	cmp qword ptr [rip+rt_ntimers], 0
+	jne 1b
+	rdtsc
+	shl rdx, 32
+	or rax, rdx
+	jmp 18b
+20:
+	mov qword ptr [rbx+M_IDLESPIN], 0
+.endif
 	cmp qword ptr [rbx+M_SPINNING], 0
 	je 13f
 	mov qword ptr [rbx+M_SPINNING], 0
@@ -1383,6 +1422,7 @@ rt_schedule:
 	jmp 1b
 9:
 	mov r12, rax
+	mov qword ptr [rbx+M_IDLESPIN], 0
 	inc qword ptr [rbx+M_TICK]
 	cmp qword ptr [rbx+M_SPINNING], 0
 	je 11f

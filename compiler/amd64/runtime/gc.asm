@@ -42,6 +42,8 @@ rt_region_list:
 	.zero 8
 rt_region_count:
 	.zero 8
+rt_region_list_lock:
+	.zero 8
 rt_region_links:
 	.zero 8
 rt_rq:
@@ -636,14 +638,14 @@ rt_region_enter:
 	mov [rbx+R_SCAN_CHUNK], rcx
 	mov [rbx+R_SCAN_BUMP], rcx
 	mov [rbx+R_SCAN_END], rcx
-	call rt_heap_acquire
+	call rt_region_list_acquire
 	mov rcx, [rip+rt_region_count]
 	mov rdx, [rip+rt_region_list]
 	mov [rdx+8*rcx], rbx
 	mov [rbx+R_INDEX], rcx
 	inc rcx
 	mov [rip+rt_region_count], rcx
-	mov qword ptr [rip+rt_heap_lock], 0
+	mov qword ptr [rip+rt_region_list_lock], 0
 	TLS_GET rax, TLS_G
 	mov rcx, [rax+G_REGION]
 	mov [rbx+R_PARENT], rcx
@@ -651,6 +653,23 @@ rt_region_enter:
 	call rt_alloc_hold
 	mov rax, rbx
 	pop rbx
+	ret
+
+rt_region_list_acquire:
+	mov eax, 1
+	xchg [rip+rt_region_list_lock], rax
+	test rax, rax
+	jz 3f
+2:
+	cmp dword ptr [rip+rt_stop], 0
+	je 4f
+	call rt_stop_here
+4:
+	pause
+	cmp qword ptr [rip+rt_region_list_lock], 0
+	jne 2b
+	jmp rt_region_list_acquire
+3:
 	ret
 
 	.globl rt_region_leave
@@ -712,7 +731,7 @@ rt_region_free:
 	push r12
 	push r13
 	mov rbx, rdi
-	call rt_heap_acquire
+	call rt_region_list_acquire
 	mov rax, [rbx+R_INDEX]
 	mov rcx, [rip+rt_region_count]
 	dec rcx
@@ -721,7 +740,7 @@ rt_region_free:
 	mov rsi, [rdx+8*rcx]
 	mov [rdx+8*rax], rsi
 	mov [rsi+R_INDEX], rax
-	mov qword ptr [rip+rt_heap_lock], 0
+	mov qword ptr [rip+rt_region_list_lock], 0
 	mov rax, [rbx+R_SCAN_CHUNK]
 	test rax, rax
 	jz 1f
