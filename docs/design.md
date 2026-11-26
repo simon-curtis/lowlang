@@ -4,27 +4,25 @@ Low is a small compiled language, about the size of Go's core. It has a tracing 
 
 | Command | Does |
 | --- | --- |
-| `low run` | Compiles and runs a file or a module directory, `.` by default. With none named, a directory that holds no `.low` file runs the one program its project declares (see [Projects](#projects)). Options come before the program. Every argument after the program goes to the program, as `low run -c debug app/ -v` does. `--target browser/wasm32` runs it as WebAssembly under `node`. |
-| `low test` | Builds the tests of the named modules and runs each test in its own process, in parallel, with a timeout, filters and a text or JSON report. |
-| `low build` | Writes a native binary, or a WebAssembly module for `browser/wasm32`, from a file or a module directory, `.` by default. `-o` or `--output` names it. `--target` picks `linux/amd64`, `windows/amd64` or `browser/wasm32` and defaults to the host. `-c debug` or `--config debug` builds without optimisation. `-c release`, the default, optimises. `low run` takes `-c` too. `--subsystem console|gui` picks the PE subsystem of a Windows executable and overrides the project's `gui` declaration. Without it, the subsystem is `gui` for a program the project's `build.low` declares with `gui`, and `console` otherwise. The option is an error for another target. With no program named, the current directory is built when it holds `.low` files. Otherwise the one program the project declares is built, an error naming them when there are several. Without `-o`, or with an `--output` that names a directory or ends in a separator, which creates it, the output is named after the file or directory and written to that directory, the current one by default, so `low build` in `app/` writes `app`, or `app.exe` on Windows. Options may come before or after the program. `--trace file.json` writes the compilation's stages, each parallel job's thread and the process's CPU and memory as a Chrome trace. It prints a stage table and a thread usage matrix to standard error. `low run`, `low asm` and `low ir` take it too. `--map file` writes every symbol outside `.L` with its address in the image at its preferred base. Each symbol gets one `hex-address name` line, sorted by address. Absolute constants carry their value, and negative ones carry it as `-hex`. The executable is the same with or without `--map`. |
-| `low install` | Builds each named program and places its executable in `LOW_BIN` or `~/.low/bin`. The executable is named as `low build` names it. It prints `installed <path>` on standard output for each. `--target` names the host and `-c` picks the configuration, as for `low build`. An executable that cannot be replaced is first renamed to `<name>.old`, and the next install removes that file. A running executable on Windows, for example, cannot be replaced. With no program named, it builds `.` when that directory holds `.low` files. Otherwise it builds every program the project declares (see [Projects](#projects)), each named after its directory. `--subsystem` is a usage error. |
-| `low update` | Resolves every version-control dependency again to the newest tag its ranges accept. It places each in the module cache and rewrites `build.lock` with each version, commit and content hash. |
-| `low publish` | `low publish <source> <version>` adds a tagged version of the package at `https://<source>` to the package index and commits it there (see [Projects](#projects)). The tag must be pushed. Its tree must resolve its dependencies and type-check. A version the index lists is refused. |
-| `low yank` | `low yank [--undo] <source> <version>` marks a version in the package index as yanked, or with `--undo` as available again. It changes only the flag of its line and commits the change. |
-| `low dev` | Runs the program and patches changed functions into it on save. Changing `main`, a type's layout or a function's signature restarts it. |
-| `low ir` | Prints the optimised SSA form. |
-| `low asm` | Prints the generated assembly. |
-| `low lint` | Type-checks a program or a library module and prints its warnings. |
-| `low doc` | Prints the public API of every module under a directory, of the standard library or of every indexed package version as JSON. |
-| `low names` | Prints every name in a file as JSON, with its hover text, definition and reference group. |
-| `low prof` | Runs a program and reports where its cycles go, by category, by function and by function with its callees. `--folded` writes the stacks for flame graph tools. `--callers` lists the call chains that reach one function. On Linux, `--event` picks what is sampled: `cycles`, `instructions`, `cache-misses`, `branch-misses`, `cpu-clock`, `faults` or `switches`. On Linux, every process the program starts is sampled with it, and each is named from its own symbol table. A Windows program is sampled by cycles. It needs `--map` with the map of `low build --map`. Options come before the program and every argument after it goes to the program. |
-| `low abbench` | Runs one command with each of two programs, `-a` and `-b`, on alternating runs. It reports the median and spread of each side, and the median of the paired `b/a` ratios with a 95% bootstrap interval. It reports these for wall time, CPU time, cycles, instructions and peak memory. Peak memory is private on Windows and resident on Linux. It leaves out a metric the host does not count. `{exe}` in the command is the program of each side. `{side}` is `a` or `b`. `--same` requires a file both sides write to be identical. `--affinity` restricts the CPUs. Options come before the command. |
-| `low protogen` | Generates one Low module for each `.proto` file named and each file it imports with `std/protobuf/proto`. It writes them under the `-o` or `--output` directory, `a/b.proto` as `a/b/b.low`. `-I` or `--include` lists the comma-separated directories that imports are resolved against, `.` by default. `--module` is the import path of the output directory when it is not the project root. A failure to read, generate or write exits with status 1. |
-| `low lsp` | Starts the language server that the editor extensions use. |
-| `low version` | Prints the release. For a build from source, it prints `dev+` and the first 12 digits of the commit `std/buildinfo` reports, then ` ~ ` and the build time in UTC as `YYYY/MM/DD HH:MM`: `dev+0e21bead73d7 ~ 2026/11/18 16:01`. A build outside a git checkout prints `dev`. |
-| `low help` | Prints the commands, or with a command name the options of that command. |
-
-Command lines follow the POSIX utility syntax guidelines with GNU long options. A short option is a dash and a letter, `-o path` or `-opath`. Short switches combine as `-vj4` does. A short option takes the rest of its argument or the next one as its value, so `-o=path` has the value `=path`. A long option is `--name value` or `--name=value`. A switch takes no value, so `--list=false` is an error. An argument that does not parse as options is reported whole, as `unknown option -vx`. A value that is given and empty is a value, so `--target=` and `-c ''` are errors for an unknown target or configuration. `--` ends the options. A lone `-` is an operand. Options and operands may be interleaved for every command except `low run`, `low prof` and `low abbench`. For those three, options end at the program or command, and later arguments belong to it. `--target` is taken by `build`, `run`, `install`, `asm`, `ir`, `lint`, `doc` and `names`. `--config` is taken by `build`, `run`, `install`, `asm` and `ir`. The short forms are `-o`/`--output`, `-c`/`--config`, `-h`/`--help`, `-V`/`--version` for `low` itself, and `-v`/`--verbose` and `-j`/`--jobs` for `low test`. `low`, `low -h`, `low --help` and `low help` print the commands; `low help <command>` and `low <command> --help` print the options of one command. Both are written to standard output with status 0, in colour when `term.colour_enabled(1)` holds. A mistake on the command line (an unknown command or option, a missing or invalid value, a wrong number of operands, `--subsystem` for a target that is not `windows/amd64`) prints one line naming the mistake, the command's `Usage:` line and a `Try 'low <command> --help'` line to standard error and exits with status 2. An unknown command prints its line and `Try 'low --help'`. Every other failure exits with status 1. One table in `compiler/low/commands.low` holds each command's name, summary, operands, description and options. The parser, both help pages and the usage line all read it.
+| [`low run`](#low-run) | Compiles and runs a program. |
+| [`low test`](#low-test) | Runs the tests of the named modules. |
+| [`low build`](#low-build) | Writes an executable or a WebAssembly module. |
+| [`low install`](#low-install) | Builds programs and places them in `LOW_BIN`. |
+| [`low update`](#low-update) | Moves every dependency to the newest version its range accepts. |
+| [`low publish`](#low-publish) | Adds a tagged version of a package to the package index. |
+| [`low yank`](#low-yank) | Marks a published version as yanked. |
+| [`low dev`](#low-dev) | Runs a program and patches changed functions into it on save. |
+| [`low ir`](#low-ir-and-low-asm) | Prints the optimised SSA form. |
+| [`low asm`](#low-ir-and-low-asm) | Prints the generated assembly. |
+| [`low lint`](#low-lint) | Type-checks a program or a library module and prints its warnings. |
+| [`low doc`](#low-doc) | Prints the public API of modules as JSON. |
+| [`low names`](#low-names) | Prints every name in a file as JSON. |
+| [`low prof`](#low-prof) | Runs a program and reports where its cycles go. |
+| [`low abbench`](#low-abbench) | Compares two builds of a program on alternating runs. |
+| [`low protogen`](#low-protogen) | Generates Low modules from `.proto` files. |
+| [`low lsp`](#low-lsp) | Starts the language server that the editor extensions use. |
+| [`low version`](#low-version) | Prints the release. |
+| [`low help`](#low-help) | Prints the commands, or the options of one command. |
 
 A directory is a module. A `build.low` file marks the project root and names its dependencies, and `import ui/text` loads `ui/text/` under it. The standard library is imported as `std/...`. The editor extensions need `low` on `PATH`.
 
@@ -35,6 +33,198 @@ $ git clone https://github.com/simon-curtis/lowlang
 $ cd lowlang
 $ ./bootstrap.sh ~/.local/bin/low
 ```
+
+## Commands
+
+`low help` prints the commands. `low help <command>` and `low <command> --help` print the options of one command.
+
+### Command lines
+
+Command lines follow the POSIX utility syntax guidelines with GNU long options.
+
+| Form | Meaning |
+| --- | --- |
+| `-o path`, `-opath` | A short option is a dash and a letter. It takes the rest of its argument or the next one as its value, so `-o=path` has the value `=path`. |
+| `-vj4` | Short switches combine. |
+| `--name value`, `--name=value` | A long option. |
+| `--list` | A switch takes no value, so `--list=false` is an error. |
+| `--` | Ends the options. |
+| `-` | A lone dash is an operand. |
+
+- An argument that does not parse as options is reported whole, as `unknown option -vx`.
+- A value that is given and empty is a value, so `--target=` and `-c ''` are errors for an unknown target or configuration.
+- Options and operands may be interleaved for every command except `low run`, `low prof` and `low abbench`. For those three, options end at the program or command, and later arguments belong to it.
+
+Some options are shared between commands.
+
+| Option | Short form | Taken by |
+| --- | --- | --- |
+| `--target` | | `build`, `run`, `install`, `asm`, `ir`, `lint`, `doc` and `names` |
+| `--config` | `-c` | `build`, `run`, `install`, `asm` and `ir` |
+| `--output` | `-o` | |
+| `--help` | `-h` | |
+| `--version` | `-V` | `low` itself |
+| `--verbose` | `-v` | `low test` |
+| `--jobs` | `-j` | `low test` |
+
+Help goes to standard output with status 0, in colour when `term.colour_enabled(1)` holds. `low`, `low -h`, `low --help` and `low help` print the commands; `low help <command>` and `low <command> --help` print the options of one command.
+
+| Exit status | When |
+| --- | --- |
+| 0 | The command succeeded, or printed help. |
+| 1 | Every failure that is not a mistake on the command line. |
+| 2 | A mistake on the command line (an unknown command or option, a missing or invalid value, a wrong number of operands, `--subsystem` for a target that is not `windows/amd64`). |
+
+A mistake on the command line prints three lines to standard error: one naming the mistake, the command's `Usage:` line and a `Try 'low <command> --help'` line. An unknown command prints its line and `Try 'low --help'`.
+
+One table in `compiler/low/commands.low` holds each command's name, summary, operands, description and options. The parser, both help pages and the usage line all read it.
+
+### low run
+
+Compiles and runs a file or a module directory, `.` by default.
+
+```
+$ low run -c debug app/ -v
+```
+
+- Options come before the program. Every argument after the program goes to the program, so the `-v` above goes to `app`.
+- With none named, a directory that holds no `.low` file runs the one program its project declares (see [Projects](#projects)).
+- `--target browser/wasm32` runs it as WebAssembly under `node`.
+- `-c` and `--trace` work as they do for [`low build`](#low-build).
+
+### low test
+
+Builds the tests of the named modules and runs each test in its own process, in parallel, with a timeout, filters and a text or JSON report.
+
+### low build
+
+Writes a native binary, or a WebAssembly module for `browser/wasm32`, from a file or a module directory, `.` by default. Options may come before or after the program.
+
+| Option | Meaning |
+| --- | --- |
+| `-o`, `--output` | Names the output. |
+| `--target` | Picks `linux/amd64`, `windows/amd64` or `browser/wasm32`. Defaults to the host. |
+| `-c debug`, `--config debug` | Builds without optimisation. |
+| `-c release` | Optimises. This is the default. |
+| `--subsystem console\|gui` | Picks the PE subsystem of a Windows executable. |
+| `--trace file.json` | Writes a Chrome trace of the compilation. |
+| `--map file` | Writes the address of every symbol. |
+
+**Which program is built.** With no program named, the current directory is built when it holds `.low` files. Otherwise the one program the project declares is built, an error naming them when there are several.
+
+**Where the output goes.** Without `-o`, or with an `--output` that names a directory or ends in a separator, which creates it, the output is named after the file or directory and written to that directory, the current one by default, so `low build` in `app/` writes `app`, or `app.exe` on Windows.
+
+**`--subsystem`** overrides the project's `gui` declaration. Without it, the subsystem is `gui` for a program the project's `build.low` declares with `gui`, and `console` otherwise. The option is an error for another target.
+
+**`--trace file.json`** writes the compilation's stages, each parallel job's thread and the process's CPU and memory as a Chrome trace. It prints a stage table and a thread usage matrix to standard error. `low run`, `low asm` and `low ir` take it too.
+
+**`--map file`** writes every symbol outside `.L` with its address in the image at its preferred base. Each symbol gets one `hex-address name` line, sorted by address. Absolute constants carry their value, and negative ones carry it as `-hex`. The executable is the same with or without `--map`.
+
+### low install
+
+Builds each named program and places its executable in `LOW_BIN` or `~/.low/bin`. The executable is named as `low build` names it. It prints `installed <path>` on standard output for each.
+
+- `--target` names the host and `-c` picks the configuration, as for `low build`. `--subsystem` is a usage error.
+- With no program named, it builds `.` when that directory holds `.low` files. Otherwise it builds every program the project declares (see [Projects](#projects)), each named after its directory.
+- An executable that cannot be replaced is first renamed to `<name>.old`, and the next install removes that file. A running executable on Windows, for example, cannot be replaced.
+
+### low update
+
+Resolves every version-control dependency again to the newest tag its ranges accept. It places each in the module cache and rewrites `build.lock` with each version, commit and content hash.
+
+### low publish
+
+```
+$ low publish <source> <version>
+```
+
+Adds a tagged version of the package at `https://<source>` to the package index and commits it there (see [Projects](#projects)).
+
+- The tag must be pushed.
+- Its tree must resolve its dependencies and type-check.
+- A version the index lists is refused.
+
+### low yank
+
+```
+$ low yank [--undo] <source> <version>
+```
+
+Marks a version in the package index as yanked, or with `--undo` as available again. It changes only the flag of its line and commits the change.
+
+### low dev
+
+Runs the program and patches changed functions into it on save. Changing `main`, a type's layout or a function's signature restarts it. [Hot reload](#hot-reload) describes how.
+
+### low ir and low asm
+
+`low ir` prints the optimised SSA form. `low asm` prints the generated assembly.
+
+### low lint
+
+Type-checks a program or a library module and prints its warnings.
+
+### low doc
+
+Prints the public API of every module under a directory, of the standard library or of every indexed package version as JSON.
+
+### low names
+
+Prints every name in a file as JSON, with its hover text, definition and reference group.
+
+### low prof
+
+Runs a program and reports where its cycles go, by category, by function and by function with its callees. Options come before the program and every argument after it goes to the program.
+
+| Option | Meaning |
+| --- | --- |
+| `--folded` | Writes the stacks for flame graph tools. |
+| `--callers` | Lists the call chains that reach one function. |
+| `--event` | On Linux, picks what is sampled: `cycles`, `instructions`, `cache-misses`, `branch-misses`, `cpu-clock`, `faults` or `switches`. |
+| `--map` | On Windows, the map that `low build --map` wrote. A Windows program needs it. |
+
+On Linux, every process the program starts is sampled with it, and each is named from its own symbol table. A Windows program is sampled by cycles.
+
+### low abbench
+
+Runs one command with each of two programs, `-a` and `-b`, on alternating runs. Options come before the command.
+
+It reports the median and spread of each side, and the median of the paired `b/a` ratios with a 95% bootstrap interval. It reports these for wall time, CPU time, cycles, instructions and peak memory. Peak memory is private on Windows and resident on Linux. It leaves out a metric the host does not count.
+
+| In the command or options | Meaning |
+| --- | --- |
+| `{exe}` | The program of each side. |
+| `{side}` | `a` or `b`. |
+| `--same` | Requires a file both sides write to be identical. |
+| `--affinity` | Restricts the CPUs. |
+
+### low protogen
+
+Generates one Low module for each `.proto` file named and each file it imports with `std/protobuf/proto`. It writes them under the output directory, `a/b.proto` as `a/b/b.low`. A failure to read, generate or write exits with status 1.
+
+| Option | Meaning |
+| --- | --- |
+| `-o`, `--output` | The output directory. |
+| `-I`, `--include` | The comma-separated directories that imports are resolved against, `.` by default. |
+| `--module` | The import path of the output directory when it is not the project root. |
+
+### low lsp
+
+Starts the language server that the editor extensions use. [Editors](#editors) covers the extensions.
+
+### low version
+
+Prints the release.
+
+| Build | Prints |
+| --- | --- |
+| A release | The release. |
+| From source | `dev+` and the first 12 digits of the commit `std/buildinfo` reports, then ` ~ ` and the build time in UTC as `YYYY/MM/DD HH:MM`: `dev+0e21bead73d7 ~ 2026/11/18 16:01`. |
+| Outside a git checkout | `dev`. |
+
+### low help
+
+Prints the commands, or with a command name the options of that command.
 
 ## Goals
 
