@@ -17,6 +17,8 @@ Low is a small compiled language, about the size of Go's core. It has a tracing 
 | [`low lint`](#low-lint) | Type-checks a program or a library module and prints its warnings. |
 | [`low doc`](#low-doc) | Prints the public API of modules as JSON. |
 | [`low names`](#low-names) | Prints every name in a file as JSON. |
+| [`low context`](#low-context) | Prints what an edit to one definition needs. |
+| [`low refs`](#low-refs) | Prints every place that names a definition. |
 | [`low prof`](#low-prof) | Runs a program and reports where its cycles go. |
 | [`low abbench`](#low-abbench) | Compares two builds of a program on alternating runs. |
 | [`low protogen`](#low-protogen) | Generates Low modules from `.proto` files. |
@@ -59,13 +61,14 @@ Some options are shared between commands.
 
 | Option | Short form | Taken by |
 | --- | --- | --- |
-| `--target` | | `build`, `run`, `install`, `asm`, `ir`, `lint`, `doc` and `names` |
+| `--target` | | `build`, `run`, `install`, `asm`, `ir`, `lint`, `doc`, `names`, `context` and `refs` |
 | `--config` | `-c` | `build`, `run`, `install`, `asm` and `ir` |
 | `--output` | `-o` | |
 | `--help` | `-h` | |
 | `--version` | `-V` | `low` itself |
 | `--verbose` | `-v` | `low test` |
 | `--jobs` | `-j` | `low test` |
+| `--json` | | `test`, `context` and `refs` |
 
 Help goes to standard output with status 0, in colour when `term.colour_enabled(1)` holds. `low`, `low -h`, `low --help` and `low help` print the commands; `low help <command>` and `low <command> --help` print the options of one command.
 
@@ -171,6 +174,22 @@ Prints the public API of every module under a directory, of the standard library
 ### low names
 
 Prints every name in a file as JSON, with its hover text, definition and reference group.
+
+### low context
+
+Prints what an edit to one definition needs, in the form an agent pastes into a prompt: the definition's source, then the signature, doc comment and place of everything it names, without bodies.
+
+```
+$ low context compiler/check.check_main
+$ low context --callers --depth 2 --budget 4000 app.describe
+$ low context app/app.low:5:24
+```
+
+See [low context output](#low-context-output).
+
+### low refs
+
+Prints every place in the project that names a definition, as `file:line:column:` and the line. It takes a definition as [`low context`](#low-context) does.
 
 ### low prof
 
@@ -2166,6 +2185,48 @@ A key is absent when the name has no such fact.
 Names with the same `first` are one reference group. A field written in shorthand, as `x` in `Point { x }`, groups with the field. The group of the local it reads starts at the shorthand when that comes first.
 
 A program that does not check prints the error and exits with status 1. `--target` picks the operating system whose files are checked. It defaults to the host.
+
+#### low context output
+
+`low context` takes one definition, written in one of three forms.
+
+| Form | Names |
+| --- | --- |
+| `module.name` | A function, constant, struct or enum. |
+| `module.Type.member` | A field of a struct or a variant of an enum. |
+| `file.low:line:col` | The definition of the name at that place. With no column, or with a column that is on no name, it is the definition around the line. |
+
+A module is a directory such as `compiler/check`, `std/name`, or an import path of the project of the current directory, such as a dependency's module. The module and its imports are type-checked, so the command does not need a `main`.
+
+The text output has these sections, in this order.
+
+| Section | Holds |
+| --- | --- |
+| The definition | Its kind, name and `file:line`, and its source with its doc comment. A member's definition is its whole struct or enum. |
+| `// imports of <file>` | The imports of the definition's file. Under `// named here and not imported` are the modules of the uses that the file does not import. |
+| `// uses` | Every function, constant, struct, enum and generic constraint the definition names, each once, in the order of first reference. A function shows its doc comment and signature as written, without a body. A constant, struct or enum shows its whole declaration. A field or variant shows as its struct or enum. |
+| `// uses at depth n` | Under `--depth n`, the uses of the previous level's uses that no shallower level holds. The default depth is 1. |
+| `// callers` | Under `--callers`, every place in the project that names the definition, as `file:line` and the signature of the definition around it. |
+| `// cut by --budget n` | What was cut, by kind and name. |
+
+Each heading of a definition or use is a comment line, `// <kind> <module>.<name>  <file>:<line>`, so the output reads as Low. A built-in constraint shows as `// constraint Ord  built in`. Paths are relative to the current directory when they are inside it.
+
+`--budget tokens` counts a token as four bytes. It drops uses from the end of the deepest level first, and then from the level above, until the output with its list of cuts fits. The definition, the imports and the callers are never cut.
+
+`--callers` and `low refs` type-check every module of the project that imports the definition's module, directly or through other modules of the project, together with the sources at the project root when they reach it. The modules are found as `low doc index` finds them. A module that does not parse, or that fails to check on its own, is left out and listed as `// not checked: <module>` after the callers or places, so callers inside it are not found.
+
+`--json` writes one object per line, each with a `kind`.
+
+| `kind` | Keys |
+| --- | --- |
+| `definition` | `item` (`fn`, `const`, `struct` or `enum`), `name`, `file`, `line` and `source`. |
+| `import` | `path`, `alias`, and `imported`, false for a module the uses name that the file does not import. |
+| `use` | `depth`, `item`, `name`, `file`, `line`, `text`, and `doc` when there is a doc comment. A constraint has only `depth`, `item` (`constraint`) and `name`. |
+| `caller` | `file`, `line`, `column`, and `in`, the signature of the definition around it. |
+| `unchecked` | `module`, a module left out of the search for callers. |
+| `cut` | The keys of a `use` without `text` and `doc`. |
+
+The objects come in the order of the text sections. `low refs --json` writes one `ref` object per place, with the keys of a `caller` and the `text` of the line, then the `unchecked` objects.
 
 ### Projects
 

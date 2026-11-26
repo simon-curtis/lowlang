@@ -1,0 +1,192 @@
+import ast
+import diag
+import lsp
+import types
+import std/slices
+import std/text
+
+struct Use {
+    depth: i64
+    decl: *Decl? = none
+    constraint: str = ""
+}
+
+struct Site {
+    file: *ast.File
+    line: i64
+    column: i64
+    within: *Decl? = none
+}
+
+fn hit_of(s: *Session, r: lsp.Referent) -> Hit? {
+    match r {
+        Described(inner, _) => s.hit_of(*inner)
+        Own(inner, _) => s.hit_of(*inner)
+        Func(f) => s.func_hit(ast.source(f))
+        Const(k) => s.keyed_hit(k.file, k.pos)
+        Type(d) => s.hit_at(decl_key(d.file_path, d.pos))
+        Field(_, owner, name, _) => s.member_hit(owner, name)
+        Variant(_, enum_type, name, _) => s.member_hit(enum_type, name)
+        _ => none
+    }
+}
+
+fn func_hit(s: *Session, f: *ast.Func) -> Hit? {
+    s.keyed_hit(f.file, f.pos)
+}
+
+fn keyed_hit(s: *Session, f: *ast.File?, pos: diag.Pos) -> Hit? {
+    let home = f ?? return none
+    s.hit_at(decl_key(home.path, pos))
+}
+
+fn hit_at(s: *Session, key: str) -> Hit? {
+    let d = s.keyed[key] ?? return none
+    Hit { decl: d }
+}
+
+fn member_hit(s: *Session, owner: *types.Type?, name: str) -> Hit? {
+    let t = owner ?? return none
+    let d = s.decl_of_type(types.struct_of(t)) ?? return none
+    Hit { decl: d, member: name }
+}
+
+fn decl_of_type(s: *Session, t: *types.Type) -> *Decl? {
+    match s.typed[t] {
+        some(d) => return d
+        none => {}
+    }
+    let origin = t.origin ?? return none
+    s.typed[origin]
+}
+
+fn sorted_occurrences(x: *lsp.Index) -> []*lsp.Occurrence {
+    var found = x.occurrences
+    slices.sort_stable_by(mut found, fn(a: *lsp.Occurrence, b: *lsp.Occurrence) -> bool { before(a, b) })
+    found
+}
+
+fn before(a: *lsp.Occurrence, b: *lsp.Occurrence) -> bool {
+    let a_line = a.pos.pos_line()
+    let b_line = b.pos.pos_line()
+    a_line < b_line || (a_line == b_line && a.pos.pos_col() < b.pos.pos_col())
+}
+
+fn query(s: *Session, x: *lsp.Index, o: *lsp.Occurrence) -> *lsp.Query {
+    new(lsp.Query { program: s.program, index: x, occ: o })
+}
+
+/// Lists what `d` names inside its own span, in the order of first reference, each once and never `d` itself.
+fn uses_in(s: *Session, d: *Decl) -> []Use {
+    var found: []Use = []
+    let x = s.index_of(d.file)
+    let from = d.pos.pos_line()
+    for o in sorted_occurrences(x) {
+        let line = o.pos.pos_line()
+        if line < from || line > d.limit {
+            continue
+        }
+        match o.anchor {
+            FieldPattern(_) => {}
+            _ => {
+                if o.local != none {
+                    continue
+                }
+            }
+        }
+        match o.anchor {
+            TypeParam(p) => {
+                for c in p.constraints {
+                    found.push(Use { depth: 0, constraint: c })
+                }
+                continue
+            }
+            _ => {}
+        }
+        let hit = s.hit_of(lsp.resolve(s.query(x, o))) ?? continue
+        if hit.decl != d {
+            found.push(Use { depth: 0, decl: hit.decl })
+        }
+    }
+    found
+}
+
+fn use_key(u: Use) -> str {
+    match u.decl {
+        some(d) => d.key
+        none => "constraint {u.constraint}"
+    }
+}
+
+/// Lists the definitions `root` reaches in `depth` levels of references, breadth first, each at the shallowest level it appears.
+fn gather(s: *Session, root: *Decl, depth: i64) -> []Use {
+    var out: []Use = []
+    var seen: [str: bool] = [root.key: true]
+    var frontier: []*Decl = [root]
+    for level in 1..depth + 1 {
+        var next: []*Decl = []
+        for d in frontier {
+            for u in s.uses_in(d) {
+                let key = use_key(u)
+                if seen[key] != none {
+                    continue
+                }
+                seen[key] = true
+                out.push(Use { depth: level, decl: u.decl, constraint: u.constraint })
+                match u.decl {
+                    some(found) => next.push(found)
+                    none => {}
+                }
+            }
+        }
+        frontier = next
+    }
+    out
+}
+
+fn search_files(s: *Session, want: Hit) -> []*ast.File {
+    let in_std = text.starts_with(want.decl.module, "std/")
+    var files: []*ast.File = []
+    for f in lsp.program_files(s.program) {
+        if in_std || !text.starts_with(f.module, "std/") {
+            files.push(f)
+        }
+    }
+    slices.sort_stable_by(mut files, fn(a: *ast.File, b: *ast.File) -> bool { s.shown_path(a.path) < s.shown_path(b.path) })
+    files
+}
+
+fn mentions(s: *Session, f: *ast.File, name: str) -> bool {
+    s.text_of(f).lines.any(fn(line) text.contains(line, name))
+}
+
+/// Lists every place in the loaded program that names `want`, its declaration left out, by file and position.
+fn sites(s: *Session, want: Hit) -> []Site {
+    var name = want.member
+    if name == "" {
+        name = want.decl.name
+    }
+    var found: []Site = []
+    for f in s.search_files(want) {
+        if !s.mentions(f, name) {
+            continue
+        }
+        let x = s.index_of(f)
+        for o in sorted_occurrences(x) {
+            if o.name != name {
+                continue
+            }
+            let r = lsp.resolve(s.query(x, o))
+            match r {
+                Own(_, _) => continue
+                _ => {}
+            }
+            let hit = s.hit_of(r) ?? continue
+            if hit.decl == want.decl && hit.member == want.member {
+                let line = o.pos.pos_line()
+                found.push(Site { file: f, line, column: o.pos.pos_col(), within: s.enclosing(f, line) })
+            }
+        }
+    }
+    found
+}

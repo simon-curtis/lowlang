@@ -1,0 +1,338 @@
+import ast
+import std/builder
+import std/json
+import std/path
+import std/text
+
+struct Shown {
+    found: Hit
+    uses: []Use
+    sites: []Site
+    searched: bool
+    depth: i64
+    budget: i64
+}
+
+struct Fitted {
+    kept: []Use
+    cut: []Use
+}
+
+fn tokens(s: str) -> i64 {
+    (s.len + 3) / 4
+}
+
+/// Drops uses from the deepest level up, last first, until the whole text fits `budget` tokens, counting the list of what was cut.
+fn fit(s: *Session, shown: Shown, fixed: i64) -> Fitted {
+    var kept = shown.uses
+    var cut: []Use = []
+    if shown.budget <= 0 {
+        return Fitted { kept, cut }
+    }
+    var total = fixed
+    for u in kept {
+        total += tokens(s.use_text(u))
+    }
+    var cut_cost = tokens(cut_heading(shown.budget))
+    for total + cut_cost > shown.budget && kept.len > 0 {
+        let last = kept[kept.len - 1]
+        kept = kept[..kept.len - 1]
+        cut.push(last)
+        total -= tokens(s.use_text(last))
+        cut_cost += tokens("{s.use_label(last)}\n")
+    }
+    var reversed: []Use = []
+    var i = cut.len - 1
+    for i >= 0 {
+        reversed.push(cut[i])
+        i -= 1
+    }
+    Fitted { kept, cut: reversed }
+}
+
+fn cut_heading(budget: i64) -> str {
+    "\n// cut by --budget {budget}\n"
+}
+
+fn use_label(s: *Session, u: Use) -> str {
+    match u.decl {
+        some(d) => "{d.kind} {s.qualified(d)}"
+        none => "constraint {u.constraint}"
+    }
+}
+
+fn use_text(s: *Session, u: Use) -> str {
+    let d = u.decl ?? return "// constraint {u.constraint}  built in\n"
+    var b = builder.builder()
+    b.write("// {d.kind} {s.qualified(d)}  {s.location(d)}\n")
+    let doc = s.doc_lines(d)
+    if doc != "" {
+        b.write("{doc}\n")
+    }
+    b.write("{s.header(d)}\n")
+    b.to_str()
+}
+
+fn definition_text(s: *Session, found: Hit) -> str {
+    let d = found.decl
+    "// {d.kind} {s.hit_name(found)}  {s.location(d)}\n{s.source_of(d)}\n"
+}
+
+fn import_line(imp: *ast.Import) -> str {
+    if imp.alias == path.base(imp.path) {
+        return "import {imp.path}"
+    }
+    "import {imp.alias} = {imp.path}"
+}
+
+/// Lists the modules that kept uses come from and that the definition's file does not import, in the order of first use.
+fn unimported(s: *Session, d: *Decl, kept: []Use) -> []str {
+    var known: [str: bool] = [d.module: true, "": true]
+    for imp in d.file.imports {
+        known[imp.path] = true
+    }
+    var found: []str = []
+    for u in kept {
+        let used = u.decl ?? continue
+        if known[used.module] == none {
+            known[used.module] = true
+            found.push(used.module)
+        }
+    }
+    found
+}
+
+fn imports_text(s: *Session, d: *Decl, kept: []Use) -> str {
+    var b = builder.builder()
+    b.write("\n// imports of {s.shown_path(d.file.path)}\n")
+    for imp in d.file.imports {
+        b.write("{import_line(imp)}\n")
+    }
+    let missing = s.unimported(d, kept)
+    if missing.len > 0 {
+        b.write("// named here and not imported\n")
+        for m in missing {
+            b.write("import {m}\n")
+        }
+    }
+    b.to_str()
+}
+
+fn within_text(s: *Session, site: Site) -> str {
+    let d = site.within ?? return ""
+    match d.func {
+        some(_) => s.header(d)
+        none => "{d.kind} {s.qualified(d)}"
+    }
+}
+
+fn callers_text(s: *Session, found: []Site) -> str {
+    var b = builder.builder()
+    b.write("\n// callers\n")
+    for site in found {
+        b.write("{s.shown_path(site.file.path)}:{site.line}  {s.within_text(site)}\n")
+    }
+    b.write(s.unchecked_text())
+    b.to_str()
+}
+
+fn unchecked_text(s: *Session) -> str {
+    var b = builder.builder()
+    for m in s.left_out {
+        b.write("// not checked: {m}\n")
+    }
+    b.to_str()
+}
+
+fn unchecked_json(s: *Session) -> str {
+    var b = builder.builder()
+    for m in s.left_out {
+        let w = record("unchecked")
+        w.json_text("module", m)
+        b.write(w.finish())
+    }
+    b.to_str()
+}
+
+fn context_text(s: *Session, shown: Shown) -> str {
+    let d = shown.found.decl
+    let definition = s.definition_text(shown.found)
+    var callers = ""
+    if shown.searched {
+        callers = s.callers_text(shown.sites)
+    }
+    let fixed = tokens(definition) + tokens(s.imports_text(d, shown.uses)) + tokens(callers)
+    let fitted = s.fit(shown, fixed)
+    var b = builder.builder()
+    b.write(definition)
+    b.write(s.imports_text(d, fitted.kept))
+    var level = 0
+    for u in fitted.kept {
+        if u.depth != level {
+            level = u.depth
+            b.write(level_heading(level))
+        }
+        b.write(s.use_text(u))
+    }
+    b.write(callers)
+    if fitted.cut.len > 0 {
+        b.write(cut_heading(shown.budget))
+        for u in fitted.cut {
+            b.write("{s.use_label(u)}\n")
+        }
+    }
+    b.to_str()
+}
+
+fn level_heading(level: i64) -> str {
+    if level == 1 {
+        return "\n// uses\n"
+    }
+    "\n// uses at depth {level}\n"
+}
+
+fn record(kind: str) -> *json.Writer {
+    let w = json.writer(0)
+    json.start_object(w)
+    w.json_text("kind", kind)
+    w
+}
+
+fn finish(w: *json.Writer) -> str {
+    json.end_object(w)
+    "{json.written_text(w)}\n"
+}
+
+fn json_text(w: *json.Writer, name: str, value: str) {
+    json.property(w, name)
+    json.string_value(w, value)
+}
+
+fn json_number(w: *json.Writer, name: str, value: i64) {
+    json.property(w, name)
+    json.integer(w, value)
+}
+
+fn json_flag(w: *json.Writer, name: str, value: bool) {
+    json.property(w, name)
+    json.boolean(w, value)
+}
+
+fn json_place(s: *Session, w: *json.Writer, d: *Decl) {
+    w.json_text("file", s.shown_path(d.file.path))
+    w.json_number("line", d.pos.pos_line())
+}
+
+fn definition_json(s: *Session, found: Hit) -> str {
+    let d = found.decl
+    let w = record("definition")
+    w.json_text("item", d.kind)
+    w.json_text("name", s.hit_name(found))
+    s.json_place(w, d)
+    w.json_text("source", s.source_of(d))
+    w.finish()
+}
+
+fn imports_json(s: *Session, d: *Decl, kept: []Use) -> str {
+    var b = builder.builder()
+    for imp in d.file.imports {
+        let w = record("import")
+        w.json_text("path", imp.path)
+        w.json_text("alias", imp.alias)
+        w.json_flag("imported", true)
+        b.write(w.finish())
+    }
+    for m in s.unimported(d, kept) {
+        let w = record("import")
+        w.json_text("path", m)
+        w.json_text("alias", path.base(m))
+        w.json_flag("imported", false)
+        b.write(w.finish())
+    }
+    b.to_str()
+}
+
+fn use_json(s: *Session, kind: str, u: Use) -> str {
+    let w = record(kind)
+    w.json_number("depth", u.depth)
+    match u.decl {
+        some(d) => {
+            w.json_text("item", d.kind)
+            w.json_text("name", s.qualified(d))
+            s.json_place(w, d)
+            if kind == "use" {
+                w.json_text("text", s.header(d))
+                if d.doc != "" {
+                    w.json_text("doc", d.doc)
+                }
+            }
+        }
+        none => {
+            w.json_text("item", "constraint")
+            w.json_text("name", u.constraint)
+        }
+    }
+    w.finish()
+}
+
+fn site_json(s: *Session, kind: str, site: Site) -> str {
+    let w = record(kind)
+    w.json_text("file", s.shown_path(site.file.path))
+    w.json_number("line", site.line)
+    w.json_number("column", site.column)
+    if kind == "ref" {
+        w.json_text("text", s.site_line(site))
+    }
+    let within = s.within_text(site)
+    if within != "" {
+        w.json_text("in", within)
+    }
+    w.finish()
+}
+
+fn context_json(s: *Session, shown: Shown) -> str {
+    let d = shown.found.decl
+    let definition = s.definition_json(shown.found)
+    var callers = builder.builder()
+    for site in shown.sites {
+        callers.write(s.site_json("caller", site))
+    }
+    if shown.searched {
+        callers.write(s.unchecked_json())
+    }
+    let fixed = tokens(definition) + tokens(s.imports_json(d, shown.uses)) + tokens(callers.to_str())
+    let fitted = s.fit(shown, fixed)
+    var b = builder.builder()
+    b.write(definition)
+    b.write(s.imports_json(d, fitted.kept))
+    for u in fitted.kept {
+        b.write(s.use_json("use", u))
+    }
+    b.write(callers.to_str())
+    for u in fitted.cut {
+        b.write(s.use_json("cut", u))
+    }
+    b.to_str()
+}
+
+fn site_line(s: *Session, site: Site) -> str {
+    text.trim(line_at(s.lines_of(site.file), site.line))
+}
+
+fn refs_text(s: *Session, found: []Site) -> str {
+    var b = builder.builder()
+    for site in found {
+        b.write("{s.shown_path(site.file.path)}:{site.line}:{site.column}: {s.site_line(site)}\n")
+    }
+    b.write(s.unchecked_text())
+    b.to_str()
+}
+
+fn refs_json(s: *Session, found: []Site) -> str {
+    var b = builder.builder()
+    for site in found {
+        b.write(s.site_json("ref", site))
+    }
+    b.write(s.unchecked_json())
+    b.to_str()
+}
