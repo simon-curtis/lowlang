@@ -1,5 +1,5 @@
 const keywords = new Set(["fn", "let", "var", "return", "if", "else", "for", "in", "match", "enum", "struct", "import"]);
-const literalTypes = { string: "str", number: "i64" };
+const literals = { string: { kind: "StrLit", type: "str" }, number: { kind: "IntLit", type: "i64" } };
 
 export const irRules = [
   [/\s+/y, "operator"],
@@ -33,7 +33,7 @@ export function lex(source) {
     } else if (word) {
       kind = keywords.has(word) ? "keyword" : "name";
     }
-    tokens.push({ text, kind });
+    tokens.push({ text, kind, at: match.index });
   }
   tokens.forEach((token, index) => {
     if (token.kind === "name" && tokens[index + 1]?.text === "(") {
@@ -69,8 +69,13 @@ class Parser {
     return this.at++;
   }
 
-  add(kind, tokens, parent, type) {
-    const node = { kind, tokens, parent, type, children: [] };
+  add(kind, tokens, parent, type, named) {
+    const label = [{ text: kind, kind: "keyword" }];
+    if (named !== undefined) {
+      const token = this.tokens[named];
+      label.push({ text: ` ${token.text}`, kind: token.kind });
+    }
+    const node = { kind, label, tokens, parent, type, children: [] };
     parent?.children.push(node);
     this.nodes.push(node);
     return node;
@@ -85,16 +90,15 @@ class Parser {
   function() {
     const keyword = this.expect("fn");
     const name = this.identifier();
-    const declaration = this.add("fn", [keyword, name], null, "fn()");
     const open = this.expect("(");
     const close = this.expect(")");
-    this.add("params", [open, close], declaration, "()");
+    const declaration = this.add("Func", [keyword, name, open, close], null, "fn()", name);
     this.block(declaration);
   }
 
   block(parent) {
     const open = this.expect("{");
-    const block = this.add("block", [open], parent, "void");
+    const block = this.add("Block", [open], parent, "void");
     while (this.peek() !== "}") {
       this.call(block);
     }
@@ -104,7 +108,8 @@ class Parser {
   call(parent) {
     const name = this.identifier();
     const open = this.expect("(");
-    const call = this.add("call", [name, open], parent, "void");
+    const call = this.add("Call", [open], parent, "void");
+    this.add("Ident", [name], call, null, name);
     while (this.peek() !== ")") {
       this.literal(call);
       if (this.peek() === ",") {
@@ -116,11 +121,12 @@ class Parser {
 
   literal(parent) {
     const token = this.tokens[this.at];
-    const type = literalTypes[token?.kind];
-    if (!type) {
-      throw new Error(`hello.low: the video draws only string and number arguments, found ${token?.text ?? "the end"}`);
+    const literal = literals[token?.kind];
+    if (!literal || token.text.includes(".")) {
+      throw new Error(`hello.low: the video draws only string and integer arguments, found ${token?.text ?? "the end"}`);
     }
-    this.add(token.kind, [this.at++], parent, type);
+    const at = this.at++;
+    this.add(literal.kind, [at], parent, literal.type, at);
   }
 }
 

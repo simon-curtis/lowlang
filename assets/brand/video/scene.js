@@ -1,5 +1,4 @@
 import * as THREE from "three";
-import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
@@ -13,12 +12,16 @@ import { compilation, loadFonts, markPolygons, origin, tagline, theme } from "./
 const width = 1200;
 const height = 630;
 const fps = 30;
-const duration = 12.5;
+const intro = 1.2;
+const hold = 2.5;
+const finale = 12.5 + hold;
+const duration = intro + finale;
 const scale = Number(new URLSearchParams(location.search).get("scale") ?? 1);
 
 const lineHeight = 0.36;
 const lineGap = 0.56;
 const pillHeight = 0.62;
+const codeScale = 1.7;
 const byteWidth = 0.6;
 const markHeight = 6;
 const markCentre = new THREE.Vector3(14, 0.6, -5);
@@ -28,14 +31,22 @@ const finalShift = 4.5;
 const flight = 1;
 const sparkKinds = ["type", "string", "number", "function", "module"];
 
+const font = "500 64px 'JetBrains Mono'";
+const textHeight = 96;
+
+function advance(size) {
+  const context = document.createElement("canvas").getContext("2d");
+  context.font = font;
+  return (context.measureText("0").width / textHeight) * size;
+}
+
 function textMesh(spans, palette, size) {
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
-  const font = "500 64px 'JetBrains Mono'";
   context.font = font;
   const joined = spans.map((span) => span.text).join("");
   canvas.width = Math.ceil(context.measureText(joined).width) + 16;
-  canvas.height = 96;
+  canvas.height = textHeight;
   context.font = font;
   context.textBaseline = "middle";
   let x = 8;
@@ -69,6 +80,17 @@ const dither = {
     "}",
   ].join("\n"),
 };
+
+function frame(width, height, rule) {
+  const outline = new THREE.Shape();
+  outline.moveTo(-width / 2, -height / 2).lineTo(width / 2, -height / 2).lineTo(width / 2, height / 2).lineTo(-width / 2, height / 2).closePath();
+  const inner = new THREE.Path();
+  const x = width / 2 - rule;
+  const y = height / 2 - rule;
+  inner.moveTo(-x, -y).lineTo(-x, y).lineTo(x, y).lineTo(x, -y).closePath();
+  outline.holes.push(inner);
+  return new THREE.ShapeGeometry(outline);
+}
 
 function reveal(line, amount) {
   const shown = Math.max(amount, 0.0001);
@@ -168,7 +190,7 @@ function cameraKeys() {
     { t: 7.2, position: new THREE.Vector3(0.4, 0.5, 10.6), target: new THREE.Vector3(0.3, 0, 0), fov: 35 },
     { t: 8.6, position: new THREE.Vector3(3, 2, 14), target: new THREE.Vector3(5.5, 0.4, -2), fov: 40 },
     { t: 10.1, position: besideMark(finalShift + 4.2, 1.2, finalDistance), target: besideMark(finalShift, 0, 0), fov: finalFov },
-    { t: duration, position: besideMark(finalShift + 3.2, 1, finalDistance - 0.6), target: besideMark(finalShift, 0, 0), fov: finalFov },
+    { t: finale, position: besideMark(finalShift + 3.2, 1, finalDistance - 0.6), target: besideMark(finalShift, 0, 0), fov: finalFov },
   ];
 }
 
@@ -194,11 +216,11 @@ class Film {
     this.address = inputs.address;
     this.tagline = inputs.tagline;
     this.stages = [
-      { name: "lex", detail: "tokens", from: -1, to: 1.75 },
+      { name: "lex", detail: "tokens", from: 0, to: 1.75 },
       { name: "parse", detail: "syntax tree", from: 1.75, to: 3.35 },
       { name: "check", detail: "types", from: 3.35, to: 4.6 },
       { name: "ssa", detail: "intermediate form", from: 4.6, to: 5.95 },
-      { name: "amd64", detail: "machine code", from: 5.95, to: 7.2 },
+      { name: "amd64", detail: "assembly", from: 5.95, to: 7.2 },
       { name: "link", detail: `${inputs.compiled.size.toLocaleString("en")} byte static ELF`, from: 7.2, to: 9.4 },
     ];
     this.renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
@@ -214,6 +236,7 @@ class Film {
     this.keys = cameraKeys();
     this.waypoints = [];
     this.light();
+    this.line = new THREE.Color(this.palette.paper).multiplyScalar(0.3);
     this.tokens(inputs.compiled.source);
     this.tree();
     this.intermediate(inputs.compiled.ir);
@@ -254,51 +277,77 @@ class Film {
     this.scene.add(key, rim, this.sweep);
   }
 
+  tile(spans) {
+    const label = textMesh(spans, this.palette, lineHeight);
+    const width = label.width + 0.34;
+    const fill = new THREE.MeshBasicMaterial({ color: this.palette.ink, transparent: true, depthWrite: false, toneMapped: false });
+    const rule = new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, toneMapped: false });
+    const card = new THREE.Mesh(new THREE.PlaneGeometry(width, pillHeight), fill);
+    const border = new THREE.Mesh(frame(width, pillHeight, 0.018), rule);
+    border.position.z = 0.005;
+    border.renderOrder = 1;
+    label.mesh.position.set(-label.width / 2, 0, 0.01);
+    label.mesh.renderOrder = 2;
+    const group = new THREE.Group();
+    group.add(card, border, label.mesh);
+    this.scene.add(group);
+    return { group, fill, rule, label, width };
+  }
+
   tokens(source) {
     const tokens = lex(source);
     const gap = 0.12;
-    const labels = tokens.map((token) => textMesh([token], this.palette, lineHeight));
-    const widths = labels.map((label) => label.width + 0.34);
-    const row = widths.reduce((sum, size) => sum + size, 0) + gap * (tokens.length - 1);
-    let x = -row / 2;
+    const tiles = tokens.map((token) => this.tile([token]));
+    const step = advance(lineHeight);
+    const lines = source.trimEnd().split("\n");
+    const columns = Math.max(...lines.map((line) => line.length));
+    const starts = lines.map((_, row) => lines.slice(0, row).reduce((sum, line) => sum + line.length + 1, 0));
+    const places = tokens.map((token) => {
+      const row = starts.findLastIndex((start) => start <= token.at);
+      return { row, column: token.at - starts[row] };
+    });
+    const rowWidths = lines.map((_, row) => {
+      const inRow = tiles.filter((_, index) => places[index].row === row);
+      const indent = Math.min(...places.filter((place) => place.row === row).map((place) => place.column));
+      return indent * step * 2 + inRow.reduce((sum, tile) => sum + tile.width, 0) + gap * (inRow.length - 1);
+    });
+    const widest = Math.max(...rowWidths);
+    const cursor = lines.map(() => null);
+    const typing = intro - 0.3;
     this.pills = tokens.map((token, index) => {
-      const pillWidth = widths[index];
-      const body = new RoundedBoxGeometry(pillWidth, pillHeight, 0.3, 4, 0.16);
-      const material = new THREE.MeshPhysicalMaterial({ color: 0x1d1d1d, roughness: 0.4, clearcoat: 0.6, clearcoatRoughness: 0.3, transparent: true });
-      const pill = new THREE.Mesh(body, material);
-      const label = labels[index];
-      label.mesh.position.set(-label.width / 2, 0, 0.152);
-      const group = new THREE.Group();
-      group.add(pill, label.mesh);
-      this.scene.add(group);
-      const home = new THREE.Vector3(x + pillWidth / 2, 0, 0);
-      x += pillWidth + gap;
-      const arrive = -0.3 + index * 0.12;
-      const above = home.clone().setY(0.62);
-      this.waypoint(arrive + 0.22, above, 0.35);
-      const glow = new THREE.Color(this.palette[token.kind]);
-      return { token, group, material, label, width: pillWidth, home, arrive, glow };
+      const tile = tiles[index];
+      const { row, column } = places[index];
+      const height = (lines.length - 1) / 2 - row;
+      cursor[row] ??= -widest / 2 + column * step * 2;
+      const home = new THREE.Vector3(cursor[row] + tile.width / 2, height * (pillHeight + 0.2), 0);
+      cursor[row] += tile.width + gap;
+      const middle = (column + token.text.length / 2 - columns / 2) * step * codeScale;
+      const code = new THREE.Vector3(middle, height * lineGap * codeScale, 0);
+      const typed = -intro + (token.at / source.length) * typing;
+      const typedFor = (token.text.length / source.length) * typing;
+      const caret = code.clone().setX(middle + (token.text.length / 2) * step * codeScale + 0.08);
+      this.waypoint(typed + typedFor, caret, 0);
+      const lexed = 0.08 + index * 0.075;
+      const above = home.clone().setY(home.y + 0.5);
+      this.waypoint(lexed + 0.1, above, 0.2);
+      return { ...tile, token, home, code, typed, typedFor, lexed };
     });
   }
 
   tree() {
     this.nodes = parse(this.pills.map((pill) => pill.token));
     layoutTree(this.nodes);
-    const gap = 0.06;
     this.nodes.forEach((node, index) => {
       node.start = 1.85 + index * 0.1;
       node.checked = 3.45 + index * 0.2;
       node.collapse = 4.6 + index * 0.05;
-      const ordered = [...node.tokens].sort((a, b) => a - b);
-      const span = ordered.reduce((sum, token) => sum + this.pills[token].width, 0) + gap * (ordered.length - 1);
-      let x = node.centre.x - span / 2;
-      for (const token of ordered) {
-        const pill = this.pills[token];
-        pill.node = node;
-        pill.tree = new THREE.Vector3(x + pill.width / 2, node.centre.y, 0);
-        x += pill.width + gap;
+      node.tile = this.tile(node.label);
+      node.tile.group.position.copy(node.centre);
+      node.glow = new THREE.Color(this.palette.type);
+      node.right = node.centre.x + node.tile.width / 2;
+      for (const token of node.tokens) {
+        this.pills[token].node = node;
       }
-      node.right = node.centre.x + span / 2;
     });
     const stalk = new THREE.CylinderGeometry(0.013, 0.013, 1, 8);
     stalk.translate(0, 0.5, 0);
@@ -322,7 +371,7 @@ class Film {
     const root = this.nodes[0].centre;
     const crown = root.clone().setY(root.y + 0.6);
     this.waypoint(this.edges.at(-1).start + 0.7, crown, 0.2);
-    this.chips = this.nodes.map((node) => {
+    this.chips = this.nodes.filter((node) => node.type).map((node) => {
       const spans = [{ text: ": ", kind: "operator" }, { text: node.type, kind: "type" }];
       const chip = textMesh(spans, this.palette, 0.3);
       chip.mesh.position.set(node.right + 0.14, node.centre.y, 0.05);
@@ -357,9 +406,9 @@ class Film {
       const margin = new THREE.Vector3(left - 0.3, line.home.y, 0.1);
       this.waypoint(line.start + 0.05, margin, 0);
     });
-    this.pills.forEach((pill) => {
-      const line = this.ir[Math.min(this.nodes.indexOf(pill.node), this.ir.length - 1)];
-      pill.fold = line.home.clone().setX(line.home.x + 0.6);
+    this.nodes.forEach((node, index) => {
+      const line = this.ir[Math.min(index, this.ir.length - 1)];
+      node.fold = line.home.clone().setX(line.home.x + 0.6);
     });
   }
 
@@ -479,21 +528,39 @@ class Film {
   animateTokens(t) {
     for (const [index, pill] of this.pills.entries()) {
       const node = pill.node;
-      const arrived = spring((t - pill.arrive) / 0.6);
-      const built = spring((t - node.start) / 0.75);
-      const folded = easeInOut((t - node.collapse) / 0.45);
-      const position = pill.home.clone().lerp(pill.tree, built).lerp(pill.fold, folded);
-      position.y += (1 - arrived) * 1.4 + Math.sin(t * 1.4 + index) * 0.025;
+      const letters = pill.token.text.length;
+      const typed = Math.ceil(clamp((t - pill.typed) / pill.typedFor) * letters) / letters;
+      const lexed = easeInOut((t - pill.lexed) / 0.45);
+      const parsed = easeInOut((t - node.start) / 0.55);
+      const position = pill.code.clone().lerp(pill.home, lexed).lerp(node.centre, parsed);
+      position.y += Math.sin(t * 1.4 + index) * 0.025 * lexed * (1 - parsed);
       pill.group.position.copy(position);
-      pill.group.rotation.set((1 - arrived) * -0.7, Math.sin(Math.PI * clamp(built)) * 0.35, 0);
-      pill.group.scale.setScalar(1 - 0.55 * folded);
-      const visible = clamp((t - pill.arrive) / 0.2) * (1 - folded);
-      pill.group.visible = visible > 0.002;
-      pill.material.depthWrite = visible > 0.98;
-      pill.material.opacity = visible;
+      pill.group.scale.setScalar(codeScale + (1 - codeScale) * lexed);
+      reveal(pill.label, typed);
+      const visible = 1 - smoothstep(0.5, 1, parsed);
+      const body = visible * clamp((t - pill.lexed - 0.2) / 0.25);
+      pill.group.visible = t > pill.typed && visible > 0.002;
+      pill.fill.opacity = body;
+      pill.rule.opacity = body;
+      pill.rule.color.copy(this.line);
       pill.label.mesh.material.opacity = visible;
+    }
+  }
+
+  animateNodes(t) {
+    for (const node of this.nodes) {
+      const tile = node.tile;
+      const shown = easeOut((t - node.start - 0.3) / 0.35);
+      const folded = easeInOut((t - node.collapse) / 0.45);
+      tile.group.position.copy(node.centre).lerp(node.fold, folded);
+      tile.group.scale.setScalar((0.85 + 0.15 * shown) * (1 - 0.55 * folded));
+      const visible = shown * (1 - folded);
+      tile.group.visible = visible > 0.002;
+      tile.fill.opacity = visible;
+      tile.rule.opacity = visible;
+      tile.label.mesh.material.opacity = visible;
       const pulse = Math.exp(-(((t - node.checked) / 0.14) ** 2));
-      pill.material.emissive.copy(pill.glow).multiplyScalar(pulse * 0.35);
+      tile.rule.color.copy(this.line).lerp(node.glow, pulse);
     }
   }
 
@@ -558,7 +625,7 @@ class Film {
   }
 
   animateSpark(t) {
-    const shown = between(t, -1, 9.95, 0.25);
+    const shown = between(t, -intro - 0.3, 9.95, 0.25);
     for (const ghost of this.trail) {
       const position = this.sparkAt(t - ghost.lag);
       ghost.mesh.position.copy(position);
@@ -568,6 +635,7 @@ class Film {
 
   stage(t) {
     this.animateTokens(t);
+    this.animateNodes(t);
     this.animateTree(t);
     this.animatePanel(this.ir, t, 0);
     this.animatePanel(this.asm, t, 0.8);
@@ -597,6 +665,9 @@ class Film {
     const shown = 1 - smoothstep(9.2, 9.6, t);
     context.font = "500 17px 'JetBrains Mono'";
     context.letterSpacing = "0px";
+    context.globalAlpha = between(t, -intro - 1, 0, 0.22);
+    context.fillStyle = this.palette.comment;
+    context.fillText("hello.low", left, 580);
     this.stages.forEach((stage, index) => {
       const active = between(t, stage.from, stage.to, 0.22);
       context.globalAlpha = shown * (0.22 + 0.78 * active);
@@ -646,7 +717,8 @@ class Film {
     context.fillText(this.address, left + 4, 520 + (1 - shown) * 16);
   }
 
-  frame(t) {
+  frame(seconds) {
+    const t = seconds - intro;
     this.stage(t);
     this.aim(t);
     this.composer.render();

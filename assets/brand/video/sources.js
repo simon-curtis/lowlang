@@ -43,8 +43,7 @@ export async function theme() {
 export async function tagline() {
   const html = await text("/site/content/index.html");
   const page = new DOMParser().parseFromString(html, "text/html");
-  const lead = page.querySelector(".lead").textContent;
-  return lead.slice(0, lead.indexOf(".") + 1);
+  return page.querySelector(".display").textContent;
 }
 
 export async function origin() {
