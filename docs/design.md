@@ -355,6 +355,7 @@ counts["a"] += 1
 counts.delete("a")
 for name, age in ages { print("{name} {age}") }
 for name in ages { print(name) }
+for at, name, age in ages { print("{at} {name} {age}") }
 ```
 
 - `[K: V]` maps keys of an integer type, `bool`, `str` or a pointer type to values of any type.
@@ -363,7 +364,7 @@ for name in ages { print(name) }
 - `m[k]` returns `V?`. `m[k] = v` inserts or replaces. A compound assignment such as `m[k] += 1` starts from a zero value when `k` is missing.
 - `m.delete(k)` removes a key; removing a missing key does nothing.
 - `m.len` is the number of entries.
-- `for k, v in m` and `for k in m` visit entries in insertion order. An overwritten value keeps its key's position; a deleted and re-inserted key moves to the end. Inserting new keys while iterating may skip or repeat entries.
+- `for k, v in m` and `for k in m` visit entries in insertion order. `for i, k, v in m` also binds `i`, an `i64` that counts the entries visited from 0, so a deleted entry leaves no gap; only a map loop binds three names. An overwritten value keeps its key's position; a deleted and re-inserted key moves to the end. Inserting new keys while iterating may skip or repeat entries.
 - A map literal of constants is built once per program in a release build. A use that only indexes, iterates or measures it shares the built table; any other use gets a copy from the prelude's `__map_clone`, which copies the entry array and the index. A literal of fewer than 4 entries is rebuilt for those uses, because the copy costs as much as the build.
 - A map is an array of entries in insertion order plus an open-addressed index of one word per slot.
   - A slot is 0 when empty, -1 when its entry was deleted, and otherwise holds the upper 32 bits of the key's 63-bit hash above the entry number plus one. A probe skips empty slots and slots of other keys without reading the entries.
