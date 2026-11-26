@@ -10,9 +10,8 @@ PAPER = "#f5f5f3"
 TYPEFACE = "Noto Sans"
 NAME = "Low"
 TAGLINE = [
-    "A compiled, garbage-collected language",
-    "with green threads, enums and typed errors.",
-    "Small static binaries for Linux and Windows.",
+    "A small language with its whole",
+    "toolchain in one binary",
 ]
 
 VIEW = 512

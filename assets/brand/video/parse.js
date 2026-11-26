@@ -85,10 +85,9 @@ class Parser {
   function() {
     const keyword = this.expect("fn");
     const name = this.identifier();
-    const declaration = this.add("fn", [keyword, name], null, "fn()");
     const open = this.expect("(");
     const close = this.expect(")");
-    this.add("params", [open, close], declaration, "()");
+    const declaration = this.add("fn", [keyword, name, open, close], null, "fn()");
     this.block(declaration);
   }
 

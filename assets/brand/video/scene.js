@@ -198,7 +198,7 @@ class Film {
       { name: "parse", detail: "syntax tree", from: 1.75, to: 3.35 },
       { name: "check", detail: "types", from: 3.35, to: 4.6 },
       { name: "ssa", detail: "intermediate form", from: 4.6, to: 5.95 },
-      { name: "amd64", detail: "machine code", from: 5.95, to: 7.2 },
+      { name: "amd64", detail: "assembly", from: 5.95, to: 7.2 },
       { name: "link", detail: `${inputs.compiled.size.toLocaleString("en")} byte static ELF`, from: 7.2, to: 9.4 },
     ];
     this.renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
