@@ -1,6 +1,6 @@
 # Low Design
 
-Low compiles to static native binaries with no libc dependency, has a tracing garbage collector and green threads with channels, and adds sum-type enums and typed error returns on top of a Go-sized core.
+Low is a small compiled language, about the size of Go's core. It has a tracing garbage collector, green threads with channels, enums that carry data and typed errors. Programs build to static native binaries that do not depend on libc.
 
 | Command | Does |
 | --- | --- |
