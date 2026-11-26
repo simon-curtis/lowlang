@@ -1401,95 +1401,6 @@ The result is a `T?` for a `value` of type `T` or `T?`, so `find(xs, 7) when xs.
 
 `str??` means the same as `(str?)?`. At the end of a line, where `??` would continue the expression, it is an error and the parenthesised form is needed.
 
-### Errors
-
-An error type is an enum. A function that can fail declares `-> T ! E`.
-
-```low
-enum ParseError {
-    Empty
-    BadDigit(at: i64)
-}
-
-fn parse(s: str) -> i64 ! ParseError {
-    if s.len == 0 { fail Empty }
-    ...
-}
-
-fn total(a: str, b: str) -> i64 ! ParseError {
-    parse(a)? + parse(b)?
-}
-
-fn validate(n: i64) ! ParseError {
-    if n < 0 { fail BadDigit(n) }
-}
-
-enum ConfigError {
-    Port(ParseError)
-    Missing
-}
-
-fn describe(e: ParseError) -> ConfigError {
-    Port(e)
-}
-
-fn port(s: str) -> i64 ! ConfigError {
-    let n = parse(s) catch Port
-    let m = s |> parse() catch describe
-    let k = parse(s) or fail Missing
-    n + m + k
-}
-
-fn main() ! ParseError {
-    let n = parse("42") catch {
-        Empty => 0
-        BadDigit(at) => at
-    }
-    let m = parse("") or -1
-    let o: i64? = parse("") or none
-    validate(n)?
-}
-```
-
-| Form | Does |
-| --- | --- |
-| `fail v` | Returns the error `v`. |
-| Postfix `?` | Returns the error to the caller. |
-| `catch { arms }` | Matches the error. |
-| `catch M` | Maps the error and returns it to the caller. |
-| `or value` | Discards the error and gives `value`. |
-
-`fn f() ! E` fails or returns nothing.
-
-A result cannot be discarded, bound or passed on without `?`, `catch` or `or`, except by returning it from a function with the same result type.
-
-#### Raising and passing on an error
-
-`fail v` returns the error `v`. `v` is checked against the function's error type, so bare variant names work.
-
-Postfix `?` returns the error to the caller, whose error type must be the same enum.
-
-#### Handling an error
-
-`catch` is for when the error matters.
-
-- `catch { arms }` matches the error exhaustively. A binding arm such as `e => report(e)` receives the whole error.
-- `catch M` returns the error to the caller after mapping it. The mapping uses `M`, a variant or a function written as a name or a qualified name.
-
-`parse(s) catch Port` is `parse(s) catch { e => fail Port(e) }`. `M(e)` must have the caller's error type, so `M` is a one-field variant of that enum or a function value of type `fn(E) -> F`. The mapping runs before the deferred statements.
-
-`or value` is for when the error does not matter. It discards the error and evaluates `value` in its place. The value may leave instead, as in `or fail Missing`, `or return none` or `or break`.
-
-Where an optional `T?` is expected, `or` and `catch { arms }` produce one, so the fallback or an arm may be `none`.
-
-#### Errors from main
-
-When `main` declares `! E`, or top-level statements give it one, and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2, as does `panic(message)`.
-
-#### Result layout
-
-A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
-
 ### Embedded data
 
 `embed("path")` is the contents of a file as a `str`, read at compile time. `embed_dir("path")` gives the regular files under a directory as a `[str: str]`.
@@ -2646,6 +2557,95 @@ Channel and value expressions are evaluated first, in order. Ready arms are take
 `sleep(ms)` pauses the green thread.
 
 `wait_readable(fd)` and `wait_writable(fd)` wait until a file descriptor is ready, using epoll on Linux. On Windows `fd` is a waitable handle and both wait until it is signalled. One green thread may wait on a descriptor at a time.
+## Errors
+
+An error type is an enum. A function that can fail declares `-> T ! E`.
+
+```low
+enum ParseError {
+    Empty
+    BadDigit(at: i64)
+}
+
+fn parse(s: str) -> i64 ! ParseError {
+    if s.len == 0 { fail Empty }
+    ...
+}
+
+fn total(a: str, b: str) -> i64 ! ParseError {
+    parse(a)? + parse(b)?
+}
+
+fn validate(n: i64) ! ParseError {
+    if n < 0 { fail BadDigit(n) }
+}
+
+enum ConfigError {
+    Port(ParseError)
+    Missing
+}
+
+fn describe(e: ParseError) -> ConfigError {
+    Port(e)
+}
+
+fn port(s: str) -> i64 ! ConfigError {
+    let n = parse(s) catch Port
+    let m = s |> parse() catch describe
+    let k = parse(s) or fail Missing
+    n + m + k
+}
+
+fn main() ! ParseError {
+    let n = parse("42") catch {
+        Empty => 0
+        BadDigit(at) => at
+    }
+    let m = parse("") or -1
+    let o: i64? = parse("") or none
+    validate(n)?
+}
+```
+
+| Form | Does |
+| --- | --- |
+| `fail v` | Returns the error `v`. |
+| Postfix `?` | Returns the error to the caller. |
+| `catch { arms }` | Matches the error. |
+| `catch M` | Maps the error and returns it to the caller. |
+| `or value` | Discards the error and gives `value`. |
+
+`fn f() ! E` fails or returns nothing.
+
+A result cannot be discarded, bound or passed on without `?`, `catch` or `or`, except by returning it from a function with the same result type.
+
+### Raising and passing on an error
+
+`fail v` returns the error `v`. `v` is checked against the function's error type, so bare variant names work.
+
+Postfix `?` returns the error to the caller, whose error type must be the same enum.
+
+### Handling an error
+
+`catch` is for when the error matters.
+
+- `catch { arms }` matches the error exhaustively. A binding arm such as `e => report(e)` receives the whole error.
+- `catch M` returns the error to the caller after mapping it. The mapping uses `M`, a variant or a function written as a name or a qualified name.
+
+`parse(s) catch Port` is `parse(s) catch { e => fail Port(e) }`. `M(e)` must have the caller's error type, so `M` is a one-field variant of that enum or a function value of type `fn(E) -> F`. The mapping runs before the deferred statements.
+
+`or value` is for when the error does not matter. It discards the error and evaluates `value` in its place. The value may leave instead, as in `or fail Missing`, `or return none` or `or break`.
+
+Where an optional `T?` is expected, `or` and `catch { arms }` produce one, so the fallback or an arm may be `none`.
+
+### Errors from main
+
+When `main` declares `! E`, or top-level statements give it one, and returns an error, the program prints `error: <Variant>` to stderr and exits with status 1. Panics exit with status 2, as does `panic(message)`.
+
+### Result layout
+
+A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
+
 ## Builtins
 
 Every module sees these names without an import. A function in the program named `pop`, `truncate`, `close`, `sleep`, `wait_readable` or `wait_writable` takes precedence over the builtin. `compiler/check/builtins.low` is the only table of builtin names, parameters, `mut` markers, receivers and handlers. `compiler/tests/check` requires an entry here for each public one.
