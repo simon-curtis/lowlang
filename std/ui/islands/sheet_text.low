@@ -1,0 +1,390 @@
+import std/builder
+import std/json
+import std/text
+import std/unicode
+
+const sheet_null_text: str = "NULL"
+const sheet_shown_characters: i64 = 50000
+const sheet_copy_page: i64 = 1024
+const sheet_ellipsis: str = "…"
+
+/// The outcome of building text from a block of cells: the text, or why the rows could not be read.
+pub struct SheetCopy {
+    /// The text built; empty when the rows could not be read.
+    pub text: str
+    /// Why the rows could not be read, or `none` when they were.
+    pub failure: str? = none
+}
+
+/// A value as the value view shows it, with the kind that names it in the title.
+pub struct SheetPresented {
+    /// The value as the value view shows it: indented for `JSON` and `XML`, hex rows for `Binary`, otherwise as it is.
+    pub text: str
+    /// The word naming the kind of value, one of `JSON`, `XML`, `Binary`, `Text` or `NULL`.
+    pub kind: str
+}
+
+fn sheet_grouped(value: i64) -> str {
+    let digits = "{value}"
+    var out = builder.builder()
+    for index, digit in digits {
+        if index > 0 && (digits.len - index) % 3 == 0 {
+            builder.write(mut out, ",")
+        }
+        builder.write_char(mut out, digit)
+    }
+    builder.to_str(out)
+}
+
+/// Returns `count` with its noun: `1 row` for one, otherwise the count grouped by thousands and the noun with an `s` after it.
+pub fn sheet_plural(count: i64, noun: str) -> str {
+    if count == 1 {
+        return "1 {noun}"
+    }
+    "{sheet_grouped(count)} {noun}s"
+}
+
+/// The text of a cell on one line: leading blanks dropped, each run of line breaks and tabs folded to one space, and the rest cut to `characters` with an ellipsis.
+pub fn sheet_clip(value: str, characters: i64) -> str {
+    var collected: u32[] = []
+    var begun = false
+    var skipping = false
+    for c in value {
+        let blank = unicode.is_space(c)
+        if !begun {
+            if blank {
+                continue
+            }
+            begun = true
+        }
+        if skipping {
+            if blank {
+                continue
+            }
+            skipping = false
+        }
+        if c == '\r' || c == '\n' || c == '\t' {
+            collected.push(' ')
+            skipping = true
+        } else {
+            collected.push(c)
+        }
+        if collected.len > characters {
+            break
+        }
+    }
+    var out = builder.builder()
+    if collected.len <= characters {
+        for c in collected {
+            builder.write_char(mut out, c)
+        }
+        return builder.to_str(out)
+    }
+    let kept = if characters > 1 { characters - 1 } else { 0 }
+    for index in 0..kept {
+        builder.write_char(mut out, collected[index])
+    }
+    builder.write(mut out, sheet_ellipsis)
+    builder.to_str(out)
+}
+
+/// How many characters a cell takes on one line, the width a fit measures.
+pub fn sheet_folded_length(value: str) -> i64 {
+    var count: i64 = 0
+    var begun = false
+    var skipping = false
+    for c in value {
+        let blank = unicode.is_space(c)
+        if !begun {
+            if blank {
+                continue
+            }
+            begun = true
+        }
+        if skipping {
+            if blank {
+                continue
+            }
+            skipping = false
+        }
+        if c == '\r' || c == '\n' || c == '\t' {
+            skipping = true
+        }
+        count += 1
+    }
+    count
+}
+
+/// The widest cell of `column` over the rows `first` to `end`, in characters, a missing value counting four.
+pub fn sheet_widest(source: SheetSource, column: i64, first: i64, end: i64) -> i64 {
+    var widest: i64 = 0
+    var start = first
+    for start < end {
+        let stop = if start + sheet_copy_page < end { start + sheet_copy_page } else { end }
+        let page = source.read(start, stop, column, column + 1)
+        for row in page.rows {
+            var width: i64 = 4
+            if row.len > 0 {
+                match row[0] {
+                    some(value) => {
+                        width = sheet_folded_length(value)
+                    }
+                    none => {}
+                }
+            }
+            if width > widest {
+                widest = width
+            }
+        }
+        if page.failure != none {
+            break
+        }
+        start = stop
+    }
+    widest
+}
+
+/// The characters a column fits to over `first` to `end`: the widest cell, and never less than the header plus two.
+pub fn sheet_fitted(source: SheetSource, column: i64, first: i64, end: i64) -> i64 {
+    var header: i64 = 0
+    if column < source.columns.len {
+        header = text.char_count(source.columns[column]) + 2
+    }
+    let widest = sheet_widest(source, column, first, end)
+    if widest > header { widest } else { header }
+}
+
+/// What the selection covers, in words, as the Sheet's toolbar shows it.
+pub fn sheet_summary(state: SheetState) -> str? {
+    let block = sheet_block(state) ?? return none
+    let rows = sheet_block_rows(block)
+    let columns = sheet_block_columns(block)
+    let first = sheet_grouped(block.first_row + 1)
+    if state.every_row && state.every_column {
+        return "All {sheet_plural(rows, "row")} selected"
+    }
+    if state.every_row {
+        return "{sheet_plural(columns, "column")} selected"
+    }
+    if state.every_column {
+        if rows == 1 {
+            return "Row {first} selected"
+        }
+        return "Rows {first} to {sheet_grouped(block.end_row)} selected"
+    }
+    if rows * columns == 1 {
+        return "Row {first}, column {sheet_grouped(block.first_column + 1)} selected"
+    }
+    "{sheet_grouped(rows)} × {sheet_grouped(columns)} selected"
+}
+
+fn sheet_cell_text(cell: str?) -> str {
+    match cell {
+        some(value) => value
+        none => sheet_null_text
+    }
+}
+
+/// The block as tab separated lines ending in CRLF, a missing value as NULL, with the column names first when asked; the rows are read a page at a time.
+pub fn sheet_block_text(source: SheetSource, block: SheetBlock, with_headers: bool) -> SheetCopy {
+    var out = builder.builder()
+    var first = true
+    if with_headers {
+        var names: str[] = []
+        for column in block.first_column..block.end_column {
+            if column < source.columns.len {
+                names.push(source.columns[column])
+            }
+        }
+        builder.write(mut out, text.join(names, "\t"))
+        first = false
+    }
+    var start = block.first_row
+    for start < block.end_row {
+        let stop = if start + sheet_copy_page < block.end_row { start + sheet_copy_page } else { block.end_row }
+        let page = source.read(start, stop, block.first_column, block.end_column)
+        match page.failure {
+            some(reason) => return SheetCopy { text: "", failure: reason }
+            none => {}
+        }
+        for row in page.rows {
+            if !first {
+                builder.write(mut out, "\r\n")
+            }
+            first = false
+            for index, cell in row {
+                if index > 0 {
+                    builder.write(mut out, "\t")
+                }
+                builder.write(mut out, sheet_cell_text(cell))
+            }
+        }
+        start = stop
+    }
+    SheetCopy { text: builder.to_str(out) }
+}
+
+/// The rows `first` to `end` as `name: value` lines, a blank line between rows.
+pub fn sheet_records_text(source: SheetSource, first: i64, end: i64) -> SheetCopy {
+    var out = builder.builder()
+    var begun = false
+    var start = first
+    for start < end {
+        let stop = if start + sheet_copy_page < end { start + sheet_copy_page } else { end }
+        let page = source.read(start, stop, 0, source.columns.len)
+        match page.failure {
+            some(reason) => return SheetCopy { text: "", failure: reason }
+            none => {}
+        }
+        for row in page.rows {
+            if begun {
+                builder.write(mut out, "\r\n\r\n")
+            }
+            begun = true
+            for index, cell in row {
+                if index > 0 {
+                    builder.write(mut out, "\r\n")
+                }
+                let name = if index < source.columns.len { source.columns[index] } else { "" }
+                builder.write(mut out, "{name}: {sheet_cell_text(cell)}")
+            }
+        }
+        start = stop
+    }
+    SheetCopy { text: builder.to_str(out) }
+}
+
+fn sheet_xml_indented(value: str) -> str? {
+    var lines: str[] = []
+    var depth: i64 = 0
+    var rest = text.trim(value)
+    for rest.len > 0 {
+        let indent = text.repeat("  ", depth)
+        if !text.starts_with(rest, "<") {
+            let found = text.index(rest, "<")
+            let end = if found < 0 { rest.len } else { found }
+            lines.push("{indent}{text.trim(rest[0..end])}")
+            rest = text.trim_start(rest[end..])
+            continue
+        }
+        var closer = ">"
+        if text.starts_with(rest, "<!--") {
+            closer = "-->"
+        } else if text.starts_with(rest, "<![CDATA[") {
+            closer = "]]>"
+        }
+        let at = text.index(rest, closer)
+        if at < 0 {
+            return none
+        }
+        let end = at + closer.len
+        let tag = rest[0..end]
+        rest = text.trim_start(rest[end..])
+        if text.starts_with(tag, "</") {
+            if depth == 0 {
+                return none
+            }
+            depth -= 1
+            lines.push("{text.repeat("  ", depth)}{tag}")
+            continue
+        }
+        if text.ends_with(tag, "/>") || text.starts_with(tag, "<?") || text.starts_with(tag, "<!") {
+            lines.push("{indent}{tag}")
+            continue
+        }
+        let found = text.index(rest, "<")
+        let text_end = if found < 0 { rest.len } else { found }
+        if text.starts_with(rest[text_end..], "</") && !text.contains(rest[0..text_end], "\n") {
+            let close = text.index(rest[text_end..], ">")
+            if close < 0 {
+                return none
+            }
+            let close_end = close + text_end + 1
+            lines.push("{indent}{tag}{rest[0..text_end]}{rest[text_end..close_end]}")
+            rest = text.trim_start(rest[close_end..])
+            continue
+        }
+        lines.push("{indent}{tag}")
+        depth += 1
+    }
+    if depth == 0 && lines.len > 1 {
+        return text.join(lines, "\n")
+    }
+    none
+}
+
+fn sheet_hex_rows(hex: str) -> str {
+    var rows: str[] = []
+    var at: i64 = 0
+    for at < hex.len {
+        let stop = if at + 32 < hex.len { at + 32 } else { hex.len }
+        let chunk = hex[at..stop]
+        var pairs: str[] = []
+        var pair: i64 = 0
+        for pair < chunk.len {
+            let end = if pair + 2 < chunk.len { pair + 2 } else { chunk.len }
+            pairs.push(chunk[pair..end])
+            pair += 2
+        }
+        let offset = text.pad_left(text.hex(at / 2), 8, '0')
+        rows.push("{offset}  {text.join(pairs, " ")}")
+        at += 32
+    }
+    text.join(rows, "\n")
+}
+
+fn sheet_is_json(value: str) -> str? {
+    let trimmed = text.trim_start(value)
+    if trimmed.len == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
+        return none
+    }
+    let parsed = json.parse(bytes(value)) catch {
+        e => return none
+    }
+    json.stringify(parsed, 2)
+}
+
+/// A value as JSON indented, XML indented, binary as hex rows, or text, with the kind that names it.
+pub fn sheet_presented(value: str?) -> SheetPresented {
+    let shown = value ?? return SheetPresented { text: sheet_null_text, kind: "NULL" }
+    match sheet_is_json(shown) {
+        some(pretty) => return SheetPresented { text: pretty, kind: "JSON" }
+        none => {}
+    }
+    let trimmed = text.trim_start(shown)
+    if text.starts_with(trimmed, "<") && text.ends_with(text.trim_end(shown), ">") {
+        match sheet_xml_indented(shown) {
+            some(indented) => return SheetPresented { text: indented, kind: "XML" }
+            none => {}
+        }
+    }
+    match text.strip_prefix(shown, "\\x") {
+        some(hex) => return SheetPresented { text: sheet_hex_rows(hex), kind: "Binary" }
+        none => {}
+    }
+    SheetPresented { text: shown, kind: "Text" }
+}
+
+fn sheet_prefix_end(value: str, characters: i64) -> i64 {
+    var at: i64 = 0
+    var seen: i64 = 0
+    for at < value.len && seen < characters {
+        let rune = unicode.decode_rune(value, at)
+        at += if rune.size > 0 { rune.size } else { 1 }
+        seen += 1
+    }
+    if at < value.len { at } else { -1 }
+}
+
+/// The part of the presented text the value view draws: the first 50,000 characters, with a note when the rest is left out.
+pub fn sheet_shown(value: str) -> str {
+    let cut = sheet_prefix_end(value, sheet_shown_characters)
+    if cut < 0 {
+        return value
+    }
+    "{value[0..cut]}\n\n… Showing the first {sheet_grouped(sheet_shown_characters)} characters; Copy copies the whole value."
+}
+
+fn sheet_value_title(name: str, row: i64, kind: str, characters: i64) -> str {
+    "{name} · row {row + 1} · {kind} · {characters} characters"
+}
