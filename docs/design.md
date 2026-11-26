@@ -2839,12 +2839,18 @@ fn main() ! io.Error {
 
 Every module except `std/math` and `std/sql/sqlite` talks to the kernel through raw syscalls. `std/math` calls libm and `std/sql/sqlite` calls libsqlite3 through `extern` blocks. `std/math/complex` and `std/math/fft` reach libm through `std/math`. A library is linked only when reachable code calls it, so a program stays static unless it calls one of their C functions.
 
+### Standard library doc comments
+
 Every public struct, enum, function, struct field and enum variant carries a doc comment, and `StdDocumented` in `compiler/tests/compiler` fails on any that does not. A doc is written for a caller reading it on hover:
 
 - The first sentence is the summary: a verb phrase for a function (`Returns the ...`, `Parses ...`), a noun phrase for a type, field or variant.
 - Later paragraphs carry the contract the signature cannot: which error variant is returned and when, whether the call blocks, what dropping or closing releases, limits, defaults and edge cases such as empty input or end of input.
 - Identifiers and literals are in backticks. A `low` example block appears only where usage is not obvious from the signature, and it type-checks. It stays a few lines long. A program that shows how to use the module goes in the module's `examples` directory, where it runs.
 - A doc states the current behaviour as read from the code.
+
+### Module table
+
+One sentence per module. Each name links to the module's page, which holds the rest.
 
 | Module | Contents |
 |---|---|
@@ -3092,178 +3098,1649 @@ Every public struct, enum, function, struct field and enum variant carries a doc
 
 Every standard library resource that must be disposed of is a droppable owner bound with `using`. `defer` is for work that is not disposal: unlocking a lock, signalling a channel, restoring ambient state and logging.
 
-- An owner keeps the resource's name (`file.File`, `net.Conn`, `net.Listener`, `net.Socket`, `dbus.Connection`, `tls.Session`, `http.Connection`, `websocket.Socket`, `process.Child`, `cancel.Registration`, `pipe.Reader`, `pipe.Writer`, `sqlite.Database`, `sql.Connection`, `cdp.Browser`, `otel.Sdk`) and holds its view in a public `handle` field. Its `drop` closes through the handle.
-- A view is named `<Owner>Handle`: `FileHandle`, `ConnHandle`, `ListenerHandle`, `SocketHandle`, `SessionHandle`, `ChildHandle`, `RegistrationHandle`, `ReaderHandle`, `WriterHandle`, `DatabaseHandle`, `ConnectionHandle`, `BrowserHandle` and `SdkHandle`. `SocketHandle` names the view in both `net` and `websocket`. A view is a copyable struct, or a pointer to the shared state when that state is mutable, so closures capture it, slices, channels, optionals and pointer-held structs store it, and `spawn` takes it. A view never closes anything on its own.
-- Operations a caller uses directly take the owner and borrow it: `net.read(c, buf)`. Operations that run after ownership has moved elsewhere (green threads, `io.Stream` closures, pools, callbacks) take the view and end in `_on`: `net.read_on(h, buf)`, `net.stream_on(h)`, `net.close_on(h)`. A function that returns a view without an owner ends in `_handle`: `net.accept_handle`, `tls.client_handle`, `cdp.launch_handle`. `adopt(h)` makes an owner from a view. `detach(mut owner)` gives up an owner's responsibility so a function that opened a resource and wrapped it can return the wrapper.
-- Closing is explicit and idempotent from the owner, the view and the stream. The drop after an explicit close does nothing. The closed state lives in the shared view. Descriptor-based views share an `io.Guard`. Every operation enters it, and `retire` marks it closed and wakes blocked operations. Once the wake has returned, the last operation to leave closes the descriptors. A view used after its owner closed fails with `NotConnected` and never reaches a reused descriptor. The SQL drivers fail with `sql.Error.Closed` and cdp with `cdp.Error.Closed`.
-- `io.Stream` is a view whose `close` closes everything beneath it. In `tls.client(net.stream(c), config)`, closing the session closes the connection, and the connection's own drop does nothing.
-- A droppable cannot be stored in a pointer, slice, map, channel, optional or enum variant. It cannot be captured by a closure or passed to `spawn`. Long-lived and shared state therefore holds views. The HTTP client's idle connections, its HTTP/2 connections and the reaper's deadlines hold `ConnHandle` and `io.Stream` views and close them explicitly with the `_on` operations. A green thread that should own a resource receives its view and binds the owner itself: `http.serve` accepts with `net.accept_handle`, and each spawned connection thread runs `using c = net.adopt(h)`. Pump threads that only use a resource take its view and leave it to its owner. A scope that opens a resource for a wrapper it returns binds it with `using var` and calls `detach`, as `tls.dial` does.
-- A `file.Mapping` unmaps its region when released and has no view. Its `data` slice is valid while the `Mapping` is held. A copy used after the release faults.
-- A `process.Child` that was not waited for is killed and reaped when released. A `pipe.Reader` or `pipe.Writer` completes when released, so a peer never waits on an abandoned end.
+#### Owners and views
+
+An owner keeps the resource's name (`file.File`, `net.Conn`, `net.Listener`, `net.Socket`, `dbus.Connection`, `tls.Session`, `http.Connection`, `websocket.Socket`, `process.Child`, `cancel.Registration`, `pipe.Reader`, `pipe.Writer`, `sqlite.Database`, `sql.Connection`, `cdp.Browser`, `otel.Sdk`) and holds its view in a public `handle` field. Its `drop` closes through the handle.
+
+A view is named `<Owner>Handle`: `FileHandle`, `ConnHandle`, `ListenerHandle`, `SocketHandle`, `SessionHandle`, `ChildHandle`, `RegistrationHandle`, `ReaderHandle`, `WriterHandle`, `DatabaseHandle`, `ConnectionHandle`, `BrowserHandle` and `SdkHandle`. `SocketHandle` names the view in both `net` and `websocket`.
+
+A view is a copyable struct, or a pointer to the shared state when that state is mutable, so closures capture it, slices, channels, optionals and pointer-held structs store it, and `spawn` takes it. A view never closes anything on its own.
+
+#### Owner and view operations
+
+| Operation | Rule |
+| --- | --- |
+| Operations a caller uses directly | Take the owner and borrow it: `net.read(c, buf)`. |
+| Operations that run after ownership has moved elsewhere (green threads, `io.Stream` closures, pools, callbacks) | Take the view and end in `_on`: `net.read_on(h, buf)`, `net.stream_on(h)`, `net.close_on(h)`. |
+| A function that returns a view without an owner | Ends in `_handle`: `net.accept_handle`, `tls.client_handle`, `cdp.launch_handle`. |
+| `adopt(h)` | Makes an owner from a view. |
+| `detach(mut owner)` | Gives up an owner's responsibility so a function that opened a resource and wrapped it can return the wrapper. |
+
+#### Closing owners, views and streams
+
+Closing is explicit and idempotent from the owner, the view and the stream. The drop after an explicit close does nothing. The closed state lives in the shared view.
+
+Descriptor-based views share an `io.Guard`. Every operation enters it, and `retire` marks it closed and wakes blocked operations. Once the wake has returned, the last operation to leave closes the descriptors.
+
+A view used after its owner closed fails with `NotConnected` and never reaches a reused descriptor. The SQL drivers fail with `sql.Error.Closed` and cdp with `cdp.Error.Closed`.
+
+#### The io.Stream view
+
+`io.Stream` is a view whose `close` closes everything beneath it. In `tls.client(net.stream(c), config)`, closing the session closes the connection, and the connection's own drop does nothing.
+
+#### Droppables and long-lived state
+
+A droppable cannot be stored in a pointer, slice, map, channel, optional or enum variant. It cannot be captured by a closure or passed to `spawn`. Long-lived and shared state therefore holds views.
+
+- The HTTP client's idle connections, its HTTP/2 connections and the reaper's deadlines hold `ConnHandle` and `io.Stream` views and close them explicitly with the `_on` operations.
+- A green thread that should own a resource receives its view and binds the owner itself: `http.serve` accepts with `net.accept_handle`, and each spawned connection thread runs `using c = net.adopt(h)`.
+- Pump threads that only use a resource take its view and leave it to its owner.
+- A scope that opens a resource for a wrapper it returns binds it with `using var` and calls `detach`, as `tls.dial` does.
+
+#### Release of mappings, children and pipes
+
+| Type | When released |
+| --- | --- |
+| `file.Mapping` | Unmaps its region and has no view. Its `data` slice is valid while the `Mapping` is held. A copy used after the release faults. |
+| `process.Child` | A `process.Child` that was not waited for is killed and reaped. |
+| `pipe.Reader` and `pipe.Writer` | A `pipe.Reader` or `pipe.Writer` completes, so a peer never waits on an abandoned end. |
 
 ### Networking
 
-- Sockets are non-blocking. An operation that would block waits with `sys.wait_socket`, so a green thread waiting on the network never holds an OS thread the collector must wait for. Every connection writes through a second descriptor from `sys.write_view`, so one green thread can wait to read while another waits to write.
-- A timeout spawns a green thread that sleeps and shuts the socket down if the operation is still waiting. It enters the guard first, so a socket already closed is left alone. The waiting operation then fails with `TimedOut`.
-- A connection counts the reads and writes in progress. Closing it shuts it down. That wakes any green thread still waiting while the descriptor stays registered. The last operation to finish closes the descriptors, so a descriptor number is never reused under a waiting operation. Reads and writes after `close` fail with `NotConnected`, and closing twice does nothing.
-- A UDP receive that waits re-enters the socket's guard after each wake, so closing the socket from another green thread fails the waiting receive with `NotConnected`.
-- `serve` runs each connection on its own green thread.
-- A resolver query tries a host in this order: IP literal, hosts file, `localhost`, then DNS over each name of the search list. Every attempt opens a new UDP socket, so the kernel picks the source port. Every attempt writes a query with a random id and an EDNS(0) payload of 1232. Only a reply from the server's address and port with that id, the query's question and QR set counts. Anything else is ignored until the attempt's timeout. A truncated reply repeats the query over TCP. Servers are tried in order (rotated with `rotate`) for `attempts` rounds. An NXDOMAIN reply that is authoritative or has recursion available ends the search, and one that is neither moves to the next server. A and AAAA are asked for each candidate name, and the search continues to the next candidate only on NODATA. A `FORMERR` reply to an EDNS query is repeated without EDNS, and `use-vc` sends every query over TCP. CNAME chains are followed within a reply and across queries, up to eight links. A loop fails `Io(Malformed)`.
-- A resolver with a token registers a callback that closes the socket or connection of the attempt in progress, and the lookup then fails with `Io(Aborted)`.
-- Cancellation is cooperative. A token runs its callbacks and closes its channel once. Code therefore stops blocking work by closing what it waits on: `net.close` wakes a waiting read or write, `process.kill` ends a child, and `select` takes `<-cancel.done(t)`.
-- An HTTP/1.1 handler without an `Upgrade` header runs on the connection's green thread while one spawned watcher reads ahead into the request reader. End of input or a read error cancels the request's token, and the response is still written. Requests read ahead are served in order afterwards. An HTTP/2 or HTTP/3 stream's token is cancelled when the client resets it or the connection ends. Every request's token is cancelled once its handler returns.
-- A client request with a token arms its deadline even without a timeout. Cancelling the token fires the deadline. The deadline shuts down the connection the request is using and wakes the request from waiting on a pooled connection or an HTTP/2 stream.
-- A server speaks HTTP/1.1 and HTTP/2 on the same port. A connection that opens with the HTTP/2 preface is served as HTTP/2. Any other connection is HTTP/1.1 with keep-alive, pipelining, chunked bodies and `Expect: 100-continue`. Over TLS, ALPN offers `h2` and `http/1.1` and the same detection applies. The `h2c` upgrade from HTTP/1.1, deprecated by RFC 9113, is not offered.
-- HTTP/2 covers framing, HPACK with its dynamic table and Huffman decoding (`std/http/huffman`), stream multiplexing, flow control in both directions, SETTINGS, PING, RST_STREAM, GOAWAY and CONTINUATION, and the request validation of RFC 9113 section 8. A reader green thread feeds frames to the connection, each request's handler runs on its own green thread, and the connection selects over frames and finished responses, so every write happens on one green thread. The encoder uses the static table and literals without Huffman coding. It passes h2spec except the test sending a garbage preface, which the shared port reads as an HTTP/1.1 request. A handler's `Response.trailers` are sent as a final HEADERS frame over HTTP/2; HTTP/1.1 responses carry none.
-- HTTP/3 (RFC 9114) is served by `serve_quic` and `serve_quic_on` over a `quic.Listener` whose ALPN is `h3`. A connection that negotiated another protocol is closed with `H3_GENERAL_PROTOCOL_ERROR`. Each connection opens a control stream that carries SETTINGS (QPACK table capacity 4096, 16 blocked streams, field section size 65536) and a QPACK decoder stream, and the encoder is static-only so no encoder stream is opened. A green thread per peer unidirectional stream reads the control, QPACK encoder and QPACK decoder streams, at most 16 at a time. A duplicate or a push stream is `H3_STREAM_CREATION_ERROR`. A closed critical stream is `H3_CLOSED_CRITICAL_STREAM`. A first control frame that is not SETTINGS is `H3_MISSING_SETTINGS`. An unknown stream type is stopped and ignored. A green thread per request stream reads HEADERS, DATA and an optional trailing HEADERS, runs the handler and writes the response. A connection runs at most the listener's `max_streams` of them at a time. It does not accept the next request stream until one has finished, so a client that stops its streams cannot push the handler count past that. One `qpack.Decoder` per connection sits behind a mutex. A section that needs table entries the encoder stream has not delivered waits for them, bounded by the life of the connection. Every `decode`, `cancel_stream` and `on_encoder_stream` writes the decoder stream bytes it owes, taking and writing them under one lock, so the instructions reach the peer in the order they were produced. A write to the decoder stream that fails because the peer sent STOP_SENDING closes the connection with `H3_CLOSED_CRITICAL_STREAM`. Frame sizes are checked before anything is read or allocated: a HEADERS frame over 64 KiB or a control frame over 16 KiB is `H3_EXCESSIVE_LOAD`, and no buffer is sized from a declared length, since a field section is read into a buffer that grows with the bytes that arrive, unknown frame types are read and discarded in chunks of at most 4 KiB, DATA is read in chunks of at most 16 KiB, each chunk no larger than what is left of the frame, and a body over 64 MiB resets the stream with `H3_EXCESSIVE_LOAD`. A frame out of order, such as DATA before HEADERS or HTTP/2-only frame types, is `H3_FRAME_UNEXPECTED`. A request with an uppercase field name, a connection-specific field, a missing or repeated pseudo-header, a pseudo-header in the trailers or a `content-length` that differs from the DATA total resets and stops its stream with `H3_MESSAGE_ERROR`. The handler is not called. A field section over the size limit is answered with `431`. A response is HEADERS, DATA, an optional trailing HEADERS for `Response.trailers`, then FIN. A streaming `Response.stream` sends one DATA frame per chunk. `Request.token` is cancelled when the response is complete, when a write of the response fails because the client stopped or reset the stream, and when the connection ends. A stop or reset that arrives while the handler runs is not noticed before the response is written. A client that resets its request stream before it is complete has its response reset with `H3_REQUEST_CANCELLED`. Server push, extended CONNECT and HTTP datagrams are not supported.
-- A handler that returns status 101 owns the connection: the server writes nothing more and closes it once the handler returns. `http.upgrade(req, headers)` writes the `101` and returns the connection's reader, and `http.upgraded()` is the response returned after a WebSocket session.
-- `Request.connection` is the buffered reader of an HTTP/1.1 connection. `websocket.accept` writes the handshake to it and reads frames from it. A WebSocket server requires masked client frames, answers pings, reassembles fragments, checks UTF-8 in text messages, limits messages to 16 MB and echoes a close frame.
-- `http.client()` returns a `Builder[Client]` value whose `with_*` functions return updated copies. `build` makes a `*Client` that any number of green threads share. `c.request(method, url)` copies the client's settings into a `Builder[Response]`, so headers, authentication, timeouts, redirects, retries, version and decompression can be overridden per request. The type parameter only selects whether `build` or `send` applies.
-- HTTP/1.1 client connections: a request takes an idle keep-alive connection from a pool keyed by scheme, host and port, dials a new one while the host is under its limit, or queues for one. A sweeper green thread expires idle connections. A pooled connection that fails before any response byte is retried once on a fresh one.
-- HTTP/2 client connections: over TLS the client offers `h2` and `http/1.1` by ALPN and keeps one HTTP/2 connection per host. A reader green thread decodes frames into per-stream queues. Request green threads wait on their stream. Flow control credits windows as bodies are consumed. SETTINGS, PING, RST_STREAM, GOAWAY and the peer's stream limit are honoured. `with_prior_knowledge(true)` speaks HTTP/2 to `http://` URLs without negotiation (h2c), keeping one connection per host as over TLS.
-- HTTP/3 client connections: `with_version(Http3)` sends `https` requests over QUIC and keeps `http` requests, requests through a proxy and requests of a client with a dialer on HTTP/1.1. There is no fallback: a QUIC connection that cannot be made fails the request with `Connect`, `Tls` or `Timeout`. The host holds one connection, shared by concurrent requests, next to its HTTP/1.1 and HTTP/2 state. The connection is replaced once it has ended or the server sent GOAWAY. `close_idle` and the sweeper close it when idle. The TLS options of the client apply with ALPN `h3` and the URL host as server name. `with_resolver` supplies the addresses, which are tried in turn when one times out or is refused. `with_connect_timeout` becomes `quic.Config.handshake_timeout`. `with_interface` fails with `Connect(Unsupported)`. The handshake runs on its own green thread, so a cancelled token or the request's deadline abandons the wait at once. The deadline of the request that dials never becomes the handshake timeout, because the connection outlives that request: a server whose HANDSHAKE_DONE arrives after the deadline still leaves a connection the next request reuses. The client shares the connection code of the server: it opens the control stream with SETTINGS and the QPACK decoder stream. It reads the server's control, QPACK encoder and decoder streams under the same limits: at most 16 at a time, with duplicates and unknown critical streams rejected. It decodes field sections through one mutex-guarded `qpack.Decoder` that waits for encoder stream instructions. A push stream is `H3_ID_ERROR` because the client never sends MAX_PUSH_ID. A MAX_PUSH_ID from the server is `H3_FRAME_UNEXPECTED`. QUIC is configured with no server-initiated bidirectional streams. A request opens a bidirectional stream. It writes HEADERS (`:method`, `:scheme`, `:authority`, `:path`, then the lowercased request headers without connection-specific ones, `host` and a `te` other than `trailers`), DATA frames for the body, streamed from a body reader in 16 KiB frames, and FIN. The response is up to 16 interim `1xx` HEADERS that are discarded, then a final HEADERS checked by `valid_h3_response`, DATA frames read as the body stream, and an optional trailing HEADERS checked by `valid_h3_trailers` that fills `Response.trailers`. `Response.version` is `Http3`. A malformed response is an invalid section, a `content-length` that differs from the DATA total, DATA on a bodiless response, or too many interim responses. Such a response resets and stops the stream with `H3_MESSAGE_ERROR` and fails as `Protocol(Malformed)`. A frame out of order closes the connection with `H3_FRAME_UNEXPECTED`. A section over 64 KiB resets the stream with `H3_EXCESSIVE_LOAD`. One green thread per request watches the deadline and the token. When either fires, it resets and stops that stream with `H3_REQUEST_CANCELLED` and wakes a blocked QPACK wait. The connection stays open. Opening a stream also races the deadline, because it parks at the peer's stream limit. So does opening the control and QPACK decoder streams right after the handshake, which parks when the server allows fewer than two unidirectional streams. That setup runs on its own green thread under the deadline, the token and the connect timeout (10 seconds when none is set). It closes the connection when one of them fires, so the host's dial flag is always cleared. A stream the server reset before the response head, a stream the server refused with GOAWAY, a request on a connection that ended, and a request that finds the connection draining count as stale. A replayable request is sent once more on a new connection, as for HTTP/2. Decompression, redirects, cookies, retries and the 64 MB body limit sit above the transport and apply as for HTTP/2.
-- One reaper green thread per client enforces whole-request deadlines by shutting down an expired HTTP/1.1 exchange. HTTP/2 and HTTP/3 waits select on the deadline and reset the stream.
-- Redirects switch 301, 302 and 303 to GET without a body, keep the method and body on 307 and 308, resolve relative locations and drop `Authorization` and `Cookie` across origins.
-- Responses are decoded from gzip, deflate (zlib or raw), Brotli and Zstandard as they stream, and chunked bodies are read and sent. An optional RFC 6265 cookie jar is shared by the client.
-- Retries apply to connection failures and, for idempotent methods, to transport errors and 429, 502, 503 and 504, through `std/retry` with exponential backoff, where `Retry-After` raises the planned wait.
+#### Non-blocking sockets
+
+Sockets are non-blocking. An operation that would block waits with `sys.wait_socket`, so a green thread waiting on the network never holds an OS thread the collector must wait for. Every connection writes through a second descriptor from `sys.write_view`, so one green thread can wait to read while another waits to write.
+
+#### Serving connections
+
+`serve` runs each connection on its own green thread.
+
+#### Socket timeouts
+
+A timeout spawns a green thread that sleeps and shuts the socket down if the operation is still waiting. It enters the guard first, so a socket already closed is left alone. The waiting operation then fails with `TimedOut`.
+
+#### Closing connections and sockets with operations in progress
+
+A connection counts the reads and writes in progress. Closing it shuts it down. That wakes any green thread still waiting while the descriptor stays registered. The last operation to finish closes the descriptors, so a descriptor number is never reused under a waiting operation. Reads and writes after `close` fail with `NotConnected`, and closing twice does nothing.
+
+A UDP receive that waits re-enters the socket's guard after each wake, so closing the socket from another green thread fails the waiting receive with `NotConnected`.
+
+#### Resolver lookup order
+
+A resolver query tries a host in this order:
+
+1. IP literal.
+2. Hosts file.
+3. `localhost`.
+4. DNS over each name of the search list.
+
+#### Resolver DNS attempts
+
+Every attempt opens a new UDP socket, so the kernel picks the source port. Every attempt writes a query with a random id and an EDNS(0) payload of 1232. Only a reply from the server's address and port with that id, the query's question and QR set counts. Anything else is ignored until the attempt's timeout.
+
+Servers are tried in order (rotated with `rotate`) for `attempts` rounds. A and AAAA are asked for each candidate name, and the search continues to the next candidate only on NODATA.
+
+| Case | Handling |
+| --- | --- |
+| A truncated reply | Repeats the query over TCP. |
+| An NXDOMAIN reply that is authoritative or has recursion available | Ends the search. |
+| An NXDOMAIN reply that is neither of those | Moves to the next server. |
+| A `FORMERR` reply to an EDNS query | Is repeated without EDNS. |
+| `use-vc` | Sends every query over TCP. |
+| CNAME chains | Are followed within a reply and across queries, up to eight links. A loop fails `Io(Malformed)`. |
+
+#### Resolver cancellation
+
+A resolver with a token registers a callback that closes the socket or connection of the attempt in progress, and the lookup then fails with `Io(Aborted)`.
+
+#### Cooperative cancellation
+
+Cancellation is cooperative. A token runs its callbacks and closes its channel once. Code therefore stops blocking work by closing what it waits on:
+
+| Call | Effect |
+| --- | --- |
+| `net.close` | Wakes a waiting read or write. |
+| `process.kill` | Ends a child. |
+| `select` | Takes `<-cancel.done(t)`. |
+
+#### Request tokens in the HTTP server
+
+| Request | Handling |
+| --- | --- |
+| An HTTP/1.1 handler without an `Upgrade` header | Runs on the connection's green thread while one spawned watcher reads ahead into the request reader. End of input or a read error cancels the request's token, and the response is still written. Requests read ahead are served in order afterwards. |
+| An HTTP/2 or HTTP/3 stream | The stream's token is cancelled when the client resets it or the connection ends. |
+| Every request | The request's token is cancelled once its handler returns. |
+
+#### Client request tokens and deadlines
+
+A client request with a token arms its deadline even without a timeout. Cancelling the token fires the deadline. The deadline shuts down the connection the request is using and wakes the request from waiting on a pooled connection or an HTTP/2 stream.
+
+One reaper green thread per client enforces whole-request deadlines by shutting down an expired HTTP/1.1 exchange. HTTP/2 and HTTP/3 waits select on the deadline and reset the stream.
+
+#### HTTP/1.1 and HTTP/2 on one server port
+
+A server speaks HTTP/1.1 and HTTP/2 on the same port.
+
+| Connection | Served as |
+| --- | --- |
+| A connection that opens with the HTTP/2 preface | HTTP/2. |
+| Any other connection | HTTP/1.1 with keep-alive, pipelining, chunked bodies and `Expect: 100-continue`. |
+
+Over TLS, ALPN offers `h2` and `http/1.1` and the same detection applies. The `h2c` upgrade from HTTP/1.1, deprecated by RFC 9113, is not offered.
+
+#### HTTP/2 coverage
+
+HTTP/2 covers:
+
+- framing
+- HPACK with its dynamic table and Huffman decoding (`std/http/huffman`)
+- stream multiplexing
+- flow control in both directions
+- SETTINGS, PING, RST_STREAM, GOAWAY and CONTINUATION
+- the request validation of RFC 9113 section 8
+
+#### HTTP/2 threads, encoder and h2spec
+
+A reader green thread feeds frames to the connection, each request's handler runs on its own green thread, and the connection selects over frames and finished responses, so every write happens on one green thread.
+
+The encoder uses the static table and literals without Huffman coding. It passes h2spec except the test sending a garbage preface, which the shared port reads as an HTTP/1.1 request.
+
+#### Response trailers
+
+A handler's `Response.trailers` are sent as a final HEADERS frame over HTTP/2; HTTP/1.1 responses carry none. `Response.trailers` holds the trailer fields of chunked HTTP/1.1 bodies and of HTTP/2 and HTTP/3 responses.
+
+#### HTTP/3 server
+
+HTTP/3 (RFC 9114) is served by `serve_quic` and `serve_quic_on` over a `quic.Listener` whose ALPN is `h3`. A connection that negotiated another protocol is closed with `H3_GENERAL_PROTOCOL_ERROR`.
+
+##### HTTP/3 server control and QPACK streams
+
+Each connection opens a control stream that carries SETTINGS and a QPACK decoder stream, and the encoder is static-only so no encoder stream is opened.
+
+| SETTINGS setting | Value |
+| --- | --- |
+| QPACK table capacity | 4096 |
+| Blocked streams | 16 |
+| Field section size | 65536 |
+
+A green thread per peer unidirectional stream reads the control, QPACK encoder and QPACK decoder streams, at most 16 at a time.
+
+| Peer stream or frame | Result |
+| --- | --- |
+| A duplicate or a push stream | `H3_STREAM_CREATION_ERROR` |
+| A closed critical stream | `H3_CLOSED_CRITICAL_STREAM` |
+| A first control frame that is not SETTINGS | `H3_MISSING_SETTINGS` |
+| An unknown stream type | Is stopped and ignored. |
+
+##### HTTP/3 server request streams
+
+A green thread per request stream reads HEADERS, DATA and an optional trailing HEADERS, runs the handler and writes the response. A connection runs at most the listener's `max_streams` of them at a time. It does not accept the next request stream until one has finished, so a client that stops its streams cannot push the handler count past that.
+
+##### HTTP/3 server QPACK decoder
+
+One `qpack.Decoder` per connection sits behind a mutex. A section that needs table entries the encoder stream has not delivered waits for them, bounded by the life of the connection.
+
+Every `decode`, `cancel_stream` and `on_encoder_stream` writes the decoder stream bytes it owes, taking and writing them under one lock, so the instructions reach the peer in the order they were produced. A write to the decoder stream that fails because the peer sent STOP_SENDING closes the connection with `H3_CLOSED_CRITICAL_STREAM`.
+
+##### HTTP/3 server frame size limits
+
+Frame sizes are checked before anything is read or allocated:
+
+| Read | Limit |
+| --- | --- |
+| A HEADERS frame | Over 64 KiB is `H3_EXCESSIVE_LOAD`. |
+| A control frame | Over 16 KiB is `H3_EXCESSIVE_LOAD`. |
+| Unknown frame types | Are read and discarded in chunks of at most 4 KiB. |
+| DATA | Is read in chunks of at most 16 KiB, each chunk no larger than what is left of the frame. |
+| A body | Over 64 MiB resets the stream with `H3_EXCESSIVE_LOAD`. |
+
+No buffer is sized from a declared length, since a field section is read into a buffer that grows with the bytes that arrive.
+
+##### HTTP/3 server invalid frames and requests
+
+| Case | Result |
+| --- | --- |
+| A frame out of order, such as DATA before HEADERS or HTTP/2-only frame types | `H3_FRAME_UNEXPECTED` |
+| A request with an uppercase field name, a connection-specific field, a missing or repeated pseudo-header, a pseudo-header in the trailers or a `content-length` that differs from the DATA total | Resets and stops its stream with `H3_MESSAGE_ERROR`. The handler is not called. |
+
+A field section over the size limit is answered with `431`.
+
+##### HTTP/3 server responses
+
+A response is:
+
+1. HEADERS.
+2. DATA.
+3. An optional trailing HEADERS for `Response.trailers`.
+4. FIN.
+
+A streaming `Response.stream` sends one DATA frame per chunk.
+
+##### HTTP/3 server request token
+
+`Request.token` is cancelled:
+
+- when the response is complete
+- when a write of the response fails because the client stopped or reset the stream
+- when the connection ends
+
+A stop or reset that arrives while the handler runs is not noticed before the response is written. A client that resets its request stream before it is complete has its response reset with `H3_REQUEST_CANCELLED`.
+
+##### HTTP/3 server unsupported features
+
+Server push, extended CONNECT and HTTP datagrams are not supported.
+
+#### Handlers that return status 101
+
+A handler that returns status 101 owns the connection: the server writes nothing more and closes it once the handler returns.
+
+| Function | Effect |
+| --- | --- |
+| `http.upgrade(req, headers)` | Writes the `101` and returns the connection's reader. |
+| `http.upgraded()` | The response returned after a WebSocket session. |
+
+#### WebSocket server
+
+`Request.connection` is the buffered reader of an HTTP/1.1 connection. `websocket.accept` writes the handshake to it and reads frames from it.
+
+A WebSocket server:
+
+- requires masked client frames
+- answers pings
+- reassembles fragments
+- checks UTF-8 in text messages
+- limits messages to 16 MB
+- echoes a close frame
+
+#### HTTP client builder
+
+| Call | Effect |
+| --- | --- |
+| `http.client()` | Returns a `Builder[Client]` value whose `with_*` functions return updated copies. |
+| `build` | Makes a `*Client` that any number of green threads share. |
+| `c.request(method, url)` | Copies the client's settings into a `Builder[Response]`, so headers, authentication, timeouts, redirects, retries, version and decompression can be overridden per request. |
+
+The type parameter only selects whether `build` or `send` applies.
+
+#### HTTP/1.1 client connections
+
+A request takes an idle keep-alive connection from a pool keyed by scheme, host and port, dials a new one while the host is under its limit, or queues for one. A sweeper green thread expires idle connections. A pooled connection that fails before any response byte is retried once on a fresh one.
+
+#### HTTP/2 client connections
+
+Over TLS the client offers `h2` and `http/1.1` by ALPN and keeps one HTTP/2 connection per host.
+
+- A reader green thread decodes frames into per-stream queues.
+- Request green threads wait on their stream.
+- Flow control credits windows as bodies are consumed.
+- SETTINGS, PING, RST_STREAM, GOAWAY and the peer's stream limit are honoured.
+
+`with_prior_knowledge(true)` speaks HTTP/2 to `http://` URLs without negotiation (h2c), keeping one connection per host as over TLS.
+
+#### HTTP/3 client
+
+##### HTTP/3 client transport selection
+
+`with_version(Http3)` sends `https` requests over QUIC and keeps `http` requests, requests through a proxy and requests of a client with a dialer on HTTP/1.1:
+
+| Request | Transport |
+| --- | --- |
+| An `https` request | QUIC |
+| An `http` request | Kept on HTTP/1.1. |
+| A request through a proxy | Kept on HTTP/1.1. |
+| A request of a client with a dialer | Kept on HTTP/1.1. |
+
+There is no fallback: a QUIC connection that cannot be made fails the request with `Connect`, `Tls` or `Timeout`.
+
+##### HTTP/3 client connection
+
+The host holds one connection, shared by concurrent requests, next to its HTTP/1.1 and HTTP/2 state. The connection is replaced once it has ended or the server sent GOAWAY. `close_idle` and the sweeper close it when idle.
+
+| Setting | Effect |
+| --- | --- |
+| The TLS options of the client | Apply with ALPN `h3` and the URL host as server name. |
+| `with_resolver` | Supplies the addresses, which are tried in turn when one times out or is refused. |
+| `with_connect_timeout` | Becomes `quic.Config.handshake_timeout`. |
+| `with_interface` | Fails with `Connect(Unsupported)`. |
+
+##### HTTP/3 client handshake
+
+The handshake runs on its own green thread, so a cancelled token or the request's deadline abandons the wait at once. The deadline of the request that dials never becomes the handshake timeout, because the connection outlives that request: a server whose HANDSHAKE_DONE arrives after the deadline still leaves a connection the next request reuses.
+
+##### HTTP/3 client control and QPACK streams
+
+The client shares the connection code of the server: it opens the control stream with SETTINGS and the QPACK decoder stream. It reads the server's control, QPACK encoder and decoder streams under the same limits: at most 16 at a time, with duplicates and unknown critical streams rejected. It decodes field sections through one mutex-guarded `qpack.Decoder` that waits for encoder stream instructions.
+
+| Case | Result |
+| --- | --- |
+| A push stream | `H3_ID_ERROR` because the client never sends MAX_PUSH_ID. |
+| A MAX_PUSH_ID from the server | `H3_FRAME_UNEXPECTED` |
+
+QUIC is configured with no server-initiated bidirectional streams.
+
+##### HTTP/3 client request
+
+A request:
+
+1. Opens a bidirectional stream.
+2. Writes HEADERS (`:method`, `:scheme`, `:authority`, `:path`, then the lowercased request headers without connection-specific ones, `host` and a `te` other than `trailers`).
+3. Writes DATA frames for the body, streamed from a body reader in 16 KiB frames.
+4. Writes FIN.
+
+##### HTTP/3 client response
+
+The response is:
+
+1. Up to 16 interim `1xx` HEADERS that are discarded.
+2. A final HEADERS checked by `valid_h3_response`.
+3. DATA frames read as the body stream.
+4. An optional trailing HEADERS checked by `valid_h3_trailers` that fills `Response.trailers`.
+
+`Response.version` is `Http3`.
+
+##### HTTP/3 client malformed responses
+
+A malformed response is:
+
+- an invalid section
+- a `content-length` that differs from the DATA total
+- DATA on a bodiless response
+- too many interim responses
+
+| Case | Result |
+| --- | --- |
+| A malformed response | Resets and stops the stream with `H3_MESSAGE_ERROR` and fails as `Protocol(Malformed)`. |
+| A frame out of order | Closes the connection with `H3_FRAME_UNEXPECTED`. |
+| A section over 64 KiB | Resets the stream with `H3_EXCESSIVE_LOAD`. |
+
+##### HTTP/3 client cancellation and stream setup
+
+One green thread per request watches the deadline and the token. When either fires, it resets and stops that stream with `H3_REQUEST_CANCELLED` and wakes a blocked QPACK wait. The connection stays open.
+
+Opening a stream also races the deadline, because it parks at the peer's stream limit. So does opening the control and QPACK decoder streams right after the handshake, which parks when the server allows fewer than two unidirectional streams. That setup runs on its own green thread under the deadline, the token and the connect timeout (10 seconds when none is set). It closes the connection when one of them fires, so the host's dial flag is always cleared.
+
+##### HTTP/3 client stale requests
+
+These count as stale:
+
+- a stream the server reset before the response head
+- a stream the server refused with GOAWAY
+- a request on a connection that ended
+- a request that finds the connection draining
+
+A replayable request is sent once more on a new connection, as for HTTP/2.
+
+##### HTTP/3 client features above the transport
+
+Decompression, redirects, cookies, retries and the 64 MB body limit sit above the transport and apply as for HTTP/2.
+
+#### Client redirects
+
+| Redirect | Handling |
+| --- | --- |
+| 301, 302 and 303 | Switch to GET without a body. |
+| 307 and 308 | Keep the method and body. |
+| Relative locations | Are resolved. |
+| Across origins | `Authorization` and `Cookie` are dropped. |
+
+#### Response decoding and cookies
+
+Responses are decoded from gzip, deflate (zlib or raw), Brotli and Zstandard as they stream, and chunked bodies are read and sent. An optional RFC 6265 cookie jar is shared by the client.
+
+#### Client retries
+
+Retries apply to:
+
+- connection failures
+- for idempotent methods, transport errors and 429, 502, 503 and 504
+
+Retries apply through `std/retry` with exponential backoff, where `Retry-After` raises the planned wait.
+
+#### TCP_NODELAY and body limit
+
 - Servers set `TCP_NODELAY` so separate HEADERS and DATA writes are not held back by delayed acknowledgements.
-- `Response.trailers` holds the trailer fields of chunked HTTP/1.1 bodies and of HTTP/2 and HTTP/3 responses.
 - Request and response bodies are limited to 64 MB.
-- The duplex server and the client's call API (`std/http/call.low`) are the HTTP/2 surface `std/grpc` stands on. A duplex handler runs when the request headers arrive and reads the body through `Request.upload`. `receive_body` returns the next chunk, and `none` at the end of the request or once the request token is cancelled. The window of received data is returned to the peer as chunks are taken, so a handler that stops reading stalls the sender. `Response.finish` supplies the trailers after the last chunk of `stream`. A reset from the peer or a closed connection cancels `Request.token`. Closing the drain channel of a duplex connection sends `GOAWAY`, refuses later streams and lets the streams in progress finish. The connection then reads and discards frames until the peer closes it or one second passes, and only then closes. The peer therefore reads the `GOAWAY` before the close. A socket on Windows closed with unread input resets the connection, and the peer loses the data it has not read. `open_call` returns a `*Call` once the request headers are sent. `call_send` writes one DATA frame and waits for the peer's window. `call_receive` returns `Head`, `Data`, `Trailers`, `Reset(code)`, `Lost` or `End`, and it returns window as events are taken. `call_close(call, complete)` releases the stream, resetting it with `CANCEL` when it is not complete. Cancelling the token of `open_call` resets the stream with `CANCEL` at once. From then on `call_send` and `call_receive` fail with `TimedOut`, without sending data or returning events that arrived before.
+
+#### HTTP/2 duplex server and call API
+
+The duplex server and the client's call API (`std/http/call.low`) are the HTTP/2 surface `std/grpc` stands on.
+
+##### Duplex server handlers
+
+A duplex handler runs when the request headers arrive and reads the body through `Request.upload`.
+
+- `receive_body` returns the next chunk, and `none` at the end of the request or once the request token is cancelled.
+- The window of received data is returned to the peer as chunks are taken, so a handler that stops reading stalls the sender.
+- `Response.finish` supplies the trailers after the last chunk of `stream`.
+- A reset from the peer or a closed connection cancels `Request.token`.
+
+##### Duplex connection drain
+
+Closing the drain channel of a duplex connection:
+
+1. Sends `GOAWAY`, refuses later streams and lets the streams in progress finish.
+2. Reads and discards frames until the peer closes it or one second passes.
+3. Only then closes the connection.
+
+The peer therefore reads the `GOAWAY` before the close. A socket on Windows closed with unread input resets the connection, and the peer loses the data it has not read.
+
+##### Client call API functions
+
+| Function | Effect |
+| --- | --- |
+| `open_call` | Returns a `*Call` once the request headers are sent. |
+| `call_send` | Writes one DATA frame and waits for the peer's window. |
+| `call_receive` | Returns `Head`, `Data`, `Trailers`, `Reset(code)`, `Lost` or `End`, and it returns window as events are taken. |
+| `call_close(call, complete)` | Releases the stream, resetting it with `CANCEL` when it is not complete. |
+
+##### Client call API cancellation
+
+Cancelling the token of `open_call` resets the stream with `CANCEL` at once. From then on `call_send` and `call_receive` fail with `TimedOut`, without sending data or returning events that arrived before.
 
 ### gRPC
 
-- `std/grpc` speaks the gRPC protocol over HTTP/2 prior knowledge (`host:port` and `http://` targets) and over TLS with ALPN `h2` (`https://` targets). Messages are `std/protobuf` structs; `*_bytes` functions carry raw message bytes. Every function that can fail returns `grpc.Error`, an enum with the one variant `Failed(status)`. `status_of(e)` returns its `Status`, and `error(code, message)` builds one.
-- `Code` has the 17 gRPC codes with their numbers. `code_name` gives the upper-case name. `Status` holds the code, the message, the `grpc-status-details-bin` bytes and the trailers that came with it. `grpc-message` is percent-encoded on the wire by `encode_message` and `decode_message`, and a message that does not decode is kept as received. `code_of_http` maps an HTTP status without gRPC trailers (400 `Internal`, 401 `Unauthenticated`, 403 `PermissionDenied`, 404 `Unimplemented`, 429, 502, 503 and 504 `Unavailable`, any other `Unknown`). `status_of_reset` maps an `RST_STREAM` code (`REFUSED_STREAM` `Unavailable`, `CANCEL` `Cancelled`, `ENHANCE_YOUR_CALM` `ResourceExhausted`, `INADEQUATE_SECURITY` `PermissionDenied`, every other code `Internal`).
-- A frame is a compressed-flag byte, a four-byte big-endian length and the message. `MessageReader` reassembles frames from arbitrary chunks. `grpc-timeout` is at most eight digits with one of `H M S m u n`. `encode_timeout` picks the finest unit that fits in eight digits, rounding up. `parse_timeout` rejects anything else. Compression is `Identity`, `Gzip` or `Deflate`, negotiated by `grpc-encoding` and `grpc-accept-encoding`. A request in an encoding the server does not have fails with `Unimplemented` and the server's accepted list in `grpc-accept-encoding`. A message longer than `max_receive` after decompression (4 MiB by default) fails with `ResourceExhausted`, as does a message longer than `max_send` before it is sent.
-- `Metadata` is an ordered multi-map of lower-case keys. `add` and `set` take ASCII values, `add_bin` and the `-bin` keys carry bytes, base64 on the wire. These fail with a `MetadataError`: keys outside lower-case letters, digits, `-`, `_` and `.`; keys that start with `grpc-` or `:` or are `content-type`, `te`, `content-length`, `host`, `connection`, `keep-alive`, `transfer-encoding`, `upgrade` or `proxy-connection`; an ASCII value outside printable ASCII; `add` with a `-bin` key; and `add_bin` with another key. Both sides send metadata as headers first and trailers last.
-- A `Channel` made by `dial` connects on the first call, shares one HTTP/2 connection per server between all calls and green threads, queues calls beyond the server's stream limit and reconnects when the connection ends. `unary` and `unary_bytes` return a `Reply`. `server_streaming`, `client_streaming` and `bidi_streaming` return a `Stream` read with `receive`, written with `send` and `close_send`, finished with `finish` and released with `close_stream`. `send` blocks while the stream's window is closed. `CallOptions.timeout` is the whole call's deadline sent as `grpc-timeout`. A call past it fails with `DeadlineExceeded` and resets the stream with `CANCEL`. `CallOptions.token` and `cancel_stream` cancel the call with `Cancelled` and reset the stream at once. A `receive` after the cancel fails with `Cancelled` without returning messages that arrived before, unless the server had already ended the call. A unary call that fails with `Unavailable` before any response header arrived is retried under `ChannelOptions.retry`, and `retry: false` turns that off. No other failure is retried.
-- A `Server` is a table from `/package.Service/Method` to a handler. `handle_unary`, `handle_server_streaming`, `handle_client_streaming` and `handle_bidi_streaming` register one with message types, `handle_bytes` one over raw bytes. A handler receives a `*Context` with the method, the request metadata, `peer`, `token`, `response_headers` and `response_trailers`. It reads and writes through `read` and `write`. `flush_headers` sends the headers early. A response that fails before any message is a Trailers-Only response. A handler that returns an error ends the call with its status. `Cancelled` from a call whose deadline passed becomes `DeadlineExceeded`. A method that is not registered fails with `Unimplemented`, an HTTP/1 request with `505`. `remaining(ctx)` is what is left of the client's deadline. `outgoing(ctx)` is the `CallOptions` for a call made on behalf of the handler, with that deadline and `ctx.token`. A cancelled or expired call therefore stops its downstream calls. `serve`, `serve_on`, `serve_tls` and `serve_tls_on` accept connections until `shutdown(s, grace)` closes the listeners, sends `GOAWAY` and waits for the calls to end. After `grace` milliseconds the remaining calls are cancelled with `Unavailable`. Methods are registered before serving starts.
-- `health()` is the state of `grpc.health.v1.Health`. `register_health` serves it. `set_health` and `set_all_not_serving` change it. `check_health` and `watch_health` are the client calls. `Check` of a service never set fails with `NotFound`. `Watch` sends the current state, `ServiceUnknown` for a service never set, and each change after it.
-- There is no server reflection, no interceptor chain, no load balancing across addresses, no service config, no hedging, and no conversion of a handler panic into `Internal`.
+#### gRPC transports and messages
+
+`std/grpc` speaks the gRPC protocol over:
+
+| Transport | Targets |
+| --- | --- |
+| HTTP/2 prior knowledge | `host:port` and `http://` targets |
+| TLS with ALPN `h2` | `https://` targets |
+
+Messages are `std/protobuf` structs; `*_bytes` functions carry raw message bytes.
+
+#### gRPC errors
+
+Every function that can fail returns `grpc.Error`, an enum with the one variant `Failed(status)`. `status_of(e)` returns its `Status`, and `error(code, message)` builds one.
+
+#### gRPC status codes
+
+| Name | What it is |
+| --- | --- |
+| `Code` | The 17 gRPC codes with their numbers. |
+| `code_name` | Gives the upper-case name. |
+| `Status` | Holds the code, the message, the `grpc-status-details-bin` bytes and the trailers that came with it. |
+| `encode_message` and `decode_message` | `grpc-message` is percent-encoded on the wire by them, and a message that does not decode is kept as received. |
+
+##### gRPC status from an HTTP status
+
+`code_of_http` maps an HTTP status without gRPC trailers:
+
+| HTTP status | Code |
+| --- | --- |
+| 400 | `Internal` |
+| 401 | `Unauthenticated` |
+| 403 | `PermissionDenied` |
+| 404 | `Unimplemented` |
+| 429, 502, 503 and 504 | `Unavailable` |
+| Any other | `Unknown` |
+
+##### gRPC status from an RST_STREAM code
+
+`status_of_reset` maps an `RST_STREAM` code:
+
+| RST_STREAM code | Code |
+| --- | --- |
+| `REFUSED_STREAM` | `Unavailable` |
+| `CANCEL` | `Cancelled` |
+| `ENHANCE_YOUR_CALM` | `ResourceExhausted` |
+| `INADEQUATE_SECURITY` | `PermissionDenied` |
+| Every other code | `Internal` |
+
+#### gRPC message frames
+
+A frame is a compressed-flag byte, a four-byte big-endian length and the message. `MessageReader` reassembles frames from arbitrary chunks.
+
+#### gRPC timeouts
+
+`grpc-timeout` is at most eight digits with one of `H M S m u n`. `encode_timeout` picks the finest unit that fits in eight digits, rounding up. `parse_timeout` rejects anything else.
+
+#### gRPC compression and message size
+
+Compression is `Identity`, `Gzip` or `Deflate`, negotiated by `grpc-encoding` and `grpc-accept-encoding`.
+
+| Case | Result |
+| --- | --- |
+| A request in an encoding the server does not have | Fails with `Unimplemented` and the server's accepted list in `grpc-accept-encoding`. |
+| A message longer than `max_receive` after decompression (4 MiB by default) | Fails with `ResourceExhausted`. |
+| A message longer than `max_send` before it is sent | Fails with `ResourceExhausted`. |
+
+#### gRPC metadata
+
+`Metadata` is an ordered multi-map of lower-case keys.
+
+| Function | Values |
+| --- | --- |
+| `add` and `set` | Take ASCII values. |
+| `add_bin` and the `-bin` keys | Carry bytes, base64 on the wire. |
+
+These fail with a `MetadataError`:
+
+- keys outside lower-case letters, digits, `-`, `_` and `.`
+- keys that start with `grpc-` or `:` or are `content-type`, `te`, `content-length`, `host`, `connection`, `keep-alive`, `transfer-encoding`, `upgrade` or `proxy-connection`
+- an ASCII value outside printable ASCII
+- `add` with a `-bin` key
+- `add_bin` with another key
+
+Both sides send metadata as headers first and trailers last.
+
+#### gRPC channels
+
+A `Channel` made by `dial`:
+
+- connects on the first call
+- shares one HTTP/2 connection per server between all calls and green threads
+- queues calls beyond the server's stream limit
+- reconnects when the connection ends
+
+##### gRPC call functions and streams
+
+| Function | Effect |
+| --- | --- |
+| `unary` and `unary_bytes` | Return a `Reply`. |
+| `server_streaming`, `client_streaming` and `bidi_streaming` | Return a `Stream`. |
+| `receive` | Reads the `Stream`. |
+| `send` and `close_send` | Write the `Stream`. `send` blocks while the stream's window is closed. |
+| `finish` | Finishes the `Stream`. |
+| `close_stream` | Releases the `Stream`. |
+
+##### gRPC call deadlines and cancellation
+
+| Option | Effect |
+| --- | --- |
+| `CallOptions.timeout` | The whole call's deadline sent as `grpc-timeout`. A call past it fails with `DeadlineExceeded` and resets the stream with `CANCEL`. |
+| `CallOptions.token` and `cancel_stream` | Cancel the call with `Cancelled` and reset the stream at once. A `receive` after the cancel fails with `Cancelled` without returning messages that arrived before, unless the server had already ended the call. |
+
+##### gRPC call retries
+
+A unary call that fails with `Unavailable` before any response header arrived is retried under `ChannelOptions.retry`, and `retry: false` turns that off. No other failure is retried.
+
+#### gRPC server methods
+
+A `Server` is a table from `/package.Service/Method` to a handler.
+
+| Function | Registers |
+| --- | --- |
+| `handle_unary`, `handle_server_streaming`, `handle_client_streaming` and `handle_bidi_streaming` | One with message types. |
+| `handle_bytes` | One over raw bytes. |
+
+Methods are registered before serving starts.
+
+##### gRPC handler context
+
+A handler receives a `*Context` with the method, the request metadata, `peer`, `token`, `response_headers` and `response_trailers`.
+
+| Function | Effect |
+| --- | --- |
+| `read` and `write` | Used to read and write. |
+| `flush_headers` | Sends the headers early. |
+| `remaining(ctx)` | What is left of the client's deadline. |
+| `outgoing(ctx)` | The `CallOptions` for a call made on behalf of the handler, with that deadline and `ctx.token`. |
+
+A cancelled or expired call therefore stops its downstream calls.
+
+##### gRPC server call errors
+
+| Case | Result |
+| --- | --- |
+| A response that fails before any message | Is a Trailers-Only response. |
+| A handler that returns an error | Ends the call with its status. |
+| `Cancelled` from a call whose deadline passed | Becomes `DeadlineExceeded`. |
+| A method that is not registered | Fails with `Unimplemented`. |
+| An HTTP/1 request | Fails with `505`. |
+
+##### gRPC serving and shutdown
+
+`serve`, `serve_on`, `serve_tls` and `serve_tls_on` accept connections until `shutdown(s, grace)` closes the listeners, sends `GOAWAY` and waits for the calls to end. After `grace` milliseconds the remaining calls are cancelled with `Unavailable`.
+
+#### gRPC health service
+
+| Function | Effect |
+| --- | --- |
+| `health()` | The state of `grpc.health.v1.Health`. |
+| `register_health` | Serves it. |
+| `set_health` and `set_all_not_serving` | Change it. |
+| `check_health` and `watch_health` | The client calls. |
+
+| Call | Result |
+| --- | --- |
+| `Check` of a service never set | Fails with `NotFound`. |
+| `Watch` | Sends the current state, `ServiceUnknown` for a service never set, and each change after it. |
+
+#### gRPC features not supported
+
+There is no server reflection, no interceptor chain, no load balancing across addresses, no service config, no hedging, and no conversion of a handler panic into `Internal`.
 
 ### Processes
 
-- `process.start` builds the path, arguments, environment and pipes before `fork`. The child therefore runs only straight-line syscalls: `setpgid` for a new group, `dup2` onto descriptors 0 to 2, `chdir` and `execve`. Every descriptor the standard library opens is close-on-exec, so the child inherits only its three streams. A child's pipes are streams over guarded descriptors, so closing one twice or using it after it closed fails with `NotConnected` and never reaches a reused descriptor.
-- `perf.held` runs the program as `/bin/sh -c 'kill -STOP $$; exec "$0" "$@"'`. The process is therefore single-threaded when it stops and keeps its process id through the `exec`. Events are opened disabled with `enable_on_exec` and `inherit`. This starts them at the program's first instruction and extends them to every thread and process it starts. A `Sampler` opens one event for each processor in `/sys/devices/system/cpu/online`. It does so because the kernel gives an inherited event a buffer only when it is bound to a processor. It maps 128 pages for each, halving down to 8 when the locked memory allowance refuses. A sample carries the user call chain the kernel reads through the frame pointers. A routine that keeps no frame, such as `rt_memmove`, therefore appears under its caller's caller. With a fixed period the sample records the processor in place of the period. This is because the kernel samples every software event when both a period and the period field are asked for. `drain` gives each such sample the period as its weight. `usage` is `waitid` with `WNOWAIT` and `WNOHANG`, whose `rusage` covers the child and the descendants it waited for and leaves the child for `process.wait` to reap. `restrict_cpus` calls `sched_setaffinity` on every thread in `/proc/self/task`, twice. A thread started during the first pass is therefore covered.
-- A failed `chdir` or `execve` writes its errno to a close-on-exec pipe, which the parent reads before returning. The read sees end of file once `execve` succeeds; otherwise the parent reaps the child and fails with that errno.
-- The parent's pipe ends are non-blocking and wait through the scheduler, as sockets do. The child's ends stay blocking. On Windows the parent's ends are overlapped pipes, as `## Compiler` describes. `wait` waits for the process's pidfd to become readable, then reaps it with `waitid` and remembers the result. `kill` signals through the pidfd, or the whole group when the command asked for one.
-- `signal.notify` installs a handler with `rt_sigaction`, or on Windows registers a console control handler with `SetConsoleCtrlHandler`. The handler is a short block of machine code in a mapped page. It writes the signal number to a non-blocking pipe and returns through `rt_sigreturn`. The Windows handler writes through an overlapped `WriteFile`. `handler_code` writes the address of that `WriteFile` into the code. The Windows handler maps Ctrl+C to `Interrupt`, Ctrl+Break to `Quit`, a closed console and logoff to `Hangup` and shutdown to `Terminate`. It runs on a thread the system starts. It returns `1` only for the events of the signals some `notify` asked for and `0` for the rest. An event no watch asked for therefore reaches the default handler and ends the process, as Ctrl+Break does in a program that watches only `Interrupt`. A `Watch` forwards only the signals it asked for. On Windows `notify` of any other signal fails with `Unsupported`. The runtime gives every OS thread an alternate signal stack, so the handler runs on whichever thread receives the signal. A forwarding green thread reads the pipe with `wait_readable` and sends to the `signals` channel, which holds 16 and drops repeats while full. Another `notify` for the same signal replaces the handler. Dropping a `Watch` restores the saved dispositions and unmaps the page, except that a handler another `notify` has replaced is silenced and its page stays mapped. `raise` signals the calling thread, so its handler has run when `raise` returns. `send` is process-directed and unordered against other threads.
-- `watch.next` reads every event an inotify read returns and queues them. With `recursive` set, new and moved-in directories are watched before the batch that reports them is returned. `stop` wakes a parked `next` by adding and removing a watch on `/`, which makes the descriptor readable. The kernel merges identical consecutive events it has not yet delivered.
+This section covers `process.start`, `perf.held`, the parent's pipes, `wait` and `kill`, `signal.notify` and `watch.next`.
+
+#### Starting a process
+
+`process.start` builds the path, arguments, environment and pipes before `fork`. The child therefore runs only straight-line syscalls: `setpgid` for a new group, `dup2` onto descriptors 0 to 2, `chdir` and `execve`.
+
+Every descriptor the standard library opens is close-on-exec, so the child inherits only its three streams. A child's pipes are streams over guarded descriptors, so closing one twice or using it after it closed fails with `NotConnected` and never reaches a reused descriptor.
+
+A failed `chdir` or `execve` writes its errno to a close-on-exec pipe, which the parent reads before returning. The read sees end of file once `execve` succeeds; otherwise the parent reaps the child and fails with that errno.
+
+#### Process pipes, waiting and killing
+
+The parent's pipe ends are non-blocking and wait through the scheduler, as sockets do. The child's ends stay blocking. On Windows the parent's ends are overlapped pipes, as `## Compiler` describes.
+
+| Function | Behaviour |
+| --- | --- |
+| `wait` | Waits for the process's pidfd to become readable, then reaps it with `waitid` and remembers the result. |
+| `kill` | Signals through the pidfd, or the whole group when the command asked for one. |
+
+#### Held perf sampling
+
+`perf.held` runs the program as `/bin/sh -c 'kill -STOP $$; exec "$0" "$@"'`. The process is therefore single-threaded when it stops and keeps its process id through the `exec`.
+
+Events are opened disabled with `enable_on_exec` and `inherit`. This starts them at the program's first instruction and extends them to every thread and process it starts.
+
+A `Sampler` opens one event for each processor in `/sys/devices/system/cpu/online`. It does so because the kernel gives an inherited event a buffer only when it is bound to a processor. It maps 128 pages for each, halving down to 8 when the locked memory allowance refuses.
+
+#### Perf samples
+
+A sample carries the user call chain the kernel reads through the frame pointers. A routine that keeps no frame, such as `rt_memmove`, therefore appears under its caller's caller.
+
+With a fixed period the sample records the processor in place of the period. This is because the kernel samples every software event when both a period and the period field are asked for. `drain` gives each such sample the period as its weight.
+
+#### Perf usage and CPU affinity
+
+| Function | Behaviour |
+| --- | --- |
+| `usage` | Is `waitid` with `WNOWAIT` and `WNOHANG`, whose `rusage` covers the child and the descendants it waited for and leaves the child for `process.wait` to reap. |
+| `restrict_cpus` | Calls `sched_setaffinity` on every thread in `/proc/self/task`, twice. A thread started during the first pass is therefore covered. |
+
+#### Signal handlers
+
+`signal.notify` installs a handler with `rt_sigaction`, or on Windows registers a console control handler with `SetConsoleCtrlHandler`. The handler is a short block of machine code in a mapped page. It writes the signal number to a non-blocking pipe and returns through `rt_sigreturn`.
+
+The Windows handler writes through an overlapped `WriteFile`. `handler_code` writes the address of that `WriteFile` into the code.
+
+#### Windows console control events
+
+The Windows handler maps console events to signals:
+
+| Console event | Signal |
+| --- | --- |
+| Ctrl+C | `Interrupt` |
+| Ctrl+Break | `Quit` |
+| A closed console and logoff | `Hangup` |
+| Shutdown | `Terminate` |
+
+The Windows handler runs on a thread the system starts. It returns `1` only for the events of the signals some `notify` asked for and `0` for the rest. An event no watch asked for therefore reaches the default handler and ends the process, as Ctrl+Break does in a program that watches only `Interrupt`.
+
+#### Signal forwarding
+
+A `Watch` forwards only the signals it asked for. On Windows `notify` of any other signal fails with `Unsupported`.
+
+The runtime gives every OS thread an alternate signal stack, so the handler runs on whichever thread receives the signal. A forwarding green thread reads the pipe with `wait_readable` and sends to the `signals` channel, which holds 16 and drops repeats while full.
+
+#### Replacing and dropping a signal watch
+
+Another `notify` for the same signal replaces the handler. Dropping a `Watch` restores the saved dispositions and unmaps the page, except that a handler another `notify` has replaced is silenced and its page stays mapped.
+
+#### Raising and sending signals
+
+| Function | Behaviour |
+| --- | --- |
+| `raise` | Signals the calling thread, so its handler has run when `raise` returns. |
+| `send` | Is process-directed and unordered against other threads. |
+
+#### Inotify watching
+
+`watch.next` reads every event an inotify read returns and queues them. With `recursive` set, new and moved-in directories are watched before the batch that reports them is returned.
+
+`stop` wakes a parked `next` by adding and removing a watch on `/`, which makes the descriptor readable. The kernel merges identical consecutive events it has not yet delivered.
 
 ### Resilience
 
-- `retry.delay` is the capped exponential backoff and `jittered` applies the chosen jitter to it. `reserve` plans the wait and stops at the attempt limit, the deadline or a cancelled token. `commit` calls the observer, waits through the clock's `sleep`, which a cancelled token ends early, and starts the next attempt. `next` is `reserve` then `commit`.
-- A `Bucket` keeps its balance as an integer in units of one token over `per` nanoseconds. Refills are therefore exact, and a wait is the ceiling of the deficit over the rate. `reserve` consumes and returns the wait. `wait` sleeps that long and refunds if cancelled.
-- `Group.do` runs the function outside its lock, removes the key and stores the result before waking the waiters. It matches the key by call identity. A `forget` followed by a new call is therefore not disturbed.
+This section covers `retry.delay`, `Bucket` and `Group.do`.
+
+#### Retry backoff
+
+| Function | Behaviour |
+| --- | --- |
+| `retry.delay` | Is the capped exponential backoff. |
+| `jittered` | Applies the chosen jitter to it. |
+| `reserve` | Plans the wait and stops at the attempt limit, the deadline or a cancelled token. |
+| `commit` | Calls the observer, waits through the clock's `sleep`, which a cancelled token ends early, and starts the next attempt. |
+| `next` | Is `reserve` then `commit`. |
+
+#### Token bucket
+
+A `Bucket` keeps its balance as an integer in units of one token over `per` nanoseconds. Refills are therefore exact, and a wait is the ceiling of the deficit over the rate.
+
+| Function | Behaviour |
+| --- | --- |
+| `reserve` | Consumes and returns the wait. |
+| `wait` | Sleeps that long and refunds if cancelled. |
+
+#### Call group
+
+`Group.do` runs the function outside its lock, removes the key and stores the result before waking the waiters. It matches the key by call identity. A `forget` followed by a new call is therefore not disturbed.
 
 ### Numerics
 
-- `std/math/stats`, `std/math/complex`, `std/math/matrix` and `std/math/fft` are written in Low and use no operating system service. Only `complex` and `fft` reach libm, through `std/math`, for `hypot`, `atan2`, `log`, `cos` and `sin`. A program that uses only `stats` or `matrix` therefore stays static. All four build for `browser/wasm32`.
-- `stats` rejects a `nan` or infinite input, and a `nan` or infinite result such as an overflowing sum, with `NotFinite`. A statistic is therefore never a silent `nan`. `variance` and `covariance` sum deviations from the mean with compensation and subtract the squared sum of the deviations. A large common offset therefore does not cost digits. `quantile` sorts a copy and takes position `q * (n - 1)`. `quantiles` sorts once for several. `histogram` takes its range from the data, widened by 0.5 on each side when every value is equal. `histogram_edges` ignores values outside the edges and finds the bin by binary search.
-- `complex.div` scales by the larger part of the divisor. A zero divisor divides each part of the dividend by zero. `csqrt` returns the root with a non-negative real part, and the sign of the imaginary part of a negative real argument follows the sign bit of the imaginary part, so the branch cut agrees with C99 `csqrt`.
-- `matrix` panics with a `matrix:` message when shapes do not fit, as `std/slices` panics on misuse. `fft.inverse_real` does the same with an `fft:` message. `lu` fails with `Singular` only when the best pivot is exactly zero. This is the criterion of LAPACK. A matrix that is singular up to rounding therefore factorises. `determinant` of a singular matrix is `0`. `least_squares` fails with `Singular` when a diagonal entry of `R` is at most `max(rows, cols) * epsilon` times the largest one. This is because rank deficiency from rounding shows as a small entry, not a zero.
-- `qr` takes `alpha = -sign(a[k][k]) * norm` for each reflection and leaves a column that is already zero below the diagonal alone. This gives the signs of LAPACK and `numpy.linalg.qr`.
-- `fft` computes twiddle factors with `cos` and `sin`, not by recurrence. Bluestein's algorithm reduces `k * k` modulo `2 * n` before forming the chirp angle. It convolves with a power-of-two transform of length at least `2 * n - 1`. `inverse` is the conjugate of the forward transform of the conjugate, divided by `n`.
-- The fixtures `testdata/run/std_math_stats`, `std_math_complex`, `std_math_matrix` and `std_math_fft` print every value rounded to six digits and normalise `-0.000000`, so the last bits of a libm do not change the output. Their `.out` files come from `numpy`, `cmath`, `math.fsum` and exact `fractions` arithmetic.
+This section covers `std/math/stats`, `std/math/complex`, `std/math/matrix` and `std/math/fft`.
+
+#### Numerics modules
+
+`std/math/stats`, `std/math/complex`, `std/math/matrix` and `std/math/fft` are written in Low and use no operating system service. Only `complex` and `fft` reach libm, through `std/math`, for `hypot`, `atan2`, `log`, `cos` and `sin`.
+
+A program that uses only `stats` or `matrix` therefore stays static. All four build for `browser/wasm32`.
+
+#### Statistics
+
+`stats` rejects a `nan` or infinite input, and a `nan` or infinite result such as an overflowing sum, with `NotFinite`. A statistic is therefore never a silent `nan`.
+
+| Function | Behaviour |
+| --- | --- |
+| `variance` and `covariance` | Sum deviations from the mean with compensation and subtract the squared sum of the deviations. A large common offset therefore does not cost digits. |
+| `quantile` | Sorts a copy and takes position `q * (n - 1)`. |
+| `quantiles` | Sorts once for several. |
+| `histogram` | Takes its range from the data, widened by 0.5 on each side when every value is equal. |
+| `histogram_edges` | Ignores values outside the edges and finds the bin by binary search. |
+
+#### Complex numbers
+
+| Function | Behaviour |
+| --- | --- |
+| `complex.div` | Scales by the larger part of the divisor. A zero divisor divides each part of the dividend by zero. |
+| `csqrt` | Returns the root with a non-negative real part, and the sign of the imaginary part of a negative real argument follows the sign bit of the imaginary part, so the branch cut agrees with C99 `csqrt`. |
+
+#### Matrix errors and singular matrices
+
+`matrix` panics with a `matrix:` message when shapes do not fit, as `std/slices` panics on misuse. `fft.inverse_real` does the same with an `fft:` message.
+
+| Function | Behaviour |
+| --- | --- |
+| `lu` | Fails with `Singular` only when the best pivot is exactly zero. This is the criterion of LAPACK. A matrix that is singular up to rounding therefore factorises. |
+| `determinant` | Of a singular matrix is `0`. |
+| `least_squares` | Fails with `Singular` when a diagonal entry of `R` is at most `max(rows, cols) * epsilon` times the largest one. This is because rank deficiency from rounding shows as a small entry, not a zero. |
+
+#### QR factorisation
+
+`qr` takes `alpha = -sign(a[k][k]) * norm` for each reflection and leaves a column that is already zero below the diagonal alone. This gives the signs of LAPACK and `numpy.linalg.qr`.
+
+#### FFT algorithms
+
+`fft` computes twiddle factors with `cos` and `sin`, not by recurrence.
+
+Bluestein's algorithm reduces `k * k` modulo `2 * n` before forming the chirp angle. It convolves with a power-of-two transform of length at least `2 * n - 1`.
+
+`inverse` is the conjugate of the forward transform of the conjugate, divided by `n`.
+
+#### Numerics fixtures
+
+The fixtures `testdata/run/std_math_stats`, `std_math_complex`, `std_math_matrix` and `std_math_fft` print every value rounded to six digits and normalise `-0.000000`, so the last bits of a libm do not change the output. Their `.out` files come from `numpy`, `cmath`, `math.fsum` and exact `fractions` arithmetic.
 
 ### Text
 
-- `diff.unified` merges hunks whose gap is at most twice the context, omits a count of 1 in a hunk header and writes `\ No newline at end of file`, as GNU `diff -u` does. The edit script is minimal.
-- `number.format_bytes` shows one decimal below 10 and rounds half to even on exact integers. `parse_bytes` reads `k` and `kb` as 1000 and `ki` and `kib` as 1024. It fails with `OutOfRange` on overflow or `TooPrecise` beyond 18 fraction digits. `si` rounds on the exact decimal expansion of the `f64`.
-- `naming.words` splits at case, acronym and digit boundaries and keeps combining marks attached to their letter, so `HTTPServerID2` is `http server id 2`.
+This section covers `diff.unified`, `number.format_bytes`, `parse_bytes`, `si` and `naming.words`.
+
+#### Unified diffs
+
+`diff.unified` merges hunks whose gap is at most twice the context, omits a count of 1 in a hunk header and writes `\ No newline at end of file`, as GNU `diff -u` does. The edit script is minimal.
+
+#### Byte sizes
+
+| Function | Behaviour |
+| --- | --- |
+| `number.format_bytes` | Shows one decimal below 10 and rounds half to even on exact integers. |
+| `parse_bytes` | Reads `k` and `kb` as 1000 and `ki` and `kib` as 1024. It fails with `OutOfRange` on overflow or `TooPrecise` beyond 18 fraction digits. |
+| `si` | Rounds on the exact decimal expansion of the `f64`. |
+
+#### Splitting names into words
+
+`naming.words` splits at case, acronym and digit boundaries and keeps combining marks attached to their letter, so `HTTPServerID2` is `http server id 2`.
 
 ### Time
 
-- Each concept is its own type: `Timestamp` is a point on the UTC timeline; `Date`, `TimeOfDay` and `DateTime` are civil values with no zone; `Zoned` is a timestamp seen through a zone; `Duration` is exact elapsed time; `Span` is a calendar amount. Types never convert silently.
-- Fields are private and constructors validate, so a `Date` cannot hold February 30. Months are 1 to 12, and `Month` and `Weekday` are enums. Nothing rolls over: `date.of(2026, 2, 30)` fails with `Invalid`, and the clamping forms are named (`clamped`, `plus_months`).
-- Calendar arithmetic and elapsed arithmetic are separate. A `Duration` moves a `Timestamp` or `Zoned` by elapsed time. A `Span` moves a `Date`, `DateTime` or `Zoned` by calendar units. A month after January 31 is the last day of February. A day after a spring-forward midnight is the next civil day, although it is 23 hours long. `until` and `since` take a `Diff`, add whole years, then months, to the start without passing the end, then count the rest.
-- Only `zone.local` reads the host zone. A civil time in a daylight saving gap or overlap needs a `Disambiguation`. In an overlap, `Compatible` and `Earlier` pick the first occurrence and `Later` the second. In a gap, `Compatible` and `Later` move forward by the gap and `Earlier` back. `Reject` fails with `Skipped` or `Ambiguous`. `zoned.start_of_day` is the first instant of the civil day, correct where midnight does not exist.
-- Zones come from TZif versions 1 to 4, using the 64-bit body from version 2. The footer's POSIX TZ rule applies after the last transition. Before the first transition the first standard-time type applies. The rules cover `Jn`, zero-based `n` and `Mm.w.d` days and transition times from -167 to 167 hours. Negative daylight saving (Dublin, Casablanca), half-hour shifts (Lord Howe) and skipped days (Apia) therefore work.
-- Parsing is strict ISO 8601, RFC 3339 and RFC 9557: `T`, `t` or a space separates date and time, a fraction has 1 to 9 digits, `:60` reads as `:59`, and a civil type rejects an offset. A written offset that disagrees with a bracketed zone is `OffsetConflict` unless an `OffsetPolicy` says which wins. Every parse error is `Syntax(at)` with the byte offset of the first bad character, or a value error naming the field.
-- The supported range is 0001-01-01 to 9999-12-31 for a `Timestamp` and years -9999 to 9999 for a `Date`. Leap seconds are not modelled. Plain arithmetic panics on overflow. The `try_` forms return an optional.
-- Month and weekday names are English. `pattern.Names` and `humanize.Words` carry other languages. `datefmt.names`, `pattern.compile_in` and `humanize.ago_in` fill them from CLDR for a `locale.Locale`.
+This section covers the time types, calendar and elapsed arithmetic, zones, parsing, the supported range and the names of months and weekdays.
+
+#### Time types
+
+Each concept is its own type:
+
+| Type | Is |
+| --- | --- |
+| `Timestamp` | A point on the UTC timeline. |
+| `Date`, `TimeOfDay` and `DateTime` | Civil values with no zone. |
+| `Zoned` | A timestamp seen through a zone. |
+| `Duration` | Exact elapsed time. |
+| `Span` | A calendar amount. |
+
+Types never convert silently.
+
+#### Time validation
+
+Fields are private and constructors validate, so a `Date` cannot hold February 30. Months are 1 to 12, and `Month` and `Weekday` are enums.
+
+Nothing rolls over: `date.of(2026, 2, 30)` fails with `Invalid`, and the clamping forms are named (`clamped`, `plus_months`).
+
+#### Calendar and elapsed arithmetic
+
+Calendar arithmetic and elapsed arithmetic are separate.
+
+| Type | Moves |
+| --- | --- |
+| `Duration` | A `Timestamp` or `Zoned` by elapsed time. |
+| `Span` | A `Date`, `DateTime` or `Zoned` by calendar units. |
+
+A month after January 31 is the last day of February. A day after a spring-forward midnight is the next civil day, although it is 23 hours long.
+
+`until` and `since` take a `Diff`, add whole years, then months, to the start without passing the end, then count the rest.
+
+#### Time zones and disambiguation
+
+Only `zone.local` reads the host zone. A civil time in a daylight saving gap or overlap needs a `Disambiguation`.
+
+| Disambiguation | In an overlap | In a gap |
+| --- | --- | --- |
+| `Compatible` | Picks the first occurrence. | Moves forward by the gap. |
+| `Earlier` | Picks the first occurrence. | Moves back. |
+| `Later` | Picks the second occurrence. | Moves forward by the gap. |
+
+`Reject` fails with `Skipped` or `Ambiguous`. `zoned.start_of_day` is the first instant of the civil day, correct where midnight does not exist.
+
+#### TZif zone data
+
+Zones come from TZif versions 1 to 4, using the 64-bit body from version 2.
+
+| Time | Applies |
+| --- | --- |
+| After the last transition | The footer's POSIX TZ rule. |
+| Before the first transition | The first standard-time type. |
+
+The rules cover `Jn`, zero-based `n` and `Mm.w.d` days and transition times from -167 to 167 hours. Negative daylight saving (Dublin, Casablanca), half-hour shifts (Lord Howe) and skipped days (Apia) therefore work.
+
+#### Time parsing
+
+Parsing is strict ISO 8601, RFC 3339 and RFC 9557:
+
+- `T`, `t` or a space separates date and time.
+- A fraction has 1 to 9 digits.
+- `:60` reads as `:59`.
+- A civil type rejects an offset.
+
+A written offset that disagrees with a bracketed zone is `OffsetConflict` unless an `OffsetPolicy` says which wins. Every parse error is `Syntax(at)` with the byte offset of the first bad character, or a value error naming the field.
+
+#### Time range and overflow
+
+| Type | Supported range |
+| --- | --- |
+| `Timestamp` | 0001-01-01 to 9999-12-31 |
+| `Date` | Years -9999 to 9999 |
+
+Leap seconds are not modelled. Plain arithmetic panics on overflow. The `try_` forms return an optional.
+
+#### Time names and locales
+
+Month and weekday names are English. `pattern.Names` and `humanize.Words` carry other languages. `datefmt.names`, `pattern.compile_in` and `humanize.ago_in` fill them from CLDR for a `locale.Locale`.
 
 ### Browser automation
 
-- `cdp.launch` finds `chromium`, `chromium-browser`, `google-chrome-stable` or `google-chrome` on `PATH` unless given an executable. It creates a profile with `file.temp_dir`. It starts the browser headless in its own process group with `--remote-debugging-port=0`. Standard input and output are discarded and standard error is piped. A green thread reads standard error until the `DevTools listening on` line, which gives the WebSocket address. That thread keeps draining standard error so the browser never blocks on a full pipe. Another green thread waits with `process.wait_exit_on` for the browser to end, so a browser that dies before the line fails the launch at once, as `Launch(Aborted)`, even while a helper it started, such as the crash reporter, keeps standard error open. Standard error closing with the browser still running gives `Launch(Eof)`. The startup deadline gives `Launch(TimedOut)`. `shutdown` closes the WebSocket, kills the process group, waits for that thread, reaps the browser and removes the profile.
-- Commands carry an id and, for a session, its `sessionId`. A pump green thread routes replies to the waiting call. It sends every other message to each subscription. A message that is not JSON fails every waiting call with `Protocol`. Sends are serialised. A call waits at most 30 seconds. Once the socket closes, every waiting call fails with `Closed` and the subscription channels close.
-- `open_page` creates a browser context that is disposed on detach. It denies downloads in that context. It turns on auto-attach with `waitForDebuggerOnStart` and flat sessions, so every page, frame and worker target pauses on creation. Each page subscribes to the events. It acts only on events of its own context and the sessions attached in it. The first page in the context is the opened page. Any other page in the context, such as a popup, is closed before it runs. Every other target in the context gets `Fetch.enable` for all URLs, `Network.enable`, auto-attach for its own children and, for pages, `Network.setBypassServiceWorker`, and only then resumes, so no request escapes interception. A target that cannot be prepared is closed. If it is the opened page, `open_page` fails. `close_page` ends the subscription and disposes the context. Each paused request is passed to `Handlers.request` on its own green thread. The request is continued or failed with the verdict. Responses and failed loads are reported with their URL.
-- Cancellation is the caller's: `let h = b.handle` and `cancel.on_cancel(t, fn() { cdp.shutdown_on(h) })` end everything the browser was doing.
+This section covers `cdp.launch`, the commands and messages of the connection, `open_page` and cancellation.
+
+#### Launching a browser
+
+`cdp.launch` finds `chromium`, `chromium-browser`, `google-chrome-stable` or `google-chrome` on `PATH` unless given an executable. It creates a profile with `file.temp_dir`. It starts the browser headless in its own process group with `--remote-debugging-port=0`. Standard input and output are discarded and standard error is piped.
+
+A green thread reads standard error until the `DevTools listening on` line, which gives the WebSocket address. That thread keeps draining standard error so the browser never blocks on a full pipe.
+
+#### Browser launch failures
+
+Another green thread waits with `process.wait_exit_on` for the browser to end, so a browser that dies before the line fails the launch at once, as `Launch(Aborted)`, even while a helper it started, such as the crash reporter, keeps standard error open.
+
+Standard error closing with the browser still running gives `Launch(Eof)`. The startup deadline gives `Launch(TimedOut)`.
+
+#### Browser shutdown
+
+`shutdown` closes the WebSocket, kills the process group, waits for the thread that waits for the browser to end, reaps the browser and removes the profile.
+
+#### Browser commands and messages
+
+Commands carry an id and, for a session, its `sessionId`. A pump green thread routes replies to the waiting call. It sends every other message to each subscription. Sends are serialised.
+
+| Condition | Result |
+| --- | --- |
+| A message that is not JSON | Fails every waiting call with `Protocol`. |
+| A call waits | At most 30 seconds. |
+| The socket closes | Every waiting call fails with `Closed` and the subscription channels close. |
+
+#### Browser page contexts and targets
+
+`open_page` creates a browser context that is disposed on detach. It denies downloads in that context. It turns on auto-attach with `waitForDebuggerOnStart` and flat sessions, so every page, frame and worker target pauses on creation.
+
+Each page subscribes to the events. It acts only on events of its own context and the sessions attached in it. The first page in the context is the opened page. Any other page in the context, such as a popup, is closed before it runs.
+
+Every other target in the context gets `Fetch.enable` for all URLs, `Network.enable`, auto-attach for its own children and, for pages, `Network.setBypassServiceWorker`, and only then resumes, so no request escapes interception. A target that cannot be prepared is closed. If it is the opened page, `open_page` fails.
+
+`close_page` ends the subscription and disposes the context.
+
+#### Browser request interception
+
+Each paused request is passed to `Handlers.request` on its own green thread. The request is continued or failed with the verdict. Responses and failed loads are reported with their URL.
+
+#### Browser cancellation
+
+Cancellation is the caller's: `let h = b.handle` and `cancel.on_cancel(t, fn() { cdp.shutdown_on(h) })` end everything the browser was doing.
 
 ### TLS
 
-- TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246), client and server. `Config.min_version` and `Config.max_version` bound the versions. They are written with `tls12` and `tls13`. They default to 1.2 through 1.3. A client offers its range through `supported_versions`. A server answers with the highest version both support. `Session.handle.version` holds the result.
-- Downgrade protection: a server that supports 1.3 ends a 1.2 ServerHello random with the RFC 8446 downgrade sentinel. A client that offered 1.3 aborts with `illegal_parameter` when it sees either sentinel. A server refuses `TLS_FALLBACK_SCSV` below its highest version with `inappropriate_fallback`.
-- `Config.cipher_suites` lists suites in preference order. A server takes the first of its own list that the client offers. `Session.handle.cipher_suite` holds the IANA code. `Session.handle.suite` holds the AEAD and hash.
-- TLS 1.3 has TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256 and TLS_AES_256_GCM_SHA384. TLS 1.2 has ECDHE with ECDSA or RSA authentication and AES-128-GCM with SHA-256, ChaCha20-Poly1305 with SHA-256 or AES-256-GCM with SHA-384, AEAD only. GCM records carry the 64-bit sequence number as their explicit nonce. ChaCha20-Poly1305 records use the RFC 7905 nonce.
-- TLS 1.3 key exchange offers the hybrid post-quantum group X25519MLKEM768 first, then X25519, P-256 and P-384. A client sends key shares for X25519MLKEM768 and X25519. A server picks the first group of its own order that the client supports. It answers with a HelloRetryRequest when the client sent no share for that group. So a client that supports X25519MLKEM768 always gets it. TLS 1.2 uses the first of X25519, P-256 and P-384 in the server's order that the client lists. In TLS 1.2 a server with an ECDSA certificate also requires the client to list the certificate's curve (RFC 8422).
-- Servers sign with ECDSA P-256 or P-384, RSA-PSS, RSA PKCS#1 v1.5 in TLS 1.2, or Ed25519. Keys are loaded from PEM (`x509.pem_certificates`, `x509.pem_private_key`). `std/crypto/x509` owns the one table of signature scheme codes. The client offer, the codes a key signs with and the key exchange authentication of a code all come from it. TLS 1.2 ECDSA signature schemes name only the hash, so either curve signs with SHA-256 or SHA-384 (`x509.SignatureRules.Tls12`). In TLS 1.3 a code names its curve. Clients verify the chain against `Config.roots`, or the system roots when that is empty. They check the host name against the certificate's subject alternative names. They verify CertificateVerify or ServerKeyExchange with any offered scheme the certificate allows and, in TLS 1.2, the suite's authentication.
-- TLS 1.2 requires the extended master secret (RFC 7627) on both sides. A client requires the secure renegotiation indication (RFC 5746). A server echoes it when the client sends it. Both refuse renegotiation with a `no_renegotiation` warning.
-- ALPN, SNI, KeyUpdate in TLS 1.3 and `close_notify` are supported. Session tickets are ignored, so there is no resumption or 0-RTT. Servers do not request client certificates. A client answers a CertificateRequest with an empty Certificate.
-- Records hold at most 2^14 bytes of plaintext, and a peer's ciphertext may add 256 bytes in TLS 1.3 or 2048 in TLS 1.2. A record or handshake error sends its fatal alert, such as `bad_record_mac`, `record_overflow`, `unexpected_message` or `decode_error`, and leaves the session unusable.
-- A session's read and write sides are independent, with a write lock, so different green threads can read and write it.
-- QUIC mode (`quic_client`, `quic_server`) runs the TLS 1.3 handshake without records. Handshake messages go to the transport per level. The traffic secrets are handed over as the schedule derives them. It offers TLS 1.3 only and carries the transport parameters in extension 0x39. It requires ALPN and an empty `legacy_session_id`. It rejects handshake data at the wrong level and bytes left over when a key changes. It caps a handshake message at 64 KiB.
-- A client with `Config.revocation.mode` other than `Off` sends the `status_request` extension (RFC 6066 section 8, `ocsp` with empty responder and request extensions). It checks what the server staples as Certificate status describes. A TLS 1.2 server answers with an empty `status_request` in its ServerHello and a `CertificateStatus` message after its Certificate. A TLS 1.3 server puts the response in the `status_request` extension of the certificate entry it belongs to. A server staples only when the client asked. It staples from `Config.staples`: each entry in TLS 1.3, the first entry alone in TLS 1.2. A revoked certificate sends `certificate_revoked`. Any other failure of the chain sends `bad_certificate`. This includes a status that cannot be established. `status_request_v2` is not offered or accepted.
-- A server with `Config.credentials` calls its `choose` once per connection. It passes the server name and ALPN protocols of the first ClientHello. The server presents the `Credentials` that `choose` returns instead of `Config.certificates`, `Config.key` and `Config.staples`. A selected `Credentials.protocol` the client did not offer fails the handshake after a `no_application_protocol` alert. Credentials without a certificate or a key refuse the handshake with `unrecognized_name`. `std/acme` uses this hook to serve a certificate that renews and to answer TLS-ALPN-01.
+This section covers TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246), client and server: versions, suites, key exchange, signatures, certificate status, QUIC mode and server credentials.
+
+#### TLS versions
+
+TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246), client and server. `Config.min_version` and `Config.max_version` bound the versions. They are written with `tls12` and `tls13`. They default to 1.2 through 1.3.
+
+A client offers its range through `supported_versions`. A server answers with the highest version both support. `Session.handle.version` holds the result.
+
+#### TLS downgrade protection
+
+| Peer | Behaviour |
+| --- | --- |
+| A server that supports 1.3 | Ends a 1.2 ServerHello random with the RFC 8446 downgrade sentinel. |
+| A client that offered 1.3 | Aborts with `illegal_parameter` when it sees either sentinel. |
+| A server | Refuses `TLS_FALLBACK_SCSV` below its highest version with `inappropriate_fallback`. |
+
+#### TLS cipher suite selection
+
+| Name | Meaning |
+| --- | --- |
+| `Config.cipher_suites` | Lists suites in preference order. |
+| `Session.handle.cipher_suite` | The IANA code. |
+| `Session.handle.suite` | The AEAD and hash. |
+
+A server takes the first of its own list that the client offers.
+
+#### TLS suites by version
+
+| Version | Suites |
+| --- | --- |
+| TLS 1.3 | TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256 and TLS_AES_256_GCM_SHA384. |
+| TLS 1.2 | ECDHE with ECDSA or RSA authentication and AES-128-GCM with SHA-256, ChaCha20-Poly1305 with SHA-256 or AES-256-GCM with SHA-384, AEAD only. |
+
+| Record | Nonce |
+| --- | --- |
+| GCM records | Carry the 64-bit sequence number as their explicit nonce. |
+| ChaCha20-Poly1305 records | Use the RFC 7905 nonce. |
+
+#### TLS 1.3 key exchange
+
+TLS 1.3 key exchange offers the hybrid post-quantum group X25519MLKEM768 first, then X25519, P-256 and P-384. A client sends key shares for X25519MLKEM768 and X25519.
+
+A server picks the first group of its own order that the client supports. It answers with a HelloRetryRequest when the client sent no share for that group. So a client that supports X25519MLKEM768 always gets it.
+
+#### TLS 1.2 key exchange
+
+TLS 1.2 uses the first of X25519, P-256 and P-384 in the server's order that the client lists. In TLS 1.2 a server with an ECDSA certificate also requires the client to list the certificate's curve (RFC 8422).
+
+#### TLS server signatures
+
+Servers sign with ECDSA P-256 or P-384, RSA-PSS, RSA PKCS#1 v1.5 in TLS 1.2, or Ed25519. Keys are loaded from PEM (`x509.pem_certificates`, `x509.pem_private_key`).
+
+#### TLS signature scheme codes
+
+`std/crypto/x509` owns the one table of signature scheme codes. The client offer, the codes a key signs with and the key exchange authentication of a code all come from it.
+
+TLS 1.2 ECDSA signature schemes name only the hash, so either curve signs with SHA-256 or SHA-384 (`x509.SignatureRules.Tls12`). In TLS 1.3 a code names its curve.
+
+#### TLS client verification of the server
+
+Clients verify the following:
+
+| Check | Against |
+| --- | --- |
+| The chain | `Config.roots`, or the system roots when that is empty. |
+| The host name | The certificate's subject alternative names. |
+| CertificateVerify or ServerKeyExchange | Any offered scheme the certificate allows and, in TLS 1.2, the suite's authentication. |
+
+#### TLS 1.2 handshake requirements
+
+TLS 1.2 requires the extended master secret (RFC 7627) on both sides. A client requires the secure renegotiation indication (RFC 5746). A server echoes it when the client sends it. Both refuse renegotiation with a `no_renegotiation` warning.
+
+#### TLS supported features and client certificates
+
+- ALPN, SNI, KeyUpdate in TLS 1.3 and `close_notify` are supported.
+- Session tickets are ignored, so there is no resumption or 0-RTT.
+- Servers do not request client certificates. A client answers a CertificateRequest with an empty Certificate.
+
+#### TLS record limits and alerts
+
+Records hold at most 2^14 bytes of plaintext, and a peer's ciphertext may add 256 bytes in TLS 1.3 or 2048 in TLS 1.2.
+
+A record or handshake error sends its fatal alert, such as `bad_record_mac`, `record_overflow`, `unexpected_message` or `decode_error`, and leaves the session unusable.
+
+#### TLS session concurrency
+
+A session's read and write sides are independent, with a write lock, so different green threads can read and write it.
+
+#### TLS in QUIC mode
+
+QUIC mode (`quic_client`, `quic_server`) runs the TLS 1.3 handshake without records.
+
+- Handshake messages go to the transport per level. The traffic secrets are handed over as the schedule derives them.
+- It offers TLS 1.3 only and carries the transport parameters in extension 0x39.
+- It requires ALPN and an empty `legacy_session_id`.
+- It rejects handshake data at the wrong level and bytes left over when a key changes.
+- It caps a handshake message at 64 KiB.
+
+#### TLS certificate status requests
+
+A client with `Config.revocation.mode` other than `Off` sends the `status_request` extension (RFC 6066 section 8, `ocsp` with empty responder and request extensions). It checks what the server staples as Certificate status describes. `status_request_v2` is not offered or accepted.
+
+#### TLS stapling by a server
+
+| Server | Behaviour |
+| --- | --- |
+| A TLS 1.2 server | Answers with an empty `status_request` in its ServerHello and a `CertificateStatus` message after its Certificate. |
+| A TLS 1.3 server | Puts the response in the `status_request` extension of the certificate entry it belongs to. |
+
+A server staples only when the client asked. It staples from `Config.staples`: each entry in TLS 1.3, the first entry alone in TLS 1.2.
+
+#### TLS revocation alerts
+
+| Condition | Alert |
+| --- | --- |
+| A revoked certificate | `certificate_revoked` |
+| Any other failure of the chain, which includes a status that cannot be established | `bad_certificate` |
+
+#### TLS server credentials hook
+
+A server with `Config.credentials` calls its `choose` once per connection. It passes the server name and ALPN protocols of the first ClientHello. The server presents the `Credentials` that `choose` returns instead of `Config.certificates`, `Config.key` and `Config.staples`.
+
+| Condition | Result |
+| --- | --- |
+| A selected `Credentials.protocol` the client did not offer | Fails the handshake after a `no_application_protocol` alert. |
+| Credentials without a certificate or a key | Refuse the handshake with `unrecognized_name`. |
+
+`std/acme` uses this hook to serve a certificate that renews and to answer TLS-ALPN-01.
 
 ### Certificate status
 
-- `x509.verify_chain` takes a `Revocation` with a `mode`, a list of stapled `staples` and an optional `fetcher`. `Off`, the default, checks nothing and does not require must-staple certificates to be stapled. `SoftFail` and `HardFail` check every certificate of the path below the trust anchor against the next certificate of the path. They skip a certificate with the `id-pkix-ocsp-nocheck` extension. The anchor is never checked.
-- A certificate's status comes from the first source that gives an answer: the stapled responses, then, with a `fetcher`, an OCSP request to each of its `ocsp_urls`, then each of its `crl_urls`. A response answers for the certificate its `CertID` names, whatever its place in the list. `Revoked` fails the check in every mode, with `Refused`. A status cannot be established because no source answered, the response is `Unknown`, unusable, unsigned by an acceptable responder or out of date, or the fetch failed. Such a status passes under `SoftFail` and fails with `Invalid` under `HardFail`. An `Unknown` OCSP answer falls through to the next source.
-- A certificate with the TLS feature extension `status_request` (must-staple, RFC 7633) needs a stapled `Good` response whenever the mode is not `Off`. A response from the fetcher does not satisfy it, and without one the check fails with `Invalid` in both modes.
-- Times are checked against the `now` the caller passes. A list or response counts as issued up to `clock_skew` (300 seconds) after `now` and as current up to `clock_skew` after its `nextUpdate`. A CRL and a single OCSP response without `nextUpdate` are not accepted.
-- `ocsp_request` writes an unsigned request with a SHA-1 or SHA-256 `CertID`. For a nonce of 1 to 32 bytes, it writes the RFC 8954 nonce extension. A fetched request carries a random 16 byte nonce. `ocsp_status` rejects a response whose nonce differs. It accepts a response with no nonce, as responders that serve precomputed responses do. It ignores the nonce of a stapled response.
-- `ocsp_status` accepts a response signed by the issuer of the certificate, named by name or by key hash. It accepts a response signed by a certificate carried in the response that the issuer issued, that is valid at `now`, has no unhandled critical extension and has `id-kp-OCSPSigning`. It recomputes the `CertID` with the hash the response names (SHA-1, SHA-256, SHA-384 or SHA-512) and verifies the signature with the algorithms of `check_signature`.
-- `parse_crl` reads v1 and v2 lists as strict DER, including every revoked entry. It keeps the entries encoded: `crl_lookup` scans them for one serial number and builds a value only for the match. `verify_crl` needs the list's issuer name to equal the issuer certificate's subject, `cRLSign` in its key usage when it has one, the authority key identifier of the list to equal the subject key identifier of the issuer when both exist, and a valid signature. `crl_status` also needs the list to cover the certificate: an issuing distribution point may be limited to user or CA certificates, or name a distribution point that must appear in the certificate's `crl_urls`. A list that is indirect, limited to some reasons or to attribute certificates, a delta list, or that has another critical extension or critical entry extension, fails to parse with `Unsupported`, since it would be incomplete for the certificates it is used for.
-- Fetching is a pair of function values, `Fetcher.ocsp` and `Fetcher.crl`, so tests and callers with their own transport substitute them. `std/crypto/x509/fetch` implements them over `std/http`. Nothing caches a response or a list. A caller that wants a cache wraps the functions.
+This section covers revocation checking in `x509.verify_chain`: its modes, status sources, must-staple, times, OCSP requests and responses, CRLs and fetching.
+
+#### Revocation modes
+
+`x509.verify_chain` takes a `Revocation` with a `mode`, a list of stapled `staples` and an optional `fetcher`.
+
+| Mode | Behaviour |
+| --- | --- |
+| `Off` | The default. Checks nothing and does not require must-staple certificates to be stapled. |
+| `SoftFail` and `HardFail` | Check every certificate of the path below the trust anchor against the next certificate of the path. They skip a certificate with the `id-pkix-ocsp-nocheck` extension. The anchor is never checked. |
+
+#### Certificate status sources
+
+A certificate's status comes from the first source that gives an answer: the stapled responses, then, with a `fetcher`, an OCSP request to each of its `ocsp_urls`, then each of its `crl_urls`.
+
+A response answers for the certificate its `CertID` names, whatever its place in the list.
+
+#### Certificate status outcomes
+
+`Revoked` fails the check in every mode, with `Refused`.
+
+A status cannot be established because no source answered, the response is `Unknown`, unusable, unsigned by an acceptable responder or out of date, or the fetch failed. Such a status passes under `SoftFail` and fails with `Invalid` under `HardFail`. An `Unknown` OCSP answer falls through to the next source.
+
+#### Must-staple certificates
+
+A certificate with the TLS feature extension `status_request` (must-staple, RFC 7633) needs a stapled `Good` response whenever the mode is not `Off`. A response from the fetcher does not satisfy it, and without one the check fails with `Invalid` in both modes.
+
+#### Certificate status times
+
+Times are checked against the `now` the caller passes.
+
+| A list or response counts as | Up to |
+| --- | --- |
+| Issued | `clock_skew` (300 seconds) after `now` |
+| Current | `clock_skew` after its `nextUpdate` |
+
+A CRL and a single OCSP response without `nextUpdate` are not accepted.
+
+#### OCSP requests and nonces
+
+`ocsp_request` writes an unsigned request with a SHA-1 or SHA-256 `CertID`. For a nonce of 1 to 32 bytes, it writes the RFC 8954 nonce extension. A fetched request carries a random 16 byte nonce.
+
+| Response | `ocsp_status` |
+| --- | --- |
+| A response whose nonce differs | Rejects it. |
+| A response with no nonce | Accepts it, as responders that serve precomputed responses do. |
+| A stapled response | Ignores its nonce. |
+
+#### OCSP response signers
+
+`ocsp_status` accepts a response signed by the issuer of the certificate, named by name or by key hash. It accepts a response signed by a certificate carried in the response that the issuer issued, that is valid at `now`, has no unhandled critical extension and has `id-kp-OCSPSigning`.
+
+It recomputes the `CertID` with the hash the response names (SHA-1, SHA-256, SHA-384 or SHA-512) and verifies the signature with the algorithms of `check_signature`.
+
+#### CRL parsing
+
+`parse_crl` reads v1 and v2 lists as strict DER, including every revoked entry. It keeps the entries encoded: `crl_lookup` scans them for one serial number and builds a value only for the match.
+
+A list that is indirect, limited to some reasons or to attribute certificates, a delta list, or that has another critical extension or critical entry extension, fails to parse with `Unsupported`, since it would be incomplete for the certificates it is used for.
+
+#### CRL verification
+
+`verify_crl` needs:
+
+- the list's issuer name to equal the issuer certificate's subject
+- `cRLSign` in its key usage when it has one
+- the authority key identifier of the list to equal the subject key identifier of the issuer when both exist
+- a valid signature
+
+`crl_status` also needs the list to cover the certificate: an issuing distribution point may be limited to user or CA certificates, or name a distribution point that must appear in the certificate's `crl_urls`.
+
+#### Certificate status fetching
+
+Fetching is a pair of function values, `Fetcher.ocsp` and `Fetcher.crl`, so tests and callers with their own transport substitute them. `std/crypto/x509/fetch` implements them over `std/http`.
+
+Nothing caches a response or a list. A caller that wants a cache wraps the functions.
 
 ### ACME
 
-- `acme.connect` fetches the directory (an `https` URL) of RFC 8555 and returns a `Client` that any number of green threads may share. Every signed request is a flattened JWS (`jose.sign_flattened`) with `url` and `nonce` in its protected header. The header has `kid` set to the account URL, or an embedded `jwk` for `new_account` and `revoke_with_key`. A request that reads a resource is POST-as-GET with an empty payload. The client keeps the `Replay-Nonce` values the server sends in a pool. It fetches one from `newNonce` when the pool is empty. A `badNonce` answer makes the client repeat the request with a fresh nonce, up to `Options.nonce_retries` times. `rejected_nonces` counts those answers. An account key signs with ES256 (P-256), ES384 (P-384), EdDSA (Ed25519) or RS256 (RSA). `x509.generate_private_key` makes the first three. `x509.pem_private_key` loads an RSA key.
-- An error answer is a `Problem`. Its `kind` is the suffix of the `urn:ietf:params:acme:error:` type (`Other` for any other type or a body that is not a problem document). It has `type_uri`, `detail`, `status`, `instance` and the `Subproblem` list of a `compound` answer. `Error` separates `Http`, `Server`, `Protocol` (an answer the protocol does not allow), `Crypto`, `Rejected` (an authorization became `invalid`), `OrderFailed`, `Timeout`, `Cancelled`, `Unsupported`, `Solver` and `Store`. `describe` writes any of them as one line.
-- Accounts: `new_account` creates an account or returns the one the server holds for the key. It does so with contacts, terms-of-service agreement and an external account binding (`Binding`, an HMAC SHA-256 key of at least 32 bytes). `find_account` never creates one and fails with kind `AccountDoesNotExist`. `change_key` signs the rollover with both keys. `deactivate_account` ends the account.
-- Orders: `new_order` takes `Identifier`s from `identifier(name)`, which makes an `ip` identifier (RFC 8738) of an IP address in its canonical text and a `dns` identifier of anything else, with an optional `profile` and the `replaces` identifier of RFC 9773. `wait_authorization` and `wait_order` poll on `Options.clock`. They wait for `Retry-After` (a number of seconds or an HTTP date) or `Options.poll_interval`. They fail with `Timeout` after `Options.poll_timeout` and with `Cancelled` when `Options.token` is cancelled. `download_chain` reads the PEM chain and lists the `alternate` links of the response in `Chain.alternates`.
-- `obtain` runs a whole order with `Solvers`. For each authorization that is not `valid`, it takes the first of `Solvers.methods` that the server offers and a solver exists for. It puts the response in place, answers the challenge and waits for the authorization. It takes the response away again, also when it fails. The TXT record of `dns-persist-01` stays. A wildcard name needs `dns-01`, or `dns-persist-01` with `PersistentDns.wildcard`. `csr_for` writes the PKCS#10 request. It uses the first DNS name as its subject when that is at most 64 bytes. It puts every name in the subject alternative name. `revoke` signs with the account. `revoke_with_key` signs with the certificate's own key.
-- Solvers: `http01_handler` answers `GET` and `HEAD` of `/.well-known/acme-challenge/<token>` from a `Challenges` table with the key authorization (404 for an unknown token). It passes every other request on. `tls_alpn_source` presents the certificate `put_certificate` holds for the server name to a ClientHello that offers `acme-tls/1`. It passes every other ClientHello to the source it wraps. `tls_alpn_credentials` writes that certificate. It is valid from an hour before `now` for 7 days. It carries the critical `id-pe-acmeIdentifier` extension holding the SHA-256 digest of the key authorization. For an IP identifier the SNI name is the `in-addr.arpa` or `ip6.arpa` name of the address. `DnsRecords` is a pair of functions that publish and remove the TXT record `dns01_name` and `dns01_value` compute. The module never contacts a DNS server.
-- DNS-PERSIST-01 (draft-ietf-acme-dns-persist) proves a domain with a TXT record at `_validation-persist.<domain>` that stays in place between orders. The record holds an issuer domain name of the CA, `accounturi`, and optionally `policy=wildcard` and `persistUntil=<Unix seconds>`. It uses the issue-value syntax of RFC 8659. `obtain` uses it when `Solvers.persistent` is set and the server offers the challenge for a `dns` identifier. It calls `PersistentDns.publish` with the record name and text. It leaves the record in place afterwards. The issuer is `PersistentDns.issuer` or the first of `Challenge.issuers`, which the client reads from `issuerDomainNames` or `issuer-domain-names` and requires to hold 1 to 10 names. `accounturi` is the account URL. For a server whose directory has `accountHashPrefix`, it is the URI of `account_hash_uri`. That URI is the prefix, `sha-256/` and the Base64url SHA-256 digest of one length byte, the lower case domain, the account key's JWK thumbprint and the account URL, which changes when the account key does. A wildcard authorization uses the challenge only with `PersistentDns.wildcard`. A `persist_until` that has passed fails with `Unsupported` before anything is published. `parse_dns_persist` reads a record as a server does. It reads names without regard to case. It ignores unknown parameters. It refuses a repeated `accounturi`, `policy` or `persistUntil`.
-- `renewal_id` builds the certificate identifier of RFC 9773 from the authority key identifier and the serial number (`Certificate.authority_key_id`, `Certificate.serial`). `renewal_info` returns the suggested `RenewalWindow` with the `Retry-After` of the answer.
-- `manager` keeps one certificate per entry of `ManagerConfig.names` obtained and renewed. It reads `account.pem` from the `Store`. It finds the account for that key or, when the server does not know it, creates one with the same key, and writes a new key there. A certificate saved as `<names joined with +>.pem` (with `*` and `:` written `_`) is used again when its key matches its leaf and its names cover the entry. Anything else counts as absent. Each issuance is retried under `ManagerConfig.backoff` with `std/retry`. Only the first attempt of a renewal carries `replaces`. A certificate is saved and served only after its leaf is checked against the key and the names. A run that gives up leaves the certificate alone for `failure_pause`. `renew_now` clears that pause.
-- A renewal is due at `renew_fraction` of the lifetime. When the directory has `renewalInfo` and `use_ari` is set, it is due instead at a random time inside the window the server suggests. The window is asked for again after its `Retry-After` or `check_interval`. A failed request keeps the earlier window. A window that ends before the certificate's validity begins is ignored. `run_once` makes one pass and returns the wait until the next. `start` runs passes on a green thread. `stop` or the cancelled `ManagerConfig.token` ends that thread. Every issuance reports an `Event` (`Obtained` with the reason `initial`, `scheduled`, `suggested` or `requested`, or `Failed`) to `ManagerConfig.observer`.
-- `source` returns the `tls.CredentialSource` that presents the current certificate of the entry whose name covers the SNI name (exact match without regard to case, or `*.` for one label). An empty name gets the first certificate held. An unknown name or nothing held yet refuses the handshake. It also answers TLS-ALPN-01 when `Solvers.challenges` is set. A renewed certificate reaches connections that start after the swap.
-- `memory_store` keeps the bytes in a map. `directory_store` creates its directory with mode `0o700`. It writes each file to a temporary file with mode `0o600` in that directory, flushes it and moves it onto the name. It refuses a name that is empty, starts with `.` or contains a path separator with `Invalid`.
-- Not supported: pre-authorization, listing the orders of an account, generating RSA keys, and for DNS-PERSIST-01 an IP identifier and a record at an ancestor of the domain (`ancestorDomain`).
+`acme.connect` fetches the directory (an `https` URL) of RFC 8555 and returns a `Client` that any number of green threads may share.
+
+#### ACME signed requests and nonces
+
+Every signed request is a flattened JWS (`jose.sign_flattened`) with `url` and `nonce` in its protected header. The header has `kid` set to the account URL, or an embedded `jwk` for `new_account` and `revoke_with_key`. A request that reads a resource is POST-as-GET with an empty payload.
+
+The client keeps the `Replay-Nonce` values the server sends in a pool. It fetches one from `newNonce` when the pool is empty. A `badNonce` answer makes the client repeat the request with a fresh nonce, up to `Options.nonce_retries` times. `rejected_nonces` counts those answers.
+
+#### ACME account keys
+
+An account key signs with one of these:
+
+| Signs with | Key | Source |
+| --- | --- | --- |
+| ES256 | P-256 | `x509.generate_private_key` makes it |
+| ES384 | P-384 | `x509.generate_private_key` makes it |
+| EdDSA | Ed25519 | `x509.generate_private_key` makes it |
+| RS256 | RSA | `x509.pem_private_key` loads an RSA key |
+
+#### ACME errors
+
+An error answer is a `Problem`. Its `kind` is the suffix of the `urn:ietf:params:acme:error:` type (`Other` for any other type or a body that is not a problem document). It has `type_uri`, `detail`, `status`, `instance` and the `Subproblem` list of a `compound` answer.
+
+`Error` separates `Http`, `Server`, `Protocol` (an answer the protocol does not allow), `Crypto`, `Rejected` (an authorization became `invalid`), `OrderFailed`, `Timeout`, `Cancelled`, `Unsupported`, `Solver` and `Store`. `describe` writes any of them as one line.
+
+#### ACME account functions
+
+| Function | What it does |
+| --- | --- |
+| `new_account` | Creates an account or returns the one the server holds for the key. It does so with contacts, terms-of-service agreement and an external account binding (`Binding`, an HMAC SHA-256 key of at least 32 bytes). |
+| `find_account` | Never creates one and fails with kind `AccountDoesNotExist`. |
+| `change_key` | Signs the rollover with both keys. |
+| `deactivate_account` | Ends the account. |
+
+#### ACME orders
+
+`new_order` takes `Identifier`s from `identifier(name)`, which makes an `ip` identifier (RFC 8738) of an IP address in its canonical text and a `dns` identifier of anything else, with an optional `profile` and the `replaces` identifier of RFC 9773.
+
+#### ACME polling and chain download
+
+`wait_authorization` and `wait_order` poll on `Options.clock`. They wait for `Retry-After` (a number of seconds or an HTTP date) or `Options.poll_interval`. They fail with:
+
+| Error | When |
+| --- | --- |
+| `Timeout` | After `Options.poll_timeout`. |
+| `Cancelled` | When `Options.token` is cancelled. |
+
+`download_chain` reads the PEM chain and lists the `alternate` links of the response in `Chain.alternates`.
+
+#### ACME obtain
+
+`obtain` runs a whole order with `Solvers`. For each authorization that is not `valid`, it takes the first of `Solvers.methods` that the server offers and a solver exists for. For that authorization it:
+
+1. Puts the response in place.
+2. Answers the challenge.
+3. Waits for the authorization.
+4. Takes the response away again, also when it fails.
+
+The TXT record of `dns-persist-01` stays. A wildcard name needs `dns-01`, or `dns-persist-01` with `PersistentDns.wildcard`.
+
+#### ACME certificate requests and revocation
+
+| Function | What it does |
+| --- | --- |
+| `csr_for` | Writes the PKCS#10 request. It uses the first DNS name as its subject when that is at most 64 bytes. It puts every name in the subject alternative name. |
+| `revoke` | Signs with the account. |
+| `revoke_with_key` | Signs with the certificate's own key. |
+
+#### ACME solvers
+
+| Solver | What it does |
+| --- | --- |
+| `http01_handler` | Answers `GET` and `HEAD` of `/.well-known/acme-challenge/<token>` from a `Challenges` table with the key authorization (404 for an unknown token). It passes every other request on. |
+| `tls_alpn_source` | Presents the certificate `put_certificate` holds for the server name to a ClientHello that offers `acme-tls/1`. It passes every other ClientHello to the source it wraps. |
+| `tls_alpn_credentials` | Writes that certificate. It is valid from an hour before `now` for 7 days. It carries the critical `id-pe-acmeIdentifier` extension holding the SHA-256 digest of the key authorization. For an IP identifier the SNI name is the `in-addr.arpa` or `ip6.arpa` name of the address. |
+| `DnsRecords` | A pair of functions that publish and remove the TXT record `dns01_name` and `dns01_value` compute. |
+
+The module never contacts a DNS server.
+
+#### ACME DNS-PERSIST-01 record
+
+DNS-PERSIST-01 (draft-ietf-acme-dns-persist) proves a domain with a TXT record at `_validation-persist.<domain>` that stays in place between orders. The record holds an issuer domain name of the CA, `accounturi`, and optionally `policy=wildcard` and `persistUntil=<Unix seconds>`. It uses the issue-value syntax of RFC 8659.
+
+| Part | What it holds |
+| --- | --- |
+| Issuer | The issuer is `PersistentDns.issuer` or the first of `Challenge.issuers`, which the client reads from `issuerDomainNames` or `issuer-domain-names` and requires to hold 1 to 10 names. |
+| `accounturi` | The account URL. For a server whose directory has `accountHashPrefix`, it is the URI of `account_hash_uri`. That URI is the prefix, `sha-256/` and the Base64url SHA-256 digest of one length byte, the lower case domain, the account key's JWK thumbprint and the account URL, which changes when the account key does. |
+
+#### ACME DNS-PERSIST-01 in obtain
+
+`obtain` uses it when `Solvers.persistent` is set and the server offers the challenge for a `dns` identifier. It calls `PersistentDns.publish` with the record name and text. It leaves the record in place afterwards.
+
+A wildcard authorization uses the challenge only with `PersistentDns.wildcard`. A `persist_until` that has passed fails with `Unsupported` before anything is published.
+
+#### ACME DNS-PERSIST-01 parsing
+
+`parse_dns_persist` reads a record as a server does:
+
+- It reads names without regard to case.
+- It ignores unknown parameters.
+- It refuses a repeated `accounturi`, `policy` or `persistUntil`.
+
+#### ACME renewal identifiers
+
+| Function | What it does |
+| --- | --- |
+| `renewal_id` | Builds the certificate identifier of RFC 9773 from the authority key identifier and the serial number (`Certificate.authority_key_id`, `Certificate.serial`). |
+| `renewal_info` | Returns the suggested `RenewalWindow` with the `Retry-After` of the answer. |
+
+#### ACME manager issuance
+
+`manager` keeps one certificate per entry of `ManagerConfig.names` obtained and renewed.
+
+It reads `account.pem` from the `Store`. It finds the account for that key or, when the server does not know it, creates one with the same key, and writes a new key there.
+
+- A certificate saved as `<names joined with +>.pem` (with `*` and `:` written `_`) is used again when its key matches its leaf and its names cover the entry. Anything else counts as absent.
+- Each issuance is retried under `ManagerConfig.backoff` with `std/retry`.
+- Only the first attempt of a renewal carries `replaces`.
+- A certificate is saved and served only after its leaf is checked against the key and the names.
+- A run that gives up leaves the certificate alone for `failure_pause`. `renew_now` clears that pause.
+
+#### ACME manager renewal timing
+
+A renewal is due at `renew_fraction` of the lifetime. When the directory has `renewalInfo` and `use_ari` is set, it is due instead at a random time inside the window the server suggests.
+
+- The window is asked for again after its `Retry-After` or `check_interval`.
+- A failed request keeps the earlier window.
+- A window that ends before the certificate's validity begins is ignored.
+
+| Name | What it does |
+| --- | --- |
+| `run_once` | Makes one pass and returns the wait until the next. |
+| `start` | Runs passes on a green thread. |
+| `stop` | Ends that thread. |
+| `ManagerConfig.token` | Ends that thread when it is cancelled. |
+
+Every issuance reports an `Event` (`Obtained` with the reason `initial`, `scheduled`, `suggested` or `requested`, or `Failed`) to `ManagerConfig.observer`.
+
+#### ACME manager certificate source
+
+`source` returns the `tls.CredentialSource` that presents the current certificate of the entry whose name covers the SNI name (exact match without regard to case, or `*.` for one label).
+
+| Case | Result |
+| --- | --- |
+| An empty name | Gets the first certificate held. |
+| An unknown name or nothing held yet | Refuses the handshake. |
+
+It also answers TLS-ALPN-01 when `Solvers.challenges` is set. A renewed certificate reaches connections that start after the swap.
+
+#### ACME stores
+
+| Store | What it does |
+| --- | --- |
+| `memory_store` | Keeps the bytes in a map. |
+| `directory_store` | Creates its directory with mode `0o700`. It writes each file to a temporary file with mode `0o600` in that directory, flushes it and moves it onto the name. It refuses a name that is empty, starts with `.` or contains a path separator with `Invalid`. |
+
+#### ACME unsupported features
+
+Not supported:
+
+- Pre-authorization.
+- Listing the orders of an account.
+- Generating RSA keys.
+- For DNS-PERSIST-01, an IP identifier.
+- For DNS-PERSIST-01, a record at an ancestor of the domain (`ancestorDomain`).
+
 ### SSH
-- The transport follows RFC 4253 with the binary packet protocol, strict key exchange (`kex-strict-c-v00@openssh.com`, `kex-strict-s-v00@openssh.com`) and `ext-info` (RFC 8308). Key exchanges are `mlkem768x25519-sha256`, `curve25519-sha256` (and its `@libssh.org` name), `ecdh-sha2-nistp256`, `ecdh-sha2-nistp384`, `diffie-hellman-group16-sha512` and `diffie-hellman-group14-sha256`. Host keys are `ssh-ed25519`, `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `rsa-sha2-256` and `rsa-sha2-512`. `ssh-rsa` with SHA-1 is not offered. Ciphers are `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com`, `aes256-ctr` and `aes128-ctr`. The CTR ciphers use `hmac-sha2-512-etm@openssh.com` or `hmac-sha2-256-etm@openssh.com`. Compression is `none`. `Algorithms` restricts each list. `default_kex`, `default_host_keys`, `default_ciphers` and `default_macs` return the defaults in preference order.
-- A packet carries at most 262144 bytes, and a larger length fails with `TooLarge` before anything is read. MACs and tags are compared in constant time. Sequence numbers run for the life of the connection. Under strict key exchange a message other than key exchange messages before `NEWKEYS`, or a first packet that is not `KEXINIT`, fails with `StrictKex`, and sequence numbers reset at each `NEWKEYS`.
-- A key exchange starts after `rekey_bytes` (default 1 GiB) or `rekey_seconds` (default one hour) under one set of keys, or when the peer starts one. `key_exchanges` counts them. The `diffie-hellman` groups use `rsa.mod_pow`, so the private exponent never selects a branch or a table index.
-- A client verifies the server's host key through `verify_host_key`, which `accept_any_host_key`, `key.known_hosts_verifier` and `key.trust_on_first_use` make. The signature over the exchange hash is checked after it. A server signs with the host key whose algorithm the client offers.
-- User authentication (RFC 4252, RFC 4256) tries the `AuthMethod`s in order: `NoAuth`, `Password`, `PublicKey` and `KeyboardInteractive`. `PublicKey` sends a query, then a signature over the session identifier. Its `Signer` may be a certified key or come from `std/ssh/agent`. The server calls `ServerAuth` callbacks. It can require several methods in sequence (`required`, answered with partial success). It shows a banner. It ends the connection with `Disconnected` after `max_attempts` failures (default 6). Queries and `none` requests do not count as failures. A client that exhausts its methods fails with `AuthFailed`.
-- `ClientConfig.handshake_timeout` (milliseconds, 0 or less for none) bounds the TCP connect of `dial` and the version exchange, key exchange and authentication of `dial` and `client` together. `dial` gives the handshake what the connect left. The bound is a timer green thread. It closes the stream when it fires. It stops once authentication succeeds, so later channel IO is not bound by it. `dial_through` bounds only the handshake. A failure of the transport in a stage is `Handshake(phase, cause)`. Such a failure is a timeout, an end of stream or a stream error. `Phase` is `Connect`, `VersionExchange`, `KeyExchange` or `Authentication`. `cause` is `TimedOut` for the timeout. The failures the protocol itself reports keep their variants, which name their stage. `BadVersion` is for the version exchange. `NoCommonAlgorithm`, `KeyExchange`, `BadSignature` and `StrictKex` are for the key exchange. `HostKeyRejected` is for the host key. `AuthFailed` is for authentication.
-- Channels are multiplexed with a 2 MiB window per channel, adjusted after half is consumed. A write waits while the peer's window is empty, so a slow reader stops the writer and the sender never overruns it. At most 1024 channels are open. `close_write_on` sends EOF. A channel closes once both sides have sent `CLOSE`. Extended data type 1 is stderr. A server handler called for each `Incoming` calls `accept` or `reject`. By default every channel is refused.
-- A session client reads `wait_exit_on` for the `exit-status` or `exit-signal` the server sent. `exec` collects stdout, stderr and the exit status.
-- Forwarding: `listen_local` binds a local port and opens a `direct-tcpip` channel for each connection. `listen_remote` sends `tcpip-forward`. `accept_forward` returns each `forwarded-tcpip` channel with the origin address. `direct_streamlocal` reaches a Unix socket. `serve_direct_tcpip` and `forward_global` give a server the matching handlers.
-- `key.parse_private_key` reads unencrypted and `aes256-ctr` plus bcrypt encrypted `openssh-key-v1` keys, with the check integers verified before the keys are returned, and PEM keys. A wrong passphrase is `WrongPassphrase`. A certificate checks the signature of its authority over the certificate body, its validity window, its type and the principal that logs in.
-- SFTP version 3 requests are pipelined. Reads run ahead by 8 requests. Writes are sent without waiting for each reply, with a failure reported by a later write, `flush` or `close`. The sizes come from `limits@openssh.com` when the server sends it, capped at 65536. The server resolves every path from its root. `..` stops at the root. Symbolic links are expanded in the process. An absolute link target is taken relative to the root. More than 40 links fail. On Windows a backslash separates components in client paths and link targets. On Windows a drive prefix of a link target is dropped before the target is taken relative to the root. On Windows a component is `NotFound` if it has a character Windows rejects (`<>:"|?*`, control characters), a trailing dot or space, or a device name (`CON`, `NUL`, `COM1` and the others). A failing `lstat` other than `NotFound` ends the request. The root itself cannot be removed, renamed or replaced. Each operation resolves its path again, so the server does not protect against a directory replaced by a link while a request runs.
-- `std/ssh/agent` keeps one `io.Stream` per `Session`. `dial` makes it, in `agent_linux.low` (a Unix socket through `std/net`) or in `agent_windows.low`. The Windows `dial` opens a path that starts with `\\.\pipe\` through `sys.open_pipe` and `sys.stream_on`, so reads and writes park the green thread. It sends any other path to the Unix socket as on Linux. `connect_env` uses `SSH_AUTH_SOCK`. When that is unset or empty, it uses the OpenSSH agent service pipe `\\.\pipe\openssh-ssh-agent` on Windows and `NoAgent` elsewhere. `connect_pageant` finds the window of class `Pageant`. Each request creates a file mapping named `PageantRequest` and sixteen hex digits. It copies the framed request into the mapping. It sends `WM_COPYDATA` with `dwData` `0x804e50ba` and the mapping's name through `SendMessageTimeoutW` (a minute, abort if hung). It reads the framed reply back from the mapping. The mapping has the default security descriptor and holds at most 262144 bytes. `agent/pageant.low` wraps that exchange in an `io.Stream`. A write collects one frame and calls the exchange. Reads return the reply. `connect_any` tries `SSH_AUTH_SOCK` when it is set, then on Windows the pipe and Pageant, and fails with the first failure. `agent/pageant_test.low` runs the framing against a fake exchange on Linux. No test exercises Pageant itself. `testdata/windows/ssh_agent_pipe.low` serves a fake agent on a named pipe from a child process. `std/ssh/agent/agent_test_windows.low` checks the default pipe, a missing pipe and a missing Pageant window.
-- The OpenSSH interoperation tests and the permission-bit tests of `std/ssh/sftp` run on Linux only (`interop_test_linux.low`, `sftp_test_linux.low`). `sftp_test_windows.low` holds the Windows path and link containment tests.
-- Interoperation is checked against OpenSSH 10.6p1. The `ssh`, `sftp` and `scp` clients run against the server and the client runs against an unprivileged `sshd`, over every cipher, MAC, key exchange and host key above.
+
+The transport follows RFC 4253 with the binary packet protocol, strict key exchange (`kex-strict-c-v00@openssh.com`, `kex-strict-s-v00@openssh.com`) and `ext-info` (RFC 8308).
+
+#### SSH algorithms
+
+| Kind | Algorithms |
+| --- | --- |
+| Key exchanges | `mlkem768x25519-sha256`, `curve25519-sha256` (and its `@libssh.org` name), `ecdh-sha2-nistp256`, `ecdh-sha2-nistp384`, `diffie-hellman-group16-sha512` and `diffie-hellman-group14-sha256`. |
+| Host keys | `ssh-ed25519`, `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `rsa-sha2-256` and `rsa-sha2-512`. `ssh-rsa` with SHA-1 is not offered. |
+| Ciphers | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com`, `aes256-ctr` and `aes128-ctr`. |
+| MACs | The CTR ciphers use `hmac-sha2-512-etm@openssh.com` or `hmac-sha2-256-etm@openssh.com`. |
+| Compression | `none`. |
+
+`Algorithms` restricts each list. `default_kex`, `default_host_keys`, `default_ciphers` and `default_macs` return the defaults in preference order.
+
+#### SSH packet limits and strict key exchange
+
+- A packet carries at most 262144 bytes, and a larger length fails with `TooLarge` before anything is read.
+- MACs and tags are compared in constant time.
+- Sequence numbers run for the life of the connection.
+- Under strict key exchange a message other than key exchange messages before `NEWKEYS`, or a first packet that is not `KEXINIT`, fails with `StrictKex`.
+- Under strict key exchange, sequence numbers reset at each `NEWKEYS`.
+
+#### SSH rekeying
+
+A key exchange starts after `rekey_bytes` or `rekey_seconds` under one set of keys, or when the peer starts one.
+
+| Option | Default |
+| --- | --- |
+| `rekey_bytes` | 1 GiB |
+| `rekey_seconds` | One hour |
+
+`key_exchanges` counts them. The `diffie-hellman` groups use `rsa.mod_pow`, so the private exponent never selects a branch or a table index.
+
+#### SSH host key verification
+
+A client verifies the server's host key through `verify_host_key`, which `accept_any_host_key`, `key.known_hosts_verifier` and `key.trust_on_first_use` make. The signature over the exchange hash is checked after it. A server signs with the host key whose algorithm the client offers.
+
+#### SSH user authentication
+
+User authentication (RFC 4252, RFC 4256) tries the `AuthMethod`s in order: `NoAuth`, `Password`, `PublicKey` and `KeyboardInteractive`.
+
+`PublicKey` sends a query, then a signature over the session identifier. Its `Signer` may be a certified key or come from `std/ssh/agent`. A client that exhausts its methods fails with `AuthFailed`.
+
+#### SSH server authentication
+
+The server calls `ServerAuth` callbacks.
+
+- It can require several methods in sequence (`required`, answered with partial success).
+- It shows a banner.
+- It ends the connection with `Disconnected` after `max_attempts` failures (default 6). Queries and `none` requests do not count as failures.
+
+#### SSH handshake timeout
+
+`ClientConfig.handshake_timeout` (milliseconds, 0 or less for none) bounds the TCP connect of `dial` and the version exchange, key exchange and authentication of `dial` and `client` together. `dial` gives the handshake what the connect left.
+
+- The bound is a timer green thread. It closes the stream when it fires.
+- It stops once authentication succeeds, so later channel IO is not bound by it.
+- `dial_through` bounds only the handshake.
+
+#### SSH handshake failures
+
+A failure of the transport in a stage is `Handshake(phase, cause)`. Such a failure is a timeout, an end of stream or a stream error. `Phase` is `Connect`, `VersionExchange`, `KeyExchange` or `Authentication`. `cause` is `TimedOut` for the timeout.
+
+The failures the protocol itself reports keep their variants, which name their stage:
+
+| Variant | Stage |
+| --- | --- |
+| `BadVersion` | The version exchange. |
+| `NoCommonAlgorithm` | The key exchange. |
+| `KeyExchange` | The key exchange. |
+| `BadSignature` | The key exchange. |
+| `StrictKex` | The key exchange. |
+| `HostKeyRejected` | The host key. |
+| `AuthFailed` | Authentication. |
+
+#### SSH channels
+
+Channels are multiplexed with a 2 MiB window per channel, adjusted after half is consumed.
+
+| Topic | Behaviour |
+| --- | --- |
+| Writes | A write waits while the peer's window is empty, so a slow reader stops the writer and the sender never overruns it. |
+| Open channels | At most 1024 channels are open. |
+| `close_write_on` | Sends EOF. |
+| Closing | A channel closes once both sides have sent `CLOSE`. |
+| Extended data | Extended data type 1 is stderr. |
+
+#### SSH server channel handlers
+
+A server handler called for each `Incoming` calls `accept` or `reject`. By default every channel is refused.
+
+#### SSH session exit and exec
+
+A session client reads `wait_exit_on` for the `exit-status` or `exit-signal` the server sent. `exec` collects stdout, stderr and the exit status.
+
+#### SSH forwarding
+
+| Function | What it does |
+| --- | --- |
+| `listen_local` | Binds a local port and opens a `direct-tcpip` channel for each connection. |
+| `listen_remote` | Sends `tcpip-forward`. |
+| `accept_forward` | Returns each `forwarded-tcpip` channel with the origin address. |
+| `direct_streamlocal` | Reaches a Unix socket. |
+| `serve_direct_tcpip` and `forward_global` | Give a server the matching handlers. |
+
+#### SSH key parsing and certificates
+
+`key.parse_private_key` reads unencrypted and `aes256-ctr` plus bcrypt encrypted `openssh-key-v1` keys, with the check integers verified before the keys are returned, and PEM keys. A wrong passphrase is `WrongPassphrase`.
+
+A certificate checks:
+
+- The signature of its authority over the certificate body.
+- Its validity window.
+- Its type.
+- The principal that logs in.
+
+#### SFTP request pipelining
+
+SFTP version 3 requests are pipelined.
+
+| Topic | Behaviour |
+| --- | --- |
+| Reads | Run ahead by 8 requests. |
+| Writes | Are sent without waiting for each reply, with a failure reported by a later write, `flush` or `close`. |
+| Sizes | Come from `limits@openssh.com` when the server sends it, capped at 65536. |
+
+#### SFTP server path resolution
+
+- The server resolves every path from its root. `..` stops at the root.
+- Symbolic links are expanded in the process. An absolute link target is taken relative to the root. More than 40 links fail.
+- A failing `lstat` other than `NotFound` ends the request.
+- The root itself cannot be removed, renamed or replaced.
+- Each operation resolves its path again, so the server does not protect against a directory replaced by a link while a request runs.
+
+#### SFTP paths on Windows
+
+- On Windows a backslash separates components in client paths and link targets.
+- On Windows a drive prefix of a link target is dropped before the target is taken relative to the root.
+- On Windows a component is `NotFound` if it has a character Windows rejects (`<>:"|?*`, control characters), a trailing dot or space, or a device name (`CON`, `NUL`, `COM1` and the others).
+
+#### SSH agent connections
+
+`std/ssh/agent` keeps one `io.Stream` per `Session`. `dial` makes it, in `agent_linux.low` (a Unix socket through `std/net`) or in `agent_windows.low`.
+
+- The Windows `dial` opens a path that starts with `\\.\pipe\` through `sys.open_pipe` and `sys.stream_on`, so reads and writes park the green thread.
+- It sends any other path to the Unix socket as on Linux.
+
+| Function | What it does |
+| --- | --- |
+| `connect_env` | Uses `SSH_AUTH_SOCK`. When that is unset or empty, it uses the OpenSSH agent service pipe `\\.\pipe\openssh-ssh-agent` on Windows and `NoAgent` elsewhere. |
+| `connect_pageant` | Finds the window of class `Pageant`. |
+| `connect_any` | Tries `SSH_AUTH_SOCK` when it is set, then on Windows the pipe and Pageant, and fails with the first failure. |
+
+#### SSH Pageant exchange
+
+Each request:
+
+1. Creates a file mapping named `PageantRequest` and sixteen hex digits.
+2. Copies the framed request into the mapping.
+3. Sends `WM_COPYDATA` with `dwData` `0x804e50ba` and the mapping's name through `SendMessageTimeoutW` (a minute, abort if hung).
+4. Reads the framed reply back from the mapping.
+
+The mapping has the default security descriptor and holds at most 262144 bytes.
+
+`agent/pageant.low` wraps that exchange in an `io.Stream`. A write collects one frame and calls the exchange. Reads return the reply.
+
+#### SSH agent tests
+
+- `agent/pageant_test.low` runs the framing against a fake exchange on Linux. No test exercises Pageant itself.
+- `testdata/windows/ssh_agent_pipe.low` serves a fake agent on a named pipe from a child process.
+- `std/ssh/agent/agent_test_windows.low` checks the default pipe, a missing pipe and a missing Pageant window.
+
+#### SSH test platforms
+
+- The OpenSSH interoperation tests and the permission-bit tests of `std/ssh/sftp` run on Linux only (`interop_test_linux.low`, `sftp_test_linux.low`).
+- `sftp_test_windows.low` holds the Windows path and link containment tests.
+
+#### SSH interoperation with OpenSSH
+
+Interoperation is checked against OpenSSH 10.6p1. The `ssh`, `sftp` and `scp` clients run against the server and the client runs against an unprivileged `sshd`, over every cipher, MAC, key exchange and host key above.
 
 ### QUIC
 
-- An endpoint is one UDP socket and one reader green thread. A datagram over 1500 bytes is dropped. The rest are routed by destination connection ID, at most 4096 routes. Each connection is a loop green thread that owns all of its state. The reader, the TLS handshake green thread and user calls reach it through channels. Every send to it also waits on a channel that closes when the loop exits, so nothing blocks on a connection that has ended.
-- A server answers an unsupported version with Version Negotiation only for datagrams of at least 1200 bytes. It holds at most 256 connections whose handshake is incomplete, at most 8 of them per client IP address. An Initial beyond either limit is dropped. From 128 of them, or always when `Config.retry` is set, a new Initial gets a Retry. Its token is an HMAC-SHA256 over the client address, an expiry 10 seconds ahead, the original connection ID and the source connection ID of the Retry. The token is compared in constant time. The token is accepted only on an Initial whose destination connection ID is that source connection ID, so one token starts one connection: later Initials with that ID are routed to it. Before the client address is validated the server sends at most three times the bytes received. A client accepts one Retry. It ignores Retry and Version Negotiation once it has processed another packet. A short-header datagram of at least 42 bytes for no connection gets a smaller stateless reset. Its token is an HMAC of the connection ID.
-- The handshake runs `tls.quic_client` or `tls.quic_server` on its own green thread. Received CRYPTO data is reassembled to at most 64 KiB in at most 64 pieces per level. Beyond that the connection fails with `CRYPTO_BUFFER_EXCEEDED`. At most 16 packets wait for keys not yet installed. CRYPTO data that arrives after the handshake, such as session tickets, is discarded. Initial keys are discarded when Handshake packets flow. Handshake keys are discarded when the handshake is confirmed. The handshake timeout runs until the handshake is confirmed. For a client that is the arrival of HANDSHAKE_DONE. So a client whose server abandoned the handshake after the client finished its side ends with `TimedOut` within that timeout. Each side checks the peer's transport parameters: the connection IDs they name, including a Retry's, must match the ones seen on the wire, and a client must not send the parameters only a server sends.
-- Packets carry ACKs for at most 32 received ranges, sent within 5 ms or at once after two ack-eliciting packets. Loss recovery is `std/quic/recovery`. The sender skips a packet number every 128 to 384 packets. An ACK of a skipped or unsent number is `PROTOCOL_VIOLATION`. Only the first 256 ranges of an ACK frame are processed. Lost frames are sent again from what the packet carried, so stream data, flow control updates and control frames are rebuilt rather than copied.
-- 1-RTT keys are updated after 2^23 packets or when `update_keys` asks, and a peer's key update is followed. Every change of the sending keys sends a PING, so the acknowledgement that allows the next update arrives even when there is no data to send. A connection closes with `AEAD_LIMIT_REACHED` once more packets fail authentication than the integrity limit of its AEAD. The limit is 2^52, or 2^36 for ChaCha20-Poly1305.
-- Connection IDs: the endpoint issues 8-byte IDs and stores at most 2 of the peer's. RETIRE_CONNECTION_ID frames owed to the peer are capped at 8. Beyond that the connection fails with `CONNECTION_ID_LIMIT_ERROR`. Only the latest PATH_CHALLENGE is answered. Connection migration is not supported.
-- Streams: flow control applies per stream and per connection in both directions, and the receive windows are credited as the application reads. A stream reassembles into one receive buffer. The buffer spans the read position to the highest offset received. It grows by doubling, never past the flow control window. Each byte is copied once into place. Bytes that were already received are not overwritten by a retransmission. A sorted list of received ranges describes the buffer. The list holds at most 256 ranges, and beyond that the connection fails with `PROTOCOL_VIOLATION`. Data past the flow control limit, a changed final size and an offset plus length over 2^62-1 fail the connection with the matching error. A peer opens at most the advertised number of streams of each type. At most 4096 are tracked. The allowance of a peer-opened stream returns (MAX_STREAMS) only when the stream is complete and the application has accepted it. So streams the application never accepts stay bounded by the advertised number. `write` parks while the stream's 1 MiB send buffer or the peer's credit is exhausted.
-- Closing: `close_on` sends CONNECTION_CLOSE. The connection stays closing for three probe timeouts, answering with the same frame. While a stream holds data the peer has not acknowledged, `close_on` holds the CONNECTION_CLOSE back for at most 5 seconds and never past the idle timeout. `close_listener` asks every connection to close before it waits for any, so it takes as long as the slowest one, not the sum. A CONNECTION_CLOSE from the peer drains it. The idle timeout, the handshake timeout and a stateless reset end it. A reason phrase is truncated to 1024 bytes and never interpreted.
-- Not supported: 0-RTT, session resumption, connection migration, datagrams (RFC 9221) and versions other than 1.
+An endpoint is one UDP socket and one reader green thread.
+
+#### QUIC datagram routing
+
+A datagram over 1500 bytes is dropped. The rest are routed by destination connection ID, at most 4096 routes.
+
+#### QUIC connection loop
+
+Each connection is a loop green thread that owns all of its state. The reader, the TLS handshake green thread and user calls reach it through channels. Every send to it also waits on a channel that closes when the loop exits, so nothing blocks on a connection that has ended.
+
+#### QUIC Version Negotiation and incomplete handshakes
+
+A server answers an unsupported version with Version Negotiation only for datagrams of at least 1200 bytes.
+
+It holds at most 256 connections whose handshake is incomplete, at most 8 of them per client IP address. An Initial beyond either limit is dropped. From 128 of them, or always when `Config.retry` is set, a new Initial gets a Retry.
+
+#### QUIC Retry token
+
+The token of a Retry is an HMAC-SHA256 over:
+
+- The client address.
+- An expiry 10 seconds ahead.
+- The original connection ID.
+- The source connection ID of the Retry.
+
+The token is compared in constant time. The token is accepted only on an Initial whose destination connection ID is that source connection ID, so one token starts one connection: later Initials with that ID are routed to it.
+
+#### QUIC address validation limit
+
+Before the client address is validated the server sends at most three times the bytes received.
+
+#### QUIC client Retry handling
+
+A client accepts one Retry. It ignores Retry and Version Negotiation once it has processed another packet.
+
+#### QUIC stateless reset
+
+A short-header datagram of at least 42 bytes for no connection gets a smaller stateless reset. Its token is an HMAC of the connection ID.
+
+#### QUIC handshake buffers and keys
+
+The handshake runs `tls.quic_client` or `tls.quic_server` on its own green thread.
+
+| Item | Behaviour |
+| --- | --- |
+| Received CRYPTO data | Reassembled to at most 64 KiB in at most 64 pieces per level. Beyond that the connection fails with `CRYPTO_BUFFER_EXCEEDED`. |
+| Packets waiting for keys not yet installed | At most 16 packets wait. |
+| CRYPTO data that arrives after the handshake | Discarded, such as session tickets. |
+| Initial keys | Discarded when Handshake packets flow. |
+| Handshake keys | Discarded when the handshake is confirmed. |
+
+#### QUIC handshake timeout
+
+The handshake timeout runs until the handshake is confirmed. For a client that is the arrival of HANDSHAKE_DONE. So a client whose server abandoned the handshake after the client finished its side ends with `TimedOut` within that timeout.
+
+#### QUIC transport parameter checks
+
+Each side checks the peer's transport parameters:
+
+- The connection IDs they name, including a Retry's, must match the ones seen on the wire.
+- A client must not send the parameters only a server sends.
+
+#### QUIC acknowledgements
+
+Packets carry ACKs for at most 32 received ranges, sent within 5 ms or at once after two ack-eliciting packets.
+
+#### QUIC loss recovery
+
+Loss recovery is `std/quic/recovery`.
+
+- The sender skips a packet number every 128 to 384 packets. An ACK of a skipped or unsent number is `PROTOCOL_VIOLATION`.
+- Only the first 256 ranges of an ACK frame are processed.
+- Lost frames are sent again from what the packet carried, so stream data, flow control updates and control frames are rebuilt rather than copied.
+
+#### QUIC key updates and AEAD limits
+
+1-RTT keys are updated after 2^23 packets or when `update_keys` asks, and a peer's key update is followed. Every change of the sending keys sends a PING, so the acknowledgement that allows the next update arrives even when there is no data to send.
+
+A connection closes with `AEAD_LIMIT_REACHED` once more packets fail authentication than the integrity limit of its AEAD. The limit is 2^52, or 2^36 for ChaCha20-Poly1305.
+
+#### QUIC connection IDs
+
+| Item | Behaviour |
+| --- | --- |
+| Issued IDs | The endpoint issues 8-byte IDs. |
+| Peer's IDs | The endpoint stores at most 2 of the peer's. |
+| RETIRE_CONNECTION_ID frames owed to the peer | Capped at 8. Beyond that the connection fails with `CONNECTION_ID_LIMIT_ERROR`. |
+| PATH_CHALLENGE | Only the latest is answered. |
+
+Connection migration is not supported.
+
+#### QUIC stream flow control
+
+Flow control applies per stream and per connection in both directions, and the receive windows are credited as the application reads.
+
+- Data past the flow control limit, a changed final size and an offset plus length over 2^62-1 fail the connection with the matching error.
+- `write` parks while the stream's 1 MiB send buffer or the peer's credit is exhausted.
+
+#### QUIC stream receive buffer
+
+A stream reassembles into one receive buffer.
+
+- The buffer spans the read position to the highest offset received.
+- It grows by doubling, never past the flow control window.
+- Each byte is copied once into place.
+- Bytes that were already received are not overwritten by a retransmission.
+- A sorted list of received ranges describes the buffer. The list holds at most 256 ranges, and beyond that the connection fails with `PROTOCOL_VIOLATION`.
+
+#### QUIC stream counts
+
+A peer opens at most the advertised number of streams of each type. At most 4096 are tracked. The allowance of a peer-opened stream returns (MAX_STREAMS) only when the stream is complete and the application has accepted it. So streams the application never accepts stay bounded by the advertised number.
+
+#### QUIC closing a connection
+
+| Function | What it does |
+| --- | --- |
+| `close_on` | Sends CONNECTION_CLOSE. The connection stays closing for three probe timeouts, answering with the same frame. While a stream holds data the peer has not acknowledged, `close_on` holds the CONNECTION_CLOSE back for at most 5 seconds and never past the idle timeout. |
+| `close_listener` | Asks every connection to close before it waits for any, so it takes as long as the slowest one, not the sum. |
+
+A CONNECTION_CLOSE from the peer drains it. The idle timeout, the handshake timeout and a stateless reset end it. A reason phrase is truncated to 1024 bytes and never interpreted.
+
+#### QUIC unsupported features
+
+Not supported:
+
+- 0-RTT.
+- Session resumption.
+- Connection migration.
+- Datagrams (RFC 9221).
+- Versions other than 1.
 
 ### STARK security
 
-`stark.security` returns three levels for an `Air` and `Params`. `conjectured` is `min(191, queries * log2(blowup))` plus the grinding bits once the queries alone give 80 bits, capped at 128 by the 256-bit Blake3 hashes of the Merkle trees. It assumes the proximity gap conjecture for Reed-Solomon codes up to capacity. `proven_unique` and `proven_list` rest on the proximity gap theorems of eprint 2024/1553. `proven_unique` is for unique decoding. `proven_list` is for the list decoding that the Johnson bound allows (the best proximity parameter from 3 up). Both use the cubic extension of 192 bits, a random linear combination of the constraints and of the DEEP terms, and folding by 2. The formulas are Winterfell 0.13.1's `ConjecturedSecurity` and `ProvenSecurity`. `std_zk_stark` compares six parameter sets with its output.
+`stark.security` returns three levels for an `Air` and `Params`.
+
+#### STARK security levels
+
+| Level | What it is |
+| --- | --- |
+| `conjectured` | Is `min(191, queries * log2(blowup))` plus the grinding bits once the queries alone give 80 bits, capped at 128 by the 256-bit Blake3 hashes of the Merkle trees. It assumes the proximity gap conjecture for Reed-Solomon codes up to capacity. |
+| `proven_unique` | Rests on the proximity gap theorems of eprint 2024/1553. It is for unique decoding. |
+| `proven_list` | Rests on the proximity gap theorems of eprint 2024/1553. It is for the list decoding that the Johnson bound allows (the best proximity parameter from 3 up). |
+
+Both `proven_unique` and `proven_list` use the cubic extension of 192 bits, a random linear combination of the constraints and of the DEEP terms, and folding by 2.
+
+#### STARK security parameter sets
+
+The formulas are Winterfell 0.13.1's `ConjecturedSecurity` and `ProvenSecurity`. `std_zk_stark` compares six parameter sets with its output.
 
 | `blowup` | `queries` | `grinding_bits` | conjectured | proven unique | proven list |
 | --- | --- | --- | --- | --- | --- |
@@ -3275,366 +4752,3705 @@ Every standard library resource that must be disposed of is a droppable owner bo
 | 32 | 80 | 20 | 128 | 96 | 128 |
 | 64 | 40 | 16 | 128 | 55 | 127 |
 
+#### STARK security and trace length
+
 The levels are for a trace of 65536 rows. A longer trace lowers the proven ones. `zero_knowledge` pads the trace, which `security` takes into account.
 
-A statement is the `Air` with its boundary values. A changed public input or a changed constraint is another statement and its proof is rejected. A proof is bound to its `Params` through the header and the transcript, so a verifier that fixes its own `Params` rejects a proof made for weaker ones. `std/zk/stark` does not hide anything about the trace without `zero_knowledge`. Its hiding with it is the trace randomisation that `std/zk/stark` in the table above describes.
+#### STARK statements and proof binding
+
+A statement is the `Air` with its boundary values. A changed public input or a changed constraint is another statement and its proof is rejected. A proof is bound to its `Params` through the header and the transcript, so a verifier that fixes its own `Params` rejects a proof made for weaker ones.
+
+#### STARK trace hiding
+
+`std/zk/stark` does not hide anything about the trace without `zero_knowledge`. Its hiding with it is the trace randomisation that `std/zk/stark` in the table above describes.
 
 ### WebRTC
 
 #### STUN
 
-- `std/stun` implements RFC 8489 as a codec plus a client and a server over UDP. A message is parsed only when its datagram length matches the header, the top two bits of the type are clear, the magic cookie matches and every attribute fits. A parsed message keeps its bytes, so the integrity and fingerprint checks hash exactly what arrived, whatever padding the sender used. Encoding pads attribute values with zero bytes, or with `Message.padding`.
-- `check_integrity` hashes the message up to the attribute, with the length field rewritten to end after it. So attributes that follow, FINGERPRINT included, do not matter. It compares in constant time. MESSAGE-INTEGRITY-SHA256 values of 16 to 32 bytes in steps of four are accepted. `seal` writes all 32. `check_fingerprint` requires the attribute to be last.
-- Long-term keys are `MD5(username:realm:password)` or the SHA-256 form without SASLprep. A caller whose password changes under SASLprep prepares it first. Short-term credentials use the password bytes as the key.
-- `request` retransmits on the RFC schedule, the first send at 0 and then after 500, 1000, 2000, 4000, 8000 and 16000 ms. It fails with `TimedOut` 8000 ms after the seventh send. It ignores datagrams from another address, with another transaction ID, that do not parse, and, when a key is given, without a valid MESSAGE-INTEGRITY. Datagrams reach it through a reader green thread and a channel of 64. A datagram that arrives when the channel is full is dropped.
-- `respond` answers Binding requests only: an indication, a response or a datagram with a wrong FINGERPRINT gets nothing, another method gets 400, an unknown attribute below `0x8000` gets 420, and with `authenticate` a request without a known USERNAME and valid MESSAGE-INTEGRITY gets 400 or 401.
+`std/stun` implements RFC 8489 as a codec plus a client and a server over UDP.
+
+##### STUN message parsing and encoding
+
+A message is parsed only when:
+
+- its datagram length matches the header
+- the top two bits of the type are clear
+- the magic cookie matches
+- every attribute fits
+
+A parsed message keeps its bytes, so the integrity and fingerprint checks hash exactly what arrived, whatever padding the sender used. Encoding pads attribute values with zero bytes, or with `Message.padding`.
+
+##### STUN integrity and fingerprint checks
+
+`check_integrity` hashes the message up to the attribute, with the length field rewritten to end after it. So attributes that follow, FINGERPRINT included, do not matter. It compares in constant time.
+
+- MESSAGE-INTEGRITY-SHA256 values of 16 to 32 bytes in steps of four are accepted. `seal` writes all 32.
+- `check_fingerprint` requires the attribute to be last.
+
+##### STUN credentials
+
+Long-term keys are `MD5(username:realm:password)` or the SHA-256 form without SASLprep. A caller whose password changes under SASLprep prepares it first. Short-term credentials use the password bytes as the key.
+
+##### STUN client requests
+
+`request` retransmits on the RFC schedule, the first send at 0 and then after 500, 1000, 2000, 4000, 8000 and 16000 ms. It fails with `TimedOut` 8000 ms after the seventh send.
+
+It ignores datagrams:
+
+- from another address
+- with another transaction ID
+- that do not parse
+- when a key is given, without a valid MESSAGE-INTEGRITY
+
+Datagrams reach it through a reader green thread and a channel of 64. A datagram that arrives when the channel is full is dropped.
+
+##### STUN server responses
+
+`respond` answers Binding requests only:
+
+| Received | Answer |
+| --- | --- |
+| An indication, a response or a datagram with a wrong FINGERPRINT | Nothing |
+| Another method | 400 |
+| An unknown attribute below `0x8000` | 420 |
+| With `authenticate`, a request without a known USERNAME and valid MESSAGE-INTEGRITY | 400 or 401 |
 
 #### ICE
 
-- `std/ice` is a state machine. It holds the checklist, the credentials and the timers. Every function takes the time as a count of milliseconds, so the same code runs against a socket and against an in-memory network. The checks use the `std/stun` codec. The agent sends no datagram itself. It queues `Transmit` values instead. A `Transmit` names the bound address of the socket to send from. With a `Tcp` or `Tls` transport, it names the host address whose connection to a TURN server carries the message.
-- Candidates have the priorities of RFC 8445 section 5.1.2: host 126, peer reflexive 110, server reflexive 100 and relayed 0. The local preference ranks IPv6 above IPv4 and earlier addresses above later ones. Pair priorities come from section 6.1.2.3. A foundation is the CRC-32 of the type, base IP, server IP and transport, in eight hexadecimal digits. `parse` takes the value of an `a=candidate` line, with or without the `a=` and `candidate:` prefixes. It skips extension attributes. It fails with `Unsupported` for TCP candidates and for host names, including the `.local` names of mDNS.
-- Gathering reports each host candidate of `Config.hosts`. It sends a Binding request from each to every `stun_servers` entry of the same family. The answer becomes a server-reflexive candidate whose related address is the host candidate. Each `turn_servers` entry of the same family gets a `std/turn` client on each host socket. Over TCP or TLS it gets one on a connection for each host address. Its allocation becomes a relayed candidate whose related address is the server-reflexive address the server reports. Gathering completes once every allocation has succeeded or failed. The relayed side is UDP whatever the transport to the server. A relayed candidate's foundation includes that transport. Its local preference ranks a candidate through UDP above one through TCP, and one through TCP above one through TLS. `relay_lost` fails the allocation of a connection that closed or could not be made. That settles the allocation for gathering. Its relayed candidate's checks and consent then fail as they time out. The next `gather` opens a new connection. A `gather` while a pair is selected keeps the allocation whose relayed address is the selected pair's base, and reports its relayed candidate again. It does so because a second allocation on the same socket or connection would have the same 5-tuple. The `gather` releases and makes again the other allocations. The selected pair so carries data through an ICE restart. Once the new checklist selects a pair, the kept allocation is released unless that pair uses it. `relay_only` is the W3C `relay` transport policy. With it, the agent announces relayed candidates alone and sends no Binding request to a STUN server. A check or a datagram sent from a relayed candidate goes to the server inside a Send indication or, once its channel is bound, ChannelData. What the server relays back is unwrapped. A STUN message is given to the agent, and anything else is queued for `poll_delivery` with the peer's address. `is_relay_server` tells a caller which datagrams the agent must see. `local_addresses` takes the addresses of the interfaces `net.interfaces` reports as up. It leaves out link-local addresses and, unless asked, loopback addresses.
-- The checklist is pruned as RFC 8445 section 6.1.2.4 says. Of two pairs with the same remote candidate and the same local base, only the higher priority stays. Pairs start frozen or waiting by foundation. The checks run one per `pacing` milliseconds, from the triggered queue first and then by priority. A check is sent `transmissions` times on the schedule of `stun.waits`. A request that arrives for a pair whose check is in flight leaves that check running instead of cancelling it, because two agents that start together would otherwise cancel each other without end.
-- A request must carry a USERNAME that starts with the local username fragment. It must carry a valid MESSAGE-INTEGRITY under the local password. When a FINGERPRINT is present, it must be valid. A missing USERNAME gets 400. A wrong one or a bad MESSAGE-INTEGRITY gets 401. An unknown attribute below `0x8000` gets 420. A datagram that does not parse or has a wrong FINGERPRINT gets nothing. The tie-breakers settle a role conflict as RFC 8445 section 7.3.1.1 says. The answer is 487 when the receiver keeps its role. A source address that no remote candidate has becomes a peer-reflexive remote candidate with the priority the request states. A candidate signalled later with the same address replaces it with its own type and priority, as libwebrtc does. A successful response that reports an unknown mapped address creates a peer-reflexive local candidate whose base is the sending socket.
-- Nomination is regular. The controlling agent sends a check with USE-CANDIDATE on the best valid pair as soon as one exists. The pair is selected when that check succeeds. The controlled agent selects a valid pair when a USE-CANDIDATE request has arrived for it. A remote that is ICE-lite makes the agent controlling. An ICE-lite agent gathers host candidates only. It sends no checks. It treats each authenticated request as a valid pair. It selects the pair whose request carries USE-CANDIDATE.
-- After selection a full agent sends a consent check on the selected pair every `consent_interval` milliseconds, randomised between 80 and 120 percent (RFC 7675). With `consent` off, it sends a Binding indication after `keepalive_interval` milliseconds without any send. The state becomes `Disconnected` when no consent response has arrived for `disconnected_after` milliseconds. It returns to `Completed` when one arrives. It becomes `Failed` after `consent_timeout`. An ICE-lite agent counts the authenticated requests it receives. The state becomes `Failed` when every pair has failed after `end_of_remote_candidates`. It becomes `Failed` when no pair is selected `failure_timeout` milliseconds after the remote credentials arrive.
-- `restart` gives the agent new credentials and drops the remote credentials, candidates and pairs. The caller gathers again and sets the remote's new credentials. A different remote username fragment does the same on the other side. The selected pair, with its consent state, stays in use until the new checklist nominates one. Its remote address stays known, so the datagrams that are not STUN still arrive from it.
-- `std/ice/session` reads every socket in its own green thread and hands the datagrams to the one green thread that owns the agent. A datagram whose first byte is 0 to 3 goes to the agent. A datagram with another first byte is passed on `incoming` only when its source is a known remote address, including the selected pair's remote. A DTLS or RTP datagram from a stranger is therefore dropped (RFC 7983). A datagram from a TURN server goes to the agent whatever its first byte. The data it relays arrives on `incoming` with the peer as its source. `send` on a relayed pair goes through the agent. The first message for a TCP or TLS TURN server opens a connection in its own green thread. That thread connects and finishes the TLS handshake within `connect_timeout`. It verifies the certificate against `Options.tls` and the server's `server_name` or, when that is empty, its IP address. It splits what it reads with a `turn.Framer` and hands each message to the agent without dropping it. A second green thread writes the queued messages in order. The agent hears `relay_lost` when the connection closes, fails to connect or verify, or sends bytes that do not frame, including a partial message at the end. A notice from a connection the session already replaced is ignored. Closing the session writes the queued Refresh of lifetime 0 before the connections close. `events` and `incoming` hold 256 entries and drop what does not fit. The commands go through a channel to the same green thread.
+`std/ice` is a state machine. It holds the checklist, the credentials and the timers.
+
+##### ICE agent time and transmits
+
+Every function takes the time as a count of milliseconds, so the same code runs against a socket and against an in-memory network. The checks use the `std/stun` codec.
+
+The agent sends no datagram itself. It queues `Transmit` values instead. A `Transmit` names the bound address of the socket to send from. With a `Tcp` or `Tls` transport, it names the host address whose connection to a TURN server carries the message.
+
+##### ICE candidate priorities
+
+Candidates have the priorities of RFC 8445 section 5.1.2:
+
+| Candidate | Priority |
+| --- | --- |
+| Host | 126 |
+| Peer reflexive | 110 |
+| Server reflexive | 100 |
+| Relayed | 0 |
+
+The local preference ranks IPv6 above IPv4 and earlier addresses above later ones. Pair priorities come from section 6.1.2.3. A foundation is the CRC-32 of the type, base IP, server IP and transport, in eight hexadecimal digits.
+
+##### ICE candidate parsing
+
+`parse` takes the value of an `a=candidate` line, with or without the `a=` and `candidate:` prefixes. It skips extension attributes. It fails with `Unsupported` for TCP candidates and for host names, including the `.local` names of mDNS.
+
+##### ICE candidate gathering
+
+Gathering reports each host candidate of `Config.hosts`. It sends a Binding request from each to every `stun_servers` entry of the same family. The answer becomes a server-reflexive candidate whose related address is the host candidate.
+
+Each `turn_servers` entry of the same family gets a `std/turn` client on each host socket. Over TCP or TLS it gets one on a connection for each host address. Its allocation becomes a relayed candidate whose related address is the server-reflexive address the server reports.
+
+Gathering completes once every allocation has succeeded or failed.
+
+##### ICE relayed candidates over UDP, TCP and TLS
+
+The relayed side is UDP whatever the transport to the server. A relayed candidate's foundation includes that transport. Its local preference ranks a candidate through UDP above one through TCP, and one through TCP above one through TLS.
+
+##### ICE relay connection loss
+
+`relay_lost` fails the allocation of a connection that closed or could not be made. That settles the allocation for gathering. Its relayed candidate's checks and consent then fail as they time out. The next `gather` opens a new connection.
+
+##### ICE gathering while a pair is selected
+
+A `gather` while a pair is selected keeps the allocation whose relayed address is the selected pair's base, and reports its relayed candidate again. It does so because a second allocation on the same socket or connection would have the same 5-tuple.
+
+The `gather` releases and makes again the other allocations. The selected pair so carries data through an ICE restart. Once the new checklist selects a pair, the kept allocation is released unless that pair uses it.
+
+##### ICE relay-only policy
+
+`relay_only` is the W3C `relay` transport policy. With it, the agent announces relayed candidates alone and sends no Binding request to a STUN server.
+
+##### ICE relayed traffic
+
+A check or a datagram sent from a relayed candidate goes to the server inside a Send indication or, once its channel is bound, ChannelData. What the server relays back is unwrapped. A STUN message is given to the agent, and anything else is queued for `poll_delivery` with the peer's address.
+
+`is_relay_server` tells a caller which datagrams the agent must see.
+
+##### ICE local addresses
+
+`local_addresses` takes the addresses of the interfaces `net.interfaces` reports as up. It leaves out link-local addresses and, unless asked, loopback addresses.
+
+##### ICE checklist pruning
+
+The checklist is pruned as RFC 8445 section 6.1.2.4 says. Of two pairs with the same remote candidate and the same local base, only the higher priority stays. Pairs start frozen or waiting by foundation.
+
+##### ICE check scheduling
+
+- The checks run one per `pacing` milliseconds, from the triggered queue first and then by priority.
+- A check is sent `transmissions` times on the schedule of `stun.waits`.
+- A request that arrives for a pair whose check is in flight leaves that check running instead of cancelling it, because two agents that start together would otherwise cancel each other without end.
+
+##### ICE incoming requests
+
+A request must carry:
+
+- a USERNAME that starts with the local username fragment
+- a valid MESSAGE-INTEGRITY under the local password
+
+When a FINGERPRINT is present, it must be valid.
+
+| Request | Answer |
+| --- | --- |
+| A missing USERNAME | 400 |
+| A wrong USERNAME or a bad MESSAGE-INTEGRITY | 401 |
+| An unknown attribute below `0x8000` | 420 |
+| A datagram that does not parse or has a wrong FINGERPRINT | Nothing |
+
+##### ICE role conflicts
+
+The tie-breakers settle a role conflict as RFC 8445 section 7.3.1.1 says. The answer is 487 when the receiver keeps its role.
+
+##### ICE peer-reflexive candidates
+
+A source address that no remote candidate has becomes a peer-reflexive remote candidate with the priority the request states. A candidate signalled later with the same address replaces it with its own type and priority, as libwebrtc does.
+
+A successful response that reports an unknown mapped address creates a peer-reflexive local candidate whose base is the sending socket.
+
+##### ICE nomination
+
+Nomination is regular.
+
+| Role | Nomination |
+| --- | --- |
+| Controlling agent | It sends a check with USE-CANDIDATE on the best valid pair as soon as one exists. The pair is selected when that check succeeds. |
+| Controlled agent | It selects a valid pair when a USE-CANDIDATE request has arrived for it. |
+
+##### ICE-lite agents
+
+A remote that is ICE-lite makes the agent controlling. An ICE-lite agent:
+
+- gathers host candidates only
+- sends no checks
+- treats each authenticated request as a valid pair
+- selects the pair whose request carries USE-CANDIDATE
+
+##### ICE consent checks
+
+After selection a full agent sends a consent check on the selected pair every `consent_interval` milliseconds, randomised between 80 and 120 percent (RFC 7675). With `consent` off, it sends a Binding indication after `keepalive_interval` milliseconds without any send.
+
+An ICE-lite agent counts the authenticated requests it receives.
+
+##### ICE connection states
+
+| State | Condition |
+| --- | --- |
+| `Disconnected` | No consent response has arrived for `disconnected_after` milliseconds. The state returns to `Completed` when one arrives. |
+| `Failed` | After `consent_timeout`. |
+| `Failed` | Every pair has failed after `end_of_remote_candidates`. |
+| `Failed` | No pair is selected `failure_timeout` milliseconds after the remote credentials arrive. |
+
+##### ICE restart
+
+`restart` gives the agent new credentials and drops the remote credentials, candidates and pairs. The caller gathers again and sets the remote's new credentials. A different remote username fragment does the same on the other side.
+
+The selected pair, with its consent state, stays in use until the new checklist nominates one. Its remote address stays known, so the datagrams that are not STUN still arrive from it.
+
+##### ICE session threads
+
+`std/ice/session` reads every socket in its own green thread and hands the datagrams to the one green thread that owns the agent. The commands go through a channel to the same green thread. `events` and `incoming` hold 256 entries and drop what does not fit.
+
+##### ICE session datagram routing
+
+| Datagram | Goes |
+| --- | --- |
+| A first byte of 0 to 3 | To the agent. |
+| Another first byte | On `incoming` only when its source is a known remote address, including the selected pair's remote. |
+| From a TURN server | To the agent whatever its first byte. |
+
+A DTLS or RTP datagram from a stranger is therefore dropped (RFC 7983). The data a TURN server relays arrives on `incoming` with the peer as its source. `send` on a relayed pair goes through the agent.
+
+##### ICE session TCP and TLS TURN connections
+
+- The first message for a TCP or TLS TURN server opens a connection in its own green thread.
+- That thread connects and finishes the TLS handshake within `connect_timeout`.
+- It verifies the certificate against `Options.tls` and the server's `server_name` or, when that is empty, its IP address.
+- It splits what it reads with a `turn.Framer` and hands each message to the agent without dropping it.
+- A second green thread writes the queued messages in order.
+
+##### ICE session relay connection loss and close
+
+The agent hears `relay_lost` when the connection:
+
+- closes
+- fails to connect or verify
+- sends bytes that do not frame, including a partial message at the end
+
+A notice from a connection the session already replaced is ignored. Closing the session writes the queued Refresh of lifetime 0 before the connections close.
 
 #### TURN
 
-- `std/turn` is a state machine like `std/ice`. Every function takes the time as a count of milliseconds. The client queues datagrams for `poll_transmit`. Requests use long-term credentials with the MD5 key. The first Allocate goes unsigned. A 401 answer gives the realm and nonce, and the request is sent again signed. A 438 answer replaces the nonce, and the request is sent again, at most twice. A 401 to a signed request fails the allocation. So does any other error, and so does a request unanswered after `transmissions` sends on the `stun.waits` schedule. Responses are checked for MESSAGE-INTEGRITY and matched by transaction ID.
-- Over TCP and TLS each request is sent once and fails after `stream_timeout`, 39.5 seconds (Ti, RFC 8489 section 6.2.2), and ChannelData is padded to four bytes. A `Framer` takes a STUN message as its header and stated length and ChannelData as its header and length rounded up to four. It fails with `Malformed` on a first byte that is neither, or on a STUN length that is not a multiple of four. It keeps a partial message for the next read. `partial` reports what is left when the stream ends. The server deletes an allocation whose connection closes, because the allocation belongs to the connection's 5-tuple. So `connection_lost` fails it, and the client does not reconnect: a new connection needs a new client and gives a new relayed address. REQUESTED-TRANSPORT is UDP on every transport. `parse_uri` takes `turn:` with `?transport=udp` or `tcp`, and `turns:` (TLS over TCP), with the default ports 3478 and 5349. It refuses `turns:` over UDP, which is DTLS.
-- `send_to` asks for a permission for the peer's IP address with CreatePermission. It holds up to 16 datagrams per address until the permission is granted. Then it sends Send indications and binds a channel from 0x4000 upwards with ChannelBind. After that, data goes as ChannelData, padded to four bytes. Data from the server is accepted only from a permitted address. Permissions are refreshed every 4 minutes, channels every 9 and the allocation a minute before its lifetime ends. `close` sends a Refresh with lifetime 0.
-- `std/turn/client_test.low` runs the client against a TURN server written in the test. It covers the 401 challenge, a stale nonce, a wrong password, data held for a permission and then moved to a channel both ways, Data indications, the refresh and release, and an Allocate that is never answered. Over a stream it covers framing at every split point and a byte at a time, coalesced and padded messages, a partial message, a request sent once and timed out after Ti, and a lost connection. `std/ice/session/stream_relay_test.low` runs a TURN server written in the test. The server has a TCP and a TLS listener, with a certificate from `x509.create_self_signed`. It relays over UDP and writes each batch of messages in two pieces. An agent with `relay_only` connects through it over each transport to an agent with host candidates. A wrong TLS name, an untrusted certificate, a refused connection and a response cut off at close each end gathering without a candidate. A connection the server closes after the allocation is replaced by the next `gather`. The server also listens on UDP. Over UDP, TCP and TLS the relay-only agent restarts ICE and gathers again while data flows both ways over the relayed pair, before and after the new pair is selected. This keeps the relayed address. `std/ice/session/relay_test_linux.low` builds `testdata/turn/pion`, a pion/turn 5.1.3 server on 127.0.0.1 with UDP, TCP and TLS listeners. It connects an agent with `relay_only` through each listener to an agent with host candidates, with data both ways over the relayed pair. It restarts ICE with data flowing, as in the in-test server's restart. It skips when `go` or `timeout` is not installed or the pion modules cannot be downloaded. pion/turn 5.1.3 holds a stream frame shorter than 9 bytes until more bytes arrive. So the test sends more than four bytes of ChannelData.
+`std/turn` is a state machine like `std/ice`. Every function takes the time as a count of milliseconds.
+
+##### TURN client requests
+
+The client queues datagrams for `poll_transmit`. Requests use long-term credentials with the MD5 key.
+
+| Event | Result |
+| --- | --- |
+| The first Allocate | It goes unsigned. |
+| A 401 answer | It gives the realm and nonce, and the request is sent again signed. |
+| A 438 answer | It replaces the nonce, and the request is sent again, at most twice. |
+| A 401 to a signed request | It fails the allocation. |
+| Any other error | It fails the allocation. |
+| A request unanswered after `transmissions` sends on the `stun.waits` schedule | It fails the allocation. |
+
+Responses are checked for MESSAGE-INTEGRITY and matched by transaction ID.
+
+##### TURN over TCP and TLS
+
+- Over TCP and TLS each request is sent once and fails after `stream_timeout`, 39.5 seconds (Ti, RFC 8489 section 6.2.2), and ChannelData is padded to four bytes.
+
+##### TURN requested transport
+
+REQUESTED-TRANSPORT is UDP on every transport.
+
+##### TURN stream framing
+
+A `Framer` takes a STUN message as its header and stated length and ChannelData as its header and length rounded up to four.
+
+- It fails with `Malformed` on a first byte that is neither, or on a STUN length that is not a multiple of four.
+- It keeps a partial message for the next read. `partial` reports what is left when the stream ends.
+
+##### TURN connection loss
+
+The server deletes an allocation whose connection closes, because the allocation belongs to the connection's 5-tuple. So `connection_lost` fails it, and the client does not reconnect: a new connection needs a new client and gives a new relayed address.
+
+##### TURN URIs
+
+`parse_uri` takes `turn:` with `?transport=udp` or `tcp`, and `turns:` (TLS over TCP), with the default ports 3478 and 5349. It refuses `turns:` over UDP, which is DTLS.
+
+##### TURN permissions and channels
+
+1. `send_to` asks for a permission for the peer's IP address with CreatePermission.
+2. It holds up to 16 datagrams per address until the permission is granted.
+3. Then it sends Send indications and binds a channel from 0x4000 upwards with ChannelBind.
+4. After that, data goes as ChannelData, padded to four bytes.
+
+Data from the server is accepted only from a permitted address.
+
+##### TURN refreshes and close
+
+Permissions are refreshed every 4 minutes, channels every 9 and the allocation a minute before its lifetime ends. `close` sends a Refresh with lifetime 0.
+
+##### TURN client tests
+
+`std/turn/client_test.low` runs the client against a TURN server written in the test. It covers:
+
+- the 401 challenge
+- a stale nonce
+- a wrong password
+- data held for a permission and then moved to a channel both ways
+- Data indications
+- the refresh and release
+- an Allocate that is never answered
+
+Over a stream it covers:
+
+- framing at every split point and a byte at a time
+- coalesced and padded messages
+- a partial message
+- a request sent once and timed out after Ti
+- a lost connection
+
+##### TURN relay tests with an in-test server
+
+`std/ice/session/stream_relay_test.low` runs a TURN server written in the test. The server has a TCP and a TLS listener, with a certificate from `x509.create_self_signed`. It relays over UDP and writes each batch of messages in two pieces.
+
+An agent with `relay_only` connects through it over each transport to an agent with host candidates. A wrong TLS name, an untrusted certificate, a refused connection and a response cut off at close each end gathering without a candidate. A connection the server closes after the allocation is replaced by the next `gather`.
+
+The server also listens on UDP. Over UDP, TCP and TLS the relay-only agent restarts ICE and gathers again while data flows both ways over the relayed pair, before and after the new pair is selected. This keeps the relayed address.
+
+##### TURN relay tests against pion
+
+`std/ice/session/relay_test_linux.low` builds `testdata/turn/pion`, a pion/turn 5.1.3 server on 127.0.0.1 with UDP, TCP and TLS listeners.
+
+- It connects an agent with `relay_only` through each listener to an agent with host candidates, with data both ways over the relayed pair.
+- It restarts ICE with data flowing, as in the in-test server's restart.
+- It skips when `go` or `timeout` is not installed or the pion modules cannot be downloaded.
+
+##### Short stream frames in pion/turn
+
+pion/turn 5.1.3 holds a stream frame shorter than 9 bytes until more bytes arrive. So the test sends more than four bytes of ChannelData.
 
 #### mDNS
 
-- `std/mdns` answers and asks for the addresses of `.local` names only. It has no service discovery, probing, announcement or conflict resolution. Names are random UUIDs, as browsers make them for host candidates, so no two hosts claim one.
-- A query asks one question, for `A` or `AAAA` records, because Chromium's responder ignores a query with more than one. `resolve` binds port 5353, shared with the host's other mDNS sockets, and joins the group. It does so because Chromium answers a one-shot query only to the group and never to the querier's port. When port 5353 cannot be shared, `resolve` queries from a free port and hears only the unicast answers a one-shot query gets. It sends both queries again every second until an answer names an address or the wait ends.
-- `respond` answers a query from a port other than 5353 as a one-shot query (RFC 6762 section 6.7). The answer goes to the querier with its ID, its questions and a time to live of 10 seconds. `respond` answers a query from port 5353 with ID 0, the cache-flush bit and a time to live of 120 seconds. That answer goes to the group unless every question set the unicast-response bit. The responder replies through every multicast interface with an IPv4 address, as Chromium does, so a querier listening on any of them hears it.
-- `std/mdns/mdns_test.low` checks the codec against a response captured from Chromium 158, with a documentation address in place of its own. It runs a responder and `resolve`'s query loop on loopback sockets. By hand, `resolve` resolved Chromium's and Firefox's host candidate names. `avahi-resolve` 0.9-rc5 resolved a name `responder` published. Python sockets on port 5353 got both the one-shot unicast and the multicast answer from it, once through each multicast interface.
+`std/mdns` answers and asks for the addresses of `.local` names only. It has no service discovery, probing, announcement or conflict resolution.
+
+##### mDNS names
+
+Names are random UUIDs, as browsers make them for host candidates, so no two hosts claim one.
+
+##### mDNS queries
+
+A query asks one question, for `A` or `AAAA` records, because Chromium's responder ignores a query with more than one.
+
+##### mDNS resolve
+
+`resolve` binds port 5353, shared with the host's other mDNS sockets, and joins the group. It does so because Chromium answers a one-shot query only to the group and never to the querier's port.
+
+When port 5353 cannot be shared, `resolve` queries from a free port and hears only the unicast answers a one-shot query gets. It sends both queries again every second until an answer names an address or the wait ends.
+
+##### mDNS responder answers
+
+`respond` answers a query as follows:
+
+| Query from | Answer |
+| --- | --- |
+| A port other than 5353 | It answers as a one-shot query (RFC 6762 section 6.7). The answer goes to the querier with its ID, its questions and a time to live of 10 seconds. |
+| Port 5353 | It answers with ID 0, the cache-flush bit and a time to live of 120 seconds. That answer goes to the group unless every question set the unicast-response bit. |
+
+##### mDNS responder interfaces
+
+The responder replies through every multicast interface with an IPv4 address, as Chromium does, so a querier listening on any of them hears it.
+
+##### mDNS tests
+
+- `std/mdns/mdns_test.low` checks the codec against a response captured from Chromium 158, with a documentation address in place of its own.
+- It runs a responder and `resolve`'s query loop on loopback sockets.
+
+##### mDNS checks
+
+- By hand, `resolve` resolved Chromium's and Firefox's host candidate names.
+- `avahi-resolve` 0.9-rc5 resolved a name `responder` published.
+- Python sockets on port 5353 got both the one-shot unicast and the multicast answer from it, once through each multicast interface.
 
 #### DTLS
 
-- `std/dtls` implements the client and the server of DTLS 1.3 and DTLS 1.2. DTLS 1.3 has the suites `0x1301` (AES-128-GCM), `0x1302` (AES-256-GCM) and `0x1303` (ChaCha20-Poly1305). DTLS 1.2 has the ECDHE-ECDSA suites `0xC02B` (AES-128-GCM), `0xC02C` (AES-256-GCM) and `0xCCA9` (ChaCha20-Poly1305). Both use X25519 and P-256 and ECDSA P-256 or P-384 certificates. It reuses the `std/tls` key schedules, key exchange and signature code, with the DTLS 1.3 labels under the prefix `dtls13`. It adds the record layers, the handshake transport and the certificate policy of WebRTC. In DTLS 1.2 the extended master secret is required and the `renegotiation_info` extension is the empty one. A ClientHello or HelloRequest sent after a DTLS 1.2 handshake finishes gets the warning alert `no_renegotiation` and changes nothing.
-- The version is negotiated through `supported_versions` (RFC 8446 section 4.2.1). A client whose `max_version` is `dtls13` offers DTLS 1.3 with its 1.3 suites and a key share for its first group. It offers DTLS 1.2 beside it unless `min_version` is `dtls13`. The `legacy_version` field is always `0xFEFD`. A server picks DTLS 1.3 when both allow it, and DTLS 1.2 otherwise. A server that allows DTLS 1.3 and negotiates DTLS 1.2 ends its random with `DOWNGRD` and 1. A client that offered DTLS 1.3 fails a DTLS 1.2 ServerHello that carries it (RFC 8446 section 4.1.3). So stripping `supported_versions` from a hello is detected. Peers with no version in common fail with `protocol_version`.
-- A DTLS 1.2 record is `epoch`, a 48-bit sequence number and a body. Epoch 0 is plaintext. Epoch 1 is protected and starts at the ChangeCipherSpec. The AEAD nonce of a GCM suite is the 4-byte implicit part and the 8 bytes of epoch and sequence number sent in the record. For ChaCha20-Poly1305 the nonce is the write IV XORed with the epoch and sequence number (RFC 7905). The additional data names the epoch, the sequence number, the type, the version and the plaintext length. The receiver keeps a window of 64 sequence numbers for epoch 1. It drops a record that is outside the window or repeated. The window moves only after the record authenticates, so a forged record cannot push it. Epoch 0 has no window because nothing authenticates it: handshake messages are deduplicated by `message_seq`. An epoch-0 alert or application record is dropped once the keys of epoch 1 exist. A record that does not parse, authenticate or fit the epoch is dropped without an alert (RFC 6347 section 4.1.2.7).
-- A DTLS 1.3 record is sent in the unified header of RFC 9147 section 4. The first byte carries the low two bits of the epoch. A 16-bit sequence number and a length follow. The sequence number is encrypted with the mask that AES-ECB or ChaCha20 under the `sn` key makes from the first 16 bytes of the ciphertext. The receiver also reads the 8-bit and the lengthless forms. It takes the full sequence number closest to the next one expected. It drops a record with a connection ID, because connection IDs (RFC 9146) are not implemented. The nonce is the write IV XORed with the 64-bit sequence number. The additional data is the header with the sequence number unencrypted. The inner plaintext is the content, its type and zero padding. Epoch 0 is plaintext. Epoch 2 carries the handshake and epoch 3 the application data. Each KeyUpdate moves one direction to the next epoch. A reader is kept for each of the four values of the epoch's low bits. Each reader has its own window of 64, so a late record of the previous epoch is still read. Once DTLS 1.3 is negotiated, a plaintext record is read only as a ClientHello or ServerHello, or as an alert while no keys exist.
-- Handshake messages carry `message_seq`, a fragment offset and a fragment length. A message larger than `Config.mtu` is split across records and datagrams. The receiver reassembles the next eight message numbers, in any arrival order and with duplicates, up to 65536 bytes per message. The DTLS 1.2 Finished hash covers each message as one unfragmented message with its DTLS header. It leaves out the first ClientHello and the HelloVerifyRequest. The DTLS 1.3 transcript covers each message in its TLS 1.3 form, without `message_seq` and the fragment fields. After a HelloRetryRequest it starts with the `message_hash` of the first ClientHello.
-- A server with `Config.cookies` keeps no state for a ClientHello without a valid cookie. That means no reassembly buffer, no transcript and no timer. In DTLS 1.2 it answers with a HelloVerifyRequest whose cookie is an HMAC-SHA-256 over the client's random, session id, cipher suites and compression methods under a random per-connection secret. In DTLS 1.3 it answers with a HelloRetryRequest. Its cookie holds the chosen suite and group, whether a key share is asked for and the hash of the first ClientHello, under an HMAC-SHA-256 with that secret. The server rebuilds the HelloRetryRequest and the transcript from the cookie of the second ClientHello. A DTLS 1.3 server without cookies sends a HelloRetryRequest only when the client has no key share for the group the server takes. A server answers a datagram that is not a valid ClientHello with nothing.
-- A DTLS 1.2 flight is retransmitted as a whole after `retransmit_initial` milliseconds, doubling to `retransmit_max`. Each message keeps its original `message_seq` and gets new record sequence numbers. The handshake fails after `handshake_timeout`. A server that has finished and sees a message of the client's last flight again sends its last flight once more. A client never answers a repeated server flight, so two peers cannot keep each other sending.
-- DTLS 1.3 acknowledges records with ACK (RFC 9147 section 7). Each sent fragment is remembered by its record number, so an ACK marks those bytes received and the next retransmission, on the same timer as DTLS 1.2, sends only what is left, in new records. The peer's next flight acknowledges a flight as a whole. Application data from the server acknowledges the client's last flight. A receiver sends an ACK of the handshake records it has read when it holds a message beyond the next one it expects. It sends one when the client's last flight completes, and for a NewSessionTicket or KeyUpdate. An ACK lists only the newest records that fit `Config.mtu`. An ACK is sent in the newest epoch the sender writes, so the server acknowledges the client's last flight at epoch 3. An ACK lists only records the receiver opened. A record of an epoch whose keys the receiver does not hold yet is dropped unacknowledged and comes back in the peer's retransmission. A server that has finished and sees the client's last flight again acknowledges it again. The client's last flight and a KeyUpdate are retransmitted until acknowledged. They are given up after `handshake_timeout` without failing the connection.
-- `update_keys` sends a KeyUpdate, optionally asking the peer to update too. It fails with `NotConnected` before the handshake finishes, with `Unsupported` over DTLS 1.2 and with `WouldBlock` while a flight is unacknowledged. The sender writes with the new keys once the KeyUpdate is acknowledged (RFC 9147 section 8). The receiver reads the next epoch at once and answers a request with its own KeyUpdate.
-- WebRTC peers authenticate with self-signed certificates, so both roles send a Certificate, the server sends a CertificateRequest, and the client sends a CertificateVerify. The peer certificate is accepted when its digest equals one of `Config.fingerprints`, as the remote SDP states, compared in constant time, and is refused otherwise unless `unverified` is set. Validity dates and the issuer are not checked (RFC 8827 section 6.5). The identity key is ECDSA on P-256 or P-384. The handshake offers and accepts `ecdsa_secp256r1_sha256` and `ecdsa_secp384r1_sha384` only.
-- `use_srtp` (RFC 5764) is offered by a client and answered by a server only when `Config.srtp_profiles` is not empty. In DTLS 1.3 the answer is in EncryptedExtensions. The server picks the first of its own profiles that the client offered. When none is shared, the extension is left out and the handshake continues. Over DTLS 1.2 `export_keying_material` is the TLS 1.2 PRF over the label, the client random and the server random, with the length-prefixed context appended for `export_keying_material_context`. Over DTLS 1.3 it is the TLS 1.3 exporter over the exporter master secret, with an empty context for `export_keying_material`. `"EXTRACTOR-dtls_srtp"` with 60 bytes gives the SRTP keys and salts of both directions.
-- A write is one record in one datagram and fails with `TooLarge` when it exceeds `Config.mtu`. `close` sends `close_notify`. A received `close_notify` closes the connection. A fatal alert fails it.
-- `std/dtls/session` runs a `Conn` in one green thread that waits on commands, datagrams and the retransmission timer together. `Handle.data` and `Handle.events` drop what does not fit. A `Transport` has no socket of its own, so the same code runs over `std/ice/session`'s `send` and `incoming`.
-- `std/dtls/conn13_test.low` opens records captured from OpenSSL 4.1.0 in each DTLS 1.3 suite. It seals them back to the same bytes. It checks the exporter against OpenSSL's `EXTRACTOR-dtls_srtp` output under the logged secrets.
-- `std/dtls/session/interop_test_linux.low` runs `openssl s_client` against a `std/dtls/session` server and a client against `openssl s_server`, with `SRTP_AES128_CM_SHA1_80`. Over `-dtls1_2`, with the HelloVerifyRequest cookie and a Low peer that offers both versions, it covers `0xC02B` with X25519, `0xC02C` with P-256, `0xCCA9` with X25519, and `0xC02B` with P-256 and a 300-byte `Config.mtu`. That `Config.mtu` fragments the certificate flight. Over `-dtls1_3` it covers `0x1301` with X25519, `0x1302` with P-256, `0x1303` with X25519, `0x1301` with P-256 at a 300-byte `Config.mtu`, a HelloRetryRequest for a key share, and `-dtls` choosing DTLS 1.3. Each DTLS 1.3 case also runs a KeyUpdate that asks the peer to update and sends data after it. One case per version at a 300-byte `Config.mtu` drops handshake datagrams the Low peer sends. Over DTLS 1.2 it drops the third and the fourth. Over DTLS 1.3 it drops the second, which from the Low server is the ServerHello. So `s_client` meets the encrypted part of the flight before the retransmitted ServerHello. The Low server sends a line before it reads one, because of how `openssl s_client` 4.1.0 behaves in blocking mode after a DTLS 1.3 handshake in which the ServerHello arrives after the encrypted records that follow it. That client finishes the handshake inside `SSL_read` and waits there for server data. It reads no standard input until some arrives. `openssl s_server -num_tickets 0` stalls the same client with the same datagram order, and an `openssl s_server` that sends its default session tickets does not. Each case requires the fingerprint check, the negotiated version, suite and profile, application data and the 60 bytes of `EXTRACTOR-dtls_srtp` keying material to match. Two more cases strip `supported_versions` and the key share from the ClientHello between the peers. The Low client fails on the downgrade sentinel of `openssl s_server`. `openssl s_client` reports an inappropriate fallback against the Low server. The DTLS 1.3 cases skip when `openssl` has no `-dtls1_3`. The test skips when `openssl` or `timeout` is not installed.
+`std/dtls` implements the client and the server of DTLS 1.3 and DTLS 1.2.
+
+##### DTLS suites and key exchange
+
+| Version | Suites |
+| --- | --- |
+| DTLS 1.3 | `0x1301` (AES-128-GCM), `0x1302` (AES-256-GCM) and `0x1303` (ChaCha20-Poly1305). |
+| DTLS 1.2 | The ECDHE-ECDSA suites `0xC02B` (AES-128-GCM), `0xC02C` (AES-256-GCM) and `0xCCA9` (ChaCha20-Poly1305). |
+
+Both use X25519 and P-256 and ECDSA P-256 or P-384 certificates.
+
+`std/dtls` reuses the `std/tls` key schedules, key exchange and signature code, with the DTLS 1.3 labels under the prefix `dtls13`. `std/dtls` adds the record layers, the handshake transport and the certificate policy of WebRTC.
+
+##### DTLS 1.2 extended master secret and renegotiation
+
+In DTLS 1.2 the extended master secret is required and the `renegotiation_info` extension is the empty one. A ClientHello or HelloRequest sent after a DTLS 1.2 handshake finishes gets the warning alert `no_renegotiation` and changes nothing.
+
+##### DTLS version negotiation
+
+The version is negotiated through `supported_versions` (RFC 8446 section 4.2.1).
+
+- A client whose `max_version` is `dtls13` offers DTLS 1.3 with its 1.3 suites and a key share for its first group. It offers DTLS 1.2 beside it unless `min_version` is `dtls13`.
+- The `legacy_version` field is always `0xFEFD`.
+- A server picks DTLS 1.3 when both allow it, and DTLS 1.2 otherwise.
+- Peers with no version in common fail with `protocol_version`.
+
+##### DTLS downgrade protection
+
+A server that allows DTLS 1.3 and negotiates DTLS 1.2 ends its random with `DOWNGRD` and 1. A client that offered DTLS 1.3 fails a DTLS 1.2 ServerHello that carries it (RFC 8446 section 4.1.3). So stripping `supported_versions` from a hello is detected.
+
+##### DTLS 1.2 record format
+
+A DTLS 1.2 record is `epoch`, a 48-bit sequence number and a body.
+
+| Epoch | Holds |
+| --- | --- |
+| 0 | Plaintext. |
+| 1 | Protected. It starts at the ChangeCipherSpec. |
+
+##### DTLS 1.2 record protection
+
+| Suite | AEAD nonce |
+| --- | --- |
+| A GCM suite | The 4-byte implicit part and the 8 bytes of epoch and sequence number sent in the record. |
+| ChaCha20-Poly1305 | The write IV XORed with the epoch and sequence number (RFC 7905). |
+
+The additional data names the epoch, the sequence number, the type, the version and the plaintext length.
+
+##### DTLS 1.2 replay window
+
+The receiver keeps a window of 64 sequence numbers for epoch 1. It drops a record that is outside the window or repeated. The window moves only after the record authenticates, so a forged record cannot push it.
+
+Epoch 0 has no window because nothing authenticates it: handshake messages are deduplicated by `message_seq`.
+
+##### DTLS 1.2 dropped records
+
+- An epoch-0 alert or application record is dropped once the keys of epoch 1 exist.
+- A record that does not parse, authenticate or fit the epoch is dropped without an alert (RFC 6347 section 4.1.2.7).
+
+##### DTLS 1.3 record header
+
+A DTLS 1.3 record is sent in the unified header of RFC 9147 section 4. The first byte carries the low two bits of the epoch. A 16-bit sequence number and a length follow. The sequence number is encrypted with the mask that AES-ECB or ChaCha20 under the `sn` key makes from the first 16 bytes of the ciphertext.
+
+##### DTLS 1.3 record receiving
+
+The receiver also reads the 8-bit and the lengthless forms. It takes the full sequence number closest to the next one expected. It drops a record with a connection ID, because connection IDs (RFC 9146) are not implemented.
+
+##### DTLS 1.3 record protection
+
+| Part | Value |
+| --- | --- |
+| Nonce | The write IV XORed with the 64-bit sequence number. |
+| Additional data | The header with the sequence number unencrypted. |
+| Inner plaintext | The content, its type and zero padding. |
+
+##### DTLS 1.3 epochs
+
+| Epoch | Carries |
+| --- | --- |
+| 0 | Plaintext. |
+| 2 | The handshake. |
+| 3 | The application data. |
+
+Each KeyUpdate moves one direction to the next epoch. A reader is kept for each of the four values of the epoch's low bits. Each reader has its own window of 64, so a late record of the previous epoch is still read.
+
+##### DTLS 1.3 plaintext records
+
+Once DTLS 1.3 is negotiated, a plaintext record is read only as a ClientHello or ServerHello, or as an alert while no keys exist.
+
+##### DTLS handshake fragmentation
+
+Handshake messages carry `message_seq`, a fragment offset and a fragment length. A message larger than `Config.mtu` is split across records and datagrams. The receiver reassembles the next eight message numbers, in any arrival order and with duplicates, up to 65536 bytes per message.
+
+##### DTLS handshake transcripts
+
+| Version | Transcript |
+| --- | --- |
+| DTLS 1.2 | The Finished hash covers each message as one unfragmented message with its DTLS header. It leaves out the first ClientHello and the HelloVerifyRequest. |
+| DTLS 1.3 | The transcript covers each message in its TLS 1.3 form, without `message_seq` and the fragment fields. After a HelloRetryRequest it starts with the `message_hash` of the first ClientHello. |
+
+##### DTLS server cookies
+
+A server with `Config.cookies` keeps no state for a ClientHello without a valid cookie. That means no reassembly buffer, no transcript and no timer.
+
+| Version | Answer |
+| --- | --- |
+| DTLS 1.2 | It answers with a HelloVerifyRequest whose cookie is an HMAC-SHA-256 over the client's random, session id, cipher suites and compression methods under a random per-connection secret. |
+| DTLS 1.3 | It answers with a HelloRetryRequest. Its cookie holds the chosen suite and group, whether a key share is asked for and the hash of the first ClientHello, under an HMAC-SHA-256 with that secret. |
+
+The server rebuilds the HelloRetryRequest and the transcript from the cookie of the second ClientHello.
+
+##### DTLS 1.3 HelloRetryRequest without cookies
+
+A DTLS 1.3 server without cookies sends a HelloRetryRequest only when the client has no key share for the group the server takes.
+
+##### DTLS invalid ClientHello datagrams
+
+A server answers a datagram that is not a valid ClientHello with nothing.
+
+##### DTLS 1.2 flight retransmission
+
+A DTLS 1.2 flight is retransmitted as a whole after `retransmit_initial` milliseconds, doubling to `retransmit_max`. Each message keeps its original `message_seq` and gets new record sequence numbers. The handshake fails after `handshake_timeout`.
+
+##### DTLS 1.2 repeated flights
+
+A server that has finished and sees a message of the client's last flight again sends its last flight once more. A client never answers a repeated server flight, so two peers cannot keep each other sending.
+
+##### DTLS 1.3 acknowledgements
+
+DTLS 1.3 acknowledges records with ACK (RFC 9147 section 7). Each sent fragment is remembered by its record number, so an ACK marks those bytes received and the next retransmission, on the same timer as DTLS 1.2, sends only what is left, in new records.
+
+- The peer's next flight acknowledges a flight as a whole.
+- Application data from the server acknowledges the client's last flight.
+
+##### DTLS 1.3 when an ACK is sent
+
+A receiver sends an ACK of the handshake records it has read when it holds a message beyond the next one it expects. It sends one when the client's last flight completes, and for a NewSessionTicket or KeyUpdate. A server that has finished and sees the client's last flight again acknowledges it again.
+
+##### DTLS 1.3 ACK contents and epoch
+
+- An ACK lists only the newest records that fit `Config.mtu`.
+- An ACK is sent in the newest epoch the sender writes, so the server acknowledges the client's last flight at epoch 3.
+- An ACK lists only records the receiver opened. A record of an epoch whose keys the receiver does not hold yet is dropped unacknowledged and comes back in the peer's retransmission.
+
+##### DTLS 1.3 retransmission until acknowledged
+
+The client's last flight and a KeyUpdate are retransmitted until acknowledged. They are given up after `handshake_timeout` without failing the connection.
+
+##### DTLS 1.3 key update
+
+`update_keys` sends a KeyUpdate, optionally asking the peer to update too. It fails with:
+
+| Error | Condition |
+| --- | --- |
+| `NotConnected` | Before the handshake finishes. |
+| `Unsupported` | Over DTLS 1.2. |
+| `WouldBlock` | While a flight is unacknowledged. |
+
+The sender writes with the new keys once the KeyUpdate is acknowledged (RFC 9147 section 8). The receiver reads the next epoch at once and answers a request with its own KeyUpdate.
+
+##### DTLS certificate exchange
+
+WebRTC peers authenticate with self-signed certificates, so both roles send a Certificate, the server sends a CertificateRequest, and the client sends a CertificateVerify.
+
+##### DTLS peer certificate checks
+
+The peer certificate is accepted when its digest equals one of `Config.fingerprints`, as the remote SDP states, compared in constant time, and is refused otherwise unless `unverified` is set. Validity dates and the issuer are not checked (RFC 8827 section 6.5).
+
+##### DTLS identity key and signature algorithms
+
+The identity key is ECDSA on P-256 or P-384. The handshake offers and accepts `ecdsa_secp256r1_sha256` and `ecdsa_secp384r1_sha384` only.
+
+##### DTLS SRTP negotiation
+
+`use_srtp` (RFC 5764) is offered by a client and answered by a server only when `Config.srtp_profiles` is not empty. In DTLS 1.3 the answer is in EncryptedExtensions. The server picks the first of its own profiles that the client offered. When none is shared, the extension is left out and the handshake continues.
+
+##### DTLS keying material export
+
+Over DTLS 1.2 `export_keying_material` is the TLS 1.2 PRF over the label, the client random and the server random, with the length-prefixed context appended for `export_keying_material_context`. Over DTLS 1.3 it is the TLS 1.3 exporter over the exporter master secret, with an empty context for `export_keying_material`.
+
+`"EXTRACTOR-dtls_srtp"` with 60 bytes gives the SRTP keys and salts of both directions.
+
+##### DTLS writes and closing
+
+- A write is one record in one datagram and fails with `TooLarge` when it exceeds `Config.mtu`.
+- `close` sends `close_notify`.
+- A received `close_notify` closes the connection.
+- A fatal alert fails it.
+
+##### DTLS session
+
+`std/dtls/session` runs a `Conn` in one green thread that waits on commands, datagrams and the retransmission timer together. `Handle.data` and `Handle.events` drop what does not fit. A `Transport` has no socket of its own, so the same code runs over `std/ice/session`'s `send` and `incoming`.
+
+##### DTLS 1.3 tests with OpenSSL records
+
+`std/dtls/conn13_test.low` opens records captured from OpenSSL 4.1.0 in each DTLS 1.3 suite. It seals them back to the same bytes. It checks the exporter against OpenSSL's `EXTRACTOR-dtls_srtp` output under the logged secrets.
+
+##### DTLS OpenSSL interop test
+
+`std/dtls/session/interop_test_linux.low` runs `openssl s_client` against a `std/dtls/session` server and a client against `openssl s_server`, with `SRTP_AES128_CM_SHA1_80`.
+
+##### DTLS 1.2 interop cases
+
+Over `-dtls1_2`, with the HelloVerifyRequest cookie and a Low peer that offers both versions, it covers:
+
+- `0xC02B` with X25519
+- `0xC02C` with P-256
+- `0xCCA9` with X25519
+- `0xC02B` with P-256 and a 300-byte `Config.mtu`
+
+That `Config.mtu` fragments the certificate flight.
+
+##### DTLS 1.3 interop cases
+
+Over `-dtls1_3` it covers:
+
+- `0x1301` with X25519
+- `0x1302` with P-256
+- `0x1303` with X25519
+- `0x1301` with P-256 at a 300-byte `Config.mtu`
+- a HelloRetryRequest for a key share
+- `-dtls` choosing DTLS 1.3
+
+Each DTLS 1.3 case also runs a KeyUpdate that asks the peer to update and sends data after it.
+
+##### DTLS interop dropped handshake datagrams
+
+One case per version at a 300-byte `Config.mtu` drops handshake datagrams the Low peer sends.
+
+| Version | Drops |
+| --- | --- |
+| DTLS 1.2 | The third and the fourth. |
+| DTLS 1.3 | The second, which from the Low server is the ServerHello, so `s_client` meets the encrypted part of the flight before the retransmitted ServerHello. |
+
+##### DTLS interop OpenSSL 4.1.0 blocking behaviour
+
+The Low server sends a line before it reads one, because of how `openssl s_client` 4.1.0 behaves in blocking mode after a DTLS 1.3 handshake in which the ServerHello arrives after the encrypted records that follow it.
+
+That client finishes the handshake inside `SSL_read` and waits there for server data. It reads no standard input until some arrives. `openssl s_server -num_tickets 0` stalls the same client with the same datagram order, and an `openssl s_server` that sends its default session tickets does not.
+
+##### DTLS interop case checks
+
+Each case requires the fingerprint check, the negotiated version, suite and profile, application data and the 60 bytes of `EXTRACTOR-dtls_srtp` keying material to match.
+
+##### DTLS interop downgrade cases
+
+Two more cases strip `supported_versions` and the key share from the ClientHello between the peers.
+
+- The Low client fails on the downgrade sentinel of `openssl s_server`.
+- `openssl s_client` reports an inappropriate fallback against the Low server.
+
+##### DTLS interop skips
+
+- The DTLS 1.3 cases skip when `openssl` has no `-dtls1_3`.
+- The test skips when `openssl` or `timeout` is not installed.
 
 #### RTP
 
-- `std/rtp` parses a datagram as exactly one RTP packet or one compound RTCP packet. `parse` fails with `Malformed` when the version is not 2, the contributing sources or the extension block run past the end, or the padding count is 0 or larger than the payload. The payload and extension values share the datagram's bytes. A one-byte extension element with identifier 15 ends the block. Zero bytes between elements are skipped. An extension block of another profile is one `Extension` with identifier 0 that holds the whole block.
-- `marshal` writes the one-byte form when every element has an identifier of 1 to 14 and 1 to 16 bytes, and the two-byte form otherwise. It does so unless `extension_profile` names one. It pads the block to whole words. It fails with `Invalid` for more than 15 contributing sources or a field wider than its wire field. Padding is written as zero bytes with the count in the last.
-- An RTCP packet whose type `parse_rtcp` reads becomes its struct: sender and receiver reports with their report blocks and the signed 24-bit cumulative loss, SDES chunks of items, goodbyes with an optional reason, Generic NACK (transport feedback format 1) expanded into the list of lost sequence numbers, and Picture Loss Indication (payload feedback format 1 with no control information). Other feedback formats, REMB and transport-wide congestion control among them, keep their control information unparsed in `FeedbackMessage`. Other packet types become `RawPacket`. `marshal_rtcp` packs a NACK's sequence numbers into packet identifiers with a 16-bit bitmask of the next 16. It ends each SDES chunk with a zero byte padded to a word. It never adds padding.
-- `classify` follows RFC 7983 and RFC 5761. A first byte of 0 to 3 is STUN, and 20 to 63 is DTLS. A first byte of 128 to 191 is RTCP when the second byte is 192 to 223, and RTP otherwise.
+`std/rtp` parses a datagram as exactly one RTP packet or one compound RTCP packet.
+
+The payload and extension values share the datagram's bytes.
+
+##### RTP packet parse errors
+
+`parse` fails with `Malformed` when:
+
+- the version is not 2
+- the contributing sources or the extension block run past the end
+- the padding count is 0 or larger than the payload
+
+##### RTP extension parsing
+
+| Case | Result of `parse` |
+| --- | --- |
+| A one-byte extension element with identifier 15 | Ends the block. |
+| Zero bytes between elements | Skipped. |
+| An extension block of another profile | One `Extension` with identifier 0 that holds the whole block. |
+
+##### RTP packet marshalling
+
+`marshal` writes the one-byte form when every element has an identifier of 1 to 14 and 1 to 16 bytes, and the two-byte form otherwise. It does so unless `extension_profile` names one. It pads the block to whole words.
+
+It fails with `Invalid` for more than 15 contributing sources or a field wider than its wire field. Padding is written as zero bytes with the count in the last.
+
+##### RTCP parsing
+
+An RTCP packet whose type `parse_rtcp` reads becomes its struct:
+
+| Packet | Parsed as |
+| --- | --- |
+| Sender and receiver reports | Their struct, with their report blocks and the signed 24-bit cumulative loss. |
+| SDES | Chunks of items. |
+| Goodbyes | Their struct, with an optional reason. |
+| Generic NACK (transport feedback format 1) | Expanded into the list of lost sequence numbers. |
+| Picture Loss Indication (payload feedback format 1 with no control information) | Its struct. |
+| Other feedback formats, REMB and transport-wide congestion control among them | Keep their control information unparsed in `FeedbackMessage`. |
+
+Other packet types become `RawPacket`.
+
+##### RTCP marshalling
+
+`marshal_rtcp` packs a NACK's sequence numbers into packet identifiers with a 16-bit bitmask of the next 16. It ends each SDES chunk with a zero byte padded to a word. It never adds padding.
+
+##### RTP packet classification
+
+`classify` follows RFC 7983 and RFC 5761.
+
+| First byte | Classified as |
+| --- | --- |
+| 0 to 3 | STUN |
+| 20 to 63 | DTLS |
+| 128 to 191 | RTCP when the second byte is 192 to 223, and RTP otherwise. |
 
 #### SRTP
 
-- `std/srtp` implements RFC 3711 with AES-128 counter mode and HMAC-SHA1 tags of 80 or 32 bits, and RFC 7714 with AES-128-GCM and AES-256-GCM and a 128-bit tag. Session keys come from the AES counter mode key derivation with a key derivation rate of 0, for the GCM profiles too, with a 12-byte master salt. MKI is not supported. SRTCP always carries an 80-bit tag in the counter mode profiles.
-- A `Context` serves one direction. Per synchronization source, it keeps the highest index seen and a 64-packet replay window, for RTP and RTCP apart. The RTP index is the 32-bit rollover counter above the sequence number. It is estimated from the highest index as RFC 3711 appendix A says. The sender estimates it the same way, so a retransmission within half the sequence space of the newest packet keeps its index. `protect` fails with `Exhausted` once the rollover counter would pass 2^32 - 1. `protect_rtcp` fails with `Exhausted` once the 31-bit SRTCP index would pass 2^31 - 1. That index starts at 0 for each source.
-- `unprotect` and `unprotect_rtcp` check the replay window, then the tag, and only then decrypt and move the window, so a forged or replayed packet changes nothing. A packet more than 64 behind the newest of its source, or already received, fails with `Replay`. `unprotect_rtcp` reads the E bit and returns an unencrypted SRTCP packet after checking its tag.
-- `from_dtls` splits the keying material that `export_keying_material(c, "EXTRACTOR-dtls_srtp", keying_material_size(profile))` returns into the client key, the server key, the client salt and the server salt (RFC 5764 section 4.2). The DTLS client sends with the client keys. The profile numbers are those of `use_srtp`, so `dtls.srtp_profile` passes straight to `from_dtls`.
-- `std/srtp/vectors_test.low` checks the key derivation and keystream of RFC 3711 appendix B, the RTP and RTCP vectors of RFC 7714 sections 16 and 17, and packets that libsrtp sealed for all four profiles across the rollover from sequence 65535 to 0, in both directions. `std/srtp/interop_test_linux.low` runs `testdata/srtp/gst_peer.py`, which drives GStreamer's `srtpenc` and `srtpdec` (libsrtp). For each profile it opens twelve packets from sequence 65530 and a sender report that libsrtp protected, and libsrtp must open every packet and the report that `std/srtp` protects. It skips when `python3`, `timeout` or GStreamer's srtp elements for Python are not installed.
+`std/srtp` implements RFC 3711 and RFC 7714.
+
+##### SRTP profiles
+
+| Standard | Cipher | Tag |
+| --- | --- | --- |
+| RFC 3711 | AES-128 counter mode | HMAC-SHA1 tags of 80 or 32 bits |
+| RFC 7714 | AES-128-GCM and AES-256-GCM | A 128-bit tag |
+
+MKI is not supported. SRTCP always carries an 80-bit tag in the counter mode profiles.
+
+##### SRTP key derivation
+
+Session keys come from the AES counter mode key derivation with a key derivation rate of 0, for the GCM profiles too, with a 12-byte master salt.
+
+##### SRTP context state
+
+A `Context` serves one direction. Per synchronization source, it keeps the highest index seen and a 64-packet replay window, for RTP and RTCP apart.
+
+##### SRTP index estimation
+
+The RTP index is the 32-bit rollover counter above the sequence number. It is estimated from the highest index as RFC 3711 appendix A says. The sender estimates it the same way, so a retransmission within half the sequence space of the newest packet keeps its index.
+
+##### SRTP index exhaustion
+
+| Function | Fails with `Exhausted` once |
+| --- | --- |
+| `protect` | The rollover counter would pass 2^32 - 1. |
+| `protect_rtcp` | The 31-bit SRTCP index would pass 2^31 - 1. That index starts at 0 for each source. |
+
+##### SRTP unprotect checks
+
+`unprotect` and `unprotect_rtcp` check the replay window, then the tag, and only then decrypt and move the window, so a forged or replayed packet changes nothing. A packet more than 64 behind the newest of its source, or already received, fails with `Replay`.
+
+`unprotect_rtcp` reads the E bit and returns an unencrypted SRTCP packet after checking its tag.
+
+##### SRTP keys from DTLS
+
+`from_dtls` splits the keying material that `export_keying_material(c, "EXTRACTOR-dtls_srtp", keying_material_size(profile))` returns into the client key, the server key, the client salt and the server salt (RFC 5764 section 4.2). The DTLS client sends with the client keys.
+
+The profile numbers are those of `use_srtp`, so `dtls.srtp_profile` passes straight to `from_dtls`.
+
+##### SRTP vector tests
+
+`std/srtp/vectors_test.low` checks:
+
+- the key derivation and keystream of RFC 3711 appendix B
+- the RTP and RTCP vectors of RFC 7714 sections 16 and 17
+- packets that libsrtp sealed for all four profiles across the rollover from sequence 65535 to 0, in both directions
+
+##### SRTP libsrtp interoperability test
+
+`std/srtp/interop_test_linux.low` runs `testdata/srtp/gst_peer.py`, which drives GStreamer's `srtpenc` and `srtpdec` (libsrtp). For each profile it opens twelve packets from sequence 65530 and a sender report that libsrtp protected, and libsrtp must open every packet and the report that `std/srtp` protects.
+
+It skips when `python3`, `timeout` or GStreamer's srtp elements for Python are not installed.
 
 #### SCTP
 
-- `std/sctp` is a state machine like `std/ice` and `std/dtls`. Every function takes the time as a count of milliseconds. The association queues packets for `poll_transmit`. The same code runs over a DTLS connection and over an in-memory network. Packets carry the common header of RFC 4960 with a CRC-32c checksum. The checksum is written little-endian and checked before anything else. A packet with a wrong checksum, a wrong port or a wrong verification tag is dropped without a reply. Chunks are padded to four bytes. Parameters and chunks that do not parse end the packet.
-- The handshake is the four-way exchange. The INIT and the COOKIE ECHO are retransmitted after `rto_initial`, doubling to `rto_max`. The handshake fails after 8 transmissions. The server keeps no state between INIT and COOKIE ECHO: the state cookie holds both tags, both first TSNs, the peer's window and stream count and the extensions it announced, under an HMAC-SHA-256 with a random per-association key. A cookie whose MAC does not match is ignored. Both sides announce RE-CONFIG and FORWARD-TSN support in the supported-extensions and forward-TSN-supported parameters.
-- A message is cut into DATA chunks of at most `Config.mtu` minus the 12-byte header and 16-byte chunk header, rounded down to a multiple of four. `Config.max_message_size` bounds the whole message. `send` fails with `TooLarge` above it. The TSN is a 32-bit serial number kept as a 64-bit count by comparison with the cumulative TSN, so a stream of any length survives wrap-around. The receiver reassembles fragments by TSN. It delivers ordered messages in stream sequence order. It delivers an unordered message as soon as its fragments are complete. It buffers at most `Config.window` bytes and discards DATA beyond it. Its SACK advertises the room left.
-- A SACK carries the cumulative TSN, the gap blocks within 65535 of it and up to 16 duplicate TSNs. It is sent for every second packet, at once when a gap or a duplicate exists, and otherwise after `sack_delay`. The sender keeps the congestion window at 4 packets at the start. It grows the window by the acknowledged bytes in slow start and by one packet per window in congestion avoidance. It bounds the flight by the smaller of the congestion window and the peer's window (RFC 4960 section 7). The third SACK that reports a gap before a chunk retransmits it at once. It halves the window once per window of data. A timeout retransmits everything outstanding, sets the window to one packet and doubles the timeout. The round-trip time uses chunks that were sent once, and the timeout stays within `rto_min` and `rto_max`.
-- `Delivery` states whether a message is ordered and its limits, `max_retransmits` and `lifetime`. When the peer announced FORWARD-TSN, a message past a limit is abandoned, the sender advances its peer's cumulative TSN with a FORWARD-TSN chunk that names the abandoned ordered streams and sequence numbers, and the receiver drops the fragments it holds below it and delivers what follows. Without the extension every message is reliable.
-- `reset_stream` queues the stream and sends an outgoing SSN reset request (RFC 6525) once everything sent before it has been sent, so the peer sees the reset after all earlier data. The peer answers with the result, resets its inbound sequence number for the stream and reports `StreamReset`. The sender restarts its own sequence numbers at 0 when the answer arrives. A stream sequence number is assigned when the first fragment of a message is sent. A message queued for a stream with a request in flight waits for the answer, so it carries the number 0 the peer expects. An incoming reset request from the peer makes the association reset the same streams in its own outgoing direction. A request is retransmitted after the retransmission timeout. A request with an unexpected sequence number is answered with the result the RFC defines for it.
-- A heartbeat goes out every `heartbeat_interval` milliseconds once the answer to the last one arrived. A heartbeat that is still unanswered when the next is due counts as a timeout. `shutdown` stops accepting messages, sends what is queued, then sends SHUTDOWN. It reports `Closed` when SHUTDOWN ACK arrives and it has sent SHUTDOWN COMPLETE (RFC 9260 section 9.2). The cumulative TSN in a SHUTDOWN acknowledges data as a SACK's does, so the receiver answers with SHUTDOWN ACK once what it sent is acknowledged. The receiver reports `Closed` when SHUTDOWN COMPLETE arrives. A side that sent SHUTDOWN answers each packet with DATA with another. If it receives SHUTDOWN in return, because both sides shut down at once, it answers with SHUTDOWN ACK and closes on the peer's SHUTDOWN ACK. SHUTDOWN and SHUTDOWN ACK are retransmitted on the retransmission timeout until `max_retransmissions` consecutive timeouts fail the association. A closed association answers a SHUTDOWN ACK that carries its tag with a SHUTDOWN COMPLETE with the T bit set, so the peer closes when the first SHUTDOWN COMPLETE was lost. `abort` sends ABORT and reports `Failed`. A peer ABORT, a handshake that does not finish and `max_retransmissions` consecutive timeouts also report `Failed`.
-- `std/sctp/session` runs an `Assoc` in one green thread that waits on commands, packets and the next timeout together. A `Transport` has no socket, so the same code runs over `std/dtls/session`'s `send` and `data`. `Handle.messages` holds 256 messages. The session stops reading packets while they wait, which closes the receiver window. `Handle.events` holds 64 and drops what does not fit.
-- `std/sctp/assoc_test.low` drives two associations over a simulated path with loss, reordering and duplication. It checks the handshake and a retransmitted INIT, fragmentation, ordered, unordered and partially reliable delivery, retransmission on a lossy path, congestion window growth, the receiver window, stream reset, heartbeat, shutdown, shutdowns that cross, shutdown on a lossy path and through the cumulative TSN of a SHUTDOWN, abort, and that a packet with a flipped bit is dropped.
+`std/sctp` is a state machine like `std/ice` and `std/dtls`. Every function takes the time as a count of milliseconds.
+
+##### SCTP association queueing
+
+The association queues packets for `poll_transmit`. The same code runs over a DTLS connection and over an in-memory network.
+
+##### SCTP packet format and checksum
+
+Packets carry the common header of RFC 4960 with a CRC-32c checksum. The checksum is written little-endian and checked before anything else. A packet with a wrong checksum, a wrong port or a wrong verification tag is dropped without a reply. Chunks are padded to four bytes. Parameters and chunks that do not parse end the packet.
+
+##### SCTP handshake
+
+The handshake is the four-way exchange. The INIT and the COOKIE ECHO are retransmitted after `rto_initial`, doubling to `rto_max`. The handshake fails after 8 transmissions.
+
+Both sides announce RE-CONFIG and FORWARD-TSN support in the supported-extensions and forward-TSN-supported parameters.
+
+##### SCTP state cookie
+
+The server keeps no state between INIT and COOKIE ECHO: the state cookie holds these, under an HMAC-SHA-256 with a random per-association key:
+
+- both tags
+- both first TSNs
+- the peer's window and stream count and the extensions it announced
+
+A cookie whose MAC does not match is ignored.
+
+##### SCTP message fragmentation
+
+A message is cut into DATA chunks of at most `Config.mtu` minus the 12-byte header and 16-byte chunk header, rounded down to a multiple of four. `Config.max_message_size` bounds the whole message. `send` fails with `TooLarge` above it.
+
+The TSN is a 32-bit serial number kept as a 64-bit count by comparison with the cumulative TSN, so a stream of any length survives wrap-around.
+
+##### SCTP receiver
+
+The receiver reassembles fragments by TSN.
+
+| Message | Delivered |
+| --- | --- |
+| Ordered | In stream sequence order. |
+| Unordered | As soon as its fragments are complete. |
+
+The receiver buffers at most `Config.window` bytes and discards DATA beyond it. Its SACK advertises the room left.
+
+##### SCTP SACK contents and timing
+
+A SACK carries:
+
+- the cumulative TSN
+- the gap blocks within 65535 of it
+- up to 16 duplicate TSNs
+
+It is sent for every second packet, at once when a gap or a duplicate exists, and otherwise after `sack_delay`.
+
+##### SCTP congestion window
+
+The sender keeps the congestion window at 4 packets at the start.
+
+| Phase | Window growth |
+| --- | --- |
+| Slow start | By the acknowledged bytes. |
+| Congestion avoidance | By one packet per window. |
+
+It bounds the flight by the smaller of the congestion window and the peer's window (RFC 4960 section 7).
+
+##### SCTP loss recovery
+
+| Event | Sender action |
+| --- | --- |
+| The third SACK that reports a gap before a chunk | Retransmits it at once. It halves the window once per window of data. |
+| A timeout | Retransmits everything outstanding, sets the window to one packet and doubles the timeout. |
+
+##### SCTP round-trip time and timeout
+
+The round-trip time uses chunks that were sent once, and the timeout stays within `rto_min` and `rto_max`.
+
+##### SCTP partial reliability
+
+`Delivery` states whether a message is ordered and its limits, `max_retransmits` and `lifetime`.
+
+When the peer announced FORWARD-TSN:
+
+- a message past a limit is abandoned
+- the sender advances its peer's cumulative TSN with a FORWARD-TSN chunk that names the abandoned ordered streams and sequence numbers
+- the receiver drops the fragments it holds below it and delivers what follows
+
+Without the extension every message is reliable.
+
+##### SCTP stream reset request
+
+`reset_stream` queues the stream and sends an outgoing SSN reset request (RFC 6525) once everything sent before it has been sent, so the peer sees the reset after all earlier data.
+
+The peer answers with the result, resets its inbound sequence number for the stream and reports `StreamReset`. The sender restarts its own sequence numbers at 0 when the answer arrives. A request is retransmitted after the retransmission timeout.
+
+##### SCTP stream sequence numbers during a reset
+
+A stream sequence number is assigned when the first fragment of a message is sent. A message queued for a stream with a request in flight waits for the answer, so it carries the number 0 the peer expects.
+
+##### SCTP incoming stream reset
+
+An incoming reset request from the peer makes the association reset the same streams in its own outgoing direction. A request with an unexpected sequence number is answered with the result the RFC defines for it.
+
+##### SCTP heartbeat
+
+A heartbeat goes out every `heartbeat_interval` milliseconds once the answer to the last one arrived. A heartbeat that is still unanswered when the next is due counts as a timeout.
+
+##### SCTP shutdown sequence
+
+`shutdown`:
+
+1. stops accepting messages
+2. sends what is queued
+3. sends SHUTDOWN
+
+It reports `Closed` when SHUTDOWN ACK arrives and it has sent SHUTDOWN COMPLETE (RFC 9260 section 9.2).
+
+The cumulative TSN in a SHUTDOWN acknowledges data as a SACK's does, so the receiver answers with SHUTDOWN ACK once what it sent is acknowledged. The receiver reports `Closed` when SHUTDOWN COMPLETE arrives.
+
+##### SCTP shutdowns that cross
+
+A side that sent SHUTDOWN answers each packet with DATA with another. If it receives SHUTDOWN in return, because both sides shut down at once, it answers with SHUTDOWN ACK and closes on the peer's SHUTDOWN ACK.
+
+##### SCTP shutdown retransmission
+
+SHUTDOWN and SHUTDOWN ACK are retransmitted on the retransmission timeout until `max_retransmissions` consecutive timeouts fail the association.
+
+A closed association answers a SHUTDOWN ACK that carries its tag with a SHUTDOWN COMPLETE with the T bit set, so the peer closes when the first SHUTDOWN COMPLETE was lost.
+
+##### SCTP abort and failure
+
+| Cause | Reports |
+| --- | --- |
+| `abort`, which sends ABORT | `Failed` |
+| A peer ABORT | `Failed` |
+| A handshake that does not finish | `Failed` |
+| `max_retransmissions` consecutive timeouts | `Failed` |
+
+##### SCTP session threading and queues
+
+`std/sctp/session` runs an `Assoc` in one green thread that waits on commands, packets and the next timeout together. A `Transport` has no socket, so the same code runs over `std/dtls/session`'s `send` and `data`.
+
+| Queue | Holds | When it does not fit |
+| --- | --- | --- |
+| `Handle.messages` | 256 messages | The session stops reading packets while they wait, which closes the receiver window. |
+| `Handle.events` | 64 | Drops what does not fit. |
+
+##### SCTP association test
+
+`std/sctp/assoc_test.low` drives two associations over a simulated path with loss, reordering and duplication. It checks:
+
+- the handshake and a retransmitted INIT
+- fragmentation
+- ordered, unordered and partially reliable delivery
+- retransmission on a lossy path
+- congestion window growth
+- the receiver window
+- stream reset
+- heartbeat
+- shutdown
+- shutdowns that cross
+- shutdown on a lossy path and through the cumulative TSN of a SHUTDOWN
+- abort
+- that a packet with a flipped bit is dropped
 
 #### Data channels
 
-- `std/datachannel` runs DCEP and the channels of one SCTP association in one green thread, which waits on commands, the association's messages and its events together. The association is a `std/sctp/session` over the `Transport` the caller gives, so the same code runs over `std/dtls/session` and over an in-memory path.
-- `Config.client` of the association names the DTLS role. The DTLS client opens channels on even stream identifiers and the DTLS server on odd ones (RFC 8832 section 6), each taking the lowest unused one. A channel cannot use identifier 65535. A DATA_CHANNEL_OPEN that arrives on a stream of the receiver's own parity, on a stream that has a channel, or that does not parse resets that stream and creates nothing.
-- `Options` map onto the OPEN message. `max_lifetime` selects the timed type with the lifetime in milliseconds. `max_retransmits` selects the retransmit type with the count. Setting neither selects the reliable type. An unordered channel sets the high bit of the type. Both limits at once fail with `Invalid`. The OPEN is sent ordered and reliable with PPID 50. The channel is usable at once, because data may follow the OPEN before the acknowledgement arrives. The receiver answers with DATA_CHANNEL_ACK and puts the channel on `Handle.incoming`. When 64 channels wait there, the new channel is closed. A received ACK is recognised by its first byte, because `pion/datachannel` pads it to four bytes. A negotiated channel sends and expects no OPEN. Both sides open it with the same `id`. This fails with `Invalid` outside 0 to 65534 or when a channel already uses it.
-- A text message has PPID 51 and a binary message 53. An empty message has no SCTP form, so it is sent as one zero byte with PPID 56 for text or 57 for binary. It is received as an empty `Message`. A message on a stream whose OPEN has not arrived waits for it. An unordered channel can produce this case. At most 64 messages wait per stream.
-- Each message is sent with the channel's `sctp.Delivery`. So a channel with `ordered: false` or a limit uses unordered delivery and partial reliability. These apply only when the peer announced FORWARD-TSN.
-- `close_channel` resets the stream once the messages queued before it were sent. The peer sees the reset, closes its channel and resets its own outgoing direction. The channel ends, closing `Channel.messages`, when that answer arrives. Sends on a closing channel fail with `NotConnected`. The identifier can be used again, with sequence numbers restarting at 0. An association that closes or fails ends every channel.
-- `Channel.messages` holds 256 messages. When a channel's queue is full the router keeps up to 256 messages in arrival order and stops reading the association, which closes the receive window, so a channel that is not read delays the others.
-- `testdata/run/std_datachannel.low` runs two peers over an in-memory path with no loss and with every third packet lost. It checks identifiers, labels, reliability parameters, text and binary messages up to 20000 bytes, empty messages, negotiated channels, closing and identifier reuse. The module was also run against `pion/datachannel` over UDP in both roles, with reliable and partially reliable unordered channels, text and binary messages up to 40000 bytes and empty messages in both directions, and a channel closed by the Low side.
+`std/datachannel` runs DCEP and the channels of one SCTP association in one green thread, which waits on commands, the association's messages and its events together. The association is a `std/sctp/session` over the `Transport` the caller gives, so the same code runs over `std/dtls/session` and over an in-memory path.
+
+##### Data channel stream identifiers
+
+`Config.client` of the association names the DTLS role (RFC 8832 section 6).
+
+| DTLS role | Opens channels on |
+| --- | --- |
+| Client | Even stream identifiers, each taking the lowest unused one |
+| Server | Odd ones, each taking the lowest unused one |
+
+A channel cannot use identifier 65535.
+
+##### Rejected DATA_CHANNEL_OPEN
+
+A DATA_CHANNEL_OPEN that arrives on a stream of the receiver's own parity, on a stream that has a channel, or that does not parse resets that stream and creates nothing.
+
+##### Data channel options
+
+`Options` map onto the OPEN message.
+
+| Option | Effect |
+| --- | --- |
+| `max_lifetime` | Selects the timed type with the lifetime in milliseconds. |
+| `max_retransmits` | Selects the retransmit type with the count. |
+| Neither | Selects the reliable type. |
+| An unordered channel | Sets the high bit of the type. |
+| Both limits at once | Fails with `Invalid`. |
+
+##### Data channel OPEN and acknowledgement
+
+The OPEN is sent ordered and reliable with PPID 50. The channel is usable at once, because data may follow the OPEN before the acknowledgement arrives.
+
+The receiver answers with DATA_CHANNEL_ACK and puts the channel on `Handle.incoming`. When 64 channels wait there, the new channel is closed. A received ACK is recognised by its first byte, because `pion/datachannel` pads it to four bytes.
+
+##### Negotiated data channels
+
+A negotiated channel sends and expects no OPEN. Both sides open it with the same `id`. This fails with `Invalid` outside 0 to 65534 or when a channel already uses it.
+
+##### Data channel message types
+
+| Message | PPID |
+| --- | --- |
+| Text | 51 |
+| Binary | 53 |
+
+An empty message has no SCTP form, so it is sent as one zero byte with PPID 56 for text or 57 for binary. It is received as an empty `Message`.
+
+##### Data channel messages before OPEN
+
+A message on a stream whose OPEN has not arrived waits for it. An unordered channel can produce this case. At most 64 messages wait per stream.
+
+##### Data channel delivery
+
+Each message is sent with the channel's `sctp.Delivery`. So a channel with `ordered: false` or a limit uses unordered delivery and partial reliability. These apply only when the peer announced FORWARD-TSN.
+
+##### Closing a data channel
+
+1. `close_channel` resets the stream once the messages queued before it were sent.
+2. The peer sees the reset, closes its channel and resets its own outgoing direction.
+3. The channel ends, closing `Channel.messages`, when that answer arrives.
+
+Sends on a closing channel fail with `NotConnected`. The identifier can be used again, with sequence numbers restarting at 0. An association that closes or fails ends every channel.
+
+##### Data channel receive queue
+
+`Channel.messages` holds 256 messages. When a channel's queue is full the router keeps up to 256 messages in arrival order and stops reading the association, which closes the receive window, so a channel that is not read delays the others.
+
+##### Data channel fixture test
+
+`testdata/run/std_datachannel.low` runs two peers over an in-memory path with no loss and with every third packet lost. It checks:
+
+- identifiers
+- labels
+- reliability parameters
+- text and binary messages up to 20000 bytes
+- empty messages
+- negotiated channels
+- closing and identifier reuse
+
+##### Data channel interoperability with pion
+
+The module was also run against `pion/datachannel` over UDP in both roles, with:
+
+- reliable and partially reliable unordered channels
+- text and binary messages up to 40000 bytes and empty messages in both directions
+- a channel closed by the Low side
 
 #### SDP
 
-- `std/sdp` reads a description line by line, with CRLF or LF line ends. It fails with `Line` at the first line that is empty, has no `type=` prefix, has a type RFC 8866 does not define, appears twice where one is allowed or does not parse. `v=0`, `o=` and `s=` are required. `t=` is not required, and `format` writes `t=0 0` for a session without one. The lines of a section may come in any order, and a `m=` line starts a media description. `format` writes the order of RFC 8866 section 5, so the text of a description in that order, which browsers and pion send, formats back to the same bytes.
-- An `Attribute` is a name and an optional value, split at the first colon. `a=rtcp-mux` has no value, and `a=msid-semantic: WMS` has the value ` WMS`. `get`, `has` and `all` look an attribute up. The typed accessors fail with `Attribute` naming the attribute whose value does not parse. They return `none` or an empty list when the attribute is absent.
-- `ice_ufrag`, `ice_pwd`, `ice_options`, `fingerprints`, `setup`, `direction` and `end_of_candidates` read the media description and then the session, because JSEP allows each on either. Chrome and pion put the credentials on every media description, and Firefox puts the fingerprint on the session. `fingerprints` and `candidates` return the attribute values for `std/dtls`'s `parse_fingerprint` and `std/ice`'s `parse`. So a candidate `std/ice` does not read, such as a TCP candidate, is the caller's to skip. `is_data_channel` is an `application` media description over `DTLS/SCTP` with the format `webrtc-datachannel` (RFC 8841). The media description's `sctp_port` and `max_message_size` are attributes.
-- `testdata/sdp/` holds offers and an answer captured from three sources. The first is Chromium 158: `chromium_offer.sdp`, with host candidates, and `chromium_answer.sdp`, its answer to the pion offer. The second is Firefox 160: `firefox_offer.sdp`, with mDNS and TCP candidates, `a=extmap:2/recvonly` and an `a=fmtp:101 0-15`. The third is pion/webrtc 4.2.27: `pion_offer.sdp`. Each comes from a data channel, an audio and a video transceiver. Documentation addresses stand in for the interface addresses, and nothing else is edited. `std/sdp/sdp_test.low` requires each to format back to its own bytes. `std/sdp/webrtc_test.low` reads the WebRTC attributes of each.
+`std/sdp` reads a description line by line, with CRLF or LF line ends.
+
+##### SDP parse errors
+
+It fails with `Line` at the first line that:
+
+- is empty
+- has no `type=` prefix
+- has a type RFC 8866 does not define
+- appears twice where one is allowed
+- does not parse
+
+##### SDP required lines
+
+| Line | Status |
+| --- | --- |
+| `v=0` | Required. |
+| `o=` | Required. |
+| `s=` | Required. |
+| `t=` | Not required, and `format` writes `t=0 0` for a session without one. |
+
+##### SDP line order
+
+The lines of a section may come in any order, and a `m=` line starts a media description. `format` writes the order of RFC 8866 section 5, so the text of a description in that order, which browsers and pion send, formats back to the same bytes.
+
+##### SDP attribute syntax
+
+An `Attribute` is a name and an optional value, split at the first colon.
+
+| Attribute | Value |
+| --- | --- |
+| `a=rtcp-mux` | No value. |
+| `a=msid-semantic: WMS` | The value ` WMS`. |
+
+`get`, `has` and `all` look an attribute up.
+
+##### SDP typed accessors
+
+The typed accessors fail with `Attribute` naming the attribute whose value does not parse. They return `none` or an empty list when the attribute is absent.
+
+##### SDP session and media description lookup
+
+`ice_ufrag`, `ice_pwd`, `ice_options`, `fingerprints`, `setup`, `direction` and `end_of_candidates` read the media description and then the session, because JSEP allows each on either. Chrome and pion put the credentials on every media description, and Firefox puts the fingerprint on the session.
+
+##### SDP fingerprints and candidates
+
+| Function | Returns the attribute values for |
+| --- | --- |
+| `fingerprints` | `std/dtls`'s `parse_fingerprint` |
+| `candidates` | `std/ice`'s `parse` |
+
+So a candidate `std/ice` does not read, such as a TCP candidate, is the caller's to skip.
+
+##### SDP data channel description
+
+`is_data_channel` is an `application` media description over `DTLS/SCTP` with the format `webrtc-datachannel` (RFC 8841). The media description's `sctp_port` and `max_message_size` are attributes.
+
+##### SDP captured descriptions
+
+`testdata/sdp/` holds offers and an answer captured from three sources.
+
+| Source | Files |
+| --- | --- |
+| First: Chromium 158 | `chromium_offer.sdp`, with host candidates, and `chromium_answer.sdp`, its answer to the pion offer. |
+| Second: Firefox 160 | `firefox_offer.sdp`, with mDNS and TCP candidates, `a=extmap:2/recvonly` and an `a=fmtp:101 0-15`. |
+| Third: pion/webrtc 4.2.27 | `pion_offer.sdp`. |
+
+Each comes from a data channel, an audio and a video transceiver. Documentation addresses stand in for the interface addresses, and nothing else is edited.
+
+##### SDP captured description tests
+
+`std/sdp/sdp_test.low` requires each to format back to its own bytes. `std/sdp/webrtc_test.low` reads the WebRTC attributes of each.
 
 #### Peer connection
 
-- `std/webrtc` is one green thread that owns the description state, the SRTP contexts and the track table. Each layer below it runs in its own session. The ICE session owns the sockets. The DTLS session runs over the ICE session's `send` and the datagrams the peer gives it. The data channel peer runs over the DTLS session's `send` and `data`. Every call is a command to that thread, so no two green threads touch the SRTP state.
-- The first `create_offer` or `create_answer` opens the ICE sockets, because the agent's role is fixed when it is made. The first offerer is controlling and the first answerer is controlled. Later exchanges keep the roles. A description holds the host candidates gathered when it was made, in its first section that is not rejected. Every local candidate, those included, also arrives as `Event.Candidate` for trickle. `add_remote_candidate` and the description's own candidates skip TCP candidates, host names outside `.local` and component 2. A candidate value seen before is ignored. Browsers send a `.local` candidate for their host addresses. `mdns.resolve` resolves it in a green thread of its own, and the candidate is added with the address it gets. It is dropped when no answer comes within 5 seconds. `end_of_remote_candidates` and `a=end-of-candidates` reach ICE once no name is still being resolved, so ICE does not fail a pair list that is still growing. With `Config.mdns` the peer opens an `mdns` responder with the ICE sockets and names each host address with `mdns.random_name`, so its descriptions and `Event.Candidate` carry the name. With `Config.mdns` the related address of a server-reflexive or relayed candidate is `0.0.0.0` port 0. `Config.ice` carries `turn_servers` and `relay_only` to the agent, so a peer gathers relayed candidates, or uses them alone.
-- Every section shares one transport (`a=group:BUNDLE`, RFC 9143, as browsers send with `max-bundle`). Every section multiplexes RTCP with RTP (`a=rtcp-mux`). The ICE credentials, the fingerprint and `setup` are read from the first section that is not rejected. Every offer says `actpass`. In the first exchange the answerer is the DTLS client unless the offer said `active`, as RFC 8842 recommends. In the first exchange the offerer takes the role opposite the answer's `active` or `passive`. One flag then drives the DTLS role, the SCTP role that picks even or odd stream identifiers and the SRTP key direction. Later exchanges keep the roles whatever their `setup` says. An answer states the role the peer has. The DTLS connection accepts only a certificate whose digest is one of the remote description's fingerprints. DTLS refuses renegotiation, so a later description whose fingerprints are not among them is refused with `Invalid`.
-- The peer splits the datagrams of known remote addresses that are not STUN by their first byte (RFC 7983, `rtp.classify`). DTLS goes to the DTLS session through a channel of 256 made when the peer opens, so a ClientHello that arrives before the DTLS session exists waits. RTP and RTCP go to SRTP. The DTLS session starts when ICE selects a pair. When the handshake finishes and `use_srtp` agreed a profile, the peer derives the SRTP contexts from `EXTRACTOR-dtls_srtp` (RFC 5764). The offered profiles are `Config.srtp_profiles`, AES-128-GCM first.
-- SCTP runs when both descriptions have a data channel section (RFC 8841). The association uses the remote `a=sctp-port`, 5000 when absent. It sizes its packets to `Config.mtu` less the 37 bytes a DTLS record with an AES-GCM suite adds. It bounds the messages it sends by the remote `a=max-message-size`, which is 65536 when absent and no bound when 0. The state is `Connected` once DTLS is up and, with a data channel section, SCTP too. `Disconnected` follows ICE consent, and `Failed` follows a failure of any layer.
-- The peer keeps its media sections in m-line order. They are the W3C transceivers that `transceivers` reports. A section keeps its `mid` and its place in every later description. A rejected or stopped section stays at port 0 and is not reused. An offer lists the negotiated sections, then a new section for each local track without one, then a data channel section when `Config.data_channels` is set and no exchange has had one. A description whose sections do not start with the negotiated `mid`s in their order is refused with `Invalid`.
-- A local track's section offers its codecs, the direction it asks for, `a=msid` and `a=ssrc` with the track's synchronization source. The direction is `sendrecv` until `set_direction` changes it or `remove_track` takes the send part away. A section without a track does not offer to send. An answer gives each new audio or video section the first local track of its kind without a section that shares one of its codecs. It keeps the offered codecs that share a name and clock rate (and channel count when both state it) with the track's, at the offered payload types, which `codecs` then returns. A section without a track is answered with every offered codec. A section sends when it has a track, its direction sends and the remote receives. It receives when its direction receives and the remote sends. A section a remote offer made is therefore `recvonly` until `add_track` gives it a track. Sections of another type, a second data channel section and sections over another protocol are rejected with port 0.
-- A section the remote sends on has a `RemoteTrack`. The peer matches its RTP by the synchronization source of the section's first `a=ssrc`. When the section has none, it matches by payload type and binds the first source that arrives. A later description that names another source on the section closes the old track's `packets` and announces a new `RemoteTrack`. SRTP keeps a rollover counter and replay window per source, so the new source needs no new keys. A description in which the remote stops sending, or that rejects or stops the section, closes the track's `packets`.
-- A data channel section accepted in a later exchange starts SCTP over the DTLS connection that is up, and `create_data_channel` waits for that association to connect. A stopped or rejected data channel section aborts an association that has not connected. It shuts a connected one down. Each side sends what its channels queued, the channels deliver it, and they end on both sides when the association reports `Closed`. A shutdown that has not finished 5 seconds later aborts the association. An abort that reaches the side that stopped the section, or that has an offer outstanding, does not fail the peer. A data channel section is offered at most once.
-- `send_rtp` replaces the packet's synchronization source with the track's and protects it. `send_rtcp` sends one compound SRTCP packet. `send_rtp` fails with `NotConnected` for a removed track and for one whose section is stopped, and neither checks the negotiated direction. The peer unprotects and parses received RTP and puts it on the track's `packets`. RTCP goes to `Handle.rtcp`. Both channels hold 256 and drop what does not fit. Codecs, jitter buffers, retransmission and congestion control are the caller's.
-- The signalling state (`signaling`) is `Stable` or `HaveLocalOffer`. `create_offer` moves to `HaveLocalOffer`, and `apply_answer` and `rollback` move back. `create_answer` applies the remote offer and makes the answer at once. It needs `Stable`. When offers cross (glare), `create_answer` fails with `WrongState` on both sides. The side that yields calls `rollback`. `rollback` takes the `mid`s back from the sections its offer added and drops a data channel section it added. The yielding side answers, and offers its own changes once stable, as the W3C perfect negotiation pattern does. Provisional answers and sections that are not bundled are not supported. The certificate is a new P-256 identity made by `open`.
-- `restart_ice` makes the next offer restart ICE (RFC 8445 section 9). The agent takes new credentials, forgets the remote credentials, candidates and pairs and gathers again. The peer forgets the candidate values it has seen, because the regathered candidates repeat them. An offer whose credentials differ from the last remote ones makes the answerer restart as well. An answer with new credentials replaces the remote ones and the checklist. The selected pair carries DTLS, SRTP and SCTP until the new checks nominate a pair, which `Event.Selected` reports. Until then each side answers consent checks under the other's old credentials with 401. This is harmless while that takes less than the 10 seconds after which consent turns `Disconnected`. A `rollback` keeps the new credentials, because the agent cannot take the old ones back. The next answer therefore carries them, and the remote restarts its checklist as it does for any new credentials. A relayed selected pair keeps its TURN allocation through the restart. `std/webrtc/relay_test_linux.low` runs the pion/turn server of `std/ice/session/relay_test_linux.low`. It restarts ICE from a `relay_only` peer through that server over UDP and TCP, with data channel messages both ways and audio during the restart and after the new `Event.Selected`. It skips as that test does.
-- `testdata/run/std_webrtc.low` runs two peers in one process over loopback sockets. The offer and the answer go through `sdp.format` and `sdp.parse`. A data channel is opened each way with text and a 20000-byte binary message. Each side's audio track carries SRTP to the other across the sequence number wrap, with an RTCP picture loss indication back. Later exchanges run with the data channel open throughout. They add a video track whose packets arrive under its new source. They turn the first answerer's audio to `recvonly` in an offer it makes, which ends that track at the first offerer while the DTLS roles stay. They remove the video track, which ends it at the other side and stops its sends. They cross two offers, one of them an ICE restart. The restarting side rolls back and answers the other's offer, which stops the video section. They restart ICE from the first answerer. Last, they stop the data channel section, which delivers a 60000-byte message the answerer sent just before answering and then ends the channel within 2 seconds, while audio still flows. During that restart, before the answer, RTP and data channel messages reach the restarting side. Afterwards both sides report a new `Event.Selected` and media and messages still flow. Neither side ever reports `Disconnected` or `Failed`. Each description's `mid`s, kinds and directions are printed and compared. `std/webrtc/interop_test_linux.low` builds `testdata/webrtc/pion`, a pion/webrtc 4.2.27 peer that echoes data channel messages and RTP. It runs that peer with Low offering and with pion offering. Each side opens a data channel. Text and a 30000-byte binary message are echoed. Five SRTP packets come back on pion's track. Then Low adds a video track and offers it, and five VP8 packets on the new source come back. Pion adds a video track and offers it, and its packets arrive on the `RemoteTrack` that announces it. The side that made the first offer restarts ICE, with a data channel echo while Low's restart offer awaits its answer, or, because pion stops sending until its own restart finds a pair, as soon as Low has answered pion's, new credentials in both descriptions, a new `Event.Selected`, and echoes of text and RTP after it. A third run has pion offer its audio track without a data channel section, so the first answer has none. Low then offers one, which starts SCTP over the DTLS connection that is up and carries a channel echo. Low then stops it, which ends the channel within 3 seconds through pion's answer to the SHUTDOWN. The test skips when `go` or `timeout` is not installed or the pion modules cannot be downloaded. The module was also run by hand against headless Chromium 158 and Firefox 160 in both offer directions. The runs used the browsers' `.local` host candidates and, with `Config.mdns`, the peer's own. Each run had a data channel each way with text and a 60000-byte binary echo, and 50 SRTP packets that each browser counted in `getStats`. Every run used DTLS 1.3 and `TLS_AES_128_GCM_SHA256`, with AES-128-GCM or AES-128 counter mode SRTP as the browser chose. In a run where the peer left the browser's names unresolved, both browsers still connected and reported a remote `host` candidate. They had therefore resolved the peer's names through its responder. A by-hand renegotiation run against both browsers had the browser offer first. In a second offer the browser restarted ICE and turned its video section to `recvonly`. In a third offer the peer added a video track to that section and restarted ICE. The data channel carried the signalling notes while each restart was outstanding and echoed after it. `Event.Selected` reported the new pair. Each browser reported its selected pair under the newest credentials and counted 50 audio and 50 video packets in `getStats`. `std/webrtc/mdns_test_linux.low` connects two peers with `Config.mdns` over loopback and requires each to select a remote `host` candidate, which only a resolved name gives. It skips when the host cannot share port 5353 or multicast does not come back to it.
+`std/webrtc` is one green thread that owns the description state, the SRTP contexts and the track table. Each layer below it runs in its own session. Every call is a command to that thread, so no two green threads touch the SRTP state.
+
+##### Peer connection layers
+
+| Layer | Behaviour |
+| --- | --- |
+| The ICE session | Owns the sockets. |
+| The DTLS session | Runs over the ICE session's `send` and the datagrams the peer gives it. |
+| The data channel peer | Runs over the DTLS session's `send` and `data`. |
+
+##### ICE sockets and agent role
+
+The first `create_offer` or `create_answer` opens the ICE sockets, because the agent's role is fixed when it is made. The first offerer is controlling and the first answerer is controlled. Later exchanges keep the roles.
+
+##### Host candidates in descriptions
+
+A description holds the host candidates gathered when it was made, in its first section that is not rejected. Every local candidate, those included, also arrives as `Event.Candidate` for trickle.
+
+##### Remote candidates skipped
+
+`add_remote_candidate` and the description's own candidates skip:
+
+- TCP candidates
+- host names outside `.local`
+- component 2
+
+A candidate value seen before is ignored.
+
+##### mDNS host candidates from browsers
+
+Browsers send a `.local` candidate for their host addresses. `mdns.resolve` resolves it in a green thread of its own, and the candidate is added with the address it gets. It is dropped when no answer comes within 5 seconds.
+
+`end_of_remote_candidates` and `a=end-of-candidates` reach ICE once no name is still being resolved, so ICE does not fail a pair list that is still growing.
+
+##### Peer mDNS responder
+
+With `Config.mdns` the peer opens an `mdns` responder with the ICE sockets and names each host address with `mdns.random_name`, so its descriptions and `Event.Candidate` carry the name. With `Config.mdns` the related address of a server-reflexive or relayed candidate is `0.0.0.0` port 0.
+
+##### TURN servers and relay only
+
+`Config.ice` carries `turn_servers` and `relay_only` to the agent, so a peer gathers relayed candidates, or uses them alone.
+
+##### Peer connection bundled transport
+
+Every section shares one transport (`a=group:BUNDLE`, RFC 9143, as browsers send with `max-bundle`). Every section multiplexes RTCP with RTP (`a=rtcp-mux`). The ICE credentials, the fingerprint and `setup` are read from the first section that is not rejected.
+
+##### DTLS role negotiation
+
+Every offer says `actpass`. In the first exchange the answerer is the DTLS client unless the offer said `active`, as RFC 8842 recommends. In the first exchange the offerer takes the role opposite the answer's `active` or `passive`.
+
+One flag then drives the DTLS role, the SCTP role that picks even or odd stream identifiers and the SRTP key direction. Later exchanges keep the roles whatever their `setup` says. An answer states the role the peer has.
+
+##### Peer connection certificate fingerprints
+
+The DTLS connection accepts only a certificate whose digest is one of the remote description's fingerprints. DTLS refuses renegotiation, so a later description whose fingerprints are not among them is refused with `Invalid`.
+
+##### Peer connection datagram routing
+
+The peer splits the datagrams of known remote addresses that are not STUN by their first byte (RFC 7983, `rtp.classify`).
+
+| Datagram | Goes to |
+| --- | --- |
+| DTLS | The DTLS session through a channel of 256 made when the peer opens, so a ClientHello that arrives before the DTLS session exists waits. |
+| RTP and RTCP | SRTP. |
+
+##### DTLS session start and SRTP keys
+
+The DTLS session starts when ICE selects a pair. When the handshake finishes and `use_srtp` agreed a profile, the peer derives the SRTP contexts from `EXTRACTOR-dtls_srtp` (RFC 5764). The offered profiles are `Config.srtp_profiles`, AES-128-GCM first.
+
+##### SCTP in the peer connection
+
+SCTP runs when both descriptions have a data channel section (RFC 8841).
+
+| Setting | Value |
+| --- | --- |
+| Port | The remote `a=sctp-port`, 5000 when absent. |
+| Packet size | `Config.mtu` less the 37 bytes a DTLS record with an AES-GCM suite adds. |
+| Message bound | The remote `a=max-message-size`, which is 65536 when absent and no bound when 0. |
+
+##### Peer connection state
+
+| State | When |
+| --- | --- |
+| `Connected` | Once DTLS is up and, with a data channel section, SCTP too. |
+| `Disconnected` | Follows ICE consent. |
+| `Failed` | Follows a failure of any layer. |
+
+##### Media section order
+
+The peer keeps its media sections in m-line order. They are the W3C transceivers that `transceivers` reports. A section keeps its `mid` and its place in every later description. A rejected or stopped section stays at port 0 and is not reused.
+
+##### Peer connection offer section order
+
+An offer lists:
+
+1. the negotiated sections
+2. a new section for each local track without one
+3. a data channel section when `Config.data_channels` is set and no exchange has had one
+
+A data channel section is offered at most once.
+
+A description whose sections do not start with the negotiated `mid`s in their order is refused with `Invalid`.
+
+##### Local track sections in an offer
+
+A local track's section offers its codecs, the direction it asks for, `a=msid` and `a=ssrc` with the track's synchronization source. The direction is `sendrecv` until `set_direction` changes it or `remove_track` takes the send part away. A section without a track does not offer to send.
+
+##### Answering a media section
+
+An answer gives each new audio or video section the first local track of its kind without a section that shares one of its codecs. It keeps the offered codecs that share a name and clock rate (and channel count when both state it) with the track's, at the offered payload types, which `codecs` then returns. A section without a track is answered with every offered codec.
+
+##### Media section send and receive
+
+| A section | When |
+| --- | --- |
+| Sends | It has a track, its direction sends and the remote receives. |
+| Receives | Its direction receives and the remote sends. |
+
+A section a remote offer made is therefore `recvonly` until `add_track` gives it a track.
+
+##### Peer connection rejected sections
+
+These sections are rejected with port 0:
+
+- sections of another type
+- a second data channel section
+- sections over another protocol
+
+##### Remote track matching
+
+A section the remote sends on has a `RemoteTrack`.
+
+| Section | RTP matching |
+| --- | --- |
+| It has an `a=ssrc` | The peer matches its RTP by the synchronization source of the section's first `a=ssrc`. |
+| It has none | The peer matches by payload type and binds the first source that arrives. |
+
+##### Remote track changes
+
+A later description that names another source on the section closes the old track's `packets` and announces a new `RemoteTrack`. SRTP keeps a rollover counter and replay window per source, so the new source needs no new keys. A description in which the remote stops sending, or that rejects or stops the section, closes the track's `packets`.
+
+##### Data channel section in a later exchange
+
+A data channel section accepted in a later exchange starts SCTP over the DTLS connection that is up, and `create_data_channel` waits for that association to connect.
+
+##### Stopping a data channel section
+
+A stopped or rejected data channel section aborts an association that has not connected. It shuts a connected one down. Each side sends what its channels queued, the channels deliver it, and they end on both sides when the association reports `Closed`.
+
+A shutdown that has not finished 5 seconds later aborts the association. An abort that reaches the side that stopped the section, or that has an offer outstanding, does not fail the peer.
+
+##### Sending RTP and RTCP
+
+| Function | Does |
+| --- | --- |
+| `send_rtp` | Replaces the packet's synchronization source with the track's and protects it. |
+| `send_rtcp` | Sends one compound SRTCP packet. |
+
+`send_rtp` fails with `NotConnected` for a removed track and for one whose section is stopped, and neither checks the negotiated direction.
+
+##### Receiving RTP and RTCP
+
+The peer unprotects and parses received RTP and puts it on the track's `packets`. RTCP goes to `Handle.rtcp`. Both channels hold 256 and drop what does not fit.
+
+##### Media left to the caller
+
+Codecs, jitter buffers, retransmission and congestion control are the caller's.
+
+##### Peer connection signalling state
+
+The signalling state (`signaling`) is `Stable` or `HaveLocalOffer`.
+
+| Call | Effect |
+| --- | --- |
+| `create_offer` | Moves to `HaveLocalOffer`. |
+| `apply_answer` and `rollback` | Move back. |
+| `create_answer` | Applies the remote offer and makes the answer at once. It needs `Stable`. |
+
+Provisional answers and sections that are not bundled are not supported.
+
+##### Offer glare and rollback
+
+When offers cross (glare), `create_answer` fails with `WrongState` on both sides. The side that yields calls `rollback`. `rollback` takes the `mid`s back from the sections its offer added and drops a data channel section it added. The yielding side answers, and offers its own changes once stable, as the W3C perfect negotiation pattern does.
+
+##### Peer connection certificate
+
+The certificate is a new P-256 identity made by `open`.
+
+##### ICE restart offer
+
+`restart_ice` makes the next offer restart ICE (RFC 8445 section 9). The agent takes new credentials, forgets the remote credentials, candidates and pairs and gathers again. The peer forgets the candidate values it has seen, because the regathered candidates repeat them.
+
+##### ICE restart from new remote credentials
+
+An offer whose credentials differ from the last remote ones makes the answerer restart as well. An answer with new credentials replaces the remote ones and the checklist.
+
+##### Selected pair during an ICE restart
+
+The selected pair carries DTLS, SRTP and SCTP until the new checks nominate a pair, which `Event.Selected` reports. Until then each side answers consent checks under the other's old credentials with 401. This is harmless while that takes less than the 10 seconds after which consent turns `Disconnected`.
+
+##### Rollback after an ICE restart
+
+A `rollback` keeps the new credentials, because the agent cannot take the old ones back. The next answer therefore carries them, and the remote restarts its checklist as it does for any new credentials.
+
+##### Relayed pair through an ICE restart
+
+A relayed selected pair keeps its TURN allocation through the restart.
+
+##### Relayed ICE restart test
+
+`std/webrtc/relay_test_linux.low` runs the pion/turn server of `std/ice/session/relay_test_linux.low`. It restarts ICE from a `relay_only` peer through that server over UDP and TCP, with data channel messages both ways and audio during the restart and after the new `Event.Selected`. It skips as that test does.
+
+##### Peer connection loopback test
+
+`testdata/run/std_webrtc.low` runs two peers in one process over loopback sockets. The offer and the answer go through `sdp.format` and `sdp.parse`. A data channel is opened each way with text and a 20000-byte binary message. Each side's audio track carries SRTP to the other across the sequence number wrap, with an RTCP picture loss indication back.
+
+##### Loopback test renegotiations and checks
+
+Later exchanges run with the data channel open throughout:
+
+1. They add a video track whose packets arrive under its new source.
+2. They turn the first answerer's audio to `recvonly` in an offer it makes, which ends that track at the first offerer while the DTLS roles stay.
+3. They remove the video track, which ends it at the other side and stops its sends.
+4. They cross two offers, one of them an ICE restart. The restarting side rolls back and answers the other's offer, which stops the video section.
+5. They restart ICE from the first answerer.
+6. Last, they stop the data channel section, which delivers a 60000-byte message the answerer sent just before answering and then ends the channel within 2 seconds, while audio still flows.
+
+During that restart, before the answer, RTP and data channel messages reach the restarting side. Afterwards both sides report a new `Event.Selected` and media and messages still flow. Neither side ever reports `Disconnected` or `Failed`. Each description's `mid`s, kinds and directions are printed and compared.
+
+##### Pion interoperability test
+
+`std/webrtc/interop_test_linux.low` builds `testdata/webrtc/pion`, a pion/webrtc 4.2.27 peer that echoes data channel messages and RTP. It runs that peer with Low offering and with pion offering.
+
+- Each side opens a data channel.
+- Text and a 30000-byte binary message are echoed.
+- Five SRTP packets come back on pion's track.
+- Then Low adds a video track and offers it, and five VP8 packets on the new source come back.
+- Pion adds a video track and offers it, and its packets arrive on the `RemoteTrack` that announces it.
+- The side that made the first offer restarts ICE, with a data channel echo while Low's restart offer awaits its answer, or, because pion stops sending until its own restart finds a pair, as soon as Low has answered pion's, new credentials in both descriptions, a new `Event.Selected`, and echoes of text and RTP after it.
+
+##### Pion interoperability third run
+
+A third run has pion offer its audio track without a data channel section, so the first answer has none.
+
+1. Low offers one, which starts SCTP over the DTLS connection that is up and carries a channel echo.
+2. Low stops it, which ends the channel within 3 seconds through pion's answer to the SHUTDOWN.
+
+##### Pion interoperability test skips
+
+The test skips when `go` or `timeout` is not installed or the pion modules cannot be downloaded.
+
+##### Peer connection browser runs
+
+The module was also run by hand against headless Chromium 158 and Firefox 160 in both offer directions.
+
+- The runs used the browsers' `.local` host candidates and, with `Config.mdns`, the peer's own.
+- Each run had a data channel each way with text and a 60000-byte binary echo, and 50 SRTP packets that each browser counted in `getStats`.
+- Every run used DTLS 1.3 and `TLS_AES_128_GCM_SHA256`, with AES-128-GCM or AES-128 counter mode SRTP as the browser chose.
+
+##### Peer connection browser run with unresolved names
+
+In a run where the peer left the browser's names unresolved, both browsers still connected and reported a remote `host` candidate. They had therefore resolved the peer's names through its responder.
+
+##### Peer connection browser renegotiation run
+
+A by-hand renegotiation run against both browsers had the browser offer first.
+
+1. In a second offer the browser restarted ICE and turned its video section to `recvonly`.
+2. In a third offer the peer added a video track to that section and restarted ICE.
+
+The data channel carried the signalling notes while each restart was outstanding and echoed after it. `Event.Selected` reported the new pair. Each browser reported its selected pair under the newest credentials and counted 50 audio and 50 video packets in `getStats`.
+
+##### Peer connection mDNS test
+
+`std/webrtc/mdns_test_linux.low` connects two peers with `Config.mdns` over loopback and requires each to select a remote `host` candidate, which only a resolved name gives. It skips when the host cannot share port 5353 or multicast does not come back to it.
 
 ### Halo2 security
 
-`std/zk/halo2` is a Halo2 proof system as `halo2_proofs` 0.3.0 defines it, so a proof is sound under the discrete logarithm assumption on Vesta and Pallas (about 127 bits of group security) and the random oracle model for Blake2b, and zero knowledge for an honest prover that draws its randomness from `crypto.random`. There is no trusted setup. `params` derives every generator by hash to curve, and `keygen` is deterministic. `read_params` reads the `2^k` generators from a file without recomputing them. Parameters from a source that is not trusted must therefore be compared with `params(c, k)`. With other generators the argument binds nothing.
+`std/zk/halo2` is a Halo2 proof system as `halo2_proofs` 0.3.0 defines it.
 
-What is hidden: the advice columns, the permutation and lookup products, and the quotient pieces. The commitments of the advice columns carry a random blind, and the advice columns' last `blinding_factors + 1` rows hold random values. The permutation and lookup products end in random rows. The quotient pieces carry blinds and are opened together with a random polynomial. Instance columns and fixed columns are public. `blinding_factors` is the larger of 3 and the largest number of queries of one advice column, plus 2. The evaluations a proof reveals therefore leave the committed polynomials uniformly random. This is the argument of `halo2_proofs`. No simulator is built or checked here.
+#### Halo2 soundness and zero knowledge
 
-What is not constant time: `std/crypto/pasta` branches on points and scalar bits in `add`, `double`, `mul` and `msm` and in `field_sqrt`. `prove` commits to and multiplies by the witness through them. It sorts the compressed lookup input by value and compares witness values, so its running time depends on the private witness, and it must not run where a local timing observer is in scope. `verify` handles public data only. `prove` does not wipe the witness or the blinds from memory.
+Because the system is as `halo2_proofs` 0.3.0 defines it, a proof is sound under the discrete logarithm assumption on Vesta and Pallas (about 127 bits of group security) and the random oracle model for Blake2b, and zero knowledge for an honest prover that draws its randomness from `crypto.random`.
 
-What differs from `halo2_proofs`: `prove` checks the gates, the equalities and the lookups. It fails with `Unsatisfied`, where `halo2_proofs` makes a proof that does not verify. `verify` rejects trailing bytes with `Malformed`, where `halo2_proofs` leaves them unread.
+#### Halo2 parameters
+
+There is no trusted setup.
+
+| Function | Does |
+| --- | --- |
+| `params` | Derives every generator by hash to curve. |
+| `keygen` | Is deterministic. |
+| `read_params` | Reads the `2^k` generators from a file without recomputing them. |
+
+Parameters from a source that is not trusted must therefore be compared with `params(c, k)`. With other generators the argument binds nothing.
+
+#### Halo2 hidden values
+
+What is hidden: the advice columns, the permutation and lookup products, and the quotient pieces.
+
+| Hidden value | Hidden by |
+| --- | --- |
+| The advice columns | Their commitments carry a random blind, and the advice columns' last `blinding_factors + 1` rows hold random values. |
+| The permutation and lookup products | They end in random rows. |
+| The quotient pieces | They carry blinds and are opened together with a random polynomial. |
+
+Instance columns and fixed columns are public.
+
+`blinding_factors` is the larger of 3 and the largest number of queries of one advice column, plus 2.
+
+The evaluations a proof reveals therefore leave the committed polynomials uniformly random. This is the argument of `halo2_proofs`. No simulator is built or checked here.
+
+#### Halo2 timing and memory
+
+What is not constant time:
+
+- `std/crypto/pasta` branches on points and scalar bits in `add`, `double`, `mul` and `msm` and in `field_sqrt`. `prove` commits to and multiplies by the witness through them. It sorts the compressed lookup input by value and compares witness values, so its running time depends on the private witness, and it must not run where a local timing observer is in scope.
+
+`verify` handles public data only. `prove` does not wipe the witness or the blinds from memory.
+
+#### Differences from halo2_proofs
+
+| Function | Here | In `halo2_proofs` |
+| --- | --- | --- |
+| `prove` | Checks the gates, the equalities and the lookups. It fails with `Unsatisfied`. | It makes a proof that does not verify. |
+| `verify` | It rejects trailing bytes with `Malformed`. | It leaves them unread. |
 
 ### Derived serialization
 
-`std/serde` defines a `Writer` and a `Reader`. They are structs of closures through which values are written and read. For every concrete type the compiler derives a function that writes a value to a `Writer`, a function that reads it from a `Reader`, and a `Schema` describing it:
+`std/serde` defines a `Writer` and a `Reader`. They are structs of closures through which values are written and read.
 
-- Booleans, integers, floats and strings map to their primitives. `u8[]` maps to binary. Slices map to sequences. Maps map to maps with keys written as text. Optionals map to null or the value. Pointers map to their target, a shared pointer in full each time. A pointer reached again while its target is being written is a cycle and panics.
-- A struct is a map from field names to values. Every field takes part, private ones included. A reader opens it with `begin_map` and steps through it with `next_field`. A format may spell `next_field` differently from `next_key`, the step through the entries of a map. Reading skips unknown fields, uses a field's default when it is missing and treats a missing optional field as `none`. Otherwise it fails with `Missing`.
-- An enum variant without fields is its name. One with labelled fields is a single-key map from its name to a map of its fields, and one with positional fields maps its name to a sequence.
-- A schema records each type's kind, name, fields and variants. For each field it records whether the field is required and its tag. For each variant it records its index, which is the position when the enum declares no indexes. A struct or enum reached again through a pointer while it is being described becomes a `Ref` to its name.
+For every concrete type the compiler derives a function that writes a value to a `Writer`, a function that reads it from a `Reader`, and a `Schema` describing it.
 
-A `Reader` reports `at` in an `Error` as its `position`. The unit of `position` is the format's: a byte offset for JSON, a line for YAML, the count of values read for CBOR, MessagePack and TOML, a column index for `std/orm` and `0` for XML. CBOR, MessagePack, TOML, YAML, `std/avro` and `std/template` build a `serde.Tree` from a value and read a value from one. The variant shape, the text of a map key and the range of a `u64` are therefore defined once, in `std/serde`.
+#### Derived serialization of primitives, collections and pointers
+
+| Type | Maps to |
+| --- | --- |
+| Booleans, integers, floats and strings | Their primitives. |
+| `u8[]` | Binary. |
+| Slices | Sequences. |
+| Maps | Maps with keys written as text. |
+| Optionals | Null or the value. |
+| Pointers | Their target, a shared pointer in full each time. A pointer reached again while its target is being written is a cycle and panics. |
+
+#### Derived struct serialization
+
+A struct is a map from field names to values. Every field takes part, private ones included.
+
+A reader opens it with `begin_map` and steps through it with `next_field`. A format may spell `next_field` differently from `next_key`, the step through the entries of a map.
+
+Reading skips unknown fields, uses a field's default when it is missing and treats a missing optional field as `none`. Otherwise it fails with `Missing`.
+
+#### Derived enum serialization
+
+| Enum variant | Written as |
+| --- | --- |
+| Without fields | Its name. |
+| With labelled fields | A single-key map from its name to a map of its fields. |
+| With positional fields | It maps its name to a sequence. |
+
+#### Serde schemas
+
+A schema records each type's kind, name, fields and variants.
+
+| Schema entry | Records |
+| --- | --- |
+| Each field | Whether the field is required and its tag. |
+| Each variant | Its index, which is the position when the enum declares no indexes. |
+
+A struct or enum reached again through a pointer while it is being described becomes a `Ref` to its name.
+
+#### Serde reader positions
+
+A `Reader` reports `at` in an `Error` as its `position`. The unit of `position` is the format's:
+
+| Unit of `position` | Format |
+| --- | --- |
+| A byte offset | JSON |
+| A line | YAML |
+| The count of values read | CBOR, MessagePack and TOML |
+| A column index | `std/orm` |
+| `0` | XML |
+
+#### Serde trees
+
+CBOR, MessagePack, TOML, YAML, `std/avro` and `std/template` build a `serde.Tree` from a value and read a value from one. The variant shape, the text of a map key and the range of a `u64` are therefore defined once, in `std/serde`.
+
+#### Modules and struct fields
 
 `std/json`, `std/orm` and `std/web` are built on these. `T.field`, where `T` is a struct type, is a `serde.Field[T, F]` that holds the field's name and index. A function can therefore take a field of a given struct with a given type.
 
 ### Data
 
-- `json.Reader` tokenizes UTF-8 bytes like .NET's `Utf8JsonReader`, strictly per RFC 8259, with a depth limit of 64. It returns strings without copying unless they contain escapes. Numbers are parsed as integers or correctly rounded floats.
-- `json.serialize_with` and `json.deserialize_with` take `Options` for indentation, naming (`Unchanged`, `CamelCase`, `SnakeCase`, `PascalCase`), maximum depth and `omit_none`. Naming applies to struct field names and to variant names in both directions. It does not apply to the keys of a map. A variant name read back is matched in PascalCase. With `omit_none`, a field whose value is `none` is left out instead of written as `null`. Binary data is base64. Non-finite floats are written as `null`.
-- `std/cbor` decodes RFC 8949 items into `Value`s: every major type, indefinite-length strings, arrays and maps, tags, simple values, and half, single and double floats, which become `f64`. Indefinite-length items arrive as their definite equivalents. Text must be valid UTF-8 and map keys must be distinct. These fail with `Malformed`: truncated input, reserved additional information, a stray break, indefinite integers or tags, mixed or nested string chunks, a two-byte simple value below 32, data after the item, and a declared length that exceeds the remaining input (checked before anything is allocated). Nesting deeper than `Options.max_depth`, or a string, array or map longer than `max_length`, fails with `TooLarge`. `decode_first` returns the first item and its length so a caller can continue after it. `encode` writes the deterministic encoding of §4.2.1: shortest heads, definite lengths, map entries sorted by the bytes of their encoded keys, and floats in the shortest of half, single or double that keeps the value, with NaN as `f97e00`. `diagnostic` writes the notation of §8. `serialize` and `deserialize` bind types through serde with `u8[]` as byte strings, structs and variants as maps with text keys, and `none` as null. Reading looks through tags and accepts integer map keys as their decimal text.
-- `std/webauthn` produces options JSON in the shape py_webauthn's `options_to_json` writes. Challenges, user ids and credential ids are base64url. `pubKeyCredParams` defaults to `supported_algorithms()` of the COSE parser (EdDSA, ES256 and RS256), and attestation is `none`.
-  - `verify_registration` takes the credential JSON a browser's `PublicKeyCredential` gives in base64url, with or without padding. It checks that `id` is the base64url of `rawId`, that `type` is `public-key`, that clientDataJSON has type `webauthn.create`, the expected challenge (compared in constant time) and the origin. It then decodes the attestation object and checks the RP ID hash, user presence, user verification when required, and attested credential data. It parses the COSE key, accepts only the `none` format with an empty statement, and rejects a backup state without backup eligibility. It returns the credential id, the COSE key bytes exactly as the authenticator wrote them, and the sign count.
-  - `verify_authentication` makes the same client data and authenticator data checks for `webauthn.get`. It rejects a sign count that is not greater than the stored one unless both are zero. It verifies the signature over authenticatorData followed by SHA-256 of clientDataJSON with the stored key: ES256 as DER ECDSA on P-256, EdDSA as Ed25519 and RS256 as PKCS#1 v1.5 with SHA-256.
-  - Each failure is its own `Error` variant.
-- `std/orm` builds queries from conditions over field references, such as `orm.filter(orm.from(users), orm.ge(User.age, 18))`, and type-checks them against the field. It renders them for the connection's `Dialect`, maps rows onto structs, stores nested values as JSON columns and creates tables from types with an identity key named `id`. It returns generated keys from inserts: through `RETURNING` on PostgreSQL and MariaDB, `OUTPUT` on SQL Server and `LAST_INSERT_ID()` on MySQL.
-- `sql.Value` holds dates as days since 1970-01-01, times as microseconds since midnight, timestamps as microseconds since 1970-01-01 UTC, infinite dates and timestamps as the `i64` maximum and minimum, and UUIDs as 16 bytes. A connection serves one green thread at a time. A call made while another is running fails with `Busy`. `orm.transaction` rolls back on any error from its body. It fails with that error, or with the rollback's error when the rollback fails too.
-- `std/sql/postgres` authenticates with SCRAM-SHA-256, MD5 or cleartext. It uses the simple protocol for statements without parameters. Otherwise it uses the extended protocol with a 64-entry prepared statement cache. It streams `each` in batches of 512 rows, reads results as text decoded by type OID, and keeps a connection usable after a server error. A `Null` or `Text` parameter is declared with OID 0, so the server infers its type. Every other `Value` is a typed parameter. The driver declares it with OID 0 as well, sends Parse, Describe statement and Sync for the unnamed statement, and reads the ParameterDescription. A typed parameter that the server inferred as anything but `text` or `unknown` keeps the inferred type, so `Int(21)` binds into the `int4` of `twice($1)` and a `Float` into a `real`. A typed parameter the server could not infer (`SELECT $1`, both sides of `$1 < $2`) is declared with its own type (`Int` as `int8`, `Float` as `float8`, `Decimal` as `numeric`, and so on). The statement is parsed again with those OIDs. Bind sends every value in text format, so the server parses the text into whichever type it chose. This round trip happens once per statement text and value types, on the call that first sees them. The later calls reuse the declared OIDs and the prepared statement cache. A statement without a typed parameter keeps its single round trip. `cancel` sends a CancelRequest over a new connection once the request is sent, and keeps the connection. The call fails with `Cancelled` when the server stops it with SQLSTATE `57014`. `each` also stops between batches. A timeout sends a CancelRequest and closes the connection. Every field of an ErrorResponse fills the `Diagnostic`. An ErrorResponse or NoticeResponse reaches `on_notice` as a `Message`. A NotificationResponse reaches it as a `Notification`. Both arrive in order with the rows, while a call reads the connection. `stream` sends a statement without parameters through the simple protocol, so every result set of a string of statements arrives in order. `stream_prepared` always sends Parse, Bind, Describe portal and Execute, with or without parameters, so the server refuses text holding more than one command with SQLSTATE `42601`. `describe` sends Parse and Describe statement for the unnamed statement and reads the ParameterDescription and the RowDescription or NoData. It leaves the prepared statement cache as it is. A `Column` takes `table` and `number` from the table OID and attribute number of its RowDescription field, and `number` is negative for a system column. A ParameterStatus after startup reaches `on_notice` as a `Setting`. A `Column` takes its `precision`, `scale` and `length` from the RowDescription type modifier: `numeric(p, s)`, the length of `varchar` and `bpchar` (-1 without one) and the fractional digits of `time`, `timetz`, `timestamp`, `timestamptz` and `interval` (6 when undeclared). A CommandComplete tag gives `Done` a count for SELECT, INSERT, UPDATE, DELETE, MERGE, COPY, FETCH and MOVE, and `none` for every other command. With `Options.server_text` every non-null value is `Text` of the server's own text, and the startup message leaves out `DateStyle` so the server's setting stands. `connect_tls` upgrades with SSLRequest and `std/tls`.
-- `std/sql/sqlserver` speaks TDS 7.4 with SQL authentication, or on Windows with integrated authentication when `connect_with` gets `Config.integrated`. In that case LOGIN7 carries an SSPI Negotiate token for `MSSQLSvc/host:port`, and the server's SSPI tokens are answered until the login completes. `Config.read_only` sets the read-only intent bit of the LOGIN7 type flags. A host written `host\instance` with no port is resolved through the SQL Server Browser on UDP port 1434. `.` and `(local)` name `localhost`.
-  - Prelogin offers no encryption to `connect` and full encryption to `connect_tls`. `connect_tls` runs the `std/tls` handshake inside PRELOGIN packets and unwraps the packets the server keeps sending around TLS records. LOGIN7 announces UTF-8 support.
-  - Statements without parameters go as SQL batches. With parameters they go to `sp_executesql` as `@p1..@pN` declared as `bigint`, `float`, `bit`, `decimal(38, s)`, `nvarchar`, `varbinary`, `uniqueidentifier`, `date`, `time(7)`, `datetime2(7)` or `datetimeoffset(7)`, with NULL sent as `nvarchar(4000)`. Every request carries the transaction descriptor. `begin`, `commit` and `rollback` use transaction manager requests.
-  - Results decode every fixed, nullable, decimal, money, date and time, GUID, character, binary, long-value, text, image, XML, `sql_variant` and user-defined type. GUIDs become RFC 4122 byte order. `char`, `varchar` and `text` decode as UTF-8 when the collation's UTF-8 flag is set and otherwise through `std/charset` in the collation's code page. A SQL collation's sort id picks the code page. A Windows collation's LCID does too, by locale where a language spans two code pages and by language otherwise. Text that is all ASCII is returned as it stands. Other text whose collation has no code page, or that the code page does not map, fails with `Conversion`. Row counts sum the DONE and DONEINPROC counts that carry the count bit. A `Column` takes `precision`, `scale` and `length` from COLMETADATA. `length` is the declared size, in characters for `nchar` and `nvarchar` and in bytes for the rest, and -1 for `max`, `xml`, `text`, `ntext` and `image`. `scale` is also the fractional-second digits of `time`, `datetime2` and `datetimeoffset`. With `Options.server_text`, `time`, `datetime2` and `datetimeoffset` (and `sql_variant` holding them) are `Text` as `yyyy-mm-dd hh:mm:ss` with exactly `scale` fractional digits. A `datetimeoffset` is in its local time followed by ` +hh:mm`. An ENVCHANGE of the database or language after the login reaches `on_notice` as a `Setting` named `database` or `language`.
-  - `each` streams rows as they arrive. Stopping early sends an ATTENTION and reads until the server acknowledges it. A server error below severity 20 leaves the connection usable. A per-connection watchdog sends an ATTENTION and closes the stream when one read waits longer than the timeout. The call fails with `Timeout`. `cancel` sends an ATTENTION once the request is sent. The call fails with `Cancelled` when the server acknowledges it. Finishing a response and sending an ATTENTION take one lock, so no ATTENTION follows a finished response.
-  - Every ERROR and INFO token becomes a `Diagnostic` with the number as its code, the state, the class, the server, the procedure and the line. Class 10 and below is `Info`, 11 to 19 `Failure` and 20 and above `Fatal`. Each one reaches `on_notice`. The ERROR tokens of a call make one `Server` error in order. In `stream`, DONE and DONEINPROC end a result set with their count, or `none` without the count bit. DONEPROC ends none.
-- `std/sql/mysql` speaks the MySQL client/server protocol, version 10 greeting and protocol 4.1. The greeting tells MySQL from MariaDB, and the connection carries `sql.mysql()` or `sql.mariadb()`.
-  - Packets are a three-byte length and a sequence number. A payload of `0xFFFFFF` bytes or more is split, with an empty packet closing an exact multiple. The sequence numbers are checked on every packet. The login negotiates protocol 4.1, `DEPRECATE_EOF`, session tracking, multiple statements and result sets, and `utf8mb4`. On MariaDB it asks for extended column metadata, which names `JSON` columns. `connect_tls` sends the SSL request and runs the `std/tls` handshake before the login. It fails with `Unsupported` when the server offers no TLS. A login after `connect_stream` uses the stream as given.
-  - Authentication follows the plugin the server names, and an auth switch changes it: `mysql_native_password`, `caching_sha2_password`, `sha256_password`, MariaDB's `client_ed25519` and `mysql_clear_password`. `caching_sha2_password` answers the fast path, and the full path sends the password in the clear over TLS and RSA-OAEP (SHA-1) encrypted under the server's public key over a plain connection, which the driver asks for with a one-byte request and which seals the NUL-terminated password XORed with the nonce. `sha256_password` does the same. `mysql_clear_password` is refused without TLS. An empty password sends an empty response. Any other plugin fails with `Unsupported`.
-  - Statements without parameters go as `COM_QUERY` and read text rows. With parameters they go through `COM_STMT_PREPARE` and `COM_STMT_EXECUTE`, read binary rows, and keep a cache of 64 prepared statements. The cache closes the oldest when full. A text or byte parameter of 1 MiB or more is sent in 1 MiB `COM_STMT_SEND_LONG_DATA` chunks. `stream` passes every result set of a statement in order, each ending with `Done` and the number of its rows. A statement without a result set gives `Done` with its affected rows. `query` returns the last set. A `Column` takes `scale` from the decimals byte of its definition (also the fractional-second digits of temporal types), `precision` from the display length of a decimal, and `length` in bytes for `char`, `varchar`, `binary` and `varbinary`. `Options.server_text` has no effect, and no `Setting` is sent. An ERR packet becomes a `Diagnostic` whose code is the SQLSTATE and whose message ends with the error number. A `LOCAL INFILE` request from the server is refused with `Unsupported`. The connection stays usable.
-  - Values decode every column type: integers with their signedness, with `BIGINT UNSIGNED` as `Decimal`, `DECIMAL` and `NEWDECIMAL` as `Decimal`, floats, `DATE`, `TIME` (negative and past 24 hours), `DATETIME`, `TIMESTAMP`, `YEAR`, `BIT` as bytes, `ENUM` and `SET` as text, `JSON` as text, binary and character columns told apart by character set, and geometry as bytes. After the login the session selects the UTC time zone.
-  - `State` reports `server`, `mariadb`, `connection_id`, `schema` and `in_transaction`, from the greeting, the status flags and the session-tracking packets. It carries `ping` and `reset`, which send `COM_PING` and `COM_RESET_CONNECTION`. `begin_with` takes an `Isolation` and a read-only flag and starts the transaction; `savepoint`, `rollback_to` and `release` manage nested ones.
-  - A timeout opens a second connection with the same options, runs `KILL QUERY` for the thread id, and closes the first. The call fails with `Timeout`. `cancel` runs the same `KILL QUERY` once the statement is sent and keeps the connection. The call fails with `Cancelled` when the server reports error 1317. A malformed packet abandons the connection with `Protocol`. Dropping the connection sends `COM_QUIT`.
-  - MySQL commits implicitly before and after a DDL statement, so a migration that creates or alters a table cannot be rolled back with the rest of its transaction. The connection reports `in_transaction` from the server's flags, so a caller can see it.
-- `std/mongo` speaks `OP_MSG` and `OP_COMPRESSED` over TCP, or over `std/tls` when the connection string or `Options.tls` asks for it.
-  - A message carries a kind 0 body and kind 1 document sequences. `insert`, `update` and `delete` send their documents as sequences, batched by the server's `maxWriteBatchSize` and `maxMessageSizeBytes`. A reply's CRC-32C is verified when the flag is set. A reply that sets `moreToCome` or an unknown flag bit, a frame over 96 MiB and a frame that does not parse fail with `Protocol`. A request sets `moreToCome` only for an unacknowledged write (`w: 0`), which gets no reply. `OP_COMPRESSED` carries snappy, zlib or zstd, chosen from `compressors` against the server's list. The handshake and authentication commands are never compressed.
-  - The handshake sends `hello` with `helloOk`, the client metadata and `saslSupportedMechs`. Authentication takes SCRAM-SHA-256 or SCRAM-SHA-1 through `std/crypto/sasl`, the strongest the server lists unless `authMechanism` names one, with `skipEmptyExchange`. The SCRAM-SHA-1 secret is the hex of `MD5("user:mongo:password")`. SCRAM-SHA-256 uses the password as given. A non-ASCII password fails with `Unsupported` because the driver has no SASLprep. A refused login fails with `Authentication`. `MONGODB-X509`, `tlsCertificateKeyFile` and `mongodb+srv://` fail with `Unsupported`.
-  - Every server has a monitor green thread with its own connection. The monitor polls `hello` every `heartbeat` milliseconds. It can be woken to recheck sooner, but never more often than every 500. The topology is unknown, single, a replica set without or with a primary, or sharded. A primary is stale when its `setVersion` and `electionId` are behind the newest seen. Members come from `hosts`, `passives` and `arbiters`. A member whose `me` differs from the address used is dropped. A selection filters by read preference mode, tag sets and `maxStalenessSeconds`, keeps the servers within `local_threshold` of the fastest and fails with `Selection` after `server_selection_timeout`. `$readPreference` goes out for any mode but `primary` on a replica set or sharded topology, and on a single member that is neither a standalone nor a mongos, where `primary` is sent as `primaryPreferred`.
-  - Each server has a pool of up to `max_pool_size` connections. An idle connection closes after `max_idle_time`, a caller waits up to `wait_queue_timeout` for one, and a network failure closes the idle connections of that server and starts a new generation.
-  - Every command runs in a session, an implicit one drawn from a pool of server sessions (`lsid` as UUID binary subtype 4) unless the call names one. `endSessions` goes out when the client closes. `$clusterTime` from every reply is carried on every request. A causal `Session` adds `afterClusterTime` from its `operationTime` to reads.
-  - A read, and a write that carries a `txnNumber` on a server that supports it, is retried once on a freshly selected server after a network failure or a retryable error. `update_many` and `delete_many` are not retried. A server error becomes `Server` with its `errorLabels`. A `writeErrors` entry becomes `Write` with the position in the batch. A `writeConcernError` becomes `WriteConcern`.
-  - A transaction sends `startTransaction`, `autocommit: false` and the next `txnNumber` with its first command and the session's read concern with `afterClusterTime`. It runs on one primary. `commit_transaction` retries once and then asks for a majority write concern. `with_transaction` reruns its body for up to 120 seconds on `TransientTransactionError` and `UnknownTransactionCommitResult`. A transaction on a server without replica set support fails with `Unsupported`.
-  - Not implemented: DNS seed lists, client certificates, SASLprep, streaming `hello` and exhaust cursors (the monitor polls, and `exhaustAllowed` is only encoded and decoded), tailable cursors, pipeline-style updates, aggregates over a database, sharded transaction pinning and `recoveryToken`, load-balanced mode, a minimum pool size, and typed documents through serde.
-- `std/toml` parses into ordered tables and applies every rule of TOML 1.0.0, including the restrictions on redefining tables through headers, dotted keys, inline tables and arrays of tables. It agrees with Python's `tomllib` on the toml-test suite. Errors carry a line and column. `encode` writes plain values first and then `[table]` and `[[array]]` sections. `serialize` and `deserialize` bind types through serde, reading date-times as RFC 3339 text.
-- `std/yaml` parses YAML 1.2.2 into ordered node trees and agrees with the yaml-test-suite on every case's event stream and JSON equivalent.
-  - A scanner modelled on libyaml tokenizes the whole stream, tracking indentation, implicit keys, JSON-like adjacent values and the YAML 1.2 tab rules, with 32-byte vector scans over plain scalars and `simd.find_byte_str` for comment and line ends. Token text is a view into the source.
-  - A recursive-descent parser turns tokens into `Event`s with resolved tags, and a composer builds `Node`s carrying line, column, tag, anchor and style.
-  - Plain scalars resolve with the core schema. `!!str`, `!!int`, `!!float`, `!!bool`, `!!null` and `!!binary` are checked against their content; other tags stay on the node. Aliases share their anchored node. `Options.max_nodes` bounds the tree with every alias expanded, failing with `TooManyNodes`, and `max_depth` bounds nesting. Duplicate scalar keys are an error.
-  - `encode` writes block style, quotes a scalar only when it would read back differently (including YAML 1.1 booleans, numbers and dates), writes multi-line text as literal blocks, and anchors any node reached more than once. `serialize` and `deserialize` bind types through serde, with `u8[]` as `!!binary`.
-- `std/otel` keeps the provider in the green thread's context slot as an immutable `Context` of the active span, baggage, a suppression flag and the SDK.
-  - `spawn` copies the slot, so a child green thread's spans parent to the spawning span. `install` and `setup_from_env` return a droppable `Sdk` that shuts down when released. They put the `SdkHandle` into the calling green thread's slot, which reaches the green threads it spawns afterwards. Programs install at the top of `main`. Every API call checks the slot first and returns a no-op value without allocating when no SDK is present.
-  - Timestamps and durations come from `time.now_nanos` and `time.monotonic`. Span and trace ids come from a `std/rand` generator behind a lock. Samplers are always on, always off, trace-id ratio on the low 63 bits, and parent-based.
-  - Batch processors for spans and logs queue to a bounded channel with a non-blocking send that counts drops. A worker green thread exports when a batch fills, when the delay passes, and on flush or shutdown. Periodic metric readers use the same control worker for flush and shutdown.
-  - Metric instruments aggregate per attribute set, keyed by a canonical encoding of the sorted attributes, in one stream per reader, capped at 2000 series plus an `otel.metric.overflow` series. Readers collect cumulatively or as deltas, periodically or on demand.
-  - Exporters encode OTLP once through a writer that emits protobuf through `std/protobuf` or the OTLP JSON mapping, and send with the context suppressed.
-  - OTLP/HTTP posts, optionally gzipped. It retries 429, 502, 503 and 504 through `std/retry` with equal-jitter exponential backoff, where `Retry-After` raises the wait.
-  - OTLP/gRPC makes unary `Export` calls on `opentelemetry.proto.collector.{trace,metrics,logs}.v1` through a `std/grpc` `Channel` dialled to the endpoint (h2c for `http://`, TLS for `https://`). The calls are gzipped under `grpc-encoding` when the exporter's `gzip` is set. They carry the exporter's headers as metadata and its timeout as the call deadline. The channel's own retry is off. The exporter's retry policy decides. CANCELLED, DEADLINE_EXCEEDED, ABORTED, OUT_OF_RANGE, UNAVAILABLE and DATA_LOSS are retried. RESOURCE_EXHAUSTED is retried only when `grpc-status-details-bin` carries a RetryInfo, whose delay replaces the backoff.
-  - `setup_from_env` reads the standard `OTEL_*` variables. `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` selects gRPC, defaulting to `http://localhost:4317`.
-- `std/http` sits below `std/otel` in the import graph, so the hook runs through the context slot. `otel.Context` declares an `http.Ambient` as its first field. `std/http` reads the slot as `*http.Ambient`, which relies on struct fields being laid out in declaration order. One constructor builds every `Context` and derives the ambient `Observer` from it. The observer is set exactly when an SDK is installed and the context is not suppressed. `std/http` does nothing when it is absent. Processors and metric readers call exporters through `quietly`, so no exporter has to suppress its own telemetry.
-  - `http.serve` and `serve_tls` open a server span per request over HTTP/1.1 and HTTP/2, with the parent extracted from `traceparent` and `client.address` from `Request.remote`, and record `http.server.request.duration`. `std/web` adopts that span, adds `http.route` and renames it to the method and route. It opens its own span only when its handler runs outside `http.serve`.
-  - The client opens a CLIENT span named after the method for each attempt sent, redirects and retries included. Each span is under the caller's span, with `http.request.resend_count` from the second attempt. The client injects `traceparent`, `tracestate` and `baggage` into that attempt, sets `url.full` without userinfo, and ends the span when the body is delivered or the attempt fails, with `error.type` the status from 400 or the `http.Error` variant. It records `http.client.request.duration`.
-  - `std/sql/driver` wraps every connection that `std/sql/postgres`, `std/sql/sqlserver`, `std/sql/mysql` and `std/sql/sqlite` return with `instrument_sql`. It reads the `db.system.name` from the connection's `Dialect`. `std/orm` opens client spans with the operation and table. A nested database span merges into the outer one, so an ORM query produces one span.
-- `std/protobuf` writes and reads the protobuf wire format without code generation. An `Encoder` appends into a buffer that doubles as needed. Signed integers sign-extend to ten bytes and `sint64` zigzag-encodes. `begin_message` returns a mark. `end_message` measures the body, shifts it right by the size of its length varint and writes the length. Nested messages therefore need neither a second buffer nor padded lengths. Output matches `protoc --encode` byte for byte. A `Decoder` walks fields in order. It yields each field as number, wire type, integer value and a view of the payload. It rejects truncated or overlong varints, lengths past the end, field 0 and wire types 6 and 7 with `Malformed`. It rejects groups with `Unsupported`. The `as_*` readers check the wire type and the `unpack_*` readers accept packed and single encodings.
-  - `serialize[T]` and `deserialize[T]` take a struct whose fields carry their protobuf numbers as tags (see Structs). They run through `std/serde`. Encoding builds a `serde.Tree` with `serde.to_tree` and writes it by the schema. Decoding turns the wire bytes into a tree by the schema and reads it with `serde.read`. A tag is a comma-separated list of the field number, `sint`, `fixed`, `unpacked`, `required`, `key=sint`, `key=fixed`, `value=sint` and `value=fixed`. A field of an enum with payload variants is tagged `oneof`. Each variant's `= n` index is the field number of its member, and a variant's payload tag has no number. Integers take the `int32`, `int64`, `uint32` or `uint64` encoding by width and sign. An enum of payload-free variants is a protobuf enum of the variants' indexes. A struct is an embedded message. A slice is repeated, packed unless tagged `unpacked`. A map is a repeated entry message.
-  - A singular field that holds its default is not written unless it declares a default of its own. An optional field is written whenever it holds a value. A non-optional embedded message is always written. Decoding gives an absent field its declared default, `none` for an optional one and zero otherwise. It takes the last value of a repeated singular field and merges repeated occurrences of an embedded message. It collects repeated fields packed or not and takes the last member of a `oneof`. It skips unknown fields, fields of the wrong wire type and enum values no variant has. It checks strings for UTF-8. It fails with `Syntax` at a byte offset for malformed input, `TooDeep` for more than 100 levels of messages, `Mismatch` for a `T` that is not a struct and `Missing` for an absent `required` field. A pointer field such as `*Node?` carries a recursive message.
-  - `std/protobuf/proto` reads `.proto` text with `parse(path, source)`. It accepts `syntax`, `package`, `import` with `public` and `weak`, `option`, `message`, nested messages and enums, `enum` with `allow_alias`, `oneof`, `map`, `repeated`, `optional`, proto2 `required` and `default`, `reserved`, `extensions`, `extend`, and `service` with `rpc` and `stream` on either side. It keeps options as written. The exceptions are that `default` and `json_name` are fields of `Field`, and `packed` and `deprecated` change what the generator writes. It rejects a proto2 `group`, an `edition` and proto3 files that use `required`, `default`, extension ranges or a first enum value other than zero, bad or duplicate field numbers and names, reserved numbers and names, wrong map keys, empty oneofs, and nesting past 32 levels. Each rejection is one `proto.Error` variant with the file, line and column. `proto.message` formats it.
-  - `read_files(paths, roots, read)` loads each path and its imports through `read`. `read` returns the text of a file or fails with `io.Error.NotFound`. The loader tries the roots in order and rejects import cycles. It lists the files with every file after the files it imports. It gives each type its full name and replaces every type name with the full name of the message or enum it refers to. A name resolves by matching the whole written name against the innermost enclosing message and then each scope outwards through the package, then absolutely. It resolves only through the file's own definitions, its imports and the `import public` closure of those. The loader touches no file system itself, so a program supplies `file.read_text` and a test supplies a map.
-  - `generate(set, options)` writes one Low module per file, `a/b.proto` as `a/b/b.low`. `Options.module` is the import path of the output directory. A message is a `pub struct`. An enum or oneof is a `pub enum`. Nested types are named by joining the names of the messages around them: `Outer.Inner` is `OuterInner`, and the oneof `choice` of `Scalars` is `ScalarsChoice`. A name that is already taken gets a number after it. Field names stay when they are `snake_case`. Other field names go through `std/text/naming`. A keyword gains a trailing `_`. An enum value loses the enum name as a prefix when a name remains. A singular message field is optional. A singular field or oneof member in a cycle of messages is `*T?`. A map is `[K: V]` with its key and value encodings in the tag. A proto2 field with a default keeps it as the field's default. A message without fields has one `bool` field `empty` on field number 536870911. A type from another file is reached through an import of that file's module. A `service` with methods becomes, for service `Greeter`, a `GreeterClient` made by `greeter_client(channel)`. The client has one function per method named after it in `snake_case` (a name another service of the file already took gains a number), whose call shape follows the `stream` keywords and whose types are the request and response messages. The service becomes a `GreeterHandlers` struct with one function-valued field per method. It becomes `register_greeter(server, handlers)`, which registers each method as `/package.Greeter/Method`. A service with no methods gets only the client. The output is a function of the files alone. Extensions and other options are left out.
-  - `low protogen -I dir,dir --module path -o outdir file.proto...` reads the files against the roots and writes the modules under `outdir`, imported files included. The generator is the library `compiler/protogen`, which `compiler/low/protogen.low` calls.
-- `std/xml` reads XML 1.0 (fifth edition) with Namespaces. The input may be UTF-8, UTF-16 with a byte order mark, or any encoding `std/charset` knows by its declared label. The reader converts it to UTF-8 and normalises line endings first.
-  - `xml.Reader` is a pull reader: `next` returns one token and `position` its line and column. Names arrive with namespaces resolved and are interned in a per-reader table. Text, CDATA, comments and attribute values are views into the input unless a reference or normalisation forces a copy. 32-byte vector scans find the bytes that end them. The reader enforces well-formedness and the namespace constraints. It agrees with libxml2 on what it accepts.
-  - The internal subset is parsed. General entities expand, including markup. Expansion has recursion detection, a nesting limit of 40 and a total of 1 MiB plus eight times the input. Attribute-list declarations supply defaults and normalise tokenised types. External entities are never fetched and parameter entities are not expanded.
-  - `xml.parse` builds an `Element` tree of owned strings with `attribute`, `child`, `children`, `text` and `find`. `xml.Writer` escapes text and attributes and splits CDATA around `]]>`. It writes namespace declarations and indents element-only content. `serialize_value` and `deserialize` bind types through serde. They map fields to attributes or child elements by local name, repeated elements to slices, and `xsi:nil` to `none`.
-- Pipes block through channels. A writer flushing more than the pause threshold waits until the reader brings the unconsumed bytes below the resume threshold, or until the reader itself waits for more data. A message larger than the thresholds therefore cannot deadlock the pipe.
-- `pool.open` stores `ConnectionHandle` views. One connection therefore serves a lease at a time, and the pool, not the owner, closes it. The pool checks idle and lifetime limits on acquire, release and `prune` against `clock.monotonic`. A release hands the connection to the oldest waiter. A lease marks its connection broken on `Connect`, `Authentication`, `Closed`, `Timeout` or `Protocol` errors. The pool closes it. A transaction left open at release is rolled back.
-- `migrate.up` refuses any applied migration whose checksum differs (`Drift`). It refuses a pending version below the highest applied one (`OutOfOrder`). It refuses duplicate or non-ascending versions. The lock is `BEGIN IMMEDIATE` on SQLite, `pg_advisory_lock` on PostgreSQL, `sp_getapplock` on SQL Server and `GET_LOCK` on MySQL and MariaDB. Each migration re-checks inside its transaction that it is not yet recorded. A migration that fails reports its own error, or the rollback's error when the rollback fails too. A lock that cannot be released fails with `Sql` unless a migration error is reported first. In a text migration a statement ends at a line ending in `;`, and `-- +begin` to `-- +end` keeps a block with several `;` as one statement.
+#### JSON reader
+
+`json.Reader` tokenizes UTF-8 bytes like .NET's `Utf8JsonReader`, strictly per RFC 8259, with a depth limit of 64. It returns strings without copying unless they contain escapes. Numbers are parsed as integers or correctly rounded floats.
+
+#### JSON serialization
+
+`json.serialize_with` and `json.deserialize_with` take `Options` for indentation, naming (`Unchanged`, `CamelCase`, `SnakeCase`, `PascalCase`), maximum depth and `omit_none`.
+
+- Naming applies to struct field names and to variant names in both directions. It does not apply to the keys of a map. A variant name read back is matched in PascalCase.
+- With `omit_none`, a field whose value is `none` is left out instead of written as `null`.
+- Binary data is base64. Non-finite floats are written as `null`.
+
+#### CBOR decoding
+
+`std/cbor` decodes RFC 8949 items into `Value`s: every major type, indefinite-length strings, arrays and maps, tags, simple values, and half, single and double floats, which become `f64`. Indefinite-length items arrive as their definite equivalents. Text must be valid UTF-8 and map keys must be distinct.
+
+`decode_first` returns the first item and its length so a caller can continue after it.
+
+#### CBOR decoding errors
+
+| Case | Fails with |
+| --- | --- |
+| Truncated input | `Malformed` |
+| Reserved additional information | `Malformed` |
+| A stray break | `Malformed` |
+| Indefinite integers or tags | `Malformed` |
+| Mixed or nested string chunks | `Malformed` |
+| A two-byte simple value below 32 | `Malformed` |
+| Data after the item | `Malformed` |
+| A declared length that exceeds the remaining input (checked before anything is allocated) | `Malformed` |
+| Nesting deeper than `Options.max_depth` | `TooLarge` |
+| A string, array or map longer than `max_length` | `TooLarge` |
+
+#### CBOR encoding
+
+`encode` writes the deterministic encoding of §4.2.1:
+
+- shortest heads
+- definite lengths
+- map entries sorted by the bytes of their encoded keys
+- floats in the shortest of half, single or double that keeps the value, with NaN as `f97e00`
+
+`diagnostic` writes the notation of §8.
+
+#### CBOR serde binding
+
+`serialize` and `deserialize` bind types through serde:
+
+| Type | Bound as |
+| --- | --- |
+| `u8[]` | Byte strings |
+| Structs and variants | Maps with text keys |
+| `none` | Null |
+
+Reading looks through tags and accepts integer map keys as their decimal text.
+
+#### WebAuthn options
+
+`std/webauthn` produces options JSON in the shape py_webauthn's `options_to_json` writes. Challenges, user ids and credential ids are base64url. `pubKeyCredParams` defaults to `supported_algorithms()` of the COSE parser (EdDSA, ES256 and RS256), and attestation is `none`.
+
+#### WebAuthn registration verification
+
+`verify_registration` takes the credential JSON a browser's `PublicKeyCredential` gives in base64url, with or without padding.
+
+- It checks that `id` is the base64url of `rawId`, that `type` is `public-key`, that clientDataJSON has type `webauthn.create`, the expected challenge (compared in constant time) and the origin.
+- It then decodes the attestation object and checks the RP ID hash, user presence, user verification when required, and attested credential data.
+- It parses the COSE key, accepts only the `none` format with an empty statement, and rejects a backup state without backup eligibility.
+- It returns the credential id, the COSE key bytes exactly as the authenticator wrote them, and the sign count.
+
+#### WebAuthn authentication verification
+
+`verify_authentication` makes the same client data and authenticator data checks for `webauthn.get`. It rejects a sign count that is not greater than the stored one unless both are zero.
+
+It verifies the signature over authenticatorData followed by SHA-256 of clientDataJSON with the stored key:
+
+| Algorithm | Signature |
+| --- | --- |
+| ES256 | DER ECDSA on P-256 |
+| EdDSA | Ed25519 |
+| RS256 | PKCS#1 v1.5 with SHA-256 |
+
+#### WebAuthn errors
+
+Each failure is its own `Error` variant.
+
+#### ORM queries
+
+`std/orm` builds queries from conditions over field references, such as `orm.filter(orm.from(users), orm.ge(User.age, 18))`, and type-checks them against the field. It renders them for the connection's `Dialect`, maps rows onto structs, stores nested values as JSON columns and creates tables from types with an identity key named `id`.
+
+#### ORM generated keys
+
+`std/orm` returns generated keys from inserts:
+
+| Database | Through |
+| --- | --- |
+| PostgreSQL and MariaDB | `RETURNING` |
+| SQL Server | `OUTPUT` |
+| MySQL | `LAST_INSERT_ID()` |
+
+#### SQL value representation
+
+`sql.Value` holds:
+
+| Value | Held as |
+| --- | --- |
+| Dates | Days since 1970-01-01 |
+| Times | Microseconds since midnight |
+| Timestamps | Microseconds since 1970-01-01 UTC |
+| Infinite dates and timestamps | The `i64` maximum and minimum |
+| UUIDs | 16 bytes |
+
+#### SQL connections and transactions
+
+A connection serves one green thread at a time. A call made while another is running fails with `Busy`.
+
+`orm.transaction` rolls back on any error from its body. It fails with that error, or with the rollback's error when the rollback fails too.
+
+#### PostgreSQL protocol and authentication
+
+- `std/sql/postgres` authenticates with SCRAM-SHA-256, MD5 or cleartext.
+- It uses the simple protocol for statements without parameters. Otherwise it uses the extended protocol with a 64-entry prepared statement cache.
+- It streams `each` in batches of 512 rows, reads results as text decoded by type OID, and keeps a connection usable after a server error.
+- `connect_tls` upgrades with SSLRequest and `std/tls`.
+
+#### PostgreSQL parameter types
+
+A `Null` or `Text` parameter is declared with OID 0, so the server infers its type. Every other `Value` is a typed parameter. The driver declares it with OID 0 as well, sends Parse, Describe statement and Sync for the unnamed statement, and reads the ParameterDescription.
+
+| Typed parameter | Declared with |
+| --- | --- |
+| One that the server inferred as anything but `text` or `unknown` | The inferred type, so `Int(21)` binds into the `int4` of `twice($1)` and a `Float` into a `real`. |
+| One the server could not infer (`SELECT $1`, both sides of `$1 < $2`) | Its own type (`Int` as `int8`, `Float` as `float8`, `Decimal` as `numeric`, and so on). |
+
+The statement is parsed again with those OIDs. Bind sends every value in text format, so the server parses the text into whichever type it chose.
+
+This round trip happens once per statement text and value types, on the call that first sees them. The later calls reuse the declared OIDs and the prepared statement cache. A statement without a typed parameter keeps its single round trip.
+
+#### PostgreSQL cancellation and timeouts
+
+- `cancel` sends a CancelRequest over a new connection once the request is sent, and keeps the connection.
+- The call fails with `Cancelled` when the server stops it with SQLSTATE `57014`. `each` also stops between batches.
+- A timeout sends a CancelRequest and closes the connection.
+
+#### PostgreSQL server messages
+
+Every field of an ErrorResponse fills the `Diagnostic`.
+
+An ErrorResponse or NoticeResponse reaches `on_notice` as a `Message`. A NotificationResponse reaches it as a `Notification`. Both arrive in order with the rows, while a call reads the connection. A ParameterStatus after startup reaches `on_notice` as a `Setting`.
+
+#### PostgreSQL statement streaming and describe
+
+| Function | Behaviour |
+| --- | --- |
+| `stream` | Sends a statement without parameters through the simple protocol, so every result set of a string of statements arrives in order. |
+| `stream_prepared` | Always sends Parse, Bind, Describe portal and Execute, with or without parameters, so the server refuses text holding more than one command with SQLSTATE `42601`. |
+| `describe` | Sends Parse and Describe statement for the unnamed statement and reads the ParameterDescription and the RowDescription or NoData. It leaves the prepared statement cache as it is. |
+
+#### PostgreSQL column metadata
+
+| `Column` field | Taken from |
+| --- | --- |
+| `table` | The table OID of its RowDescription field |
+| `number` | The attribute number of its RowDescription field, and `number` is negative for a system column |
+| `precision`, `scale` and `length` | The RowDescription type modifier: `numeric(p, s)`, the length of `varchar` and `bpchar` (-1 without one) and the fractional digits of `time`, `timetz`, `timestamp`, `timestamptz` and `interval` (6 when undeclared) |
+
+#### PostgreSQL command tags
+
+A CommandComplete tag gives `Done`:
+
+| Command | `Done` gets |
+| --- | --- |
+| SELECT, INSERT, UPDATE, DELETE, MERGE, COPY, FETCH and MOVE | A count |
+| Every other command | `none` |
+
+#### PostgreSQL server text
+
+With `Options.server_text` every non-null value is `Text` of the server's own text, and the startup message leaves out `DateStyle` so the server's setting stands.
+
+#### SQL Server login
+
+`std/sql/sqlserver` speaks TDS 7.4 with SQL authentication, or on Windows with integrated authentication when `connect_with` gets `Config.integrated`. In that case LOGIN7 carries an SSPI Negotiate token for `MSSQLSvc/host:port`, and the server's SSPI tokens are answered until the login completes.
+
+`Config.read_only` sets the read-only intent bit of the LOGIN7 type flags. LOGIN7 announces UTF-8 support.
+
+#### SQL Server host names
+
+| Host | Resolved as |
+| --- | --- |
+| `host\instance` with no port | Through the SQL Server Browser on UDP port 1434 |
+| `.` and `(local)` | They name `localhost` |
+
+#### SQL Server encryption
+
+| Call | Prelogin offers |
+| --- | --- |
+| `connect` | No encryption |
+| `connect_tls` | Full encryption |
+
+`connect_tls` runs the `std/tls` handshake inside PRELOGIN packets and unwraps the packets the server keeps sending around TLS records.
+
+#### SQL Server statements and transactions
+
+Statements without parameters go as SQL batches. With parameters they go to `sp_executesql` as `@p1..@pN` declared as `bigint`, `float`, `bit`, `decimal(38, s)`, `nvarchar`, `varbinary`, `uniqueidentifier`, `date`, `time(7)`, `datetime2(7)` or `datetimeoffset(7)`, with NULL sent as `nvarchar(4000)`.
+
+Every request carries the transaction descriptor. `begin`, `commit` and `rollback` use transaction manager requests.
+
+#### SQL Server result decoding
+
+Results decode every fixed, nullable, decimal, money, date and time, GUID, character, binary, long-value, text, image, XML, `sql_variant` and user-defined type. GUIDs become RFC 4122 byte order.
+
+#### SQL Server text collations
+
+`char`, `varchar` and `text` decode as UTF-8 when the collation's UTF-8 flag is set and otherwise through `std/charset` in the collation's code page.
+
+| Collation | Code page picked by |
+| --- | --- |
+| SQL collation | Its sort id |
+| Windows collation | Its LCID, by locale where a language spans two code pages and by language otherwise |
+
+Text that is all ASCII is returned as it stands. Other text whose collation has no code page, or that the code page does not map, fails with `Conversion`.
+
+#### SQL Server column metadata
+
+A `Column` takes `precision`, `scale` and `length` from COLMETADATA.
+
+| `Column` field | Holds |
+| --- | --- |
+| `length` | The declared size, in characters for `nchar` and `nvarchar` and in bytes for the rest, and -1 for `max`, `xml`, `text`, `ntext` and `image` |
+| `scale` | Also the fractional-second digits of `time`, `datetime2` and `datetimeoffset` |
+
+#### SQL Server server text
+
+With `Options.server_text`, `time`, `datetime2` and `datetimeoffset` (and `sql_variant` holding them) are `Text` as `yyyy-mm-dd hh:mm:ss` with exactly `scale` fractional digits. A `datetimeoffset` is in its local time followed by ` +hh:mm`.
+
+#### SQL Server row counts and result sets
+
+Row counts sum the DONE and DONEINPROC counts that carry the count bit.
+
+In `stream`, DONE and DONEINPROC end a result set with their count, or `none` without the count bit. DONEPROC ends none.
+
+#### SQL Server streaming, cancellation and timeouts
+
+- `each` streams rows as they arrive. Stopping early sends an ATTENTION and reads until the server acknowledges it.
+- A server error below severity 20 leaves the connection usable.
+- A per-connection watchdog sends an ATTENTION and closes the stream when one read waits longer than the timeout. The call fails with `Timeout`.
+- `cancel` sends an ATTENTION once the request is sent. The call fails with `Cancelled` when the server acknowledges it.
+- Finishing a response and sending an ATTENTION take one lock, so no ATTENTION follows a finished response.
+
+#### SQL Server diagnostics and settings
+
+Every ERROR and INFO token becomes a `Diagnostic` with the number as its code, the state, the class, the server, the procedure and the line.
+
+| Class | `Diagnostic` kind |
+| --- | --- |
+| 10 and below | `Info` |
+| 11 to 19 | `Failure` |
+| 20 and above | `Fatal` |
+
+Each one reaches `on_notice`. The ERROR tokens of a call make one `Server` error in order. An ENVCHANGE of the database or language after the login reaches `on_notice` as a `Setting` named `database` or `language`.
+
+#### MySQL protocol
+
+`std/sql/mysql` speaks the MySQL client/server protocol, version 10 greeting and protocol 4.1. The greeting tells MySQL from MariaDB, and the connection carries `sql.mysql()` or `sql.mariadb()`.
+
+#### MySQL packets
+
+Packets are a three-byte length and a sequence number. A payload of `0xFFFFFF` bytes or more is split, with an empty packet closing an exact multiple. The sequence numbers are checked on every packet.
+
+#### MySQL login and TLS
+
+The login negotiates protocol 4.1, `DEPRECATE_EOF`, session tracking, multiple statements and result sets, and `utf8mb4`. On MariaDB it asks for extended column metadata, which names `JSON` columns.
+
+`connect_tls` sends the SSL request and runs the `std/tls` handshake before the login. It fails with `Unsupported` when the server offers no TLS. A login after `connect_stream` uses the stream as given.
+
+#### MySQL authentication plugins
+
+Authentication follows the plugin the server names, and an auth switch changes it: `mysql_native_password`, `caching_sha2_password`, `sha256_password`, MariaDB's `client_ed25519` and `mysql_clear_password`.
+
+`caching_sha2_password` answers the fast path, and the full path sends the password in the clear over TLS and RSA-OAEP (SHA-1) encrypted under the server's public key over a plain connection, which the driver asks for with a one-byte request and which seals the NUL-terminated password XORed with the nonce. `sha256_password` does the same.
+
+- `mysql_clear_password` is refused without TLS.
+- An empty password sends an empty response.
+- Any other plugin fails with `Unsupported`.
+
+#### MySQL statements
+
+| Statement | Goes |
+| --- | --- |
+| Without parameters | As `COM_QUERY` and reads text rows. |
+| With parameters | Through `COM_STMT_PREPARE` and `COM_STMT_EXECUTE`, reads binary rows, and keeps a cache of 64 prepared statements. |
+
+The cache closes the oldest when full. A text or byte parameter of 1 MiB or more is sent in 1 MiB `COM_STMT_SEND_LONG_DATA` chunks.
+
+#### MySQL result sets
+
+`stream` passes every result set of a statement in order, each ending with `Done` and the number of its rows. A statement without a result set gives `Done` with its affected rows. `query` returns the last set.
+
+#### MySQL column metadata
+
+| `Column` field | Value |
+| --- | --- |
+| `scale` | The decimals byte of its definition (also the fractional-second digits of temporal types) |
+| `precision` | The display length of a decimal |
+| `length` | In bytes for `char`, `varchar`, `binary` and `varbinary` |
+
+#### MySQL server text
+
+`Options.server_text` has no effect, and no `Setting` is sent.
+
+#### MySQL errors and unsupported requests
+
+An ERR packet becomes a `Diagnostic` whose code is the SQLSTATE and whose message ends with the error number. A `LOCAL INFILE` request from the server is refused with `Unsupported`. The connection stays usable.
+
+#### MySQL value decoding
+
+Values decode every column type:
+
+- integers with their signedness, with `BIGINT UNSIGNED` as `Decimal`
+- `DECIMAL` and `NEWDECIMAL` as `Decimal`
+- floats
+- `DATE`
+- `TIME` (negative and past 24 hours)
+- `DATETIME`
+- `TIMESTAMP`
+- `YEAR`
+- `BIT` as bytes
+- `ENUM` and `SET` as text
+- `JSON` as text
+- binary and character columns told apart by character set
+- geometry as bytes
+
+After the login the session selects the UTC time zone.
+
+#### MySQL connection state and transactions
+
+`State` reports `server`, `mariadb`, `connection_id`, `schema` and `in_transaction`, from the greeting, the status flags and the session-tracking packets. It carries `ping` and `reset`, which send `COM_PING` and `COM_RESET_CONNECTION`.
+
+`begin_with` takes an `Isolation` and a read-only flag and starts the transaction; `savepoint`, `rollback_to` and `release` manage nested ones.
+
+#### MySQL cancellation and timeouts
+
+- A timeout opens a second connection with the same options, runs `KILL QUERY` for the thread id, and closes the first. The call fails with `Timeout`.
+- `cancel` runs the same `KILL QUERY` once the statement is sent and keeps the connection. The call fails with `Cancelled` when the server reports error 1317.
+- A malformed packet abandons the connection with `Protocol`.
+- Dropping the connection sends `COM_QUIT`.
+
+#### MySQL implicit commits
+
+MySQL commits implicitly before and after a DDL statement, so a migration that creates or alters a table cannot be rolled back with the rest of its transaction. The connection reports `in_transaction` from the server's flags, so a caller can see it.
+
+#### MongoDB wire protocol
+
+`std/mongo` speaks `OP_MSG` and `OP_COMPRESSED` over TCP, or over `std/tls` when the connection string or `Options.tls` asks for it.
+
+#### MongoDB messages
+
+A message carries a kind 0 body and kind 1 document sequences. `insert`, `update` and `delete` send their documents as sequences, batched by the server's `maxWriteBatchSize` and `maxMessageSizeBytes`.
+
+- A reply's CRC-32C is verified when the flag is set.
+- A reply that sets `moreToCome` or an unknown flag bit, a frame over 96 MiB and a frame that does not parse fail with `Protocol`.
+- A request sets `moreToCome` only for an unacknowledged write (`w: 0`), which gets no reply.
+
+#### MongoDB compression
+
+`OP_COMPRESSED` carries snappy, zlib or zstd, chosen from `compressors` against the server's list. The handshake and authentication commands are never compressed.
+
+#### MongoDB handshake and authentication
+
+The handshake sends `hello` with `helloOk`, the client metadata and `saslSupportedMechs`.
+
+Authentication takes SCRAM-SHA-256 or SCRAM-SHA-1 through `std/crypto/sasl`, the strongest the server lists unless `authMechanism` names one, with `skipEmptyExchange`.
+
+| Mechanism | Secret |
+| --- | --- |
+| SCRAM-SHA-1 | The hex of `MD5("user:mongo:password")` |
+| SCRAM-SHA-256 | The password as given |
+
+- A non-ASCII password fails with `Unsupported` because the driver has no SASLprep.
+- A refused login fails with `Authentication`.
+- `MONGODB-X509`, `tlsCertificateKeyFile` and `mongodb+srv://` fail with `Unsupported`.
+
+#### MongoDB server monitoring
+
+Every server has a monitor green thread with its own connection. The monitor polls `hello` every `heartbeat` milliseconds. It can be woken to recheck sooner, but never more often than every 500.
+
+#### MongoDB topology
+
+The topology is unknown, single, a replica set without or with a primary, or sharded. A primary is stale when its `setVersion` and `electionId` are behind the newest seen. Members come from `hosts`, `passives` and `arbiters`. A member whose `me` differs from the address used is dropped.
+
+#### MongoDB server selection
+
+A selection filters by read preference mode, tag sets and `maxStalenessSeconds`, keeps the servers within `local_threshold` of the fastest and fails with `Selection` after `server_selection_timeout`.
+
+`$readPreference` goes out for any mode but `primary` on a replica set or sharded topology, and on a single member that is neither a standalone nor a mongos, where `primary` is sent as `primaryPreferred`.
+
+#### MongoDB connection pools
+
+Each server has a pool of up to `max_pool_size` connections.
+
+| Setting or event | Effect |
+| --- | --- |
+| `max_idle_time` | An idle connection closes after it. |
+| `wait_queue_timeout` | A caller waits up to it for one. |
+| A network failure | It closes the idle connections of that server and starts a new generation. |
+
+#### MongoDB sessions
+
+- Every command runs in a session, an implicit one drawn from a pool of server sessions (`lsid` as UUID binary subtype 4) unless the call names one.
+- `endSessions` goes out when the client closes.
+- `$clusterTime` from every reply is carried on every request.
+- A causal `Session` adds `afterClusterTime` from its `operationTime` to reads.
+
+#### MongoDB retries
+
+A read, and a write that carries a `txnNumber` on a server that supports it, is retried once on a freshly selected server after a network failure or a retryable error. `update_many` and `delete_many` are not retried.
+
+#### MongoDB error mapping
+
+| Server reply | Becomes |
+| --- | --- |
+| A server error | `Server` with its `errorLabels` |
+| A `writeErrors` entry | `Write` with the position in the batch |
+| A `writeConcernError` | `WriteConcern` |
+
+#### MongoDB transactions
+
+A transaction sends `startTransaction`, `autocommit: false` and the next `txnNumber` with its first command and the session's read concern with `afterClusterTime`. It runs on one primary.
+
+- `commit_transaction` retries once and then asks for a majority write concern.
+- `with_transaction` reruns its body for up to 120 seconds on `TransientTransactionError` and `UnknownTransactionCommitResult`.
+- A transaction on a server without replica set support fails with `Unsupported`.
+
+#### MongoDB unsupported features
+
+Not implemented:
+
+- DNS seed lists
+- client certificates
+- SASLprep
+- streaming `hello` and exhaust cursors (the monitor polls, and `exhaustAllowed` is only encoded and decoded)
+- tailable cursors
+- pipeline-style updates
+- aggregates over a database
+- sharded transaction pinning and `recoveryToken`
+- load-balanced mode
+- a minimum pool size
+- typed documents through serde
+
+#### TOML parsing and encoding
+
+`std/toml` parses into ordered tables and applies every rule of TOML 1.0.0, including the restrictions on redefining tables through headers, dotted keys, inline tables and arrays of tables. It agrees with Python's `tomllib` on the toml-test suite. Errors carry a line and column.
+
+`encode` writes plain values first and then `[table]` and `[[array]]` sections. `serialize` and `deserialize` bind types through serde, reading date-times as RFC 3339 text.
+
+#### YAML parsing
+
+`std/yaml` parses YAML 1.2.2 into ordered node trees and agrees with the yaml-test-suite on every case's event stream and JSON equivalent.
+
+#### YAML scanner, parser and composer
+
+A scanner modelled on libyaml tokenizes the whole stream, tracking indentation, implicit keys, JSON-like adjacent values and the YAML 1.2 tab rules, with 32-byte vector scans over plain scalars and `simd.find_byte_str` for comment and line ends. Token text is a view into the source.
+
+A recursive-descent parser turns tokens into `Event`s with resolved tags, and a composer builds `Node`s carrying line, column, tag, anchor and style.
+
+#### YAML scalars, aliases and limits
+
+Plain scalars resolve with the core schema. `!!str`, `!!int`, `!!float`, `!!bool`, `!!null` and `!!binary` are checked against their content; other tags stay on the node. Aliases share their anchored node.
+
+| Limit | Effect |
+| --- | --- |
+| `Options.max_nodes` | Bounds the tree with every alias expanded, failing with `TooManyNodes`. |
+| `max_depth` | Bounds nesting. |
+
+Duplicate scalar keys are an error.
+
+#### YAML encoding and serde
+
+`encode`:
+
+- writes block style
+- quotes a scalar only when it would read back differently (including YAML 1.1 booleans, numbers and dates)
+- writes multi-line text as literal blocks
+- anchors any node reached more than once
+
+`serialize` and `deserialize` bind types through serde, with `u8[]` as `!!binary`.
+
+#### OpenTelemetry context
+
+`std/otel` keeps the provider in the green thread's context slot as an immutable `Context` of the active span, baggage, a suppression flag and the SDK.
+
+`spawn` copies the slot, so a child green thread's spans parent to the spawning span.
+
+#### OpenTelemetry installation
+
+`install` and `setup_from_env` return a droppable `Sdk` that shuts down when released. They put the `SdkHandle` into the calling green thread's slot, which reaches the green threads it spawns afterwards. Programs install at the top of `main`.
+
+Every API call checks the slot first and returns a no-op value without allocating when no SDK is present.
+
+#### OpenTelemetry timestamps, ids and samplers
+
+| Item | Comes from |
+| --- | --- |
+| Timestamps and durations | `time.now_nanos` and `time.monotonic` |
+| Span and trace ids | A `std/rand` generator behind a lock |
+
+Samplers are always on, always off, trace-id ratio on the low 63 bits, and parent-based.
+
+#### OpenTelemetry batch processors
+
+Batch processors for spans and logs queue to a bounded channel with a non-blocking send that counts drops. A worker green thread exports:
+
+- when a batch fills
+- when the delay passes
+- on flush or shutdown
+
+Periodic metric readers use the same control worker for flush and shutdown.
+
+#### OpenTelemetry metric instruments
+
+Metric instruments aggregate per attribute set, keyed by a canonical encoding of the sorted attributes, in one stream per reader, capped at 2000 series plus an `otel.metric.overflow` series. Readers collect cumulatively or as deltas, periodically or on demand.
+
+#### OpenTelemetry exporters
+
+Exporters encode OTLP once through a writer that emits protobuf through `std/protobuf` or the OTLP JSON mapping, and send with the context suppressed.
+
+Processors and metric readers call exporters through `quietly`, so no exporter has to suppress its own telemetry.
+
+#### OTLP/HTTP exporter
+
+OTLP/HTTP posts, optionally gzipped. It retries 429, 502, 503 and 504 through `std/retry` with equal-jitter exponential backoff, where `Retry-After` raises the wait.
+
+#### OTLP/gRPC exporter
+
+OTLP/gRPC makes unary `Export` calls on `opentelemetry.proto.collector.{trace,metrics,logs}.v1` through a `std/grpc` `Channel` dialled to the endpoint:
+
+| Endpoint | Channel |
+| --- | --- |
+| `http://` | h2c |
+| `https://` | TLS |
+
+The calls are gzipped under `grpc-encoding` when the exporter's `gzip` is set. They carry the exporter's headers as metadata and its timeout as the call deadline.
+
+#### OTLP/gRPC retries
+
+The channel's own retry is off. The exporter's retry policy decides.
+
+| Status | Retried |
+| --- | --- |
+| CANCELLED, DEADLINE_EXCEEDED, ABORTED, OUT_OF_RANGE, UNAVAILABLE and DATA_LOSS | Retried. |
+| RESOURCE_EXHAUSTED | Retried only when `grpc-status-details-bin` carries a RetryInfo, whose delay replaces the backoff. |
+
+#### OpenTelemetry environment setup
+
+`setup_from_env` reads the standard `OTEL_*` variables. `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` selects gRPC, defaulting to `http://localhost:4317`.
+
+#### HTTP tracing hook
+
+`std/http` sits below `std/otel` in the import graph, so the hook runs through the context slot. `otel.Context` declares an `http.Ambient` as its first field. `std/http` reads the slot as `*http.Ambient`, which relies on struct fields being laid out in declaration order.
+
+One constructor builds every `Context` and derives the ambient `Observer` from it. The observer is set exactly when an SDK is installed and the context is not suppressed. `std/http` does nothing when it is absent.
+
+#### HTTP server spans
+
+`http.serve` and `serve_tls` open a server span per request over HTTP/1.1 and HTTP/2, with the parent extracted from `traceparent` and `client.address` from `Request.remote`, and record `http.server.request.duration`.
+
+`std/web` adopts that span, adds `http.route` and renames it to the method and route. It opens its own span only when its handler runs outside `http.serve`.
+
+#### HTTP client spans
+
+- The client opens a CLIENT span named after the method for each attempt sent, redirects and retries included.
+- Each span is under the caller's span, with `http.request.resend_count` from the second attempt.
+- The client injects `traceparent`, `tracestate` and `baggage` into that attempt, sets `url.full` without userinfo, and ends the span when the body is delivered or the attempt fails, with `error.type` the status from 400 or the `http.Error` variant.
+- It records `http.client.request.duration`.
+
+#### SQL driver tracing
+
+`std/sql/driver` wraps every connection that `std/sql/postgres`, `std/sql/sqlserver`, `std/sql/mysql` and `std/sql/sqlite` return with `instrument_sql`. It reads the `db.system.name` from the connection's `Dialect`.
+
+`std/orm` opens client spans with the operation and table. A nested database span merges into the outer one, so an ORM query produces one span.
+
+#### Protobuf encoder
+
+`std/protobuf` writes and reads the protobuf wire format without code generation. An `Encoder` appends into a buffer that doubles as needed. Signed integers sign-extend to ten bytes and `sint64` zigzag-encodes.
+
+`begin_message` returns a mark. `end_message` measures the body, shifts it right by the size of its length varint and writes the length. Nested messages therefore need neither a second buffer nor padded lengths. Output matches `protoc --encode` byte for byte.
+
+#### Protobuf decoder
+
+A `Decoder` walks fields in order. It yields each field as number, wire type, integer value and a view of the payload.
+
+| Input | Rejected with |
+| --- | --- |
+| Truncated or overlong varints | `Malformed` |
+| Lengths past the end | `Malformed` |
+| Field 0 | `Malformed` |
+| Wire types 6 and 7 | `Malformed` |
+| Groups | `Unsupported` |
+
+The `as_*` readers check the wire type and the `unpack_*` readers accept packed and single encodings.
+
+#### Protobuf serde binding
+
+`serialize[T]` and `deserialize[T]` take a struct whose fields carry their protobuf numbers as tags (see Structs). They run through `std/serde`. Encoding builds a `serde.Tree` with `serde.to_tree` and writes it by the schema. Decoding turns the wire bytes into a tree by the schema and reads it with `serde.read`.
+
+#### Protobuf field tags
+
+A tag is a comma-separated list of the field number, `sint`, `fixed`, `unpacked`, `required`, `key=sint`, `key=fixed`, `value=sint` and `value=fixed`.
+
+#### Protobuf type mapping
+
+| Type | Protobuf form |
+| --- | --- |
+| Integers | The `int32`, `int64`, `uint32` or `uint64` encoding by width and sign |
+| A field of an enum with payload variants | Tagged `oneof`. Each variant's `= n` index is the field number of its member, and a variant's payload tag has no number. |
+| An enum of payload-free variants | A protobuf enum of the variants' indexes |
+| A struct | An embedded message |
+| A slice | Repeated, packed unless tagged `unpacked` |
+| A map | A repeated entry message |
+| A pointer field such as `*Node?` | Carries a recursive message |
+
+#### Protobuf writing rules
+
+| Field | Written |
+| --- | --- |
+| A singular field that holds its default | Not written unless it declares a default of its own |
+| An optional field | Whenever it holds a value |
+| A non-optional embedded message | Always |
+
+#### Protobuf decoding rules
+
+- Decoding gives an absent field its declared default, `none` for an optional one and zero otherwise.
+- It takes the last value of a repeated singular field and merges repeated occurrences of an embedded message.
+- It collects repeated fields packed or not and takes the last member of a `oneof`.
+- It skips unknown fields, fields of the wrong wire type and enum values no variant has.
+- It checks strings for UTF-8.
+
+#### Protobuf serde errors
+
+| Error | Raised for |
+| --- | --- |
+| `Syntax` | Malformed input, at a byte offset |
+| `TooDeep` | More than 100 levels of messages |
+| `Mismatch` | A `T` that is not a struct |
+| `Missing` | An absent `required` field |
+
+#### Protobuf schema parsing
+
+`std/protobuf/proto` reads `.proto` text with `parse(path, source)`. It accepts `syntax`, `package`, `import` with `public` and `weak`, `option`, `message`, nested messages and enums, `enum` with `allow_alias`, `oneof`, `map`, `repeated`, `optional`, proto2 `required` and `default`, `reserved`, `extensions`, `extend`, and `service` with `rpc` and `stream` on either side.
+
+It keeps options as written. The exceptions are:
+
+- `default` and `json_name` are fields of `Field`.
+- `packed` and `deprecated` change what the generator writes.
+
+#### Protobuf schema rejections
+
+`parse` rejects:
+
+- a proto2 `group`
+- an `edition`
+- proto3 files that use `required`, `default`, extension ranges or a first enum value other than zero
+- bad or duplicate field numbers and names
+- reserved numbers and names
+- wrong map keys
+- empty oneofs
+- nesting past 32 levels
+
+Each rejection is one `proto.Error` variant with the file, line and column. `proto.message` formats it.
+
+#### Protobuf file loading
+
+`read_files(paths, roots, read)` loads each path and its imports through `read`. `read` returns the text of a file or fails with `io.Error.NotFound`. The loader tries the roots in order and rejects import cycles. It lists the files with every file after the files it imports.
+
+The loader touches no file system itself, so a program supplies `file.read_text` and a test supplies a map.
+
+#### Protobuf name resolution
+
+The loader gives each type its full name and replaces every type name with the full name of the message or enum it refers to. A name resolves by matching the whole written name against the innermost enclosing message and then each scope outwards through the package, then absolutely. It resolves only through the file's own definitions, its imports and the `import public` closure of those.
+
+#### Protobuf module generation
+
+`generate(set, options)` writes one Low module per file, `a/b.proto` as `a/b/b.low`. `Options.module` is the import path of the output directory.
+
+| Protobuf | Generated |
+| --- | --- |
+| A message | A `pub struct` |
+| An enum or oneof | A `pub enum` |
+| A singular message field | Optional |
+| A singular field or oneof member in a cycle of messages | `*T?` |
+| A map | `[K: V]` with its key and value encodings in the tag |
+| A proto2 field with a default | Keeps it as the field's default |
+| A message without fields | One `bool` field `empty` on field number 536870911 |
+| A type from another file | Reached through an import of that file's module |
+
+The output is a function of the files alone. Extensions and other options are left out.
+
+#### Protobuf generated names
+
+- Nested types are named by joining the names of the messages around them: `Outer.Inner` is `OuterInner`, and the oneof `choice` of `Scalars` is `ScalarsChoice`.
+- A name that is already taken gets a number after it.
+- Field names stay when they are `snake_case`. Other field names go through `std/text/naming`.
+- A keyword gains a trailing `_`.
+- An enum value loses the enum name as a prefix when a name remains.
+
+#### Protobuf generated services
+
+A `service` with methods becomes, for service `Greeter`, a `GreeterClient` made by `greeter_client(channel)`. The client has one function per method named after it in `snake_case` (a name another service of the file already took gains a number), whose call shape follows the `stream` keywords and whose types are the request and response messages.
+
+The service becomes a `GreeterHandlers` struct with one function-valued field per method. It becomes `register_greeter(server, handlers)`, which registers each method as `/package.Greeter/Method`.
+
+A service with no methods gets only the client.
+
+#### Protobuf generation command
+
+`low protogen -I dir,dir --module path -o outdir file.proto...` reads the files against the roots and writes the modules under `outdir`, imported files included. The generator is the library `compiler/protogen`, which `compiler/low/protogen.low` calls.
+
+#### XML input
+
+`std/xml` reads XML 1.0 (fifth edition) with Namespaces. The input may be:
+
+- UTF-8
+- UTF-16 with a byte order mark
+- any encoding `std/charset` knows by its declared label
+
+The reader converts it to UTF-8 and normalises line endings first.
+
+#### XML pull reader
+
+`xml.Reader` is a pull reader: `next` returns one token and `position` its line and column. Names arrive with namespaces resolved and are interned in a per-reader table. Text, CDATA, comments and attribute values are views into the input unless a reference or normalisation forces a copy. 32-byte vector scans find the bytes that end them.
+
+The reader enforces well-formedness and the namespace constraints. It agrees with libxml2 on what it accepts.
+
+#### XML internal subset and entities
+
+The internal subset is parsed. General entities expand, including markup. Expansion has recursion detection, a nesting limit of 40 and a total of 1 MiB plus eight times the input.
+
+Attribute-list declarations supply defaults and normalise tokenised types. External entities are never fetched and parameter entities are not expanded.
+
+#### XML tree and writer
+
+`xml.parse` builds an `Element` tree of owned strings with `attribute`, `child`, `children`, `text` and `find`.
+
+`xml.Writer` escapes text and attributes and splits CDATA around `]]>`. It writes namespace declarations and indents element-only content.
+
+#### XML serde binding
+
+`serialize_value` and `deserialize` bind types through serde. They map:
+
+- fields to attributes or child elements by local name
+- repeated elements to slices
+- `xsi:nil` to `none`
+
+#### Pipe blocking
+
+Pipes block through channels. A writer flushing more than the pause threshold waits until the reader brings the unconsumed bytes below the resume threshold, or until the reader itself waits for more data. A message larger than the thresholds therefore cannot deadlock the pipe.
+
+#### Connection pool
+
+- `pool.open` stores `ConnectionHandle` views. One connection therefore serves a lease at a time, and the pool, not the owner, closes it.
+- The pool checks idle and lifetime limits on acquire, release and `prune` against `clock.monotonic`.
+- A release hands the connection to the oldest waiter.
+- A lease marks its connection broken on `Connect`, `Authentication`, `Closed`, `Timeout` or `Protocol` errors. The pool closes it.
+- A transaction left open at release is rolled back.
+
+#### Migration checks
+
+- `migrate.up` refuses any applied migration whose checksum differs (`Drift`).
+- It refuses a pending version below the highest applied one (`OutOfOrder`).
+- It refuses duplicate or non-ascending versions.
+
+#### Migration locks
+
+The lock is:
+
+| Database | Lock |
+| --- | --- |
+| SQLite | `BEGIN IMMEDIATE` |
+| PostgreSQL | `pg_advisory_lock` |
+| SQL Server | `sp_getapplock` |
+| MySQL and MariaDB | `GET_LOCK` |
+
+Each migration re-checks inside its transaction that it is not yet recorded.
+
+#### Migration failures
+
+A migration that fails reports its own error, or the rollback's error when the rollback fails too. A lock that cannot be released fails with `Sql` unless a migration error is reported first.
+
+#### Text migrations
+
+In a text migration a statement ends at a line ending in `;`, and `-- +begin` to `-- +end` keeps a block with several `;` as one statement.
 
 #### Unicode
 
-- `std/unicode` reads tables generated by `compiler/tablegen unicode` from UnicodeData.txt, CaseFolding.txt and DerivedNormalizationProps.txt of Unicode 16.0.0. This is the version Python's `unicodedata` reports, and `std/unicode` agrees with it on every code point. `compiler/tablegen unicode` and `compiler/tablegen properties` also write `normalization_layout.low` and `property_layout.low`: constants for the record sizes, field offsets, trie shifts and masks, Hangul constants and packed property bit fields, and one `<table>_table()` accessor per `.bin` file that `embed`s it. The module sources read these instead of literals. `layout_files_match_generator` in `compiler/tests/tablegen` fails when a committed layout file differs from the generator. `compiler/tablegen classes` writes the simple case folding orbits and the word set that `std/regex` embeds, as `### Regular expressions` describes.
-- The tables are `embed`ded binary files. A two-level trie of 64-entry blocks covers code points below U+2FA40 and gives 0 above. It maps each code point to a 16-bit record id. Each record holds the canonical combining class and 16-bit offsets and lengths into a pool of `u32` code points. The offsets and lengths cover the full canonical decomposition, the full compatibility decomposition and the C and F case folding.
-- Hangul syllables decompose and compose algorithmically. Decomposition is followed by a stable canonical reordering by combining class. Composition binary-searches a sorted table of primary composites. The table leaves out Full_Composition_Exclusion. ASCII input returns at once, or lowercased by `casefold` and `search_key`.
-- Word, sentence and line break data live in their own tries, `word_*`, `sentence_*` and `line_*` `.bin` files of an index, 32-entry blocks and records. `compiler/tablegen segmentation` writes them from WordBreakProperty.txt, SentenceBreakProperty.txt, LineBreak.txt, EastAsianWidth.txt, emoji-data.txt and UnicodeData.txt of Unicode 17.0.0. `segmentation_layout.low` holds the shifts, masks, flag bits and class constants. A word record holds the Word_Break class and the Extended_Pictographic bit. A line record holds the Line_Break class after the LB1 resolution (AI, SG and XX to AL, SA to CM for Mn and Mc and to AL otherwise, CJ to NS), the East Asian Width F, W or H bit, the Extended_Pictographic and Cn bit, and the Pi and Pf bits of quotation marks. The tries cost 45,877 bytes (word), 47,343 bytes (sentence) and 43,546 bytes (line). Each is linked only when `words`, `sentences` or `line_breaks` is reachable.
-- `word_end`, `sentence_end` and `grapheme_end` scan forward from a segment start with a small state record and the next code point. They look ahead only where a rule needs it (WB6, WB7b, WB12, SB8). WB4 and SB5 fold Extend, Format and ZWJ into the character before them. `line_breaks` scans the whole string once, because UAX #14 rules (LB15a, LB19a) read the character before a break position and a restart at an earlier break would change the answer. It implements LB1 to LB31 of Unicode 17.0.0 with no tailoring. LB9 and LB10 fold or replace CM and ZWJ. LB15a to LB15d, LB20a, LB28a with U+25CC and LB30b use the record bits. The break after the last character is mandatory (LB3), as are the breaks after BK, LF, NL and a CR not followed by LF (LB4 and LB5). The default rules pass every line of WordBreakTest.txt, SentenceBreakTest.txt and LineBreakTest.txt of 17.0.0.
-- `search_key(s)` equals Python's `''.join(c for c in unicodedata.normalize('NFKD', s.casefold()) if not unicodedata.combining(c))`. It skips reordering, since every reordered character is dropped.
+`std/unicode` reads tables generated by `compiler/tablegen`. The normalization and case folding tables are of Unicode 16.0.0, and the word, sentence and line break tables of Unicode 17.0.0.
+
+##### Unicode normalization tables
+
+`std/unicode` reads tables generated by `compiler/tablegen unicode` from UnicodeData.txt, CaseFolding.txt and DerivedNormalizationProps.txt of Unicode 16.0.0. This is the version Python's `unicodedata` reports, and `std/unicode` agrees with it on every code point.
+
+##### Unicode layout files
+
+`compiler/tablegen unicode` and `compiler/tablegen properties` also write `normalization_layout.low` and `property_layout.low`: constants for the record sizes, field offsets, trie shifts and masks, Hangul constants and packed property bit fields, and one `<table>_table()` accessor per `.bin` file that `embed`s it. The module sources read these instead of literals.
+
+`layout_files_match_generator` in `compiler/tests/tablegen` fails when a committed layout file differs from the generator.
+
+##### Case folding orbits for regular expressions
+
+`compiler/tablegen classes` writes the simple case folding orbits and the word set that `std/regex` embeds, as `### Regular expressions` describes.
+
+##### Normalization table format
+
+The tables are `embed`ded binary files. A two-level trie of 64-entry blocks covers code points below U+2FA40 and gives 0 above. It maps each code point to a 16-bit record id.
+
+Each record holds the canonical combining class and 16-bit offsets and lengths into a pool of `u32` code points. The offsets and lengths cover:
+
+- the full canonical decomposition
+- the full compatibility decomposition
+- the C and F case folding
+
+##### Normalization algorithms
+
+Hangul syllables decompose and compose algorithmically. Decomposition is followed by a stable canonical reordering by combining class.
+
+Composition binary-searches a sorted table of primary composites. The table leaves out Full_Composition_Exclusion. ASCII input returns at once, or lowercased by `casefold` and `search_key`.
+
+##### Segmentation tables
+
+Word, sentence and line break data live in their own tries, `word_*`, `sentence_*` and `line_*` `.bin` files of an index, 32-entry blocks and records. `compiler/tablegen segmentation` writes them from WordBreakProperty.txt, SentenceBreakProperty.txt, LineBreak.txt, EastAsianWidth.txt, emoji-data.txt and UnicodeData.txt of Unicode 17.0.0. `segmentation_layout.low` holds the shifts, masks, flag bits and class constants.
+
+| Record | Holds |
+| --- | --- |
+| Word record | The Word_Break class and the Extended_Pictographic bit. |
+| Line record | The Line_Break class after the LB1 resolution (AI, SG and XX to AL, SA to CM for Mn and Mc and to AL otherwise, CJ to NS), the East Asian Width F, W or H bit, the Extended_Pictographic and Cn bit, and the Pi and Pf bits of quotation marks. |
+
+| Trie | Cost |
+| --- | --- |
+| Word | 45,877 bytes |
+| Sentence | 47,343 bytes |
+| Line | 43,546 bytes |
+
+Each is linked only when `words`, `sentences` or `line_breaks` is reachable.
+
+##### Grapheme, word and sentence scanning
+
+`word_end`, `sentence_end` and `grapheme_end` scan forward from a segment start with a small state record and the next code point. They look ahead only where a rule needs it (WB6, WB7b, WB12, SB8). WB4 and SB5 fold Extend, Format and ZWJ into the character before them.
+
+##### Line break scanning
+
+`line_breaks` scans the whole string once, because UAX #14 rules (LB15a, LB19a) read the character before a break position and a restart at an earlier break would change the answer. It implements LB1 to LB31 of Unicode 17.0.0 with no tailoring.
+
+| Rule | Handling |
+| --- | --- |
+| LB9 and LB10 | Fold or replace CM and ZWJ. |
+| LB15a to LB15d, LB20a, LB28a with U+25CC and LB30b | Use the record bits. |
+| LB3 | The break after the last character is mandatory. |
+| LB4 and LB5 | The breaks after BK, LF, NL and a CR not followed by LF are mandatory. |
+
+##### Segmentation conformance
+
+The default rules pass every line of WordBreakTest.txt, SentenceBreakTest.txt and LineBreakTest.txt of 17.0.0.
+
+##### Search keys
+
+`search_key(s)` equals Python's `''.join(c for c in unicodedata.normalize('NFKD', s.casefold()) if not unicodedata.combining(c))`. It skips reordering, since every reordered character is dropped.
 
 #### Hostnames
 
-- `std/net/punycode` implements RFC 3492 with 32-bit overflow checks. Its encoder and decoder agree with every sample of section 7.1 and with Python's `punycode` codec on 300 random strings.
-- `std/net/idna` follows UTS #46 revision 33 for Unicode 16.0.0. It maps, normalises to NFC through `std/unicode`, breaks at the label separators and decodes `xn--` labels. It then validates each label against the criteria `V1` to `V7` and `U1`. It applies the RFC 5893 Bidi rule when `check_bidi` is set. It applies the RFC 5892 ContextJ rule for U+200C and U+200D when `check_joiners` is set. `to_ascii` encodes the labels with Punycode and applies the length limits when `verify_dns_length` is set. `use_std3_ascii_rules` restricts ASCII code points to letters, digits and `-`. The mapping table of this version has no `disallowed_STD3` entries. ContextO and `IgnoreInvalidPunycode` are not provided.
-- `compiler/tablegen idna <ucd directory> <output directory>` generates the tables from IdnaMappingTable.txt of `Public/idna/16.0.0`, and DerivedBidiClass.txt, DerivedJoiningType.txt and UnicodeData.txt of Unicode 16.0.0. It writes `idna_mapping.bin` (sorted ranges with a status and a pool offset, adjacent equal ranges merged), `idna_pool.bin` (the mapped UTF-8 text, shared), `idna_classes.bin` (sorted ranges holding the Bidi class, the joining type and the mark flag) and `idna_layout.low`. Lookups binary-search the ranges.
-- The conformance fixture runs every line of IdnaTestV2.txt for 16.0.0 through `to_unicode` and through `to_ascii` with nontransitional and transitional processing. 6,387 of 6,387 lines agree on the text and on the failed check. The two lines whose source holds an unpaired surrogate are not run, because a `str` cannot hold one.
-- `std/net/publicsuffix` stores the rules as a trie of reversed labels in UTF-8. `compiler/tablegen publicsuffix <public_suffix_list.dat> <output directory>` writes it into `suffix_nodes.bin`, `suffix_labels.bin`, `suffix_version.bin` and `suffix_layout.low`. Each node records whether a rule ends there, whether a wildcard rule `*.` hangs from it, whether an exception rule `!` ends there, and for each whether the rule is in the private section. The longest rule wins. An exception rule wins over any other and drops its leftmost label. A name no rule matches takes its last label by the default rule `*`.
-- The embedded list is version 2026-11-14_09-32-49_UTC, commit c3a53eed2cc49353c5fb5c30536186795d5c451b of github.com/publicsuffix/list. `compiler/tablegen publicsuffix public_suffix_list.dat std/net/publicsuffix` regenerates it from a downloaded `public_suffix_list.dat`. The fixtures replay the list's `tests/test_psl.txt` and check every rule of the list against the tables.
-- A label that is ASCII and does not begin with `xn--` is matched as its lowercase form without UTS #46 processing, so `_dmarc` is accepted. Any other label is processed with `check_hyphens`, `use_std3_ascii_rules` and `verify_dns_length` off. An empty label or a rejected label gives `none`.
-- `http.parse_url` converts a host with non-ASCII bytes with `to_ascii`. It runs with `check_hyphens`, `use_std3_ascii_rules` and `verify_dns_length` off, as the WHATWG URL standard does. It fails with `Invalid` when the conversion fails. `Url.host` is therefore ASCII for the `host` header, the TLS server name, the resolver, `net.dial` and the proxies. A `Domain` attribute is converted the same way. One that is a public suffix is accepted only when it equals the request host. This makes the cookie host-only (RFC 6265bis section 5.7). A request to an IP literal skips the check.
-- The tables are linked into a program only when it calls a function that reads them. A program that serves HTTP without the client links none. A program that uses the client links the mapping tables of `std/net/idna`, the tables of `std/net/publicsuffix` and the normalisation tables of `std/unicode`.
+##### Punycode
+
+`std/net/punycode` implements RFC 3492 with 32-bit overflow checks. Its encoder and decoder agree with every sample of section 7.1 and with Python's `punycode` codec on 300 random strings.
+
+##### IDNA processing
+
+`std/net/idna` follows UTS #46 revision 33 for Unicode 16.0.0. It:
+
+- maps
+- normalises to NFC through `std/unicode`
+- breaks at the label separators
+- decodes `xn--` labels
+- then validates each label against the criteria `V1` to `V7` and `U1`
+
+##### IDNA options
+
+| Option | Effect |
+| --- | --- |
+| `check_bidi` | Applies the RFC 5893 Bidi rule when set. |
+| `check_joiners` | Applies the RFC 5892 ContextJ rule for U+200C and U+200D when set. |
+| `use_std3_ascii_rules` | Restricts ASCII code points to letters, digits and `-`. |
+
+`to_ascii` encodes the labels with Punycode and applies the length limits when `verify_dns_length` is set.
+
+The mapping table of this version has no `disallowed_STD3` entries. ContextO and `IgnoreInvalidPunycode` are not provided.
+
+##### IDNA tables
+
+`compiler/tablegen idna <ucd directory> <output directory>` generates the tables from IdnaMappingTable.txt of `Public/idna/16.0.0`, and DerivedBidiClass.txt, DerivedJoiningType.txt and UnicodeData.txt of Unicode 16.0.0. It writes `idna_layout.low` and these files:
+
+| File | Holds |
+| --- | --- |
+| `idna_mapping.bin` | Sorted ranges with a status and a pool offset, adjacent equal ranges merged. |
+| `idna_pool.bin` | The mapped UTF-8 text, shared. |
+| `idna_classes.bin` | Sorted ranges holding the Bidi class, the joining type and the mark flag. |
+
+Lookups binary-search the ranges.
+
+##### IDNA conformance
+
+The conformance fixture runs every line of IdnaTestV2.txt for 16.0.0 through `to_unicode` and through `to_ascii` with nontransitional and transitional processing. 6,387 of 6,387 lines agree on the text and on the failed check.
+
+The two lines whose source holds an unpaired surrogate are not run, because a `str` cannot hold one.
+
+##### Public suffix trie
+
+`std/net/publicsuffix` stores the rules as a trie of reversed labels in UTF-8. `compiler/tablegen publicsuffix <public_suffix_list.dat> <output directory>` writes it into `suffix_nodes.bin`, `suffix_labels.bin`, `suffix_version.bin` and `suffix_layout.low`.
+
+Each node records:
+
+- whether a rule ends there
+- whether a wildcard rule `*.` hangs from it
+- whether an exception rule `!` ends there
+
+and for each whether the rule is in the private section.
+
+##### Public suffix matching
+
+- The longest rule wins.
+- An exception rule wins over any other and drops its leftmost label.
+- A name no rule matches takes its last label by the default rule `*`.
+
+##### Embedded public suffix list
+
+The embedded list is version 2026-11-14_09-32-49_UTC, commit c3a53eed2cc49353c5fb5c30536186795d5c451b of github.com/publicsuffix/list. `compiler/tablegen publicsuffix public_suffix_list.dat std/net/publicsuffix` regenerates it from a downloaded `public_suffix_list.dat`.
+
+The fixtures replay the list's `tests/test_psl.txt` and check every rule of the list against the tables.
+
+##### Public suffix label matching
+
+| Label | Handling |
+| --- | --- |
+| A label that is ASCII and does not begin with `xn--` | Matched as its lowercase form without UTS #46 processing, so `_dmarc` is accepted. |
+| Any other label | Processed with `check_hyphens`, `use_std3_ascii_rules` and `verify_dns_length` off. |
+| An empty label or a rejected label | Gives `none`. |
+
+##### URL host conversion
+
+`http.parse_url` converts a host with non-ASCII bytes with `to_ascii`. It runs with `check_hyphens`, `use_std3_ascii_rules` and `verify_dns_length` off, as the WHATWG URL standard does. It fails with `Invalid` when the conversion fails.
+
+`Url.host` is therefore ASCII for the `host` header, the TLS server name, the resolver, `net.dial` and the proxies.
+
+##### Cookie Domain attributes
+
+A `Domain` attribute is converted the same way. One that is a public suffix is accepted only when it equals the request host. This makes the cookie host-only (RFC 6265bis section 5.7). A request to an IP literal skips the check.
+
+##### Linking of hostname tables
+
+The tables are linked into a program only when it calls a function that reads them.
+
+| Program | Links |
+| --- | --- |
+| A program that serves HTTP without the client | None. |
+| A program that uses the client | The mapping tables of `std/net/idna`, the tables of `std/net/publicsuffix` and the normalisation tables of `std/unicode`. |
+
 #### Locales
-- `std/locale` and its sub-modules read CLDR 48.0 (the `common` directory of `cldr-common-48.0.zip`) and, for collation, `common/uca/allkeys_CLDR.txt`, `common/uca/FractionalUCA.txt` and the Unicode 17.0.0 `UnicodeData.txt`. The tables are generated: `compiler/tablegen cldr <cldr common> std/locale/data` writes the locale blobs, the supplemental tables, the plural tables and `layout.low`, and `compiler/tablegen collate <cldr common> <ucd directory> std/locale/data` writes the collation tables. A different CLDR release is a regeneration of both over that release.
-- `std/locale/data/bin` holds one binary blob per CLDR locale file, 621 in all. `locales.txt` lists the 1122 identifiers that resolve to data. A blob is a list of numbered groups (`layout.low` names them): decimal and percent patterns and symbols, compact patterns, currency names, month, weekday, quarter, day-period and era names, date and time patterns, available formats, interval formats, zone formats, relative-time patterns and list patterns. A formatter walks `Locale.blobs` from the most specific blob to the root and takes the first one that has the entry. Inheritance therefore follows the CLDR parent chain.
-- A program pays for the tables it reaches. `locale.parse` reaches every blob through `data.blob_by_id`. `locale.parse_with` with `data.chain_<id>()` reaches the blobs of one chain. Sizes of the linked program on Linux amd64: `print("hello")` is 40,952 bytes. A program that calls only the English forms of `std/text/number`, `std/time/humanize`, `std/time/datetime` and `std/time/pattern` is 117,808 bytes. That is 4,760 bytes more than the same program with the locale-taking functions deleted. The program links no locale table. For one locale (`de`, through `parse_with`): `number.grouped_in` is 491,208 bytes, `datefmt.format` 426,120 bytes, `collate.root` 1,224,136 bytes and `collate.for_locale` for `sv` 1,638,808 bytes. For all locales (`locale.parse`): `number.grouped_in` is 4,263,816 bytes, and a program that uses `datefmt.format`, `numfmt.format_int` and `collate.for_locale` is 5,723,888 bytes. The root collation table is linked only when a collator is built. The 191 KB of tailoring rules is linked only when `collate.for_locale` is reached.
-- Plural rules come from `plurals.xml`, `ordinals.xml` and `pluralRanges.xml` as tables that `plural.cardinal`, `plural.ordinal` and `plural.range` evaluate. `locale_plural` checks every `@integer` and `@decimal` sample of every rule of both files. `locale_plural_range` checks the range category of 91 locale tags against `Intl.PluralRules.selectRange`.
-- Number formatting follows ECMA-402 `Intl.NumberFormat` over the CLDR patterns: grouping with the minimum grouping digits of the locale, numbering systems from `-u-nu`, rounding by fraction digits, significant digits, increment and the nine rounding modes on the exact decimal, sign display, compact notation and currency symbols, narrow symbols, codes and plural names with accounting and cash digits. Parsing localized numbers is not provided.
-- Date formatting is Gregorian only. The `ca` key is read and does not change the output. The data of other calendars is not generated. `datefmt.format` prints the standard patterns of the four lengths, or the pattern the CLDR distance rules pick from the available formats for a skeleton, with the `j` skeleton letter resolved by the hour-cycle preference of the locale and `hc` overriding it. Month, weekday, era, quarter and day-period names come from the locale. A zone field prints the localized GMT offset form (`GMT+01:00`, `GMT+1`). The zone names of CLDR are not generated. `format_range` follows the interval formats of the locale.
-- `std/time/pattern` accepts `%c`, `%x` and `%X` through `compile_in` and `datefmt.layouts`. Both turn the standard date, time and date-time patterns of a locale into strftime layouts with ASCII digits. A standard pattern with a field no strftime verb prints, as in `la` and `zh-Hant`, fails with `NoLayout`.
-- Collation implements UTS #10 over the CLDR root order (`allkeys_CLDR.txt`): 32-bit weights with implicit weights for unassigned and Han code points, contractions, expansions and canonical reordering, non-ignorable and shifted variable weighting, strengths primary to identical, backwards secondary weights, `caseFirst` upper and lower, numeric ordering of ASCII digit runs, `sort_key` and `compare`. A tailored collator compiles the CLDR rules of the locale when it is built: `&` resets (with `[before n]` and `[last regular]`), `<` through `<<<<`, `=`, expansions, `[reorder]`, `[suppressContractions]` and the `caseFirst` and `alternate` settings of the collation. The collations CLDR 48 defines without an `alt` attribute are generated for 113 locale files. The locale's own tag or its `-u-co-` type selects one (`phonebook`, `traditional`, `search`, `eor` and the rest). Absent: `zh` and `zh-Hant`, which use the root order (the rules of `zh.xml` are not generated), collations with an `alt` attribute, and the rules that use a prefix context (`|`), a logical position other than `[last regular]` (`[first ...]` and the other `[last ...]`), or `[import]`. `caseLevel`, `optimize`, a `maxVariable` other than punctuation, and numeric ordering of non-ASCII digits are not implemented. `caseFirst` is decided per collation element, with no separate class for mixed-case contractions.
-- Verification. `locale_collate` runs `CollationTest_CLDR_NON_IGNORABLE_SHORT.txt` and `CollationTest_CLDR_SHIFTED_SHORT.txt` (CLDR 48 UCA conformance files) through the root collator and compares each line's sort key and the order of adjacent lines. The full files (not embedded, 18 MB and 22 MB) pass at 206,298 of 206,298 and 227,809 of 227,809 sort keys and 206,297 of 206,297 and 227,808 of 227,808 adjacent orders. The other tests compare the module with Node 24.19.0 `Intl` (ICU 78.3, CLDR 48.0, Unicode 17.0) over matrices. Scripts kept outside the repository generate the matrices, and the matrices are embedded as TSV files: `locale_number` (10,509 rows, 86 tags: decimal, percent, scientific, compact, currency, accounting, sign display, grouping, rounding), `locale_numbers` (3,791 rows, 48 tags: `grouped_in`, `percent_in`, `compact_in`, `currency_in`), `locale_date` (6,846 rows, 81 tags), `locale_date_range` (8,836 rows, 30 tags), `locale_list` (8,640 rows, 80 tags), `locale_reltime` (7,218 rows, 81 tags), `locale_humanize` (5,400 rows, 40 tags), `locale_pattern` (765 rows, 51 tags for `%c`, `%x`, `%X`) and `locale_collate_intl` (39,217 rows, 66 tags including `-u-co-phonebk` and `-u-co-trad`, and the strength, alternate, case-first, numeric and backwards-secondary options). Every embedded row passes.
-- Rows left out of the matrices because the module and `Intl` differ: 1 `fr` compact-long row (it needs the exact-count plural key `count="1"` that `numfmt` does not read); 79 `ko` rows containing the day-period names `오전` and `오후` and 18 `zh-Hant` rows with a date and a time, in `locale_date`; 44 interval rows (`bg` and `vi` `jm` across midnight, `ja` `h12` across midnight) in `locale_date_range`; and 32 collation rows, those of `fr-CA` with `ð` or `đ` and those of `da` with `caseFirst: lower` and `Aa`. Interval formats are matrix-checked for date-only skeletons and for time-only skeletons within one day. Skeletons that combine a date and a time across different dates are covered by the interval rules and not by a matrix.
-- Not provided: other calendars, time zone display names, CLDR units and unit formatting, `humanize.in_words` and `humanize.compact` for other languages, ordinal suffixes by locale, number parsing, and the collation features listed above.
+
+`std/locale` and its sub-modules read CLDR 48.0. The tables are generated, and a program pays for the tables it reaches.
+
+##### Locale data sources
+
+`std/locale` and its sub-modules read CLDR 48.0 (the `common` directory of `cldr-common-48.0.zip`) and, for collation, `common/uca/allkeys_CLDR.txt`, `common/uca/FractionalUCA.txt` and the Unicode 17.0.0 `UnicodeData.txt`. The tables are generated:
+
+| Command | Writes |
+| --- | --- |
+| `compiler/tablegen cldr <cldr common> std/locale/data` | The locale blobs, the supplemental tables, the plural tables and `layout.low`. |
+| `compiler/tablegen collate <cldr common> <ucd directory> std/locale/data` | The collation tables. |
+
+A different CLDR release is a regeneration of both over that release.
+
+##### Locale blobs
+
+`std/locale/data/bin` holds one binary blob per CLDR locale file, 621 in all. `locales.txt` lists the 1122 identifiers that resolve to data.
+
+A blob is a list of numbered groups (`layout.low` names them):
+
+- decimal and percent patterns and symbols
+- compact patterns
+- currency names
+- month, weekday, quarter, day-period and era names
+- date and time patterns
+- available formats
+- interval formats
+- zone formats
+- relative-time patterns
+- list patterns
+
+##### Locale blob inheritance
+
+A formatter walks `Locale.blobs` from the most specific blob to the root and takes the first one that has the entry. Inheritance therefore follows the CLDR parent chain.
+
+##### Locale table linking
+
+A program pays for the tables it reaches.
+
+| Call | Reaches |
+| --- | --- |
+| `locale.parse` | Every blob through `data.blob_by_id`. |
+| `locale.parse_with` with `data.chain_<id>()` | The blobs of one chain. |
+
+##### Linked program sizes
+
+These are sizes of the linked program on Linux amd64.
+
+| Program | Bytes on Linux amd64 |
+| --- | --- |
+| `print("hello")` | 40,952 |
+| A program that calls only the English forms of `std/text/number`, `std/time/humanize`, `std/time/datetime` and `std/time/pattern` | 117,808. That is 4,760 bytes more than the same program with the locale-taking functions deleted. The program links no locale table. |
+
+| Locales | Program | Bytes on Linux amd64 |
+| --- | --- | --- |
+| One locale (`de`, through `parse_with`) | `number.grouped_in` | 491,208 |
+| One locale (`de`, through `parse_with`) | `datefmt.format` | 426,120 |
+| One locale (`de`, through `parse_with`) | `collate.root` | 1,224,136 |
+| One locale (`de`, through `parse_with`) | `collate.for_locale` for `sv` | 1,638,808 |
+| All locales (`locale.parse`) | `number.grouped_in` | 4,263,816 |
+| All locales (`locale.parse`) | A program that uses `datefmt.format`, `numfmt.format_int` and `collate.for_locale` | 5,723,888 |
+
+The root collation table is linked only when a collator is built. The 191 KB of tailoring rules is linked only when `collate.for_locale` is reached.
+
+##### Locale plural rules
+
+Plural rules come from `plurals.xml`, `ordinals.xml` and `pluralRanges.xml` as tables that `plural.cardinal`, `plural.ordinal` and `plural.range` evaluate.
+
+`locale_plural` checks every `@integer` and `@decimal` sample of every rule of both files. `locale_plural_range` checks the range category of 91 locale tags against `Intl.PluralRules.selectRange`.
+
+##### Locale number formatting
+
+Number formatting follows ECMA-402 `Intl.NumberFormat` over the CLDR patterns:
+
+- grouping with the minimum grouping digits of the locale
+- numbering systems from `-u-nu`
+- rounding by fraction digits, significant digits, increment and the nine rounding modes on the exact decimal
+- sign display
+- compact notation
+- currency symbols, narrow symbols, codes and plural names with accounting and cash digits
+
+Parsing localized numbers is not provided.
+
+##### Calendars in date formatting
+
+Date formatting is Gregorian only. The `ca` key is read and does not change the output. The data of other calendars is not generated.
+
+##### Date patterns and names
+
+`datefmt.format` prints the standard patterns of the four lengths, or the pattern the CLDR distance rules pick from the available formats for a skeleton, with the `j` skeleton letter resolved by the hour-cycle preference of the locale and `hc` overriding it. Month, weekday, era, quarter and day-period names come from the locale.
+
+##### Zone fields and date ranges
+
+A zone field prints the localized GMT offset form (`GMT+01:00`, `GMT+1`). The zone names of CLDR are not generated. `format_range` follows the interval formats of the locale.
+
+##### Locale strftime layouts
+
+`std/time/pattern` accepts `%c`, `%x` and `%X` through `compile_in` and `datefmt.layouts`. Both turn the standard date, time and date-time patterns of a locale into strftime layouts with ASCII digits.
+
+A standard pattern with a field no strftime verb prints, as in `la` and `zh-Hant`, fails with `NoLayout`.
+
+##### Collation algorithm
+
+Collation implements UTS #10 over the CLDR root order (`allkeys_CLDR.txt`):
+
+- 32-bit weights with implicit weights for unassigned and Han code points
+- contractions, expansions and canonical reordering
+- non-ignorable and shifted variable weighting
+- strengths primary to identical
+- backwards secondary weights
+- `caseFirst` upper and lower
+- numeric ordering of ASCII digit runs
+- `sort_key` and `compare`
+
+##### Tailored collators
+
+A tailored collator compiles the CLDR rules of the locale when it is built:
+
+- `&` resets (with `[before n]` and `[last regular]`)
+- `<` through `<<<<`
+- `=`
+- expansions
+- `[reorder]`
+- `[suppressContractions]`
+- the `caseFirst` and `alternate` settings of the collation
+
+The collations CLDR 48 defines without an `alt` attribute are generated for 113 locale files. The locale's own tag or its `-u-co-` type selects one (`phonebook`, `traditional`, `search`, `eor` and the rest).
+
+##### Collation limits
+
+Absent:
+
+- `zh` and `zh-Hant`, which use the root order (the rules of `zh.xml` are not generated)
+- collations with an `alt` attribute
+- the rules that use a prefix context (`|`), a logical position other than `[last regular]` (`[first ...]` and the other `[last ...]`), or `[import]`
+
+Not implemented:
+
+- `caseLevel`
+- `optimize`
+- a `maxVariable` other than punctuation
+- numeric ordering of non-ASCII digits
+
+`caseFirst` is decided per collation element, with no separate class for mixed-case contractions.
+
+##### Collation conformance
+
+`locale_collate` runs `CollationTest_CLDR_NON_IGNORABLE_SHORT.txt` and `CollationTest_CLDR_SHIFTED_SHORT.txt` (CLDR 48 UCA conformance files) through the root collator and compares each line's sort key and the order of adjacent lines. The full files (not embedded, 18 MB and 22 MB) pass at 206,298 of 206,298 and 227,809 of 227,809 sort keys and 206,297 of 206,297 and 227,808 of 227,808 adjacent orders.
+
+##### Locale matrices compared with Intl
+
+The other tests compare the module with Node 24.19.0 `Intl` (ICU 78.3, CLDR 48.0, Unicode 17.0) over matrices. Scripts kept outside the repository generate the matrices, and the matrices are embedded as TSV files:
+
+| Test | Rows | Tags | Covers |
+| --- | --- | --- | --- |
+| `locale_number` | 10,509 | 86 | Decimal, percent, scientific, compact, currency, accounting, sign display, grouping, rounding. |
+| `locale_numbers` | 3,791 | 48 | `grouped_in`, `percent_in`, `compact_in`, `currency_in`. |
+| `locale_date` | 6,846 | 81 | |
+| `locale_date_range` | 8,836 | 30 | |
+| `locale_list` | 8,640 | 80 | |
+| `locale_reltime` | 7,218 | 81 | |
+| `locale_humanize` | 5,400 | 40 | |
+| `locale_pattern` | 765 | 51 | `%c`, `%x`, `%X`. |
+| `locale_collate_intl` | 39,217 | 66 | Tags including `-u-co-phonebk` and `-u-co-trad`, and the strength, alternate, case-first, numeric and backwards-secondary options. |
+
+Every embedded row passes.
+
+##### Rows left out of the locale matrices
+
+Rows left out of the matrices because the module and `Intl` differ:
+
+- 1 `fr` compact-long row (it needs the exact-count plural key `count="1"` that `numfmt` does not read)
+- in `locale_date`: 79 `ko` rows containing the day-period names `오전` and `오후` and 18 `zh-Hant` rows with a date and a time
+- in `locale_date_range`: 44 interval rows (`bg` and `vi` `jm` across midnight, `ja` `h12` across midnight)
+- 32 collation rows, those of `fr-CA` with `ð` or `đ` and those of `da` with `caseFirst: lower` and `Aa`
+
+##### Interval format coverage
+
+Interval formats are matrix-checked for date-only skeletons and for time-only skeletons within one day. Skeletons that combine a date and a time across different dates are covered by the interval rules and not by a matrix.
+
+##### Locale features not provided
+
+Not provided:
+
+- other calendars
+- time zone display names
+- CLDR units and unit formatting
+- `humanize.in_words` and `humanize.compact` for other languages
+- ordinal suffixes by locale
+- number parsing
+- the collation features listed above
 
 #### HTML
 
-- `std/html` tokenizes UTF-8 HTML following the WHATWG tokenization states and never fails. Tag and attribute names are lowercased in ASCII. Attribute values may be double-quoted, single-quoted or unquoted. A repeated attribute keeps its first value. A tag cut off by the end of input is dropped.
-- A start tag for `script`, `style`, `xmp`, `iframe`, `noembed` or `noframes` switches to raw text, and one for `title` or `textarea` to escapable raw text, until the matching end tag in any case. `plaintext` takes the rest of the input. Script data follows the escaped and double-escaped states of the standard. `<script><!--<script></script>--></script>` is therefore one element. `noscript` is tokenized as when scripting is disabled.
-- Comments end at `-->` or `--!>`, with `<!-->` and `<!--->` empty. `<?target data?>` is an `Instruction` token when the target starts with a letter or `_` and holds letters, digits, `-` and `_`. `<?xml ...>`, `<?xml-stylesheet ...>`, any other `<?...>`, `<!...>` other than comments and doctypes, `<![CDATA[...]]>` and `</` followed by a non-letter become comments. `</>` is skipped. `Doctype` carries the lowercased name, the optional public and system identifiers and `force_quirks`.
-- Character references are decoded in text, escapable raw text and attribute values. Named references match the longest name against the full WHATWG table of 2,231 names, including the names valid without a semicolon. `compiler/tablegen entities` generates the table and also writes `entity_layout.low` with the index entry layout, the name length limit and the table accessors. Decimal and hexadecimal references work with or without a semicolon. Zero, surrogates and values above U+10FFFF become U+FFFD. 0x80 to 0x9F map through Windows-1252. Inside an attribute, a match without a semicolon that is followed by `=` or a letter or digit stays literal. Text without references is a view into the input.
-- `parse` runs the tree construction algorithm of the standard over the tokenizer, which the builder drives: every insertion mode, the stack of open elements, the list of active formatting elements with the adoption agency algorithm, foster parenting for table content, `template` contents, `frameset`, the HTML integration points and the adjusted tag and attribute names of SVG and MathML, and the quirks mode decision from the doctype. `parse_fragment(context, input)` applies the fragment case with a context element. `parse_body(input)` is the fragment case with `body`. Scripting is disabled: `noscript` content is parsed as elements. The result `Parsed` holds `root` (the document, or a fragment node), `quirks` and `errors`. `errors` holds the parse errors of the tree builder in the order found. The tokenizer's recoveries are not listed. The `Document` node carries the quirks mode.
-- Once parsing ends, a `select` element that is not `multiple` and has a display size of 1 gets its first `selectedcontent` descendant filled with a deep copy of the children of its selected option. The selected option is the last option with `selected`, or else the first option that is not disabled.
-- `parse`, `parse_fragment`, `parse_body`, `sanitize` and `clean` take time and memory linear in the input for every input. Nesting 100,000 levels deep therefore takes milliseconds. The stack of open elements keeps, for every entry, pointers to the nearest entry at or below it that is a scope boundary of each kind (default, list item, button, table), a special element, a list-item scan stop, a reset-insertion-mode stop and an HTML-namespace element. It keeps a chain per element name. As a result "has an element in scope", the `li`, `dd` and `dt` scans, "any other end tag", foster parenting and the reset of the insertion mode do not walk the stack. The list of active formatting elements is a linked list with a marker segment per `template` or applet-like boundary and a queue of at most three entries per name and attribute set. The Noah's Ark clause is therefore a lookup. The adoption agency algorithm keeps the standard's bounds of 8 outer and 3 inner iterations. It uses an entry pointer in place of the bookmark index. Text is appended to a byte buffer that is written to its node once. Attributes are deduplicated through a map. The one superlinear case in the standard is the reconstruction of formatting elements, which can create a new element for every formatting entry at every `p` start tag. A parse creates at most four times the input length in reconstructed elements. After that the entries are dropped instead of recreated.
-- `ParseOptions.max_depth` bounds the element nesting the way Blink and WebKit do. The default is 512 (`default_max_depth`), and 0 or less means no limit. While more elements than that are open, a new element, comment or instruction becomes a child of the parent of the current node. Every node past the limit is therefore a child of the element at the limit. The stack of open elements keeps growing, so end tags still match their start tags. Text, nodes foster parented out of a table, `template` content and nodes the adoption agency algorithm moves are placed as the standard says. A text node can sit one level below the limit. Misnested formatting markup can still build a tree deeper than the limit, as it does in browsers. A program that walks a parsed tree therefore must not recurse once per level. `sanitize` always parses with the default limit and parses its own output again. Its result is therefore never deeper than the limit allows. `parse_with` and `parse_fragment_with` take the options. `max_depth: 0` gives the standard's tree. `testdata/run/std_html_depth` holds the element count and depth of twelve nesting shapes. The default tree of each equals Chromium's.
-- A `Node` has a `data` of `Document`, `Fragment`, `Doctype`, `Element`, `Text`, `Comment` or `Instruction`, and first, last, previous and next links. Insertion and removal therefore take constant time. An `Element` has a `Namespace` (`Html`, `Svg` or `MathMl`), a name, its attributes in source order (each with an optional namespace, prefix, name and value) and, for `template`, a content fragment. `create_element`, `create_text`, `create_comment`, `create_doctype`, `create_instruction`, `create_document` and `create_fragment` make detached nodes. `append_child` and `insert_before` fail with `HierarchyRequest` or `NotFound` and change nothing when they fail. `remove` detaches a node. `clone` copies a node or a subtree. `contains`, `children`, `parent`, `first_child`, `last_child`, `previous_sibling`, `next_sibling`, `attr`, `has_attr`, `set_attr`, `remove_attr`, `local_name`, `is_html`, `template_contents` and `text_content` read and edit it. Walks, `clone`, serialization, selector matching and `clean` are iterative. A tree 300,000 levels deep therefore does not exhaust the stack.
-- `inner_html` and `outer_html` serialize as section 13.3 of the standard. Text and attribute values escape `&` and U+00A0. Attributes also escape `"`, and text also escapes `<` and `>`. Void elements of the HTML namespace have no end tag. The children of `style`, `script`, `xmp`, `iframe`, `noembed`, `noframes` and `plaintext` are written raw. The content of a `template` is written inside it. A `pre`, `textarea` or `listing` element does not get an added line feed. A leading line feed in its content is therefore lost when the text is parsed again. `reparsable_html` writes one more line feed after those start tags when the content begins with one. Parsing its result gives the same tree.
-- `compile(source)` turns a selector list into a `Selector` once. `matches`, `closest`, `query` and `query_all` use it many times. It supports type and universal selectors, `.class`, `#id`, attribute selectors with `=`, `~=`, `|=`, `^=`, `$=`, `*=` and the `i` and `s` flags, the descendant, `>`, `+` and `~` combinators, selector lists, `:not()`, `:is()`, `:where()`, `:has()` with a relative selector list, `:first-child`, `:last-child`, `:only-child`, `:nth-child()` and `:nth-last-child()` with an optional `of` selector list, the `-of-type` forms, `:empty`, `:root`, `:checked`, `:disabled` and `:enabled`. A source it cannot compile fails with `SelectorError.Invalid(at, message)`, where `at` is a byte offset. Namespace prefixes, pseudo-elements, other pseudo-classes (`:hover`, `:focus`, `:lang()`, `:dir()`, `:scope`, `:required` and the rest), `||`, `&`, a `:has()` inside `:has()`, unterminated constructs, more than 1000 compound selectors in one complex selector and more than 32 nested functional pseudo-classes are errors. `:is()` and `:where()` drop an empty or invalid argument, while `:not()`, `:has()` and `nth-child` with `of` reject one.
-- Matching runs right to left with backtracking. `:has()` tests candidates below or after the subject. Type and attribute names match without regard to case on an HTML element and exactly on SVG and MathML elements. Attribute values match exactly except for the attributes HTML lists as case-insensitive (`type`, `lang`, `dir`, `rel`, `method` and the like). The `i` and `s` flags override that. `:empty` matches an element with no child element and no text. Whitespace therefore counts as content. `:checked` reads the `checked` attribute of a checkbox or radio `input` and the `selected` attribute of an `option`. `:root` matches the child of the document. In a document in quirks mode, `.class` and `#id` match without regard to ASCII case, and attribute selectors still compare exactly. `query` and `query_all` search the descendants of the node in document order, skip the content of `template` elements and never return the node itself. `closest` starts at the node.
-- `sanitize(input, policy)` parses `input` as the content of a `body`, removes what a `Policy` does not allow and serializes the rest. A `Policy` lists the allowed HTML elements, the attributes allowed on every element and on each named element, the allowed URL schemes, whether a URL without a scheme is allowed, the elements dropped with their content, and the allowed SVG and MathML elements. An HTML element that is not listed is unwrapped, so its children take its place, unless it is in the drop list. A foreign element that is not listed is dropped with its content. Comments, instructions and doctypes, the elements `script`, `style`, `noscript`, `template`, `iframe`, `object`, `embed`, `applet`, `noembed`, `noframes`, `plaintext`, `xmp`, `frame`, `frameset`, `base`, `link` and `meta`, the SVG elements `script`, `style`, `foreignObject`, `use`, `image`, `feImage`, `iframe` and the animation elements, and the MathML elements `annotation-xml` and `maction` are always removed. An attribute stays only when it is allowed, its name does not start with `on` and it is not `srcdoc`. The attributes that hold a URL (`href`, `src`, `srcset`, `action`, `formaction`, `poster`, `cite`, `xlink:href` and the older `background`, `data`, `longdesc`, `manifest`, `usemap`, `codebase`, `classid`, `profile`, `icon`, `lowsrc`, `dynsrc`, `imagesrcset` and `ping`) are checked as a browser reads them. Tabs and line breaks anywhere and control characters and spaces at either end are ignored. A scheme is what precedes a `:` that comes before any `/`, `?` or `#`. Every candidate of a `srcset` and every URL of a `ping` must pass.
-- `sanitize` serializes with `reparsable_html`. The result is checked before it is returned: parsing it and serializing the tree gives the same text and cleaning that tree removes nothing. When the check fails, the output is cleaned again. When five rounds do not settle it, the result is the empty string. No input therefore yields markup that a second parse reads differently. `default_policy` allows headings, paragraphs, lists, tables, quotations, inline text elements, links and images with `class`, `dir`, `lang` and `title`, the `http`, `https` and `mailto` schemes and relative URLs, and no SVG or MathML. `clean(root, policy)` does the same to a tree in place.
-- `testdata/run/std_html_tree` runs the html5lib tree-construction files of the web-platform-tests copy of the html5lib suite and passes every case except the ones that need scripting enabled. `testdata/run/std_html_serialize` compares `inner_html` and `outer_html` with parse5, and `testdata/run/std_html_select` compares the selector results and rejections with jsdom and soupsieve. `testdata/run/std_html_quirks` holds the mode of 41 doctypes, equal to parse5's, and the class and id counts with and without a doctype, equal to jsdom's. `testdata/run/std_html_adversarial` parses, cleans and sanitizes 25 hostile shapes (nested `div`, `b`, `a`, `table`, `svg`, `math`, `template`, `li`, `dd`, `option` and `button`, stray end tags, repeated and distinct attributes, one-character text tokens and character references) at sizes where a quadratic parser takes seconds. Its counts for the unlimited tree equal parse5's. `testdata/run/std_html_edit` compares the tree editing results and errors with jsdom, and `clean` with hand-derived counts. `testdata/run/std_html_sanitize` compares `sanitize` with a reference sanitizer written over parse5 for URL obfuscations, mutation-XSS payloads and generated markup. It checks that the output holds no `script` element, event handler attribute or `javascript:` URL. It checks that the output is a fixed point of parse and serialize.
+`std/html` tokenizes UTF-8 HTML following the WHATWG tokenization states and never fails.
+
+##### HTML tokenizer rules
+
+- Tag and attribute names are lowercased in ASCII.
+- Attribute values may be double-quoted, single-quoted or unquoted.
+- A repeated attribute keeps its first value.
+- A tag cut off by the end of input is dropped.
+
+##### Raw text and script data
+
+| Start tag | Switches to |
+| --- | --- |
+| `script`, `style`, `xmp`, `iframe`, `noembed` or `noframes` | Raw text, until the matching end tag in any case. |
+| `title` or `textarea` | Escapable raw text, until the matching end tag in any case. |
+| `plaintext` | Takes the rest of the input. |
+
+Script data follows the escaped and double-escaped states of the standard. `<script><!--<script></script>--></script>` is therefore one element. `noscript` is tokenized as when scripting is disabled.
+
+##### Comments, instructions and doctypes
+
+Comments end at `-->` or `--!>`, with `<!-->` and `<!--->` empty. `<?target data?>` is an `Instruction` token when the target starts with a letter or `_` and holds letters, digits, `-` and `_`.
+
+These become comments:
+
+- `<?xml ...>`
+- `<?xml-stylesheet ...>`
+- any other `<?...>`
+- `<!...>` other than comments and doctypes
+- `<![CDATA[...]]>`
+- `</` followed by a non-letter
+
+`</>` is skipped. `Doctype` carries the lowercased name, the optional public and system identifiers and `force_quirks`.
+
+##### HTML character references
+
+Character references are decoded in text, escapable raw text and attribute values.
+
+| Reference | Handling |
+| --- | --- |
+| Named references | Match the longest name against the full WHATWG table of 2,231 names, including the names valid without a semicolon. |
+| Decimal and hexadecimal references | Work with or without a semicolon. |
+| Zero, surrogates and values above U+10FFFF | Become U+FFFD. |
+| 0x80 to 0x9F | Map through Windows-1252. |
+| Inside an attribute, a match without a semicolon that is followed by `=` or a letter or digit | Stays literal. |
+
+`compiler/tablegen entities` generates the table and also writes `entity_layout.low` with the index entry layout, the name length limit and the table accessors. Text without references is a view into the input.
+
+##### Tree construction
+
+`parse` runs the tree construction algorithm of the standard over the tokenizer, which the builder drives:
+
+- every insertion mode
+- the stack of open elements
+- the list of active formatting elements with the adoption agency algorithm
+- foster parenting for table content
+- `template` contents
+- `frameset`
+- the HTML integration points
+- the adjusted tag and attribute names of SVG and MathML
+- the quirks mode decision from the doctype
+
+Scripting is disabled: `noscript` content is parsed as elements.
+
+##### Fragment parsing
+
+| Function | Parses |
+| --- | --- |
+| `parse_fragment(context, input)` | Applies the fragment case with a context element. |
+| `parse_body(input)` | Is the fragment case with `body`. |
+
+##### Parse results
+
+The result `Parsed` holds `root` (the document, or a fragment node), `quirks` and `errors`. `errors` holds the parse errors of the tree builder in the order found. The tokenizer's recoveries are not listed. The `Document` node carries the quirks mode.
+
+##### Selected content of a select element
+
+Once parsing ends, a `select` element that is not `multiple` and has a display size of 1 gets its first `selectedcontent` descendant filled with a deep copy of the children of its selected option.
+
+The selected option is the last option with `selected`, or else the first option that is not disabled.
+
+##### Parse time and memory
+
+`parse`, `parse_fragment`, `parse_body`, `sanitize` and `clean` take time and memory linear in the input for every input. Nesting 100,000 levels deep therefore takes milliseconds.
+
+##### Stack of open elements
+
+The stack of open elements keeps, for every entry, pointers to the nearest entry at or below it that is:
+
+- a scope boundary of each kind (default, list item, button, table)
+- a special element
+- a list-item scan stop
+- a reset-insertion-mode stop
+- an HTML-namespace element
+
+It keeps a chain per element name. As a result "has an element in scope", the `li`, `dd` and `dt` scans, "any other end tag", foster parenting and the reset of the insertion mode do not walk the stack.
+
+##### Active formatting elements
+
+The list of active formatting elements is a linked list with a marker segment per `template` or applet-like boundary and a queue of at most three entries per name and attribute set. The Noah's Ark clause is therefore a lookup.
+
+##### Adoption agency bounds
+
+The adoption agency algorithm keeps the standard's bounds of 8 outer and 3 inner iterations. It uses an entry pointer in place of the bookmark index.
+
+##### Text and attributes while parsing
+
+Text is appended to a byte buffer that is written to its node once. Attributes are deduplicated through a map.
+
+##### Reconstruction of formatting elements
+
+The one superlinear case in the standard is the reconstruction of formatting elements, which can create a new element for every formatting entry at every `p` start tag. A parse creates at most four times the input length in reconstructed elements. After that the entries are dropped instead of recreated.
+
+##### Maximum nesting depth
+
+`ParseOptions.max_depth` bounds the element nesting the way Blink and WebKit do. The default is 512 (`default_max_depth`), and 0 or less means no limit.
+
+##### Nodes past the depth limit
+
+While more elements than `max_depth` are open, a new element, comment or instruction becomes a child of the parent of the current node. Every node past the limit is therefore a child of the element at the limit. The stack of open elements keeps growing, so end tags still match their start tags.
+
+Text, nodes foster parented out of a table, `template` content and nodes the adoption agency algorithm moves are placed as the standard says. A text node can sit one level below the limit.
+
+Misnested formatting markup can still build a tree deeper than the limit, as it does in browsers. A program that walks a parsed tree therefore must not recurse once per level.
+
+##### Sanitizing and the depth limit
+
+`sanitize` always parses with the default limit and parses its own output again. Its result is therefore never deeper than the limit allows.
+
+##### Parse options and the depth fixture
+
+`parse_with` and `parse_fragment_with` take the options. `max_depth: 0` gives the standard's tree. `testdata/run/std_html_depth` holds the element count and depth of twelve nesting shapes. The default tree of each equals Chromium's.
+
+##### Node structure
+
+A `Node` has a `data` of `Document`, `Fragment`, `Doctype`, `Element`, `Text`, `Comment` or `Instruction`, and first, last, previous and next links. Insertion and removal therefore take constant time.
+
+An `Element` has:
+
+- a `Namespace` (`Html`, `Svg` or `MathMl`)
+- a name
+- its attributes in source order (each with an optional namespace, prefix, name and value)
+- for `template`, a content fragment
+
+##### Node functions
+
+| Functions | Do |
+| --- | --- |
+| `create_element`, `create_text`, `create_comment`, `create_doctype`, `create_instruction`, `create_document` and `create_fragment` | Make detached nodes. |
+| `append_child` and `insert_before` | Fail with `HierarchyRequest` or `NotFound` and change nothing when they fail. |
+| `remove` | Detaches a node. |
+| `clone` | Copies a node or a subtree. |
+| `contains`, `children`, `parent`, `first_child`, `last_child`, `previous_sibling`, `next_sibling`, `attr`, `has_attr`, `set_attr`, `remove_attr`, `local_name`, `is_html`, `template_contents` and `text_content` | Read and edit it. |
+
+##### Iterative tree walks
+
+Walks, `clone`, serialization, selector matching and `clean` are iterative. A tree 300,000 levels deep therefore does not exhaust the stack.
+
+##### HTML serialization
+
+`inner_html` and `outer_html` serialize as section 13.3 of the standard.
+
+| Where | Escapes |
+| --- | --- |
+| Text and attribute values | `&` and U+00A0. |
+| Attributes | Also `"`. |
+| Text | Also `<` and `>`. |
+
+| Content | Written |
+| --- | --- |
+| Void elements of the HTML namespace | With no end tag. |
+| The children of `style`, `script`, `xmp`, `iframe`, `noembed`, `noframes` and `plaintext` | Raw. |
+| The content of a `template` | Inside it. |
+
+##### Reparsable serialization
+
+A `pre`, `textarea` or `listing` element does not get an added line feed. A leading line feed in its content is therefore lost when the text is parsed again. `reparsable_html` writes one more line feed after those start tags when the content begins with one. Parsing its result gives the same tree.
+
+##### Selector compilation
+
+`compile(source)` turns a selector list into a `Selector` once. `matches`, `closest`, `query` and `query_all` use it many times.
+
+##### Supported selectors
+
+`compile` supports:
+
+- type and universal selectors
+- `.class`
+- `#id`
+- attribute selectors with `=`, `~=`, `|=`, `^=`, `$=`, `*=` and the `i` and `s` flags
+- the descendant, `>`, `+` and `~` combinators
+- selector lists
+- `:not()`, `:is()`, `:where()`
+- `:has()` with a relative selector list
+- `:first-child`, `:last-child`, `:only-child`
+- `:nth-child()` and `:nth-last-child()` with an optional `of` selector list
+- the `-of-type` forms
+- `:empty`, `:root`, `:checked`, `:disabled` and `:enabled`
+
+##### Selector errors
+
+A source it cannot compile fails with `SelectorError.Invalid(at, message)`, where `at` is a byte offset. These are errors:
+
+- namespace prefixes
+- pseudo-elements
+- other pseudo-classes (`:hover`, `:focus`, `:lang()`, `:dir()`, `:scope`, `:required` and the rest)
+- `||`
+- `&`
+- a `:has()` inside `:has()`
+- unterminated constructs
+- more than 1000 compound selectors in one complex selector
+- more than 32 nested functional pseudo-classes
+
+| Selector | Empty or invalid argument |
+| --- | --- |
+| `:is()` and `:where()` | Dropped. |
+| `:not()`, `:has()` and `nth-child` with `of` | Rejected. |
+
+##### Selector matching
+
+Matching runs right to left with backtracking. `:has()` tests candidates below or after the subject.
+
+##### Selector case sensitivity
+
+| Match | Case |
+| --- | --- |
+| Type and attribute names on an HTML element | Without regard to case. |
+| Type and attribute names on SVG and MathML elements | Exactly. |
+| Attribute values | Exactly except for the attributes HTML lists as case-insensitive (`type`, `lang`, `dir`, `rel`, `method` and the like). The `i` and `s` flags override that. |
+| `.class` and `#id` in a document in quirks mode | Without regard to ASCII case. |
+| Attribute selectors in a document in quirks mode | Still compare exactly. |
+
+##### Pseudo-class matching
+
+| Pseudo-class | Matches |
+| --- | --- |
+| `:empty` | An element with no child element and no text. Whitespace therefore counts as content. |
+| `:checked` | Reads the `checked` attribute of a checkbox or radio `input` and the `selected` attribute of an `option`. |
+| `:root` | The child of the document. |
+
+##### Selector queries
+
+`query` and `query_all` search the descendants of the node in document order, skip the content of `template` elements and never return the node itself. `closest` starts at the node.
+
+##### Sanitize policy
+
+`sanitize(input, policy)`:
+
+- parses `input` as the content of a `body`
+- removes what a `Policy` does not allow
+- serializes the rest
+
+A `Policy` lists:
+
+- the allowed HTML elements
+- the attributes allowed on every element and on each named element
+- the allowed URL schemes
+- whether a URL without a scheme is allowed
+- the elements dropped with their content
+- the allowed SVG and MathML elements
+
+##### Sanitizing elements
+
+| Element | Result |
+| --- | --- |
+| An HTML element that is not listed | Unwrapped, so its children take its place, unless it is in the drop list. |
+| A foreign element that is not listed | Dropped with its content. |
+
+These are always removed:
+
+- comments, instructions and doctypes
+- the elements `script`, `style`, `noscript`, `template`, `iframe`, `object`, `embed`, `applet`, `noembed`, `noframes`, `plaintext`, `xmp`, `frame`, `frameset`, `base`, `link` and `meta`
+- the SVG elements `script`, `style`, `foreignObject`, `use`, `image`, `feImage`, `iframe` and the animation elements
+- the MathML elements `annotation-xml` and `maction`
+
+##### Sanitizing attributes
+
+An attribute stays only when:
+
+- it is allowed
+- its name does not start with `on`
+- it is not `srcdoc`
+
+##### Sanitizing URL attributes
+
+The attributes that hold a URL (`href`, `src`, `srcset`, `action`, `formaction`, `poster`, `cite`, `xlink:href` and the older `background`, `data`, `longdesc`, `manifest`, `usemap`, `codebase`, `classid`, `profile`, `icon`, `lowsrc`, `dynsrc`, `imagesrcset` and `ping`) are checked as a browser reads them.
+
+- Tabs and line breaks anywhere and control characters and spaces at either end are ignored.
+- A scheme is what precedes a `:` that comes before any `/`, `?` or `#`.
+- Every candidate of a `srcset` and every URL of a `ping` must pass.
+
+##### Sanitize output check
+
+`sanitize` serializes with `reparsable_html`. The result is checked before it is returned: parsing it and serializing the tree gives the same text and cleaning that tree removes nothing. When the check fails, the output is cleaned again. When five rounds do not settle it, the result is the empty string. No input therefore yields markup that a second parse reads differently.
+
+##### Default policy and clean
+
+`default_policy` allows headings, paragraphs, lists, tables, quotations, inline text elements, links and images with `class`, `dir`, `lang` and `title`, the `http`, `https` and `mailto` schemes and relative URLs, and no SVG or MathML. `clean(root, policy)` does the same to a tree in place.
+
+##### HTML fixtures
+
+| Fixture | Checks |
+| --- | --- |
+| `testdata/run/std_html_tree` | Runs the html5lib tree-construction files of the web-platform-tests copy of the html5lib suite and passes every case except the ones that need scripting enabled. |
+| `testdata/run/std_html_serialize` | Compares `inner_html` and `outer_html` with parse5. |
+| `testdata/run/std_html_select` | Compares the selector results and rejections with jsdom and soupsieve. |
+| `testdata/run/std_html_quirks` | Holds the mode of 41 doctypes, equal to parse5's, and the class and id counts with and without a doctype, equal to jsdom's. |
+| `testdata/run/std_html_adversarial` | Parses, cleans and sanitizes 25 hostile shapes (nested `div`, `b`, `a`, `table`, `svg`, `math`, `template`, `li`, `dd`, `option` and `button`, stray end tags, repeated and distinct attributes, one-character text tokens and character references) at sizes where a quadratic parser takes seconds. Its counts for the unlimited tree equal parse5's. |
+| `testdata/run/std_html_edit` | Compares the tree editing results and errors with jsdom, and `clean` with hand-derived counts. |
+| `testdata/run/std_html_sanitize` | Compares `sanitize` with a reference sanitizer written over parse5 for URL obfuscations, mutation-XSS payloads and generated markup. It checks that the output holds no `script` element, event handler attribute or `javascript:` URL. It checks that the output is a fixed point of parse and serialize. |
 
 #### Markdown
 
-- `std/markdown` parses blocks with the CommonMark line algorithm: a stack of open containers, lazy continuation lines, and a list that is loose when a blank line separates its items or two of its blocks. GFM adds tables, strikethrough, task list items and extended autolinks. The autolinks are `http://`, `https://`, `ftp://`, `www.` and bare email addresses, with `marked`'s trailing punctuation rules. A table needs a delimiter row of the same width as the header. It ends at a blank line or a line that starts another block. Body rows are padded or cut to the header width.
-- Inline parsing scans delimiter runs into a chain. It resolves emphasis, strong and strikethrough with the CommonMark flanking and rule-of-three tests, so the work is linear in practice. Links and images use a bracket stack. Inline content is parsed once per heading, paragraph or table cell. This happens after every reference definition in the document is known.
-- Escapes and entities stay in the tree as `Escape` and `Entity` nodes, so a renderer can tell `\*` from `*`. Numeric references decode. Named references pass through to the HTML unchanged, as `marked` does.
-- `Heading` and `Cell` carry the raw source text next to the parsed content. `plain_text` renders spans without emphasis, link or image markup. Images give their alt text and character references are decoded. Inline HTML stays as written and a break is a line ending.
-- `render` writes the HTML `marked` writes with `gfm` on. It writes `<br>` and `<hr>` without a slash and a `<tbody>` with no line ending before its first row. It writes tight list items without `<p>`, a `language-` class from the first word of the info string, and `cleanUrl` for hrefs. A raw HTML block is written as parsed, so a block followed by a blank line is not followed by a line ending.
-- Each hook of a `Renderer` receives the renderer. `render` and `render_inline` take any renderer, so a hook can nest the rest of the output. The default hooks are public, and a custom hook can call them.
-- The output equals `marked` on `docs/design.md`, `editors/README.md` and the doc comments of the standard library. Paragraphs keep their leading and trailing whitespace as `marked` does, except at the end of a list. Known departures are in unusual input. One is an empty list item that follows a paragraph or a setext underline. Another is a bare URL directly followed by `[`, a backtick or a backslash, which `marked` takes into the link. The last is a paragraph that ends in a whitespace-only line.
+`std/markdown` parses blocks with the CommonMark line algorithm and GFM extensions. `render` writes the HTML `marked` writes with `gfm` on.
+
+##### Markdown block parsing
+
+`std/markdown` parses blocks with the CommonMark line algorithm: a stack of open containers, lazy continuation lines, and a list that is loose when a blank line separates its items or two of its blocks.
+
+##### GFM extensions
+
+GFM adds tables, strikethrough, task list items and extended autolinks. The autolinks are `http://`, `https://`, `ftp://`, `www.` and bare email addresses, with `marked`'s trailing punctuation rules.
+
+##### Markdown tables
+
+- A table needs a delimiter row of the same width as the header.
+- It ends at a blank line or a line that starts another block.
+- Body rows are padded or cut to the header width.
+
+##### Markdown inline parsing
+
+Inline parsing scans delimiter runs into a chain. It resolves emphasis, strong and strikethrough with the CommonMark flanking and rule-of-three tests, so the work is linear in practice. Links and images use a bracket stack.
+
+Inline content is parsed once per heading, paragraph or table cell. This happens after every reference definition in the document is known.
+
+##### Markdown escapes and entities
+
+Escapes and entities stay in the tree as `Escape` and `Entity` nodes, so a renderer can tell `\*` from `*`. Numeric references decode. Named references pass through to the HTML unchanged, as `marked` does.
+
+##### Markdown plain text
+
+`Heading` and `Cell` carry the raw source text next to the parsed content. `plain_text` renders spans without emphasis, link or image markup. Images give their alt text and character references are decoded. Inline HTML stays as written and a break is a line ending.
+
+##### Markdown HTML rendering
+
+`render` writes the HTML `marked` writes with `gfm` on. It writes:
+
+- `<br>` and `<hr>` without a slash
+- a `<tbody>` with no line ending before its first row
+- tight list items without `<p>`
+- a `language-` class from the first word of the info string
+- `cleanUrl` for hrefs
+
+A raw HTML block is written as parsed, so a block followed by a blank line is not followed by a line ending.
+
+##### Markdown renderer hooks
+
+Each hook of a `Renderer` receives the renderer. `render` and `render_inline` take any renderer, so a hook can nest the rest of the output. The default hooks are public, and a custom hook can call them.
+
+##### Markdown agreement with marked
+
+The output equals `marked` on `docs/design.md`, `editors/README.md` and the doc comments of the standard library. Paragraphs keep their leading and trailing whitespace as `marked` does, except at the end of a list.
+
+Known departures are in unusual input:
+
+- an empty list item that follows a paragraph or a setext underline
+- a bare URL directly followed by `[`, a backtick or a backslash, which `marked` takes into the link
+- a paragraph that ends in a whitespace-only line
 
 ### D-Bus
 
-- `std/dbus` does not use `std/serde`: its model is name-keyed structs, with no 16-bit integer, signature typing, variant, dict entry or descriptor, and derived code cannot produce the tuple structs of D-Bus. Values are the dynamic `Value` enum. Its variants are `Byte`, `Boolean`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Double`, `String`, `ObjectPath`, `Signature`, `UnixFd`, `Bytes` for `ay`, `Array`, `Struct`, `Variant` and `DictEntry`. `Int16` carries an `i64` in -32768..32767 because Low has no 16-bit integer. `Array` holds the element signature so an empty array keeps its type. `variant`, `strings`, `dict` and `dict_of` build values. `bool_of`, `int_of`, `uint_of`, `double_of`, `string_of`, `fd_of`, `bytes_of`, `array_of`, `fields_of` and `unwrap` read them, failing with `Marshal` on a different variant.
-- `Type` is a parsed signature. `parse_signature` accepts at most 255 bytes, array nesting of 32, struct nesting of 32 and 64 nesting levels in all. It rejects empty structs, a dict entry outside an array and a non-basic dict key. `parse_type` takes one complete type and `parse_element` takes one array element type. `valid_object_path`, `valid_interface`, `valid_member`, `valid_error_name` and `valid_bus_name` follow the specification's name rules. Those rules include the 255-byte limit and the unique-name form.
-- `encode(value, order)` returns an `Encoded`, which holds bytes and descriptor numbers. `decode` reads either byte order. Alignment is relative to the start of the message. Array lengths exclude their padding. Strings and signatures must be UTF-8 without NUL. Booleans are 0 or 1 and padding bytes are zero. An array over 64 MiB fails with `TooLarge`. A variant nests at most 64 deep.
-- `Message` carries the type, the flags, the serial, the header fields and the body. The flags are `no_reply_expected`, `no_auto_start` and `allow_interactive_authorization`. `encode_message` writes the header `yyyyuua(yv)` padded to 8 bytes and checks the fields each type requires. `message_length` reads the fixed header from 16 bytes and returns the total length, failing with `TooLarge` over 128 MiB. `message_fd_count` returns the `UNIX_FDS` field. `decode_message` takes the message with the descriptors that accompanied it. `method_call`, `signal`, `method_return` and `error_reply` build messages. `remote_error` turns an error message into `Remote(name, message)`.
-- `parse_addresses` splits an address on `;` into `Address` values, each a transport and a key map. `address_guid` reads the `guid` key and `address_text` writes an address back. `escape_address_value` and `unescape_address_value` apply the `%xx` escaping. `socket_path` resolves `unix:path=`, `unix:abstract=` and `unix:runtime=yes`, where the last means `$XDG_RUNTIME_DIR/bus`. `session_addresses` and `system_addresses` read `DBUS_SESSION_BUS_ADDRESS` and `DBUS_SYSTEM_BUS_ADDRESS`. They fall back to `unix:path=$XDG_RUNTIME_DIR/bus` and `unix:path=/run/dbus/system_bus_socket`.
-- Authentication is the SASL exchange of the specification. A client sends the NUL byte, `AUTH EXTERNAL` with the hexadecimal uid, falls back to `ANONYMOUS` after a `REJECTED`, sends `NEGOTIATE_UNIX_FD` and `BEGIN`. `ServerAuth` configures the other side with `guid`, `uid`, `anonymous` and `unix_fds`. EXTERNAL is accepted when the uid the client states equals `uid` and the peer credentials of the socket report the same uid. `uid` is the effective uid of the process by default. Lines are at most 16384 bytes.
-- `connect_session`, `connect_system` and `connect_addresses` open a `Connection`. `connect_over` takes an open `net.ConnHandle` and says whether to send `Hello`. `accept_over` is the server side. `Connection` is the owner of a `ConnectionHandle`. The handle shares one reader green thread, which matches replies to calls by serial. That thread offers every other message to the filters added with `add_filter`, and it ends when the socket closes. `call`, `call_with` and `send` take serial numbers from the connection. `call_with` takes a `CallOptions` with a timeout and a `cancel.Token`. Pending calls fail with `Closed` when the connection ends. They fail with `Timeout` or `Cancelled` when their option fires. A method return carries the descriptors that came with its message. Descriptors travel with a sent message through `SCM_RIGHTS` on one write.
-- `request_name`, `release_name` and `name_has_owner` use the bus daemon. `add_match`, `remove_match` and `subscribe` register a `MatchRule`. `rule_text` writes the rule and `rule_matches` evaluates it locally. A `Subscription` delivers the matching messages on a channel. `get_property`, `set_property`, `get_all`, `ping`, `machine_id`, `introspect_xml` and `introspect` call the standard interfaces. `introspect` parses the XML with `std/xml` into a `NodeInfo`.
-- `serve` makes a `Service`, a filter that answers every method call that arrives. It answers with `UnknownObject` for a path nothing is exported at. `export` takes an `InterfaceSpec`, which holds methods, properties and signals. Each call runs on its own green thread. `Introspectable`, `Properties` and `Peer` are answered from the specifications. A handler fails with `Remote(name, message)` to reply with that error. Other errors reply `org.freedesktop.DBus.Error.Failed` or `InvalidArgs`. An unknown path, interface, method or property replies with the matching standard error. `emit_changed` sends `PropertiesChanged`.
-- Every operation has a form that takes the `*ConnectionHandle` and ends in `_on`. It is for threads the connection has been moved away from, as `### Resource ownership` describes.
-- Marshalling vectors come from `jeepney`, cross-checked against GLib `GVariant`. Signatures and addresses come from libdbus, and names come from GLib. The protocol fixtures run with no daemon, over a socket pair. `std/dbus/daemon_test_linux.low` starts a private `dbus-daemon`. It runs a Low service against `busctl`, `gdbus` and `dbus-send`, and a Low client against a Gio service. Each test skips when a tool is missing.
+`std/dbus` does not use `std/serde`: its model is name-keyed structs, with no 16-bit integer, signature typing, variant, dict entry or descriptor, and derived code cannot produce the tuple structs of D-Bus.
+
+#### D-Bus values
+
+Values are the dynamic `Value` enum. Its variants are `Byte`, `Boolean`, `Int16`, `UInt16`, `Int32`, `UInt32`, `Int64`, `UInt64`, `Double`, `String`, `ObjectPath`, `Signature`, `UnixFd`, `Bytes` for `ay`, `Array`, `Struct`, `Variant` and `DictEntry`.
+
+- `Int16` carries an `i64` in -32768..32767 because Low has no 16-bit integer.
+- `Array` holds the element signature so an empty array keeps its type.
+
+| Functions | Do |
+| --- | --- |
+| `variant`, `strings`, `dict` and `dict_of` | Build values. |
+| `bool_of`, `int_of`, `uint_of`, `double_of`, `string_of`, `fd_of`, `bytes_of`, `array_of`, `fields_of` and `unwrap` | Read them, failing with `Marshal` on a different variant. |
+
+#### D-Bus signatures and names
+
+`Type` is a parsed signature.
+
+| Function | Behaviour |
+| --- | --- |
+| `parse_signature` | Accepts at most 255 bytes, array nesting of 32, struct nesting of 32 and 64 nesting levels in all. It rejects empty structs, a dict entry outside an array and a non-basic dict key. |
+| `parse_type` | Takes one complete type. |
+| `parse_element` | Takes one array element type. |
+| `valid_object_path`, `valid_interface`, `valid_member`, `valid_error_name` and `valid_bus_name` | Follow the specification's name rules. Those rules include the 255-byte limit and the unique-name form. |
+
+#### D-Bus value encoding
+
+`encode(value, order)` returns an `Encoded`, which holds bytes and descriptor numbers. `decode` reads either byte order.
+
+- Alignment is relative to the start of the message.
+- Array lengths exclude their padding.
+- Strings and signatures must be UTF-8 without NUL.
+- Booleans are 0 or 1 and padding bytes are zero.
+- An array over 64 MiB fails with `TooLarge`.
+- A variant nests at most 64 deep.
+
+#### D-Bus messages
+
+`Message` carries the type, the flags, the serial, the header fields and the body. The flags are `no_reply_expected`, `no_auto_start` and `allow_interactive_authorization`.
+
+| Function | Behaviour |
+| --- | --- |
+| `encode_message` | Writes the header `yyyyuua(yv)` padded to 8 bytes and checks the fields each type requires. |
+| `message_length` | Reads the fixed header from 16 bytes and returns the total length, failing with `TooLarge` over 128 MiB. |
+| `message_fd_count` | Returns the `UNIX_FDS` field. |
+| `decode_message` | Takes the message with the descriptors that accompanied it. |
+| `method_call`, `signal`, `method_return` and `error_reply` | Build messages. |
+| `remote_error` | Turns an error message into `Remote(name, message)`. |
+
+#### D-Bus addresses
+
+`parse_addresses` splits an address on `;` into `Address` values, each a transport and a key map.
+
+| Function | Behaviour |
+| --- | --- |
+| `address_guid` | Reads the `guid` key. |
+| `address_text` | Writes an address back. |
+| `escape_address_value` and `unescape_address_value` | Apply the `%xx` escaping. |
+| `socket_path` | Resolves `unix:path=`, `unix:abstract=` and `unix:runtime=yes`, where the last means `$XDG_RUNTIME_DIR/bus`. |
+| `session_addresses` and `system_addresses` | Read `DBUS_SESSION_BUS_ADDRESS` and `DBUS_SYSTEM_BUS_ADDRESS`. They fall back to `unix:path=$XDG_RUNTIME_DIR/bus` and `unix:path=/run/dbus/system_bus_socket`. |
+
+#### D-Bus authentication
+
+Authentication is the SASL exchange of the specification. A client:
+
+1. Sends the NUL byte.
+2. Sends `AUTH EXTERNAL` with the hexadecimal uid.
+3. Falls back to `ANONYMOUS` after a `REJECTED`.
+4. Sends `NEGOTIATE_UNIX_FD` and `BEGIN`.
+
+`ServerAuth` configures the other side with `guid`, `uid`, `anonymous` and `unix_fds`. EXTERNAL is accepted when the uid the client states equals `uid` and the peer credentials of the socket report the same uid. `uid` is the effective uid of the process by default. Lines are at most 16384 bytes.
+
+#### D-Bus connections
+
+| Function | Behaviour |
+| --- | --- |
+| `connect_session`, `connect_system` and `connect_addresses` | Open a `Connection`. |
+| `connect_over` | Takes an open `net.ConnHandle` and says whether to send `Hello`. |
+| `accept_over` | The server side. |
+
+`Connection` is the owner of a `ConnectionHandle`. The handle shares one reader green thread, which matches replies to calls by serial. That thread offers every other message to the filters added with `add_filter`, and it ends when the socket closes.
+
+#### D-Bus calls and descriptors
+
+`call`, `call_with` and `send` take serial numbers from the connection. `call_with` takes a `CallOptions` with a timeout and a `cancel.Token`.
+
+| Pending calls fail with | When |
+| --- | --- |
+| `Closed` | The connection ends. |
+| `Timeout` or `Cancelled` | Their option fires. |
+
+A method return carries the descriptors that came with its message. Descriptors travel with a sent message through `SCM_RIGHTS` on one write.
+
+#### D-Bus bus daemon and standard interfaces
+
+| Function | Behaviour |
+| --- | --- |
+| `request_name`, `release_name` and `name_has_owner` | Use the bus daemon. |
+| `add_match`, `remove_match` and `subscribe` | Register a `MatchRule`. |
+| `rule_text` | Writes the rule. |
+| `rule_matches` | Evaluates it locally. |
+| `Subscription` | Delivers the matching messages on a channel. |
+| `get_property`, `set_property`, `get_all`, `ping`, `machine_id`, `introspect_xml` and `introspect` | Call the standard interfaces. |
+| `introspect` | Parses the XML with `std/xml` into a `NodeInfo`. |
+
+#### D-Bus services
+
+| Function | Behaviour |
+| --- | --- |
+| `serve` | Makes a `Service`, a filter that answers every method call that arrives. It answers with `UnknownObject` for a path nothing is exported at. |
+| `export` | Takes an `InterfaceSpec`, which holds methods, properties and signals. |
+| `emit_changed` | Sends `PropertiesChanged`. |
+
+Each call runs on its own green thread. `Introspectable`, `Properties` and `Peer` are answered from the specifications.
+
+#### D-Bus service errors
+
+- A handler fails with `Remote(name, message)` to reply with that error.
+- Other errors reply `org.freedesktop.DBus.Error.Failed` or `InvalidArgs`.
+- An unknown path, interface, method or property replies with the matching standard error.
+
+#### D-Bus operations on a connection handle
+
+Every operation has a form that takes the `*ConnectionHandle` and ends in `_on`. It is for threads the connection has been moved away from, as `### Resource ownership` describes.
+
+#### D-Bus tests
+
+| Checked | Comes from |
+| --- | --- |
+| Marshalling vectors | `jeepney`, cross-checked against GLib `GVariant`. |
+| Signatures and addresses | libdbus. |
+| Names | GLib. |
+
+The protocol fixtures run with no daemon, over a socket pair. `std/dbus/daemon_test_linux.low` starts a private `dbus-daemon`. It runs a Low service against `busctl`, `gdbus` and `dbus-send`, and a Low client against a Gio service. Each test skips when a tool is missing.
 
 ### Desktop portals
 
-- `std/portal` talks to `org.freedesktop.portal.Desktop` on the session bus. `connect()` returns a `Portal` that owns its connection. `over(handle)` returns a `Portal` that borrows a `*dbus.ConnectionHandle`. `connect_within(ms)` limits the calls that do not wait on the user, and the limit is 25 seconds otherwise. A `Portal` is bound with `using`, and several green threads may use it at once.
-- A call that waits on the user follows the portal's request pattern in `request(p, ask, token, stop)`. The request object path is `/org/freedesktop/portal/desktop/request/<sender>/<token>`. It is computed from the connection's unique name and the handle token. The unique name drops its leading colon and writes dots as underscores. The `Response` signal on that path is subscribed to before the call. The call returns the handle, and a handle other than the computed one moves the subscription. The call waits for `Response`, for the connection to close, or for `stop`. `Response` carries a code and an `a{sv}` of results. Cancelling `stop` sends `Request.Close` and fails with `Cancelled`. An empty handle token takes `low1`, `low2` and on, per `Portal`.
-- `open_file(p, dialog)` and `save_file(p, dialog)` take a `FileDialog`. A `FileDialog` holds a parent window string, title, accept label, `modal`, `multiple`, `directory`, `filters`, `current_filter`, `current_name`, `current_folder`, `current_file`, token and cancel token. Both functions return the chosen `file://` URIs and the selected filter. They return `none` when the user closed the dialog. Response code 2 fails with `Remote("org.freedesktop.portal.Error.Failed", ...)`. A `FileFilter` has a name, glob patterns and MIME types. `parent_window` is the portal's string: `x11:<id in hex>`, `wayland:<exported handle>`, or empty for none. `std/ui` windows do not export a Wayland handle, so they pass it empty.
-- `std/portal` does not import `std/ui`, and `parent_window` is a string the caller builds. A window of `std/ui` on Wayland offers only its `wl_surface` through `native_window`. The portal needs `wayland:` and a handle from `zxdg_exporter_v2`. The Wayland client in `std/ui/platform` does not speak `zxdg_exporter_v2`. A dialog from a `std/ui` program therefore passes an empty `parent_window` and is not attached to the window.
-- `open_uri(p, uri, request)` returns `false` when the user closed the application chooser. `read_setting`, `color_scheme`, `accent_color` and `animations_enabled` read `org.freedesktop.portal.Settings.Read` and unwrap its variants. `color_scheme` returns `NoPreference`, `Dark` or `Light`. `accent_color` returns `none` when a channel is outside 0 to 1. `watch_settings(p, namespace)` and `setting_change` follow `SettingChanged`. `add_notification`, `remove_notification`, `watch_actions` and `action_invoked` cover the notification portal with a title, body, themed icon name, priority, default action and buttons.
-- Each call has a `..._call` function that returns its `dbus.Message` without sending it. `std/portal/portal_test.low` compares the marshalled bodies of those calls with `testdata/portal/*.hex`. `testdata/portal/generate.py` writes those files with `jeepney`. `portal_test_linux.low` runs a Low `FileChooser` service on a private `dbus-daemon`. It tests the request pattern, dismissal, failure and cancellation without a dialog. It reads the colour scheme from the session's portal when one runs. Each skips when its tool or portal is missing.
+`std/portal` talks to `org.freedesktop.portal.Desktop` on the session bus.
+
+#### Portal connections
+
+| Function | Behaviour |
+| --- | --- |
+| `connect()` | Returns a `Portal` that owns its connection. |
+| `over(handle)` | Returns a `Portal` that borrows a `*dbus.ConnectionHandle`. |
+| `connect_within(ms)` | Limits the calls that do not wait on the user, and the limit is 25 seconds otherwise. |
+
+A `Portal` is bound with `using`, and several green threads may use it at once.
+
+#### Portal request pattern
+
+A call that waits on the user follows the portal's request pattern in `request(p, ask, token, stop)`.
+
+The request object path is `/org/freedesktop/portal/desktop/request/<sender>/<token>`. It is computed from the connection's unique name and the handle token. The unique name drops its leading colon and writes dots as underscores.
+
+1. The `Response` signal on that path is subscribed to before the call.
+2. The call returns the handle, and a handle other than the computed one moves the subscription.
+3. The call waits for `Response`, for the connection to close, or for `stop`.
+
+`Response` carries a code and an `a{sv}` of results. Cancelling `stop` sends `Request.Close` and fails with `Cancelled`. An empty handle token takes `low1`, `low2` and on, per `Portal`.
+
+#### Portal file chooser
+
+`open_file(p, dialog)` and `save_file(p, dialog)` take a `FileDialog`. A `FileDialog` holds a parent window string, title, accept label, `modal`, `multiple`, `directory`, `filters`, `current_filter`, `current_name`, `current_folder`, `current_file`, token and cancel token. A `FileFilter` has a name, glob patterns and MIME types.
+
+Both functions return the chosen `file://` URIs and the selected filter. They return `none` when the user closed the dialog. Response code 2 fails with `Remote("org.freedesktop.portal.Error.Failed", ...)`.
+
+#### Portal parent window
+
+`parent_window` is the portal's string: `x11:<id in hex>`, `wayland:<exported handle>`, or empty for none. `std/ui` windows do not export a Wayland handle, so they pass it empty.
+
+`std/portal` does not import `std/ui`, and `parent_window` is a string the caller builds. A window of `std/ui` on Wayland offers only its `wl_surface` through `native_window`. The portal needs `wayland:` and a handle from `zxdg_exporter_v2`. The Wayland client in `std/ui/platform` does not speak `zxdg_exporter_v2`. A dialog from a `std/ui` program therefore passes an empty `parent_window` and is not attached to the window.
+
+#### Portal open URI and settings
+
+| Function | Behaviour |
+| --- | --- |
+| `open_uri(p, uri, request)` | Returns `false` when the user closed the application chooser. |
+| `read_setting`, `color_scheme`, `accent_color` and `animations_enabled` | Read `org.freedesktop.portal.Settings.Read` and unwrap its variants. |
+| `color_scheme` | Returns `NoPreference`, `Dark` or `Light`. |
+| `accent_color` | Returns `none` when a channel is outside 0 to 1. |
+| `watch_settings(p, namespace)` and `setting_change` | Follow `SettingChanged`. |
+
+#### Portal notifications
+
+`add_notification`, `remove_notification`, `watch_actions` and `action_invoked` cover the notification portal with a title, body, themed icon name, priority, default action and buttons.
+
+#### Portal call functions
+
+Each call has a `..._call` function that returns its `dbus.Message` without sending it.
+
+#### Portal tests
+
+- `std/portal/portal_test.low` compares the marshalled bodies of those calls with `testdata/portal/*.hex`.
+- `testdata/portal/generate.py` writes those files with `jeepney`.
+- `portal_test_linux.low` runs a Low `FileChooser` service on a private `dbus-daemon`. It tests the request pattern, dismissal, failure and cancellation without a dialog. It reads the colour scheme from the session's portal when one runs. Each skips when its tool or portal is missing.
 
 ### Accessibility
 
-- `std/atspi` exports one application's accessible tree on the accessibility bus. `bus_address()` asks `org.a11y.Bus.GetAddress` on the session bus. `connect(application, notify)` connects to that address and exports the objects. It registers the application with the registry through `org.a11y.atspi.Socket.Embed` on `org.a11y.atspi.Registry`. `serve(h, application, notify)` exports on a connection the caller made, which is how the tests run the bridge over a socket pair. A `Bridge` is a copyable handle. `close(b)` ends a connection `connect` made.
-- The tree is the application object `/org/a11y/atspi/accessible/root` (`Accessible` and `Application`), one window object `/org/a11y/atspi/accessible/window` (`Accessible` and `Component`, role frame) and one object per `Node` under `/org/a11y/atspi/accessible/e<n>`. The tree is flat: every node is a child of the window. A node has `Accessible` and `Component`. It has `Action` with one action named `click` when it is `actionable`. It has `Text` when `text` is set. A `Node` carries a `key`, a `name`, a `Role`, bounds in window coordinates, `visible`, `focused`, `focusable`, `actionable`, `editable` and `text`. `Role` holds the AT-SPI numbers of `atspi-constants.h`: check box 7, dialog 16, frame 23, image 27, label 29, list 31, list item 32, menu 33, menu item 35, page tab 37, panel 39, push button 43, application 75, entry 79, heading 83 and link 88. The state bits follow the same header. A visible node has `enabled`, `sensitive`, `visible` and `showing`. The node itself supplies `focusable`, `focused`, `editable` and `single-line`. A check box has `checkable`, and the window has `active`.
-- `update(b, title, active, nodes)` replaces the tree. A key keeps its object path for the life of the bridge. An object appears for a new key and goes away for a key the update leaves out. An update equal to the last one does nothing. The signals go out as the tree changes, on `org.a11y.atspi.Event.Object`: `ChildrenChanged` with `add` or `remove` and the index on the window, `StateChanged` for `focused`, `showing`, `visible` and `active`, and `PropertyChange` for `accessible-name`; plus `org.a11y.atspi.Event.Focus.Focus` for a node that gains focus and `org.a11y.atspi.Event.Window.Activate` and `Deactivate`.
-- What assistive technology asks for is queued, not run. `DoAction` queues `Click(key)` and `GrabFocus` queues `Focus(key)`. `notify` runs on the connection's green thread, and the application's own thread calls `take_actions(b)`. `Text` serves characters, not bytes, so offsets and counts are in code points.
-- `std/ui` connects the two. `on_frame(cx, f)` runs `f` after each frame. `enable_accessibility(cx, application) -> Accessibility ! Error` connects a bridge, publishes `elements(cx)`, `window_title(cx)` and `window_focused(cx)` after every frame and runs the queued actions on the context's green thread before the next frame, with `click_element` and `set_focus`. A button, link, check box, list item, tab or menu item is `actionable`. A field is `focusable` and `editable`. A text run, heading or field serves its text, but a `masked` field's text is empty. A text run inside an actionable element is left out because the element's name already holds it. Releasing the `Accessibility` closes the connection. It fails with `Unsupported` when the session has no accessibility bus and on Windows, where UI Automation is not implemented.
-- Not done: the tree is flat and has no `Cache` object, so a client that asks for the cache falls back to calling each object. A `text_area`'s text is not exported because `ElementInfo.text` is empty for it. `Selection`, `Value`, `EditableText` and the caret are absent. The extents are window coordinates because a Wayland client does not know where its window is. `std/atspi/atspi_test_linux.low` walks the tree through a client on a socket pair and checks the events, the actions and the registration. `daemon_test_linux.low` starts a private `dbus-daemon` with a stand-in registry, registers the bridge with it and reads the tree back with `gdbus`, and skips without `dbus-daemon` or `gdbus`. `std/ui/accessibility_test_linux.low` draws a form in a headless context, reads the exported tree through a client on a socket pair and presses and focuses its elements. A window opened with `ui.open` and `enable_accessibility` was read from outside through libatspi against the session's `at-spi2-registryd`. The read covered the application, frame, heading, button, entry and label with their names, roles, extents and text. It covered `DoAction` on the button, `GrabFocus` on the entry, and the tree after the click. Orca has not been run against it.
+`std/atspi` exports one application's accessible tree on the accessibility bus.
+
+#### AT-SPI bridge connection
+
+| Function | Behaviour |
+| --- | --- |
+| `bus_address()` | Asks `org.a11y.Bus.GetAddress` on the session bus. |
+| `connect(application, notify)` | Connects to that address and exports the objects. It registers the application with the registry through `org.a11y.atspi.Socket.Embed` on `org.a11y.atspi.Registry`. |
+| `serve(h, application, notify)` | Exports on a connection the caller made, which is how the tests run the bridge over a socket pair. |
+| `close(b)` | Ends a connection `connect` made. |
+
+A `Bridge` is a copyable handle.
+
+#### AT-SPI object tree
+
+The tree is flat: every node is a child of the window.
+
+| Object | Path | Interfaces |
+| --- | --- | --- |
+| The application object | `/org/a11y/atspi/accessible/root` | `Accessible` and `Application` |
+| One window object | `/org/a11y/atspi/accessible/window` | `Accessible` and `Component`, role frame |
+| One object per `Node` | `/org/a11y/atspi/accessible/e<n>` | `Accessible` and `Component`. `Action` with one action named `click` when it is `actionable`. `Text` when `text` is set. |
+
+A `Node` carries a `key`, a `name`, a `Role`, bounds in window coordinates, `visible`, `focused`, `focusable`, `actionable`, `editable` and `text`.
+
+#### AT-SPI roles
+
+`Role` holds the AT-SPI numbers of `atspi-constants.h`:
+
+| Role | Number |
+| --- | --- |
+| check box | 7 |
+| dialog | 16 |
+| frame | 23 |
+| image | 27 |
+| label | 29 |
+| list | 31 |
+| list item | 32 |
+| menu | 33 |
+| menu item | 35 |
+| page tab | 37 |
+| panel | 39 |
+| push button | 43 |
+| application | 75 |
+| entry | 79 |
+| heading | 83 |
+| link | 88 |
+
+#### AT-SPI state bits
+
+The state bits follow the same header.
+
+| Object | State bits |
+| --- | --- |
+| A visible node | `enabled`, `sensitive`, `visible` and `showing` |
+| The node itself supplies | `focusable`, `focused`, `editable` and `single-line` |
+| A check box | `checkable` |
+| The window | `active` |
+
+#### AT-SPI updates and signals
+
+`update(b, title, active, nodes)` replaces the tree. A key keeps its object path for the life of the bridge. An object appears for a new key and goes away for a key the update leaves out. An update equal to the last one does nothing.
+
+The signals go out as the tree changes, on `org.a11y.atspi.Event.Object`:
+
+| Signal | Sent |
+| --- | --- |
+| `ChildrenChanged` | With `add` or `remove` and the index on the window. |
+| `StateChanged` | For `focused`, `showing`, `visible` and `active`. |
+| `PropertyChange` | For `accessible-name`. |
+
+Plus `org.a11y.atspi.Event.Focus.Focus` for a node that gains focus and `org.a11y.atspi.Event.Window.Activate` and `Deactivate`.
+
+#### AT-SPI queued actions
+
+What assistive technology asks for is queued, not run.
+
+| Request | Queues |
+| --- | --- |
+| `DoAction` | `Click(key)` |
+| `GrabFocus` | `Focus(key)` |
+
+`notify` runs on the connection's green thread, and the application's own thread calls `take_actions(b)`.
+
+#### AT-SPI text offsets
+
+`Text` serves characters, not bytes, so offsets and counts are in code points.
+
+#### AT-SPI in std/ui programs
+
+`std/ui` connects the two.
+
+| Function | Behaviour |
+| --- | --- |
+| `on_frame(cx, f)` | Runs `f` after each frame. |
+| `enable_accessibility(cx, application) -> Accessibility ! Error` | Connects a bridge, publishes `elements(cx)`, `window_title(cx)` and `window_focused(cx)` after every frame and runs the queued actions on the context's green thread before the next frame, with `click_element` and `set_focus`. |
+
+| Element | Exported as |
+| --- | --- |
+| A button, link, check box, list item, tab or menu item | `actionable`. |
+| A field | `focusable` and `editable`. |
+| A text run, heading or field | Serves its text, but a `masked` field's text is empty. |
+| A text run inside an actionable element | Left out because the element's name already holds it. |
+
+Releasing the `Accessibility` closes the connection. It fails with `Unsupported` when the session has no accessibility bus and on Windows, where UI Automation is not implemented.
+
+#### AT-SPI missing features
+
+Not done:
+
+- The tree is flat and has no `Cache` object, so a client that asks for the cache falls back to calling each object.
+- A `text_area`'s text is not exported because `ElementInfo.text` is empty for it.
+- `Selection`, `Value`, `EditableText` and the caret are absent.
+- The extents are window coordinates because a Wayland client does not know where its window is.
+
+#### AT-SPI tests
+
+- `std/atspi/atspi_test_linux.low` walks the tree through a client on a socket pair and checks the events, the actions and the registration.
+- `daemon_test_linux.low` starts a private `dbus-daemon` with a stand-in registry, registers the bridge with it and reads the tree back with `gdbus`, and skips without `dbus-daemon` or `gdbus`.
+- `std/ui/accessibility_test_linux.low` draws a form in a headless context, reads the exported tree through a client on a socket pair and presses and focuses its elements.
+
+#### AT-SPI read through libatspi
+
+A window opened with `ui.open` and `enable_accessibility` was read from outside through libatspi against the session's `at-spi2-registryd`.
+
+- The read covered the application, frame, heading, button, entry and label with their names, roles, extents and text.
+- It covered `DoAction` on the button, `GrabFocus` on the entry, and the tree after the click.
+
+Orca has not been run against it.
 
 ### Regular expressions
 
-- `std/regex` compiles a pattern once into a program for a Pike VM. A Pike VM is a Thompson NFA simulation that carries capture slots per thread. Matching therefore takes time linear in the input times the program size and never backtracks.
-- A `Regex` keeps two pools of idle machines. One pool has no capture slots and serves `is_match`. The other has capture slots and serves `find`, `full_match` and the scans. Each machine owns its thread queues, capture slots and scratch. A call takes an idle machine under a lock. It builds one when none is idle, and it puts the machine back when it finishes. A compiled value is therefore shared freely between green threads, and a callback that matches with the same `Regex` during `replace_all` gets its own machine. A `Match` copies its slots out of the machine.
-- Syntax: literals; escapes `\n \t \r \f \v \a`, `\xhh`, `\uhhhh`, `\Uhhhhhhhh` and escaped punctuation; `.`; classes with ranges, negation and `\d \w \s \D \W \S` inside; `\d \w \s \D \W \S \b \B \A \Z \z`; `^` and `$`; capturing groups, `(?:...)`, inline flags `(?i)`, `(?m)`, `(?s)`, `(?-i)` and scoped `(?i:...)`; alternation; `*`, `+`, `?`, `{m}`, `{m,}`, `{,n}` and `{m,n}` with lazy forms. A `{` that does not form a valid count is a literal. Inline flags apply to the rest of the enclosing group.
-- Input is UTF-8 matched by code point. Offsets are bytes. `\d` and `\s` are ASCII: `[0-9]` and `[\t-\r ]`.
-  - `\w` is the UTS #18 word set: Alphabetic, Mark (`Mn`, `Mc`, `Me`), Decimal_Number (`Nd`), Connector_Punctuation (`Pc`) and Join_Control (U+200C and U+200D). `\W` is its complement. `\b` and `\B` compare the word-ness of the code point before the position with that of the code point at it, so a boundary is a change in word-ness. A byte that is not valid UTF-8 is not a word character.
-  - `(?i)` folds by Unicode simple case folding (`CaseFolding.txt` status C and S). A literal, a class member or every code point of a range matches all members of its orbit. So `k` matches `K` and U+212A KELVIN SIGN, `s` matches U+017F, `σ` matches `ς` and `Σ`, `ß` matches U+1E9E and `ǆ` matches `ǅ` and `Ǆ`. `(?i)[a-z]` also matches U+017F and U+212A. A class folds before it is negated, so `(?i)[^k]` matches none of the three. `\d`, `\s`, `\w` and their negations are not folded.
-  - `.` excludes only `\n` unless `dot_all` is set, so it matches `\r`. `[^\r\n]` is a character outside a line terminator. Without `multiline`, `^` matches only at the start of the input and `$` matches at the end or before a final `\n`. With `multiline`, a line ends at `\n`, at a `\r` not followed by `\n`, or at `\r\n`: `^` matches at the start, after `\n` and after a `\r` not followed by `\n`, and `$` matches at the end, before `\r` and before a `\n` not preceded by `\r`, so neither matches between the `\r` and the `\n` of one terminator.
-  - The word set and the fold orbits are `word_ranges.bin` and `fold_orbits.bin` in `std/regex`. `compiler/tablegen classes <ucd directory> std/regex` writes them from `UnicodeData.txt`, `DerivedCoreProperties.txt`, `PropList.txt` and `CaseFolding.txt` of Unicode 16.0.0, the version of the category data in `std/unicode`. It writes `class_layout.low`, which holds the entry sizes and the `embed` accessors. `word_ranges.bin` is 796 sorted `lo`, `hi` pairs of little-endian `u32` (6,368 bytes). `fold_orbits.bin` is 2,938 `code`, `next` pairs sorted by `code` (23,504 bytes). `next` is the next larger member of the orbit, and the largest member points to the smallest. Folding a range binary-searches the first orbit member inside it and follows each orbit, so a range as wide as the code space costs one pass over the table. `compiler/regex` embeds the same two files, so a generated pattern and `compile` build identical classes.
-  - Bytes below U+0080 never reach the tables. `in_class` scans the ranges that start below U+0080 before it binary-searches the rest. `word_before` and `word_at` test an ASCII byte directly. A non-ASCII word test decodes the code point and binary-searches `word_ranges.bin`. For the code point before the position, it steps back at most three continuation bytes.
-- Matching is leftmost-first, as in Python and RE2. Results for ASCII patterns and ASCII text without `\r` agree with Python's `re` under `re.ASCII`. `find_all`, `replace_all` and `split` follow Python 3.7. An empty match is allowed right after a non-empty one. After an empty match, the next one may start at the same offset only if it is not empty. `split` does not include group text. `split_n` splits at most `max` times, and a negative `max` splits everywhere.
-- Repeat counts are limited to 10000 and programs to 100,000 instructions. Invalid patterns fail with `Invalid(at, message)`, at the byte offset Python reports. Backreferences, lookaround, named groups and possessive quantifiers are rejected.
-- `regex.generated("pattern")` is a `Regex` built at compile time, like .NET's `[GeneratedRegex]`. The pattern must be a string literal, and flags are written inline. An invalid pattern is a compile error at the literal, `invalid regex at byte N: message`. The offset and message are the ones `compile` would fail with. The result is used through the same functions as a compiled `Regex`, and it matches identically.
-- `compiler/regex` holds the parser and assembler the checker runs on a literal pattern. It is held to the `std/regex` one by running the `std_regex_errors` fixture's patterns through it. The checker turns each distinct literal into Low functions named `__regex_` and the FNV-1a hash of the pattern. It parses them with the prelude's privileges and adds them to `std/regex`, so they reach its private types.
-- A `Regex` carries an `Engine` of thread-start, step and skip functions with the queue size. `compile` fills it with the Pike VM. The generated engine keeps the VM's queues, priorities and capture slots but replaces interpretation with code per instruction:
-  - One function per instruction that starts a thread, follows a consumed character or joins two epsilon paths, each guarded by the queue's sparse set. The remaining jumps, splits, saves and assertions are inlined into it.
-  - Characters and classes of up to four ranges compare inline in the step, which dispatches on the program counter by binary search. Larger classes get a function that tests the ranges below U+0080 first and binary-searches the rest. There is one such function per distinct set of ranges, shared by every instruction that tests it. `^` and `$` under `multiline` call `line_start` and `line_end`, and `\b` and `\B` call `word_before` and `word_at`, the functions the interpreter uses.
-  - When no empty match is possible from the start, a skip function moves past ASCII bytes that cannot begin a match before a thread starts.
-  - Programs over 2000 instructions are compiled at run time by `compile` instead, so call depth stays bounded.
+`std/regex` compiles a pattern once into a program for a Pike VM. A Pike VM is a Thompson NFA simulation that carries capture slots per thread. Matching therefore takes time linear in the input times the program size and never backtracks.
+
+#### Regex machine pools
+
+A `Regex` keeps two pools of idle machines.
+
+| Pool | Serves |
+| --- | --- |
+| The pool with no capture slots | `is_match` |
+| The pool with capture slots | `find`, `full_match` and the scans |
+
+Each machine owns its thread queues, capture slots and scratch. A call takes an idle machine under a lock. It builds one when none is idle, and it puts the machine back when it finishes. A compiled value is therefore shared freely between green threads, and a callback that matches with the same `Regex` during `replace_all` gets its own machine. A `Match` copies its slots out of the machine.
+
+#### Regex syntax
+
+The syntax is:
+
+- literals
+- escapes `\n \t \r \f \v \a`, `\xhh`, `\uhhhh`, `\Uhhhhhhhh` and escaped punctuation
+- `.`
+- classes with ranges, negation and `\d \w \s \D \W \S` inside
+- `\d \w \s \D \W \S \b \B \A \Z \z`
+- `^` and `$`
+- capturing groups, `(?:...)`, inline flags `(?i)`, `(?m)`, `(?s)`, `(?-i)` and scoped `(?i:...)`
+- alternation
+- `*`, `+`, `?`, `{m}`, `{m,}`, `{,n}` and `{m,n}` with lazy forms
+
+A `{` that does not form a valid count is a literal. Inline flags apply to the rest of the enclosing group.
+
+#### Regex input encoding
+
+Input is UTF-8 matched by code point. Offsets are bytes. `\d` and `\s` are ASCII: `[0-9]` and `[\t-\r ]`.
+
+#### Regex word characters
+
+`\w` is the UTS #18 word set: Alphabetic, Mark (`Mn`, `Mc`, `Me`), Decimal_Number (`Nd`), Connector_Punctuation (`Pc`) and Join_Control (U+200C and U+200D). `\W` is its complement.
+
+`\b` and `\B` compare the word-ness of the code point before the position with that of the code point at it, so a boundary is a change in word-ness. A byte that is not valid UTF-8 is not a word character.
+
+#### Regex case folding
+
+`(?i)` folds by Unicode simple case folding (`CaseFolding.txt` status C and S). A literal, a class member or every code point of a range matches all members of its orbit. So under `(?i)` these match:
+
+| Pattern | Matches |
+| --- | --- |
+| `k` | `K` and U+212A KELVIN SIGN |
+| `s` | U+017F |
+| `σ` | `ς` and `Σ` |
+| `ß` | U+1E9E |
+| `ǆ` | `ǅ` and `Ǆ` |
+| `(?i)[a-z]` | Also U+017F and U+212A |
+
+A class folds before it is negated, so `(?i)[^k]` matches none of the three. `\d`, `\s`, `\w` and their negations are not folded.
+
+#### Regex dot and line terminators
+
+- `.` excludes only `\n` unless `dot_all` is set, so it matches `\r`. `[^\r\n]` is a character outside a line terminator.
+- Without `multiline`, `^` matches only at the start of the input and `$` matches at the end or before a final `\n`.
+- With `multiline`, a line ends at `\n`, at a `\r` not followed by `\n`, or at `\r\n`: `^` matches at the start, after `\n` and after a `\r` not followed by `\n`, and `$` matches at the end, before `\r` and before a `\n` not preceded by `\r`, so neither matches between the `\r` and the `\n` of one terminator.
+
+#### Regex Unicode tables
+
+The word set and the fold orbits are `word_ranges.bin` and `fold_orbits.bin` in `std/regex`. `compiler/tablegen classes <ucd directory> std/regex` writes them from `UnicodeData.txt`, `DerivedCoreProperties.txt`, `PropList.txt` and `CaseFolding.txt` of Unicode 16.0.0, the version of the category data in `std/unicode`.
+
+| File | Holds |
+| --- | --- |
+| `word_ranges.bin` | 796 sorted `lo`, `hi` pairs of little-endian `u32` (6,368 bytes). |
+| `fold_orbits.bin` | 2,938 `code`, `next` pairs sorted by `code` (23,504 bytes). `next` is the next larger member of the orbit, and the largest member points to the smallest. |
+| `class_layout.low` | Holds the entry sizes and the `embed` accessors. `compiler/tablegen classes` writes it. |
+
+Folding a range binary-searches the first orbit member inside it and follows each orbit, so a range as wide as the code space costs one pass over the table. `compiler/regex` embeds the same two files, so a generated pattern and `compile` build identical classes.
+
+#### Regex ASCII fast paths
+
+Bytes below U+0080 never reach the tables.
+
+| Function | Behaviour |
+| --- | --- |
+| `in_class` | Scans the ranges that start below U+0080 before it binary-searches the rest. |
+| `word_before` and `word_at` | Test an ASCII byte directly. |
+| A non-ASCII word test | Decodes the code point and binary-searches `word_ranges.bin`. For the code point before the position, it steps back at most three continuation bytes. |
+
+#### Regex leftmost-first matching
+
+Matching is leftmost-first, as in Python and RE2. Results for ASCII patterns and ASCII text without `\r` agree with Python's `re` under `re.ASCII`.
+
+#### Regex empty matches and splitting
+
+`find_all`, `replace_all` and `split` follow Python 3.7.
+
+- An empty match is allowed right after a non-empty one.
+- After an empty match, the next one may start at the same offset only if it is not empty.
+- `split` does not include group text.
+- `split_n` splits at most `max` times, and a negative `max` splits everywhere.
+
+#### Regex limits and rejected patterns
+
+| Limit | Value |
+| --- | --- |
+| Repeat counts | 10000 |
+| Programs | 100,000 instructions |
+
+Invalid patterns fail with `Invalid(at, message)`, at the byte offset Python reports. Backreferences, lookaround, named groups and possessive quantifiers are rejected.
+
+#### Regex generated patterns
+
+`regex.generated("pattern")` is a `Regex` built at compile time, like .NET's `[GeneratedRegex]`.
+
+- The pattern must be a string literal, and flags are written inline.
+- An invalid pattern is a compile error at the literal, `invalid regex at byte N: message`. The offset and message are the ones `compile` would fail with.
+- The result is used through the same functions as a compiled `Regex`, and it matches identically.
+
+#### Regex generated pattern checker
+
+`compiler/regex` holds the parser and assembler the checker runs on a literal pattern. It is held to the `std/regex` one by running the `std_regex_errors` fixture's patterns through it.
+
+The checker turns each distinct literal into Low functions named `__regex_` and the FNV-1a hash of the pattern. It parses them with the prelude's privileges and adds them to `std/regex`, so they reach its private types.
+
+#### Regex generated engine
+
+A `Regex` carries an `Engine` of thread-start, step and skip functions with the queue size. `compile` fills it with the Pike VM. The generated engine keeps the VM's queues, priorities and capture slots but replaces interpretation with code per instruction:
+
+- One function per instruction that starts a thread, follows a consumed character or joins two epsilon paths, each guarded by the queue's sparse set. The remaining jumps, splits, saves and assertions are inlined into it.
+- Characters and classes of up to four ranges compare inline in the step, which dispatches on the program counter by binary search.
+- Larger classes get a function that tests the ranges below U+0080 first and binary-searches the rest. There is one such function per distinct set of ranges, shared by every instruction that tests it.
+- `^` and `$` under `multiline` call `line_start` and `line_end`, and `\b` and `\B` call `word_before` and `word_at`, the functions the interpreter uses.
+- When no empty match is possible from the start, a skip function moves past ASCII bytes that cannot begin a match before a thread starts.
+- Programs over 2000 instructions are compiled at run time by `compile` instead, so call depth stays bounded.
 
 ### Compression
 
-- `std/compress/codec` holds what the codecs share. `Buffer` is a growable byte buffer with an LSB bit packer, and every write to it is infallible. Each encoder is a core that writes into a `Buffer`. The shared `Encoder` runs the core's `feed`, `sync` and `close` steps, drains the buffer to its sink and rejects every call after `finish` with `Invalid`, so one-shot `compress` has no error to handle. `BitReader` reads LSB-first bits from a slice or an `io.Reader` and fails with `Malformed` on short input. `Tables` builds two-level lookup tables for canonical Huffman codes. `Builder` computes length-limited code lengths. `Chain` is a hash-chain match finder, and `History` is the sliding window that zstd and LZ4 index with it. `decompress` runs the one-shot decode of a codec under an output limit. `copy_match` copies an LZ77 match. `read_varint` and `write_varint` code LEB128 integers, which `std/protobuf` and xz also use. Deflate, brotli, WebP lossless, zstd, LZ4, snappy, xz and bzip2 build on it where their formats agree.
-- DEFLATE, zlib and gzip decode stored, fixed and dynamic blocks with two-level lookup tables. They check Adler-32, CRC-32, ISIZE and the gzip header CRC, and they read concatenated gzip members. The encoder uses greedy matching at levels 1 to 3 and lazy matching at 4 to 9, over a hash chain on a 32 KB window. It chooses dynamic, fixed or stored encoding per block. `flush` emits a sync flush so streamed output is decodable as it arrives.
-- xz decodes multiple blocks and streams, the none, CRC32, CRC64 and SHA-256 checks, LZMA2 chunks with their resets, and the delta filter. Other filters fail with `Unsupported`. The encoder writes LZMA2 with a hash-chain match finder and lazy parsing. The dictionary runs from 256 KiB to 64 MiB by level. The encoder writes raw chunks where compression does not pay.
-- `std/compress/zstd` and `std/compress/lz4` each offer `compress(data, level)` and `decompress(data, limit)`. They offer a streaming `decode(reader, sink, limit)` that passes output to the sink one block at a time. They offer a streaming `Encoder` with `encode`, `flush` and `finish`.
-  - The zstd decoder handles every block and literal type, 1- and 4-stream Huffman literals, all four FSE table modes, repeat offsets, skippable and concatenated frames, and the content checksum. Its history grows with real output up to the smaller of the window and the remaining limit. Large windows therefore never allocate what the header claims up front.
-  - The zstd encoder finds matches with two hash chains keyed on 8-byte and 4- or 5-byte prefixes. The level sets the depth and lazy evaluation. It Huffman-codes literals and picks predefined, RLE or custom FSE tables per block by estimated cost. It falls back to raw or RLE blocks.
-  - The LZ4 decoder accepts linked and independent blocks, block and content checksums, content sizes and skippable frames. The encoder writes linked 64 KB blocks with a content checksum.
-  - Dictionaries and LZ4 frames with magic number `0x184C2102` fail with `Unsupported`.
-- `std/compress/brotli` has the same API as zstd and LZ4.
-  - The decoder handles compressed, uncompressed and metadata meta-blocks. It handles block switching for literals, commands and distances, and all four literal context modes. It handles context maps with run-length coding and inverse move-to-front, and distance postfix and direct parameters. It handles the static dictionary with all 121 transforms, and windows of 10 to 24 bits. Output collects in a ring buffer that starts at 64 KB and doubles up to the window. The output reaches the sink at the end of each meta-block, when the ring wraps, and before each blocking read. The 122,784-byte dictionary is `embed`ded from `dictionary.bin`.
-  - The encoder writes uncompressed meta-blocks at level 0. Levels 1 to 11 run hash chains of depth 2^(level-1). They use lazy matching from level 4 and check against the four recent distances and their neighbours. They write 256 KB meta-blocks with Huffman-coded commands and distances. From level 5 they model literals in UTF-8 context mode with up to 3·level-11 clustered trees. A block that would grow is stored. `flush` ends the meta-block and pads with an empty metadata block so everything sent decodes.
-- `std/bits` holds a growable `Set` over `u64[]` words. Counts use a SWAR popcount. Scans step a word at a time. The scans are `next_set`, `next_clear`, `min`, `max`, `rank`, `select_at` and `members`.
-- `std/bits/roaring` holds `Roaring`, a set of `u32` split into 65536-value chunks keyed by the high 16 bits. Each chunk is a sorted `u16[]` array of up to 4096 values, a 1024-word bitmap, or a list of runs. Arrays and bitmaps convert at 4096 values. Ranges create runs, and unions and intersections of runs stay runs. Every container tracks its cardinality, so `cardinality` is constant time. Set operations come as new-set and in-place `_with` forms. They work word by word on bitmaps and by galloping merge on arrays. `run_optimize` picks the smallest form per container by the Go library's rule. `serialize` and `deserialize` implement the portable Roaring format byte for byte as Go `roaring/v2` writes it. They reject any inconsistent length, ordering or cardinality with `Malformed`.
-- `std/image` holds an `Image` of width, height, `Format`, stride and pixel bytes. `Format` is one of `Gray8`, `GrayAlpha8`, `Rgb8`, `Rgba8`, `Gray16` and `Rgba16`, and 16-bit samples are big-endian.
-  - Pixels read and write as 8-bit `Rgba`, with operations converting through 16-bit intermediates. `get` outside the image is transparent black, and `set` there does nothing. Operations convert formats, crop, flip, rotate, apply EXIF orientation, fill rectangles, composite straight alpha, and premultiply and unpremultiply. They resize separably on premultiplied values with nearest, bilinear, Catmull-Rom bicubic or Lanczos-3 filters.
-  - `decode` picks a codec by signature and rejects images over 2^26 pixels. `decode_limited` takes another limit.
-  - PNG decodes every colour type, bit depth and Adam7, checks every CRC, and encodes with per-row adaptive filtering. The result is `Gray16` for 16-bit gray without transparency and `Rgba16` for other 16-bit images. It is `Gray8` or `GrayAlpha8` for gray, `Rgba8` for colour with alpha or `tRNS`, and `Rgb8` otherwise. `decode_png` decodes only PNG and fails with `Unsupported` on any other signature. `gAMA`, `cHRM`, `sRGB` and `iCCP` chunks are not read, so samples are returned as stored. The PngSuite in `testdata/ui_png` checks the result against ImageMagick's.
-  - JPEG decodes baseline and progressive scans with restart markers, any sampling, grayscale and Adobe CMYK/YCCK. It uses libjpeg's integer IDCT and fancy upsampling, so output matches libjpeg byte for byte. It encodes baseline 4:2:0 with the standard tables scaled by quality.
-  - GIF decodes 87a and 89a and composites every frame by disposal method in `decode_gif_frames`. It encodes one frame with a given or median-cut palette.
-  - BMP covers 1 to 32 bits, RLE, bitfields and every header version, and encodes 24 or 32 bits.
-  - QOI decodes and encodes. The result is `Rgb8` or `Rgba8` by channel count.
-  - WebP decodes lossless VP8L with every transform, the colour cache and meta prefix codes. Lossy VP8, alpha chunks and animation fail with `Unsupported`.
-- Every codec has buffer functions, a streaming decoder and a streaming encoder. The streaming decoder pulls from an `io.Reader`, pushes output to a sink and fails with `TooLarge` past a caller's limit.
+`std/compress/codec` holds what the codecs share. Deflate, brotli, WebP lossless, zstd, LZ4, snappy, xz and bzip2 build on it where their formats agree.
+
+#### Shared codec pieces
+
+Each encoder is a core that writes into a `Buffer`.
+
+| Name | Behaviour |
+| --- | --- |
+| `Buffer` | A growable byte buffer with an LSB bit packer, and every write to it is infallible. |
+| `Encoder` | The shared `Encoder` runs the core's `feed`, `sync` and `close` steps, drains the buffer to its sink and rejects every call after `finish` with `Invalid`, so one-shot `compress` has no error to handle. |
+| `BitReader` | Reads LSB-first bits from a slice or an `io.Reader` and fails with `Malformed` on short input. |
+| `Tables` | Builds two-level lookup tables for canonical Huffman codes. |
+| `Builder` | Computes length-limited code lengths. |
+| `Chain` and `History` | `Chain` is a hash-chain match finder, and `History` is the sliding window that zstd and LZ4 index with it. |
+| `decompress` | Runs the one-shot decode of a codec under an output limit. |
+| `copy_match` | Copies an LZ77 match. |
+| `read_varint` and `write_varint` | Code LEB128 integers, which `std/protobuf` and xz also use. |
+
+#### DEFLATE, zlib and gzip codecs
+
+DEFLATE, zlib and gzip decode stored, fixed and dynamic blocks with two-level lookup tables. They check Adler-32, CRC-32, ISIZE and the gzip header CRC, and they read concatenated gzip members.
+
+The encoder uses greedy matching at levels 1 to 3 and lazy matching at 4 to 9, over a hash chain on a 32 KB window. It chooses dynamic, fixed or stored encoding per block. `flush` emits a sync flush so streamed output is decodable as it arrives.
+
+#### xz codec
+
+xz decodes:
+
+- multiple blocks and streams
+- the none, CRC32, CRC64 and SHA-256 checks
+- LZMA2 chunks with their resets
+- the delta filter
+
+Other filters fail with `Unsupported`.
+
+The encoder writes LZMA2 with a hash-chain match finder and lazy parsing. The dictionary runs from 256 KiB to 64 MiB by level. The encoder writes raw chunks where compression does not pay.
+
+#### zstd and LZ4 functions
+
+`std/compress/zstd` and `std/compress/lz4` each offer:
+
+- `compress(data, level)` and `decompress(data, limit)`.
+- A streaming `decode(reader, sink, limit)` that passes output to the sink one block at a time.
+- A streaming `Encoder` with `encode`, `flush` and `finish`.
+
+#### zstd decoder
+
+The zstd decoder handles:
+
+- every block and literal type
+- 1- and 4-stream Huffman literals
+- all four FSE table modes
+- repeat offsets
+- skippable and concatenated frames
+- the content checksum
+
+Its history grows with real output up to the smaller of the window and the remaining limit. Large windows therefore never allocate what the header claims up front.
+
+#### zstd encoder
+
+The zstd encoder finds matches with two hash chains keyed on 8-byte and 4- or 5-byte prefixes. The level sets the depth and lazy evaluation. It Huffman-codes literals and picks predefined, RLE or custom FSE tables per block by estimated cost. It falls back to raw or RLE blocks.
+
+#### LZ4 decoder and encoder
+
+The LZ4 decoder accepts linked and independent blocks, block and content checksums, content sizes and skippable frames. The encoder writes linked 64 KB blocks with a content checksum.
+
+#### zstd and LZ4 unsupported inputs
+
+Dictionaries and LZ4 frames with magic number `0x184C2102` fail with `Unsupported`.
+
+#### Brotli codec
+
+`std/compress/brotli` has the same API as zstd and LZ4.
+
+#### Brotli decoder
+
+The decoder handles:
+
+- compressed, uncompressed and metadata meta-blocks
+- block switching for literals, commands and distances, and all four literal context modes
+- context maps with run-length coding and inverse move-to-front, and distance postfix and direct parameters
+- the static dictionary with all 121 transforms, and windows of 10 to 24 bits
+
+Output collects in a ring buffer that starts at 64 KB and doubles up to the window. The output reaches the sink at the end of each meta-block, when the ring wraps, and before each blocking read. The 122,784-byte dictionary is `embed`ded from `dictionary.bin`.
+
+#### Brotli encoder
+
+| Levels | Encoder |
+| --- | --- |
+| 0 | Writes uncompressed meta-blocks. |
+| 1 to 11 | Run hash chains of depth 2^(level-1). They use lazy matching from level 4 and check against the four recent distances and their neighbours. They write 256 KB meta-blocks with Huffman-coded commands and distances. |
+| From level 5 | They model literals in UTF-8 context mode with up to 3·level-11 clustered trees. |
+
+A block that would grow is stored. `flush` ends the meta-block and pads with an empty metadata block so everything sent decodes.
+
+#### Bit sets
+
+`std/bits` holds a growable `Set` over `u64[]` words. Counts use a SWAR popcount. Scans step a word at a time. The scans are `next_set`, `next_clear`, `min`, `max`, `rank`, `select_at` and `members`.
+
+#### Roaring bitmap containers
+
+`std/bits/roaring` holds `Roaring`, a set of `u32` split into 65536-value chunks keyed by the high 16 bits. Each chunk is a sorted `u16[]` array of up to 4096 values, a 1024-word bitmap, or a list of runs.
+
+- Arrays and bitmaps convert at 4096 values.
+- Ranges create runs, and unions and intersections of runs stay runs.
+- Every container tracks its cardinality, so `cardinality` is constant time.
+
+#### Roaring set operations and run_optimize
+
+Set operations come as new-set and in-place `_with` forms.
+
+| Container | Set operations work |
+| --- | --- |
+| Bitmaps | Word by word. |
+| Arrays | By galloping merge. |
+
+`run_optimize` picks the smallest form per container by the Go library's rule.
+
+#### Roaring serialization
+
+`serialize` and `deserialize` implement the portable Roaring format byte for byte as Go `roaring/v2` writes it. They reject any inconsistent length, ordering or cardinality with `Malformed`.
+
+#### Image type and formats
+
+`std/image` holds an `Image` of width, height, `Format`, stride and pixel bytes. `Format` is one of `Gray8`, `GrayAlpha8`, `Rgb8`, `Rgba8`, `Gray16` and `Rgba16`, and 16-bit samples are big-endian.
+
+#### Image pixels and operations
+
+Pixels read and write as 8-bit `Rgba`, with operations converting through 16-bit intermediates. `get` outside the image is transparent black, and `set` there does nothing.
+
+Operations convert formats, crop, flip, rotate, apply EXIF orientation, fill rectangles, composite straight alpha, and premultiply and unpremultiply. They resize separably on premultiplied values with nearest, bilinear, Catmull-Rom bicubic or Lanczos-3 filters.
+
+#### Image decoding
+
+| Function | Behaviour |
+| --- | --- |
+| `decode` | Picks a codec by signature and rejects images over 2^26 pixels. |
+| `decode_limited` | Takes another limit. |
+
+#### PNG codec
+
+PNG decodes every colour type, bit depth and Adam7, checks every CRC, and encodes with per-row adaptive filtering. The result is:
+
+| Image | Result |
+| --- | --- |
+| 16-bit gray without transparency | `Gray16` |
+| Other 16-bit images | `Rgba16` |
+| Gray | `Gray8` or `GrayAlpha8` |
+| Colour with alpha or `tRNS` | `Rgba8` |
+| Otherwise | `Rgb8` |
+
+`decode_png` decodes only PNG and fails with `Unsupported` on any other signature. `gAMA`, `cHRM`, `sRGB` and `iCCP` chunks are not read, so samples are returned as stored. The PngSuite in `testdata/ui_png` checks the result against ImageMagick's.
+
+#### JPEG codec
+
+JPEG decodes baseline and progressive scans with restart markers, any sampling, grayscale and Adobe CMYK/YCCK. It uses libjpeg's integer IDCT and fancy upsampling, so output matches libjpeg byte for byte. It encodes baseline 4:2:0 with the standard tables scaled by quality.
+
+#### GIF, BMP, QOI and WebP codecs
+
+| Format | Behaviour |
+| --- | --- |
+| GIF | Decodes 87a and 89a and composites every frame by disposal method in `decode_gif_frames`. It encodes one frame with a given or median-cut palette. |
+| BMP | Covers 1 to 32 bits, RLE, bitfields and every header version, and encodes 24 or 32 bits. |
+| QOI | Decodes and encodes. The result is `Rgb8` or `Rgba8` by channel count. |
+| WebP | Decodes lossless VP8L with every transform, the colour cache and meta prefix codes. Lossy VP8, alpha chunks and animation fail with `Unsupported`. |
+
+#### Buffer and streaming functions of every codec
+
+Every codec has buffer functions, a streaming decoder and a streaming encoder. The streaming decoder pulls from an `io.Reader`, pushes output to a sink and fails with `TooLarge` past a caller's limit.
 
 ### Web
 
-- `web.app()` holds routes and middleware. `get`, `post`, `put`, `patch`, `del` and `route` add handlers for paths with `:name` parameters and a trailing `*`. `group` makes a sub-application with a prefix and more middleware that registers its routes on the same router. An unknown path is a 404. A known path with another method runs the middleware of the first route with that path, then answers 405 with `Allow`, so `cors` answers a preflight for any route.
-- `endpoint[Req, Res]` and `query_endpoint[Res]` read a JSON body into `Req` and call a handler returning `Res ! web.Problem`. They write the result as JSON, or the problem as `application/problem+json`. Their schemas describe the operation in the OpenAPI document that `openapi` serves, along with path parameters and each route's security schemes.
-- Middleware is a struct of a `run` closure and an optional security scheme. `api_key`, `basic` and `bearer` authenticate requests and set `Context.user`. `sessions` keeps a map in a cookie sealed with AES-256-GCM, with the cookie name as associated data and an expiry inside. `csrf` requires the session's token in `X-CSRF-Token` on unsafe methods. `require_session`, `cors` (with the request headers it allows), `logger` and `compress` complete the set. `compress` picks Zstandard, Brotli or gzip, in that order, from what `Accept-Encoding` allows.
-- `jwt` verifies bearer tokens against a key set with `std/crypto/jose`. `oidc` does the same for an OpenID Connect issuer. It reads the discovery document and the JWKS and refreshes them hourly. It refreshes early, at most once a minute, when a token names a key it does not know. `oidc_login` adds two routes. The sign-in route redirects to the issuer with `state`, `nonce` and a PKCE S256 challenge kept in the session. The callback route checks the state, exchanges the code and verifies the ID token and its nonce. It hands the claims to the application.
-- A handler streams a body by returning a `Response` with `stream` set to a `chan[u8[]]` and closing it at the end. The server writes each chunk as it arrives. It cancels `req.token` when the stream ends, the client disconnects or a write fails. It drops the stream for `HEAD` and bodiless statuses. Response compression skips streamed responses.
-- `sse.stream` sets `text/event-stream`, `no-cache` and `x-accel-buffering: no`. It flushes every event and sends a `: keepalive` comment every 15 seconds unless `keepalive` is 0. It stops when `req.token` is cancelled. `Emitter.send` returns false after the client has gone. `sse.format` removes CR and LF from `id` and `event` and NUL from `id`.
-- `web.static` decodes each path segment and answers 400 for `..`, an embedded separator, NUL or a bad escape, and 404 for dotfiles, non-regular files and any file whose real path leaves the root. A directory without a trailing slash is redirected, and a directory serves `index.html` or an optional listing. `precompressed` picks `.br` then `.gz` by `Accept-Encoding`. A multi-range or malformed `Range` gives the whole file. Files stream in 64 KiB chunks.
+`web.app()` holds routes and middleware.
+
+#### Web routes
+
+| Function | Behaviour |
+| --- | --- |
+| `get`, `post`, `put`, `patch`, `del` and `route` | Add handlers for paths with `:name` parameters and a trailing `*`. |
+| `group` | Makes a sub-application with a prefix and more middleware that registers its routes on the same router. |
+
+| Request | Answer |
+| --- | --- |
+| An unknown path | A 404. |
+| A known path with another method | Runs the middleware of the first route with that path, then answers 405 with `Allow`, so `cors` answers a preflight for any route. |
+
+#### Web typed endpoints
+
+`endpoint[Req, Res]` and `query_endpoint[Res]` read a JSON body into `Req` and call a handler returning `Res ! web.Problem`. They write the result as JSON, or the problem as `application/problem+json`. Their schemas describe the operation in the OpenAPI document that `openapi` serves, along with path parameters and each route's security schemes.
+
+#### Web middleware
+
+Middleware is a struct of a `run` closure and an optional security scheme.
+
+| Middleware | Behaviour |
+| --- | --- |
+| `api_key`, `basic` and `bearer` | Authenticate requests and set `Context.user`. |
+| `sessions` | Keeps a map in a cookie sealed with AES-256-GCM, with the cookie name as associated data and an expiry inside. |
+| `csrf` | Requires the session's token in `X-CSRF-Token` on unsafe methods. |
+| `require_session`, `cors` (with the request headers it allows), `logger` and `compress` | Complete the set. |
+| `compress` | Picks Zstandard, Brotli or gzip, in that order, from what `Accept-Encoding` allows. |
+
+#### Web JWT and OpenID Connect verification
+
+`jwt` verifies bearer tokens against a key set with `std/crypto/jose`. `oidc` does the same for an OpenID Connect issuer. It reads the discovery document and the JWKS and refreshes them hourly. It refreshes early, at most once a minute, when a token names a key it does not know.
+
+#### Web OpenID Connect login routes
+
+`oidc_login` adds two routes.
+
+| Route | Behaviour |
+| --- | --- |
+| Sign-in | Redirects to the issuer with `state`, `nonce` and a PKCE S256 challenge kept in the session. |
+| Callback | Checks the state, exchanges the code and verifies the ID token and its nonce. It hands the claims to the application. |
+
+#### Web streaming responses
+
+A handler streams a body by returning a `Response` with `stream` set to a `chan[u8[]]` and closing it at the end. The server writes each chunk as it arrives. It cancels `req.token` when the stream ends, the client disconnects or a write fails. It drops the stream for `HEAD` and bodiless statuses. Response compression skips streamed responses.
+
+#### Web server-sent events
+
+| Function | Behaviour |
+| --- | --- |
+| `sse.stream` | Sets `text/event-stream`, `no-cache` and `x-accel-buffering: no`. It flushes every event and sends a `: keepalive` comment every 15 seconds unless `keepalive` is 0. It stops when `req.token` is cancelled. |
+| `Emitter.send` | Returns false after the client has gone. |
+| `sse.format` | Removes CR and LF from `id` and `event` and NUL from `id`. |
+
+#### Web static files
+
+`web.static` decodes each path segment.
+
+| Case | Result |
+| --- | --- |
+| `..`, an embedded separator, NUL or a bad escape | Answers 400. |
+| Dotfiles, non-regular files and any file whose real path leaves the root | Answers 404. |
+| A directory without a trailing slash | Is redirected. |
+| A directory | Serves `index.html` or an optional listing. |
+| `precompressed` | Picks `.br` then `.gz` by `Accept-Encoding`. |
+| A multi-range or malformed `Range` | Gives the whole file. |
+| Files | Stream in 64 KiB chunks. |
 ## Compiler
 
 The compiler is written in Low, in `compiler/`. Pipeline:
