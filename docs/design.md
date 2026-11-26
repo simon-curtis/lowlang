@@ -1300,33 +1300,202 @@ build.pre_build("npm", ["install"])
 build.post_build("npm", ["run", "clean"])
 ```
 
-- A `build.low` at the project root describes the project. The compiler reads it from its source and never runs it. It therefore holds only `import std/build` and top-level calls of `std/build` functions. Their arguments are string literals, or slices of string literals for a hook's arguments. Anything else is an error at its position.
-- `title` names the project and `version` gives its semantic version. Each is declared at most once.
-- `dep(source, range)` names a dependency kept in a `git` repository at `https://<source>`. The source names directories in the module cache. Its `/`-separated segments are therefore not empty, `.` or `..`, and it holds no `\`, `:` or `@`. Its versions are the repository's tags that parse as semantic versions, with or without a leading `v`. The range is one of these forms. `^1.2` means the versions up to the next change of the first non-zero part. `~1.2.3` means up to the next minor version, or the next major version for `~1`. `=1.2.3` means that version alone. `1.2` means `^1.2`. A pre-release version is accepted only by an `=` range that names it.
-- `local(dir)` names a dependency in a directory, relative to the `build.low` that declares it; `dir` may name that directory's `build.low`. It has no version and is never fetched.
-- `modules(dir)` names the directory under the project root, `.` by default, that holds the project's own modules, so that a project with its code under `src/` imports `lib` and not `src/lib`. It is declared at most once and has the shape of a `program` directory. It changes where an import is placed and what `low test` calls a module, and nothing else. The project root stays the nearest `build.low` or `low.mod`. Hooks, `build.lock`, `dep` and `local` stay relative to the `build.low`. A `low.mod` or `build.low` directly inside the modules directory would take over as the root of everything below it. Loading the project, or the programs it declares, is therefore an error: `<dir>/low.mod marks another project root inside the modules directory`. A build of a path that starts below such a marker finds that marker as its root and reads no declaration of the outer project.
-- `program(dir)` declares a console program in the directory `dir`, and `gui(dir)` declares a windowed program there. The directory is relative to the `build.low`. Either may repeat. `dir` is not empty, absolute, rooted or drive-lettered, such as `/x`, a backslash first, or `C:/x`. It has no `..` segment. `\` counts as `/`. A directory named by two declarations is an error. A declared directory must exist when a program of the project is built, run or installed. A dependency's declarations are checked and otherwise ignored.
-- `low build`, `low run` and `low install` link a program the `build.low` declares with `gui` with the GUI subsystem for `windows/amd64`. This holds whichever way its directory is named, as a directory or as a file in it. `--subsystem` on `low build` overrides the declaration. The other targets ignore it. `low test` never reads it, so a test program is a console program.
-- `icon(file)` names a Windows `.ico` file relative to the `build.low`. It is written as a `program` directory is, and is declared at most once. Every program of the project that `low build`, `low run` and `low install` link for `windows/amd64` carries its images as the executable's icon. Explorer, a shortcut and a pinned taskbar button show that icon. A window's own icon is set apart from it, through `std/ui`.
-- `manifest(file)` names the XML application manifest of the Windows executables. It is relative to the `build.low` and declared at most once, like `icon`. An application asks in it for per-monitor DPI awareness, long path awareness, the common controls, the UTF-8 code page and an execution level. The executable carries it as the resource `RT_MANIFEST` number 1, so it needs no sidecar `.manifest` file. The file is written as it is, and must be well-formed XML whose root element is `assembly`.
-- `version(number)` and `file_info(key, value)` give the executables their version information. The file properties dialog and installers read it. `version` sets the strings `FileVersion` and `ProductVersion` to the version in its canonical form, `1.4.0` or `1.4.0-rc.1`. `file_info` sets the string `key` to `value`. Keys include `CompanyName`, `ProductName`, `FileDescription`, `InternalName`, `OriginalFilename` and `LegalCopyright`. A `file_info` of `FileVersion` or `ProductVersion` overrides the string `version` gave, so it can carry a fourth number. `file_info` may repeat for different keys but not for one key. The numeric file and product version of the fixed part come from the leading dotted numbers of `FileVersion` and `ProductVersion`, up to four and zero when absent, so `1.4.0-rc.1` is `1.4.0.0`. Each of those numbers is at most 65535. A project that declares neither `version` nor `file_info` has no version information.
-- Every program of the project that is linked for `windows/amd64` carries what `icon`, `manifest`, `version` and `file_info` declare, console or windowed. For any target, a declared file that is missing or is a directory, an icon file that is not an icon file, holds no image or names an image outside itself, a manifest that is not well-formed XML with an `assembly` root, and version information that is too large for its block or has a version number above 65535 is an error at the declaration. `low test` and a dependency's declarations add no resources.
-- With no program named, `low install` installs every declared program. `low build` and `low run` build the one declared. They do this only in a directory that holds no `.low` file and whose project declares programs. Any directory of the project qualifies, not only the root. `low run` then takes no program arguments. A directory with `.low` files builds as it did without a declaration.
-- `pre_build(program, args)` and `post_build(program, args)` run a program in the project root, with the streams of `low`. They run before and after `low build`, `low run` and `low install` compile the program, in the order declared. A non-zero exit stops the command with `pre_build <program> exited with status <n>`. `low test` and the other commands run no hooks.
-- `low build`, `low run` and `low test` resolve the version-control dependencies of the project and of every dependency's `build.low`, local or fetched. Each source gets the newest version that every range naming it accepts. If `build.lock` holds a version they all accept, that version is kept instead. `low update [dir]` resolves again to the newest accepted versions and rewrites `build.lock`.
-- `build.lock` holds one line per dependency, `source version commit hash`, sorted by source. It is written when the resolution changes. `hash` is `h1:` followed by the standard base64 of the SHA-256 of a listing of the dependency's tree. The listing has one line per regular file, sorted by path. Each line is made of the file's SHA-256 in lower-case hexadecimal, two spaces, the path relative to the tree root with `/` separators, and a newline. This is the `h1` hash of Go's `dirhash`.
-- Fetched dependencies live in a module cache shared by every project of the user. Its location is the `LOW_CACHE` environment variable. Otherwise it is `$XDG_CACHE_HOME/low` or `$HOME/.cache/low` on Linux, and `%LOCALAPPDATA%\low` on Windows. `<cache>/git/<source>` is a bare mirror of the repository. `<cache>/deps/<source>@<commit>` is the tree of one commit. It is written from `git archive` with line endings untouched and placed by a rename, so a tree is either complete or absent and projects that fetch at once share it. A tree already in the cache is reused.
-- A published version never changes. A tree written to the cache fails with an error if its hash differs from the one `build.lock` holds for that version. The error names the source, the version, and the expected and actual hashes. When a resolution lists a source's tags and a tag that `build.lock` holds points at another commit, it fails with an error. That error names the source, the tag, and the old and new commits. The hash is checked when a tree is written to the cache, not on each use.
-- The other commands and the language server read the trees in the cache through `build.lock`. They report a dependency that `build.lock` does not list, or whose tree is not in the cache, at its `dep`.
-- A dependency's hooks never run.
-- The package index is a git repository of plain files. `LOW_INDEX` names a checkout of it. A package is named by its source, `github.com/acme/ui`. Its file is `<index>/<source>`, so no segment of a source may start with `.`. Each line is `tag commit hash`, with `yanked` after the hash for a yanked version. The tag is spelled as the repository spells it. The commit is the one the tag names. The hash is the `h1:` hash of that commit's tree as `build.lock` holds it. Lines are appended in the order of publication and never edited, except for the flag. The checkout is read as it stands, with no network, and kept current with `git pull`. With `LOW_INDEX` unset, or without a file for a source, the source resolves from the repository's tags.
-- A source that the index lists takes its versions, commits and hashes from the index instead of from `git ls-remote`, so only an indexed version is chosen. A fetched tree is checked against the index's hash on first use, not only against `build.lock`. A resolution skips a yanked version when it chooses one, `low update` included. An error that finds only yanked versions in range names them. A version `build.lock` holds that the index has yanked still resolves, builds and keeps its tree. `low build`, `low run` and `low install` print `warning: <source> <version> is yanked from the package index` once on standard error for it. A locked version that the index lists with another commit or hash fails as a moved tag does.
-- `low publish <source> <version>` reads the tags of the repository at `https://<source>` and takes the one whose version is `<version>`, so the indexed commit is one dependents can fetch. It extracts that commit's tree to a scratch directory, as dependencies are fetched, and hashes it. It resolves the tree's own dependencies there. It requires that the version in its `build.low`, when declared, equals the tag's. It type-checks every module of the tree, the directories that hold `.low` files other than tests. It skips `testdata`, `examples` and directories that start with `.` or `_`, and it fails when there is none. It then appends the line to the index and commits that file with the message `publish <source> <tag>`. A version the index lists under any spelling of its tag is refused, so a tag that moved after publication changes nothing. A failure leaves the index checkout as it was. Pushing the index is left to git.
-- `low yank <source> <version>` rewrites only the flag of the line of that version. `--undo` clears it. The change is committed as `yank <source> <tag>` or `unyank <source> <tag>`. Yanking withdraws a version from new resolutions and never deletes a line, so the history of the index lists every version ever published.
-- A tree written to the cache holds only regular files and directories. Fetching a tag whose archive holds a symbolic link, a hard link or a device fails with an error that names the entry, so the hash covers everything the tree contains.
-- In a module of a fetched dependency, `embed` and `embed_dir` fail with an error when the file's absolute path, or its real path once symbolic links resolve, is outside the dependency's tree. This covers `..` segments, absolute paths and links. A `local` dependency of a fetched dependency is confined to the same tree. The root project and the `local` dependencies of the root project are not confined.
-- A dependency's modules are imported under its name: the source for a `dep`, the directory's last segment for a `local`. `import github.com/acme/ui` loads the dependency's modules directory, which is its root unless its `build.low` declares `modules`. `import github.com/acme/ui/text` loads its `text/` module. Of a dependency's declarations only `modules` is used. Its `program` and `gui` are checked and ignored. Inside a dependency, `import text` loads its own `text/`, so two projects may each hold a module of one name. A project imports only its own modules and those of the dependencies its `build.low` names. A module path that is both one of the project's directories and a dependency is an error. One name given to two dependency directories is an error.
-- Warnings are printed for the project's own modules only.
+A `build.low` at the project root describes the project: its name and version, its dependencies, where its modules live, the programs it builds and the commands to run around a build.
+
+The compiler reads `build.low` from its source and never runs it. It therefore holds only `import std/build` and top-level calls of `std/build` functions. Their arguments are string literals, or slices of string literals for a hook's arguments. Anything else is an error at its position.
+
+| Declaration | Declares | Times |
+| --- | --- | --- |
+| `title(name)` | The project's name. | At most once |
+| `version(number)` | The project's semantic version. | At most once |
+| `dep(source, range)` | A dependency fetched from a `git` repository. | Any |
+| `local(dir)` | A dependency in a directory on disk. | Any |
+| `modules(dir)` | The directory that holds the project's own modules. | At most once |
+| `program(dir)` | A console program. | Any |
+| `gui(dir)` | A windowed program. | Any |
+| `icon(file)` | The icon of the Windows executables. | At most once |
+| `manifest(file)` | The application manifest of the Windows executables. | At most once |
+| `file_info(key, value)` | One string of the Windows version information. | Once per key |
+| `pre_build(program, args)` | A command to run before a build. | Any |
+| `post_build(program, args)` | A command to run after a build. | Any |
+
+Warnings are printed for the project's own modules only.
+
+#### Dependencies
+
+`dep(source, range)` names a dependency kept in a `git` repository at `https://<source>`. Its versions are the repository's tags that parse as semantic versions, with or without a leading `v`.
+
+The source names directories in the module cache. Its `/`-separated segments are therefore not empty, `.` or `..`, and it holds no `\`, `:` or `@`.
+
+| Range | Accepts |
+| --- | --- |
+| `^1.2` | The versions up to the next change of the first non-zero part. |
+| `~1.2.3` | The versions up to the next minor version, or the next major version for `~1`. |
+| `=1.2.3` | That version alone. |
+| `1.2` | The same as `^1.2`. |
+
+A pre-release version is accepted only by an `=` range that names it.
+
+`local(dir)` names a dependency in a directory, relative to the `build.low` that declares it; `dir` may name that directory's `build.low`. It has no version and is never fetched.
+
+A dependency's hooks never run.
+
+#### Importing a dependency
+
+A dependency's modules are imported under its name: the source for a `dep`, the directory's last segment for a `local`.
+
+| Import | Loads |
+| --- | --- |
+| `import github.com/acme/ui` | The dependency's modules directory, which is its root unless its `build.low` declares `modules`. |
+| `import github.com/acme/ui/text` | Its `text/` module. |
+| `import text`, inside a dependency | Its own `text/`, so two projects may each hold a module of one name. |
+
+- A project imports only its own modules and those of the dependencies its `build.low` names.
+- A module path that is both one of the project's directories and a dependency is an error.
+- One name given to two dependency directories is an error.
+- Of a dependency's declarations only `modules` is used. Its `program` and `gui` are checked and ignored.
+
+#### The modules directory
+
+`modules(dir)` names the directory under the project root, `.` by default, that holds the project's own modules, so that a project with its code under `src/` imports `lib` and not `src/lib`. It is declared at most once and has the shape of a `program` directory.
+
+It changes where an import is placed and what `low test` calls a module, and nothing else:
+
+- The project root stays the nearest `build.low` or `low.mod`.
+- Hooks, `build.lock`, `dep` and `local` stay relative to the `build.low`.
+
+A `low.mod` or `build.low` directly inside the modules directory would take over as the root of everything below it. Loading the project, or the programs it declares, is therefore an error: `<dir>/low.mod marks another project root inside the modules directory`. A build of a path that starts below such a marker finds that marker as its root and reads no declaration of the outer project.
+
+#### Programs
+
+`program(dir)` declares a console program in the directory `dir`, and `gui(dir)` declares a windowed program there. The directory is relative to the `build.low`. Either may repeat.
+
+- `dir` is not empty, absolute, rooted or drive-lettered, such as `/x`, a backslash first, or `C:/x`. It has no `..` segment. `\` counts as `/`.
+- A directory named by two declarations is an error.
+- A declared directory must exist when a program of the project is built, run or installed.
+- A dependency's declarations are checked and otherwise ignored.
+
+With no program named, the commands pick from the declared programs:
+
+| Command | Builds |
+| --- | --- |
+| `low install` | Every declared program. |
+| `low build`, `low run` | The one declared. |
+
+`low build` and `low run` do this only in a directory that holds no `.low` file and whose project declares programs. Any directory of the project qualifies, not only the root. `low run` then takes no program arguments. A directory with `.low` files builds as it did without a declaration.
+
+`low build`, `low run` and `low install` link a program the `build.low` declares with `gui` with the GUI subsystem for `windows/amd64`. This holds whichever way its directory is named, as a directory or as a file in it. `--subsystem` on `low build` overrides the declaration. The other targets ignore it. `low test` never reads it, so a test program is a console program.
+
+#### Windows resources
+
+Every program of the project that is linked for `windows/amd64` carries what `icon`, `manifest`, `version` and `file_info` declare, console or windowed. `low test` and a dependency's declarations add no resources.
+
+**Icon.** `icon(file)` names a Windows `.ico` file relative to the `build.low`. It is written as a `program` directory is, and is declared at most once. Every program of the project that `low build`, `low run` and `low install` link for `windows/amd64` carries its images as the executable's icon. Explorer, a shortcut and a pinned taskbar button show that icon. A window's own icon is set apart from it, through `std/ui`.
+
+**Manifest.** `manifest(file)` names the XML application manifest of the Windows executables. It is relative to the `build.low` and declared at most once, like `icon`. An application asks in it for per-monitor DPI awareness, long path awareness, the common controls, the UTF-8 code page and an execution level. The executable carries it as the resource `RT_MANIFEST` number 1, so it needs no sidecar `.manifest` file. The file is written as it is, and must be well-formed XML whose root element is `assembly`.
+
+**Version information.** `version(number)` and `file_info(key, value)` give the executables their version information. The file properties dialog and installers read it. A project that declares neither `version` nor `file_info` has no version information.
+
+- `version` sets the strings `FileVersion` and `ProductVersion` to the version in its canonical form, `1.4.0` or `1.4.0-rc.1`.
+- `file_info` sets the string `key` to `value`. Keys include `CompanyName`, `ProductName`, `FileDescription`, `InternalName`, `OriginalFilename` and `LegalCopyright`. It may repeat for different keys but not for one key.
+- A `file_info` of `FileVersion` or `ProductVersion` overrides the string `version` gave, so it can carry a fourth number.
+- The numeric file and product version of the fixed part come from the leading dotted numbers of `FileVersion` and `ProductVersion`, up to four and zero when absent, so `1.4.0-rc.1` is `1.4.0.0`. Each of those numbers is at most 65535.
+
+**Errors.** For any target, each of these is an error at the declaration:
+
+- a declared file that is missing or is a directory
+- an icon file that is not an icon file, holds no image or names an image outside itself
+- a manifest that is not well-formed XML with an `assembly` root
+- version information that is too large for its block or has a version number above 65535
+
+#### Build hooks
+
+`pre_build(program, args)` and `post_build(program, args)` run a program in the project root, with the streams of `low`. They run before and after `low build`, `low run` and `low install` compile the program, in the order declared.
+
+A non-zero exit stops the command with `pre_build <program> exited with status <n>`. `low test` and the other commands run no hooks.
+
+#### Resolving versions
+
+`low build`, `low run` and `low test` resolve the version-control dependencies of the project and of every dependency's `build.low`, local or fetched.
+
+- Each source gets the newest version that every range naming it accepts.
+- If `build.lock` holds a version they all accept, that version is kept instead.
+- `low update [dir]` resolves again to the newest accepted versions and rewrites `build.lock`.
+
+The other commands and the language server read the trees in the cache through `build.lock`. They report a dependency that `build.lock` does not list, or whose tree is not in the cache, at its `dep`.
+
+#### build.lock
+
+`build.lock` holds one line per dependency, `source version commit hash`, sorted by source. It is written when the resolution changes.
+
+`hash` is `h1:` followed by the standard base64 of the SHA-256 of a listing of the dependency's tree. The listing has one line per regular file, sorted by path. Each line is made of the file's SHA-256 in lower-case hexadecimal, two spaces, the path relative to the tree root with `/` separators, and a newline. This is the `h1` hash of Go's `dirhash`.
+
+A published version never changes, and two checks enforce it:
+
+- A tree written to the cache fails with an error if its hash differs from the one `build.lock` holds for that version. The error names the source, the version, and the expected and actual hashes.
+- When a resolution lists a source's tags and a tag that `build.lock` holds points at another commit, it fails with an error. That error names the source, the tag, and the old and new commits.
+
+The hash is checked when a tree is written to the cache, not on each use.
+
+#### The module cache
+
+Fetched dependencies live in a module cache shared by every project of the user.
+
+| Location | Used |
+| --- | --- |
+| `LOW_CACHE` | When the environment variable is set. |
+| `$XDG_CACHE_HOME/low` or `$HOME/.cache/low` | Otherwise, on Linux. |
+| `%LOCALAPPDATA%\low` | Otherwise, on Windows. |
+
+| Path | Holds |
+| --- | --- |
+| `<cache>/git/<source>` | A bare mirror of the repository. |
+| `<cache>/deps/<source>@<commit>` | The tree of one commit. |
+
+A tree is written from `git archive` with line endings untouched and placed by a rename, so a tree is either complete or absent and projects that fetch at once share it. A tree already in the cache is reused.
+
+A tree written to the cache holds only regular files and directories. Fetching a tag whose archive holds a symbolic link, a hard link or a device fails with an error that names the entry, so the hash covers everything the tree contains.
+
+In a module of a fetched dependency, `embed` and `embed_dir` fail with an error when the file's absolute path, or its real path once symbolic links resolve, is outside the dependency's tree. This covers `..` segments, absolute paths and links. A `local` dependency of a fetched dependency is confined to the same tree. The root project and the `local` dependencies of the root project are not confined.
+
+#### The package index
+
+The package index is a git repository of plain files. `LOW_INDEX` names a checkout of it. With `LOW_INDEX` unset, or without a file for a source, the source resolves from the repository's tags.
+
+A package is named by its source, `github.com/acme/ui`. Its file is `<index>/<source>`, so no segment of a source may start with `.`. Each line is `tag commit hash`, with `yanked` after the hash for a yanked version.
+
+| Field | Holds |
+| --- | --- |
+| `tag` | The tag, spelled as the repository spells it. |
+| `commit` | The commit the tag names. |
+| `hash` | The `h1:` hash of that commit's tree as `build.lock` holds it. |
+
+Lines are appended in the order of publication and never edited, except for the flag. The checkout is read as it stands, with no network, and kept current with `git pull`.
+
+A source that the index lists takes its versions, commits and hashes from the index instead of from `git ls-remote`, so only an indexed version is chosen. A fetched tree is checked against the index's hash on first use, not only against `build.lock`. A locked version that the index lists with another commit or hash fails as a moved tag does.
+
+#### Publishing
+
+`low publish <source> <version>` adds a version to the index:
+
+1. It reads the tags of the repository at `https://<source>` and takes the one whose version is `<version>`, so the indexed commit is one dependents can fetch.
+2. It extracts that commit's tree to a scratch directory, as dependencies are fetched, and hashes it.
+3. It resolves the tree's own dependencies there.
+4. It requires that the version in its `build.low`, when declared, equals the tag's.
+5. It type-checks every module of the tree, the directories that hold `.low` files other than tests. It skips `testdata`, `examples` and directories that start with `.` or `_`, and it fails when there is none.
+6. It appends the line to the index and commits that file with the message `publish <source> <tag>`.
+
+A version the index lists under any spelling of its tag is refused, so a tag that moved after publication changes nothing. A failure leaves the index checkout as it was. Pushing the index is left to git.
+
+#### Yanking
+
+`low yank <source> <version>` rewrites only the flag of the line of that version. `--undo` clears it. The change is committed as `yank <source> <tag>` or `unyank <source> <tag>`.
+
+Yanking withdraws a version from new resolutions and never deletes a line, so the history of the index lists every version ever published.
+
+- A resolution skips a yanked version when it chooses one, `low update` included.
+- An error that finds only yanked versions in range names them.
+- A version `build.lock` holds that the index has yanked still resolves, builds and keeps its tree. `low build`, `low run` and `low install` print `warning: <source> <version> is yanked from the package index` once on standard error for it.
 
 ### Doc comments
 
