@@ -1,0 +1,265 @@
+import std/file
+import std/git
+import std/http
+import std/net
+import std/os
+import std/process
+import std/testing
+import std/text
+import std/time
+import std/time/duration
+
+const fixtures = "testdata/git"
+
+fn scratch(t: *testing.T) -> str {
+    file.temp_dir("low-remote-") catch {
+        e => testing.must(t, e, "")
+    }
+}
+
+fn fixture(t: *testing.T, name: str) -> u8[] {
+    file.read_file("{fixtures}/{name}") catch {
+        e => {
+            let empty: u8[] = []
+            testing.must(t, e, empty)
+        }
+    }
+}
+
+fn bare(t: *testing.T, location: str) -> *git.Repository {
+    git.init(location, true) catch {
+        e => {
+            t.fatal("init {location}: {git.message(e)}")
+            panic("unreachable")
+        }
+    }
+}
+
+fn source(t: *testing.T, location: str) -> *git.Repository {
+    let r = bare(t, location)
+    for name in ["base.pack", "thin.pack"] {
+        git.add_pack(r, fixture(t, name)) catch {
+            e => {
+                t.fatal("add {name}: {git.message(e)}")
+                return r
+            }
+        }
+    }
+    file.write_file("{r.git_dir}/packed-refs", fixture(t, "packed-refs")) catch {
+        e => t.fatal("write packed-refs: {testing.format(e)}")
+    }
+    r
+}
+
+fn listed(t: *testing.T, r: *git.Repository) -> str[] {
+    let found: git.Ref[] = git.refs(r, "refs/") catch {
+        e => {
+            t.fatal("list refs: {git.message(e)}")
+            []
+        }
+    }
+    var out: str[] = []
+    for ref in found {
+        out.push("{ref.name} {ref.id} {ref.peeled}")
+    }
+    out
+}
+
+fn listing_lines(l: Listing) -> str[] {
+    var out: str[] = []
+    for ref in l.refs {
+        out.push("{ref.name} {ref.id} {ref.peeled}")
+    }
+    out
+}
+
+fn fetched(t: *testing.T, r: *git.Repository, url: str) -> Listing {
+    fetch(r, url, Options {}) catch {
+        e => {
+            t.fatal("fetch {url}: {message(e)}")
+            Listing { refs: [], head: "" }
+        }
+    }
+}
+
+fn add_commit(t: *testing.T, r: *git.Repository, body: str) -> str {
+    let parent = git.resolve(r, "refs/heads/main") catch { e => testing.must(t, e, "") }
+    let blob = git.write_object(r, Blob, bytes(body)) catch { e => testing.must(t, e, "") }
+    let tree = git.write_tree(r, [git.TreeEntry { name: "added.txt", mode: File, id: blob }]) catch { e => testing.must(t, e, "") }
+    let who = git.Signature { name: "low", email: "low@example.com", time: 1700001000 }
+    let commit = git.write_commit(r, git.Commit { tree, parents: [parent], author: who, committer: who, message: "added\n" }) catch { e => testing.must(t, e, "") }
+    git.set_ref(r, "refs/heads/main", commit) catch { e => t.fatal(git.message(e)) }
+    commit
+}
+
+fn listener(t: *testing.T) -> net.Listener {
+    net.listen("127.0.0.1", 0) catch {
+        e => {
+            t.fatal("listen: {testing.format(e)}")
+            panic("unreachable")
+        }
+    }
+}
+
+fn serve_in_background(l: net.ListenerHandle, handler: fn(http.Request) -> http.Response) {
+    http.serve_on(l, handler) or {}
+}
+
+fn test_a_fetch_over_http_brings_every_reference_and_object_and_then_new_commits(t: *testing.T) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let src = source(t, "{dir}/src.git")
+    using l = listener(t)
+    spawn serve_in_background(l.handle, http_handler(src))
+    let url = "http://127.0.0.1:{l.handle.addr.port}/src.git"
+    let dst = bare(t, "{dir}/dst.git")
+    let first = fetched(t, dst, url)
+    t.equal(first.head, "refs/heads/main")
+    t.equal_slice(listing_lines(first), listed(t, src))
+    t.equal_slice(listed(t, dst), listed(t, src))
+    for line in text.lines(text.trim(str(fixture(t, "objects.txt")))) {
+        let id = text.fields(line)[0]
+        t.error_if(!git.has(dst, id), "{id} was not fetched")
+    }
+    let commit = add_commit(t, src, "second\n")
+    fetched(t, dst, url)
+    t.equal(git.resolve(dst, "main") catch { e => testing.must(t, e, "") }, commit)
+    let listing = list(url, Options { prefixes: ["refs/tags/"] }) catch { e => testing.must(t, e, Listing { refs: [], head: "" }) }
+    t.equal(listing.refs.len, 3)
+}
+
+fn has_git(t: *testing.T) -> bool {
+    if process.find("git") == none {
+        t.skip("needs git on PATH")
+        return false
+    }
+    for pair in [["GIT_CONFIG_GLOBAL", "/dev/null"], ["GIT_CONFIG_NOSYSTEM", "1"]] {
+        os.set_env(pair[0], pair[1]) catch {
+            e => t.fatal("set {pair[0]}: {testing.format(e)}")
+        }
+    }
+    true
+}
+
+fn git_output(t: *testing.T, args: str[]) -> str {
+    var c = process.command("git", args)
+    c.stdout = Piped
+    c.stderr = Piped
+    let out = process.run(c, []) catch {
+        e => testing.must(t, e, process.Output { status: Exited(1), stdout: [], stderr: [] })
+    }
+    if !process.success(out.status) {
+        t.fatal("git {text.join(args, " ")}: {str(out.stderr)}")
+    }
+    text.trim(str(out.stdout))
+}
+
+fn test_git_clones_the_served_repository(t: *testing.T) {
+    if !has_git(t) {
+        return
+    }
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let src = source(t, "{dir}/src.git")
+    using l = listener(t)
+    spawn serve_in_background(l.handle, http_handler(src))
+    let url = "http://127.0.0.1:{l.handle.addr.port}/src.git"
+    git_output(t, ["clone", "--quiet", "--mirror", url, "{dir}/clone.git"])
+    git_output(t, ["--git-dir", "{dir}/clone.git", "fsck", "--strict", "--no-dangling"])
+    t.equal(git_output(t, ["--git-dir", "{dir}/clone.git", "show-ref", "-d"]), text.trim(str(fixture(t, "refs.txt"))))
+    add_commit(t, src, "second\n")
+    git_output(t, ["--git-dir", "{dir}/clone.git", "fetch", "--quiet", "origin"])
+    git_output(t, ["--git-dir", "{dir}/clone.git", "fsck", "--strict", "--no-dangling"])
+    t.equal(git_output(t, ["--git-dir", "{dir}/clone.git", "rev-parse", "main"]), git.resolve(src, "main") catch { e => testing.must(t, e, "") })
+}
+
+fn free_port(t: *testing.T) -> i64 {
+    using l = net.listen("127.0.0.1", 0) catch {
+        e => {
+            t.fatal("listen: {testing.format(e)}")
+            return 0
+        }
+    }
+    l.handle.addr.port
+}
+
+fn listening(port: i64) -> bool {
+    for _ in 0..100 {
+        using conn = net.dial("127.0.0.1", port) catch {
+            _ => {
+                time.sleep_for(duration.milliseconds(50))
+                continue
+            }
+        }
+        return true
+    }
+    false
+}
+
+fn test_a_fetch_over_the_git_protocol_from_git_daemon_matches_the_source(t: *testing.T) {
+    if !has_git(t) {
+        return
+    }
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let src = source(t, "{dir}/src.git")
+    let port = free_port(t)
+    var daemon = process.command("git", ["daemon", "--export-all", "--reuseaddr", "--base-path={dir}", "--listen=127.0.0.1", "--port={port}", dir])
+    daemon.stderr = Piped
+    using child = process.start(daemon) catch {
+        e => {
+            t.skip("git daemon does not start: {testing.format(e)}")
+            return
+        }
+    }
+    if !listening(port) {
+        t.skip("git daemon did not listen on {port}")
+        return
+    }
+    let url = "git://127.0.0.1:{port}/src.git"
+    let dst = bare(t, "{dir}/dst.git")
+    let l = fetched(t, dst, url)
+    t.equal(l.head, "refs/heads/main")
+    t.equal_slice(listed(t, dst), listed(t, src))
+    let commit = add_commit(t, src, "second\n")
+    fetched(t, dst, url)
+    t.equal(git.resolve(dst, "main") catch { e => testing.must(t, e, "") }, commit)
+    git_output(t, ["--git-dir", "{dir}/dst.git", "fsck", "--strict", "--no-dangling"])
+}
+
+fn test_the_longest_matching_insteadof_rewrites_a_url(t: *testing.T) {
+    let c = git.parse_config("[url \"file:///all/\"]\n\tinsteadOf = https://\n[url \"ssh://git@example.com/\"]\n\tinsteadOf = https://example.com/\n", "config") catch {
+        e => testing.must(t, e, git.Config { settings: [] })
+    }
+    t.equal(rewrite(c, "https://example.com/a/b"), "ssh://git@example.com/a/b")
+    t.equal(rewrite(c, "https://other.org/c"), "file:///all/other.org/c")
+    t.equal(rewrite(c, "git://example.com/d"), "git://example.com/d")
+}
+
+struct TargetCase {
+    url: str
+    want: str
+}
+
+fn test_ssh_locations_parse_into_user_host_port_and_path(t: *testing.T) {
+    let cases = [
+        TargetCase { url: "ssh://git@example.com/a/b.git", want: "git example.com 22 /a/b.git" }
+        TargetCase { url: "ssh://example.com:2222/~/r.git", want: " example.com 2222 ~/r.git" }
+        TargetCase { url: "git+ssh://u@[::1]:2200/r", want: "u ::1 2200 /r" }
+        TargetCase { url: "git@github.com:octo/r.git", want: "git github.com 22 octo/r.git" }
+        TargetCase { url: "[host.example]:it's", want: " host.example 22 it's" }
+        TargetCase { url: "ssh://example.com/-oProxyCommand=x", want: " example.com 22 /-oProxyCommand=x" }
+        TargetCase { url: "example.com:-x", want: "refused" }
+        TargetCase { url: "ssh://-oProxyCommand=x/r", want: "refused" }
+    ]
+    t.table_of(cases, fn(c: TargetCase) -> str { c.url }, fn(t: *testing.T, c: TargetCase) {
+        let got = ssh_target(c.url) catch {
+            _ => {
+                t.equal("refused", c.want)
+                return
+            }
+        }
+        t.equal("{got.user} {got.host} {got.port} {got.path}", c.want)
+    })
+    t.equal(shell_quote("it's"), "'it'\\''s'")
+}

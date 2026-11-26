@@ -1,0 +1,387 @@
+import std/file
+import std/os
+import std/process
+import std/slices
+import std/testing
+import std/text
+
+const fixtures = "testdata/git"
+
+fn scratch(t: *testing.T) -> str {
+    file.temp_dir("low-git-") catch {
+        e => testing.must(t, e, "")
+    }
+}
+
+fn read_fixture(t: *testing.T, name: str) -> u8[] {
+    file.read_file("{fixtures}/{name}") catch {
+        e => {
+            let empty: u8[] = []
+            testing.must(t, e, empty)
+        }
+    }
+}
+
+fn fixture_lines(t: *testing.T, name: str) -> str[] {
+    text.lines(text.trim(str(read_fixture(t, name))))
+}
+
+fn bare(t: *testing.T, dir: str) -> *Repository {
+    init(dir, true) catch {
+        e => {
+            t.fatal("init {dir}: {message(e)}")
+            panic("unreachable")
+        }
+    }
+}
+
+fn from_packs(t: *testing.T, dir: str) -> *Repository {
+    let r = bare(t, dir)
+    for name in ["base.pack", "thin.pack"] {
+        r.add_pack(read_fixture(t, name)) catch {
+            e => {
+                t.fatal("add {name}: {message(e)}")
+                return r
+            }
+        }
+    }
+    file.write_file("{r.git_dir}/packed-refs", read_fixture(t, "packed-refs")) catch {
+        e => t.fatal("write packed-refs: {testing.format(e)}")
+    }
+    r
+}
+
+fn test_objects_of_a_delta_pack_and_a_thin_pack_read_as_git_lists_them(t: *testing.T) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let r = from_packs(t, dir)
+    let listed = fixture_lines(t, "objects.txt")
+    t.equal(listed.len, 25)
+    for line in listed {
+        let fields = text.fields(line)
+        let o = r.read(fields[0]) catch {
+            e => {
+                t.error("read {fields[0]}: {message(e)}")
+                continue
+            }
+        }
+        t.equal(kind_name(o.kind), fields[1])
+        t.equal("{o.data.len}", fields[2])
+        t.equal(hash_object(o.kind, o.data), fields[0])
+    }
+}
+
+fn test_references_and_revisions_resolve_as_git_resolves_them(t: *testing.T) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let r = from_packs(t, dir)
+    var want: str[] = []
+    for line in fixture_lines(t, "refs.txt") {
+        let fields = text.fields(line)
+        if text.ends_with(fields[1], "^{{}}") {
+            let last = want.len - 1
+            want[last] = "{want[last]} {fields[0]}"
+        } else {
+            want.push("{fields[1]} {fields[0]}")
+        }
+    }
+    var got: str[] = []
+    let listed: Ref[] = r.refs("refs/") catch {
+        e => {
+            t.fatal("list refs: {message(e)}")
+            []
+        }
+    }
+    for found in listed {
+        got.push(if found.peeled == "" { "{found.name} {found.id}" } else { "{found.name} {found.id} {found.peeled}" })
+    }
+    t.equal_slice(got, want)
+    for line in fixture_lines(t, "revs.txt") {
+        let fields = text.fields(line)
+        let id = r.resolve(fields[0]) catch {
+            e => {
+                t.error("resolve {fields[0]}: {message(e)}")
+                continue
+            }
+        }
+        t.equal("{fields[0]} {id}", line)
+    }
+    let main = r.resolve("main") catch { e => testing.must(t, e, "") }
+    r.set_ref("refs/heads/topic", main) catch {
+        e => t.fatal("set topic: {message(e)}")
+    }
+    t.equal(r.resolve("topic") catch { e => testing.must(t, e, "") }, main)
+    t.equal(r.head() catch { e => testing.must(t, e, "") }, main)
+}
+
+fn has_git(t: *testing.T) -> bool {
+    if process.find("git") == none {
+        t.skip("needs git on PATH")
+        return false
+    }
+    for pair in [["GIT_CONFIG_GLOBAL", "/dev/null"], ["GIT_CONFIG_NOSYSTEM", "1"], ["GIT_AUTHOR_NAME", "low"], ["GIT_AUTHOR_EMAIL", "low@example.com"], ["GIT_COMMITTER_NAME", "low"], ["GIT_COMMITTER_EMAIL", "low@example.com"]] {
+        os.set_env(pair[0], pair[1]) catch {
+            e => t.fatal("set {pair[0]}: {testing.format(e)}")
+        }
+    }
+    true
+}
+
+fn git_output(t: *testing.T, args: str[]) -> str {
+    var c = process.command("git", args)
+    c.stdout = Piped
+    c.stderr = Piped
+    let out = process.run(c, []) catch {
+        e => testing.must(t, e, process.Output { status: Exited(1), stdout: [], stderr: [] })
+    }
+    if !process.success(out.status) {
+        t.fatal("git {text.join(args, " ")}: {str(out.stderr)}")
+    }
+    text.trim(str(out.stdout))
+}
+
+struct Planned {
+    path: str
+    body: str
+    mode: Mode
+}
+
+fn planned_files() -> Planned[] {
+    [
+        Planned { path: "a-b", body: "dash\n", mode: File }
+        Planned { path: "a.b", body: "dot\n", mode: File }
+        Planned { path: "a/inner.txt", body: "inner\n", mode: File }
+        Planned { path: "a0", body: "zero\n", mode: File }
+        Planned { path: "bin/run.sh", body: "echo hi\n", mode: Executable }
+        Planned { path: "link", body: "a.b", mode: Symlink }
+        Planned { path: "empty", body: "", mode: File }
+    ]
+}
+
+fn write_planned(t: *testing.T, root: str, files: Planned[]) {
+    for f in files {
+        let location = "{root}/{f.path}"
+        file.mkdir_all(location[..text.last_index_byte(location, '/')]) catch {
+            e => t.fatal("create the directory of {location}: {testing.format(e)}")
+        }
+        let mode = match f.mode {
+            Executable => 0o755
+            _ => 0o644
+        }
+        match f.mode {
+            Symlink => file.symlink(f.body, location) catch { e => t.fatal("link {location}: {testing.format(e)}") }
+            _ => file.write_text_mode(location, f.body, mode) catch { e => t.fatal("write {location}: {testing.format(e)}") }
+        }
+    }
+}
+
+fn tree_of(t: *testing.T, r: *Repository, files: Planned[], prefix: str) -> str {
+    var entries: TreeEntry[] = []
+    var dirs: str[] = []
+    for f in files {
+        let rest = text.strip_prefix(f.path, prefix) ?? continue
+        let slash = text.index_byte(rest, '/')
+        if slash >= 0 {
+            let dir = rest[..slash]
+            if !slices.contains(dirs, dir) {
+                dirs.push(dir)
+                entries.push(TreeEntry { name: dir, mode: Dir, id: tree_of(t, r, files, "{prefix}{dir}/") })
+            }
+            continue
+        }
+        let id = r.write_object(Blob, bytes(f.body)) catch { e => testing.must(t, e, "") }
+        entries.push(TreeEntry { name: rest, mode: f.mode, id })
+    }
+    r.write_tree(entries) catch { e => testing.must(t, e, "") }
+}
+
+fn test_written_objects_are_the_ones_git_writes_and_pass_fsck(t: *testing.T) {
+    if !has_git(t) {
+        return
+    }
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let r = bare(t, "{dir}/bare.git")
+    let files = planned_files()
+    let tree = tree_of(t, r, files, "")
+    let who = Signature { name: "low", email: "low@example.com", time: 1700000000, zone: "+0100" }
+    let commit = r.write_commit(Commit { tree, author: who, committer: who, message: "one\n" }) catch { e => testing.must(t, e, "") }
+    let tag = r.write_tag(TagInfo { object: commit, kind: Commit, name: "v1", tagger: who, message: "version 1\n" }) catch { e => testing.must(t, e, "") }
+    r.set_ref("refs/heads/main", commit) catch { e => t.fatal(message(e)) }
+    r.set_ref("refs/tags/v1", tag) catch { e => t.fatal(message(e)) }
+    git_output(t, ["--git-dir", r.git_dir, "fsck", "--strict", "--no-dangling"])
+    t.equal(git_output(t, ["--git-dir", r.git_dir, "rev-parse", "v1^{{}}", "HEAD^{{tree}}"]), "{commit}\n{tree}")
+    let work = "{dir}/work"
+    write_planned(t, work, files)
+    git_output(t, ["init", "--quiet", work])
+    git_output(t, ["-C", work, "add", "-A"])
+    t.equal(git_output(t, ["-C", work, "write-tree"]), tree)
+}
+
+fn snapshot(t: *testing.T, root: str) -> str[] {
+    var seen: str[] = []
+    file.walk(root, fn(v: file.Visit) -> file.Step {
+        if v.path == root {
+            return Continue
+        }
+        let name = v.path[root.len + 1..]
+        if v.link {
+            seen.push("{name} -> {file.readlink(v.path) or "?"}")
+        } else if v.regular {
+            let info = file.stat(v.path) or return Continue
+            seen.push("{name} {info.mode & 0o111 != 0} {str(file.read_file(v.path) or [])}")
+        } else if v.dir {
+            seen.push("{name}/")
+        }
+        Continue
+    }) catch {
+        e => t.fatal("walk {root}: {testing.format(e)}")
+    }
+    slices.sort(mut seen)
+    seen
+}
+
+fn test_export_writes_the_tree_git_archive_writes(t: *testing.T) {
+    if !has_git(t) {
+        return
+    }
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let work = "{dir}/work"
+    var files = planned_files()
+    for extra in [
+        Planned { path: ".gitattributes", body: "*.log export-ignore\n/docs/ export-ignore\nsecret/** export-ignore\n[xy].tmp export-ignore\nkeep.txt -export-ignore\n", mode: File }
+        Planned { path: "trace.log", body: "log\n", mode: File }
+        Planned { path: "nested/deep.log", body: "log\n", mode: File }
+        Planned { path: "docs/guide.md", body: "guide\n", mode: File }
+        Planned { path: "nested/docs/kept.md", body: "kept\n", mode: File }
+        Planned { path: "secret/key", body: "key\n", mode: File }
+        Planned { path: "secret/more/key", body: "key\n", mode: File }
+        Planned { path: "x.tmp", body: "x\n", mode: File }
+        Planned { path: "z.tmp", body: "z\n", mode: File }
+        Planned { path: "keep.txt", body: "keep\n", mode: File }
+        Planned { path: "sub/.gitattributes", body: "only.txt export-ignore\n", mode: File }
+        Planned { path: "sub/only.txt", body: "gone\n", mode: File }
+        Planned { path: "only.txt", body: "kept\n", mode: File }
+    ] {
+        files.push(extra)
+    }
+    write_planned(t, work, files)
+    git_output(t, ["init", "--quiet", work])
+    git_output(t, ["-C", work, "add", "-A"])
+    git_output(t, ["-C", work, "commit", "--quiet", "-m", "one"])
+    file.mkdir_all("{dir}/theirs") catch { e => t.fatal(testing.format(e)) }
+    var archive = process.command("sh", ["-c", "git -C \"$0\" archive HEAD | tar -x -C \"$1\"", work, "{dir}/theirs"])
+    archive.stderr = Piped
+    let out = process.run(archive, []) catch { e => testing.must(t, e, process.Output { status: Exited(1), stdout: [], stderr: [] }) }
+    if !process.success(out.status) {
+        t.fatal("git archive: {str(out.stderr)}")
+    }
+    let r = open(work) catch {
+        e => {
+            t.fatal("open {work}: {message(e)}")
+            panic("unreachable")
+        }
+    }
+    r.export("HEAD", "{dir}/ours") catch {
+        e => t.fatal("export: {message(e)}")
+    }
+    t.equal_slice(snapshot(t, "{dir}/ours"), snapshot(t, "{dir}/theirs"))
+}
+
+fn test_export_refuses_attributes_that_rewrite_content(t: *testing.T) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    let r = bare(t, dir)
+    let files = [
+        Planned { path: ".gitattributes", body: "*.c ident\n", mode: File }
+        Planned { path: "main.c", body: "$Id$\n", mode: File }
+    ]
+    let tree = tree_of(t, r, files, "")
+    let who = Signature { name: "low", email: "low@example.com", time: 1700000000 }
+    let commit = r.write_commit(Commit { tree, author: who, committer: who, message: "one\n" }) catch { e => testing.must(t, e, "") }
+    let failed = r.export_entries(commit) catch {
+        e => {
+            t.contains(message(e), "ident")
+            return
+        }
+    }
+    t.error("export_entries listed {failed.len} entries for a tree that sets ident")
+}
+
+fn test_configuration_reads_as_git_reads_it(t: *testing.T) {
+    let source = "# comment\n[Core]\n\tBare = false ; trailing\n[remote \"Origin\"]\n\turl = \"https://example.com/a b\" # quoted\n[url \"file:///srv/\"]\n\tinsteadOf = https://\n\tinsteadOf = git://\n[alias]\n\tflag\n\tlong = one \\\n two\n\tescaped = \"tab\\there \\\"q\\\" back\\\\slash\"\n[Section.Sub]\n\tkey = dotted\n"
+    let c = parse_config(source, "config") catch { e => testing.must(t, e, Config { settings: [] }) }
+    t.equal(c.get("core.bare") ?? "", "false")
+    t.equal(c.get("CORE.BARE") ?? "", "false")
+    t.equal(c.get("remote.Origin.url") ?? "", "https://example.com/a b")
+    t.is_none(c.get("remote.origin.url"))
+    t.equal_slice(c.get_all("url.file:///srv/.insteadof"), ["https://", "git://"])
+    t.equal(c.get("alias.flag") ?? "", "true")
+    t.equal(c.get("alias.long") ?? "", "one  two")
+    t.equal(c.get("alias.escaped") ?? "", "tab\there \"q\" back\\slash")
+    t.equal(c.get("section.sub.key") ?? "", "dotted")
+}
+
+fn test_configuration_reads_included_files_relative_to_the_including_one(t: *testing.T) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    file.write_text("{dir}/extra", "[user]\n\tname = included\n[include]\n\tpath = missing\n") catch { e => t.fatal(testing.format(e)) }
+    let c = parse_config("[user]\n\tname = first\n[include]\n\tpath = extra\n[core]\n\tbare = true\n", "{dir}/config") catch { e => testing.must(t, e, Config { settings: [] }) }
+    t.equal(c.get("user.name") ?? "", "included")
+    t.equal(c.get("core.bare") ?? "", "true")
+}
+
+fn test_discover_finds_the_repository_above_a_relative_path(t: *testing.T) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    init("{dir}/work", false) catch {
+        e => {
+            t.fatal("init: {message(e)}")
+            return
+        }
+    }
+    file.mkdir_all("{dir}/work/a/b") catch { e => t.fatal(testing.format(e)) }
+    os.chdir("{dir}/work/a") catch { e => t.fatal(testing.format(e)) }
+    let found = discover("b") catch {
+        e => {
+            t.fatal("discover: {message(e)}")
+            return
+        }
+    }
+    t.equal(found.git_dir, "{file.realpath(dir) or dir}/work/.git")
+}
+
+fn test_open_refuses_a_repository_extension_it_does_not_implement(t: *testing.T) {
+    let dir = scratch(t)
+    defer file.remove_all(dir) or {}
+    for i, extensions in ["\trefStorage = reftable\n", "\tunknownFeature = true\n", "\tobjectFormat = sha256\n"] {
+        let location = "{dir}/r{i}"
+        bare(t, location)
+        file.write_text("{location}/config", "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n{extensions}") catch {
+            e => t.fatal(testing.format(e))
+        }
+        let opened = open(location) catch {
+            e => {
+                match e {
+                    Unsupported(_) => {}
+                    _ => t.error("open {location}: {message(e)}")
+                }
+                continue
+            }
+        }
+        t.error("opened a repository with {text.trim(extensions)} as {opened.git_dir}")
+    }
+    let location = "{dir}/files"
+    bare(t, location)
+    file.write_text("{location}/config", "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\trefStorage = files\n\tpreciousObjects = true\n") catch {
+        e => t.fatal(testing.format(e))
+    }
+    let opened = open(location) catch {
+        e => {
+            t.error("open a files repository: {message(e)}")
+            return
+        }
+    }
+    t.equal(opened.git_dir, location)
+}
