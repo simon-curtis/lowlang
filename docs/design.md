@@ -2816,7 +2816,7 @@ A kernel and the functions it calls cannot use:
 
 The checker reports the first rejected construct a kernel reaches, in the kernel or in a function it calls, and names the kernel.
 
-`launch(kernel, count, arguments)` binds a kernel to the number of invocations to run and to its arguments after the index. It runs nothing: a function of `std/gpu` runs what it gives, once for each index below `count`.
+`launch(kernel, count, arguments)` binds a kernel to the number of invocations to run and to its arguments after the index. It runs nothing: a function of `std/gpu` runs what it gives, once for each index below `count`. What it gives has the type `launch`, so a job can be returned, held in a field and run any number of times.
 
 ```low
 import std/gpu
@@ -3111,7 +3111,7 @@ Every compile error and warning carries a code, printed after the message in bra
 
 ## Builtins
 
-Every module sees these names without an import. A function in the program named `launch`, `pop`, `truncate`, `close`, `sleep`, `wait_readable` or `wait_writable` takes precedence over the builtin. `compiler/check/builtins.low` is the only table of builtin names, parameters, `mut` markers, receivers and handlers. `compiler/tests/check` requires an entry here for each public one.
+Every module sees these names without an import. A function or a type in a module named `launch` takes precedence there over the builtin of that kind. A function in the program named `pop`, `truncate`, `close`, `sleep`, `wait_readable` or `wait_writable` takes precedence over the builtin. `compiler/check/builtins.low` is the only table of builtin names, parameters, `mut` markers, receivers and handlers. `compiler/tests/check` requires an entry here for each public one.
 
 ### `bytes`
 
@@ -3155,7 +3155,7 @@ Every module sees these names without an import. A function in the program named
 
 ### `launch`
 
-`launch(kernel, count: u32, arguments) -> *__Launch` binds a kernel to an invocation count and to one argument for each of its parameters after the index, and runs nothing. `kernel` is the name of a `kernel fn`. Each argument is checked against its parameter as in a call, with `mut` before the slice a `mut` parameter takes, and is evaluated once, after `count`. The result holds what a run needs: the kernel's SPIR-V module, the bytes of its push constants, each slice with its size in bytes, and a function that calls the kernel's CPU build with one index. `std/gpu` runs it.
+`launch(kernel, count: u32, arguments) -> launch` binds a kernel to an invocation count and to one argument for each of its parameters after the index, and runs nothing. `kernel` is the name of a `kernel fn`. Each argument is checked against its parameter as in a call, with `mut` before the slice a `mut` parameter takes, and is evaluated once, after `count`. The result holds what a run needs: the kernel's SPIR-V module, the bytes of its push constants, each slice with its size in bytes, and a function that calls the kernel's CPU build with one index. `std/gpu` runs it.
 
 ### `load`
 
@@ -3234,6 +3234,7 @@ Calling a numeric type converts a number to it, as in `u8(x)`, `f64(n)` and `i64
 | `bool` | `true` and `false`. |
 | `str` | An immutable pointer and length over UTF-8 bytes. `str(b)` copies a `u8[]` into a string, and `str(p)` copies a NUL-terminated `ptr[u8]`. |
 | `ptr` | `ptr[T]` is a nullable pointer to C memory. `ptr` alone is `void*` and converts to and from any `ptr[T]`. |
+| `launch` | What `launch(kernel, count, arguments)` gives: a kernel bound to its count and arguments, which `std/gpu` runs. |
 | `chan` | `chan[T]` is a channel of `T` values. `chan[T](n)` makes a channel holding up to `n` values. `chan[T]()` makes an unbuffered one. |
 | `u8x16` | 16 lanes of `u8`, 128 bits. |
 | `u8x32` | 32 lanes of `u8`, 256 bits. |
@@ -3512,7 +3513,7 @@ One sentence per module. Each name links to the module's page, which holds the r
 | `std/ratelimit` | `Bucket` (token bucket in exact nanosecond units) with `allow`, `allow_n`, `reserve`, `wait` and `set_rate`. |
 | `std/singleflight` | `Group[K, V]` with `do`, `do_shared`, `forget` and `in_flight`, which run one call per key while the others wait for its result. |
 | `std/parallel` | `each(count, job)` calls a job once for every index on one green thread per CPU, `chunks` hands it ranges of indices, `try_each` returns the error of the lowest failing index and `map` keeps the order of its slice. |
-| `std/gpu` | Runs what `launch` gives: `run(device, job)` on a Vulkan device that `open` gives, and `run_on_cpu(job)` on the CPU through `std/parallel`. |
+| `std/gpu` | Runs what `launch` gives: `run(device, job)` on a Vulkan device that `open` gives, which keeps each kernel's pipeline, and `run_on_cpu(job)` on the CPU through `std/parallel`. |
 | `std/atomic` | `Int`, `Bool` and `Flag` built on compare-and-swap, with `load_int`, `store_int`, `add_int`, `swap_int`, `compare_and_swap_int` and `update_int`, and the same forms for `Bool`. |
 | `std/rand` | A seedable, non-cryptographic xoshiro256** generator: `seeded`, `rng` (all 256 bits of state from `std/crypto`), `next`, unbiased `below` and `between`, `float`, `chance`, `shuffle` and `pick`. |
 | `std/uuid` | Random v4 and time-ordered v7 UUIDs, `format`, `parse` (reports the offset of the first bad character), `version`, `timestamp` for v7, `equal` and `nil`. |
@@ -9358,6 +9359,8 @@ Optimiser:
 
 A kernel is compiled like any function, and that function is what a call runs. `ir.kernel_builds` also gives each kernel the program reaches a second body, in `ir.Program.kernels`: a copy of the kernel's SSA as it was built, before the optimiser, with every call replaced by the body of its callee until none is left, then simplified. The checker has already refused recursion and calls through function values, so the loop ends. `low` does not build them into a program.
 
+### SPIR-V
+
 `compiler/spirv` turns one kernel build into a SPIR-V 1.5 compute module, `spirv.generate`:
 
 - The module declares the `Shader` and `Int64` capabilities, and `Float64` when the kernel computes in `f64` or calls `exp`, so a device needs `shaderInt64` and for those kernels `shaderFloat64`. The workgroup is 64 by 1 by 1.
@@ -9374,9 +9377,9 @@ A kernel is compiled like any function, and that function is what a call runs. `
 
 The push constant layout is `ir.kernel_layout`, which `compiler/spirv` and the lowering of `launch` both read: a member sits at the next multiple of its own size, 8 bytes for a 64-bit integer or `f64` and 4 for anything else.
 
-`launch` is lowered from an expansion the checker builds, `ast.Launch`: one binding for the count and one for each argument, and a call of the prelude's `__launch` with the count and a closure that calls the kernel with an index and the bound arguments. The lowering then gives the `__Launch` its module and writes its operands:
+The type `launch` is a pointer to the prelude's `__Launch`, whose `types.Type.pointer_name` makes a diagnostic print it as `launch`. `launch` is lowered from an expansion the checker builds, `ast.Launch`: one binding for the count and one for each argument, and a call of the prelude's `__launch` with the count and a closure that calls the kernel with an index and the bound arguments. The lowering then gives the `__Launch` its module and writes its operands:
 
-- The module is an `embed` value named by `ir.kernel_module_path`. `native` generates the module of each kernel a `launch` names and holds it with the embedded files, behind its length in 8 bytes. A kernel no `launch` names gets no module, so a kernel only called on the CPU builds whatever the back end refuses. A refusal of a launched kernel is the error `kernel-device` at the kernel. `compiler/wasm` holds an empty module, since `browser/wasm32` has no device.
+- The module is an `embed` value named by `ir.kernel_module_path`. `native` generates the module of each kernel a `launch` names, keeps it in `ir.Program.modules` behind its length in 8 bytes and holds it with the embedded files. The label of the embedded data carries a hash of those bytes from `ir.Program.module_digests`, as an embedded file's label carries the file's, so under `low dev` a change to a kernel or to a function it calls reloads the functions that launch it. A kernel no `launch` names gets no module, so a kernel only called on the CPU builds whatever the back end refuses. A refusal of a launched kernel is the error `kernel-device` at the kernel. `compiler/wasm` holds an empty module, since `browser/wasm32` has no device.
 - `__launch_scalar` writes each scalar argument at its member's offset, and `__launch_slice` writes each slice's length and records its pointer, its size in bytes and whether the parameter is `mut`.
 
 It fails with `spirv.Error.Unsupported` on a jump table, irreducible control flow, a float remainder, a load or store of 8 or 16 bits, a vector with lanes under 32 bits, a vector shuffle, a `mut` slice's header used as a value, an `if` whose two arms enter one block that holds a phi, a call's result read outside the call's block, a struct or vector passed as a scalar parameter, push constants over 128 bytes, and a runtime routine other than `rt_exp`.
@@ -9942,8 +9945,8 @@ Text areas:
   - `compiler/tests/vkgen` tests declaration parsing, extension enum values and the selection format, and checks the shape of the generated bindings. It renders a rounded, bordered quad offscreen with the quad shaders through the bindings and dynamic rendering, comparing pixels. It skips without libvulkan or a Vulkan 1.3 device.
 - `compiler/tests/shaders` checks that the sources and the SPIR-V match the sums recorded in `shaders.sum` and validates the SPIR-V with `spirv-val` when installed.
 - `compiler/tests/spirv` generates the module of each kernel in `testdata/run/kernel.low`. One test validates each module with `spirv-val --target-env vulkan1.2`; `compiler/oracletool` pins SPIRV-Tools v2026.4, and the test skips without it. The other runs `parity.py` under `python3`, skipping without it: `interp.py` interprets each module as the fixture's `main` calls its kernel, and the values must equal the lines of `testdata/run/kernel.out`. It also checks the flag after a failed bounds check and a division by zero, and that an invocation at or past the count stores nothing.
-- `testdata/run/launch.low` launches kernels from a function, a generic function and a closure and runs them with `gpu.run_on_cpu`, and prints the push constants each `launch` packs. `testdata/run/launch_imported` launches a kernel of another module. The `launch_*` programs in `testdata/fail` hold each rejected `launch`, and `launch_device` a kernel the SPIR-V back end refuses. `testdata/run/launch_imported` and `testdata/run/fork_imported` also hold a `launch` and a `fork` written in an imported module, whose expansions call prelude functions from outside the root module.
-- `std/gpu/device_test_amd64.low` runs kernels on every Vulkan device the host has and compares each with `run_on_cpu`: float arithmetic, struct slices with `bool`, `f64` and `i64` fields, loops, vectors, conversions, a count above `ir.kernel_row`, a job run after a collection, an empty slice and a count of zero. Division and `sqrt` are compared within a tolerance. Infinities, NaN and negative zero must come out as on the CPU. An index outside a slice and a division by zero must give `Faulted`. The tests skip on a host with no such device.
+- `testdata/run/launch.low` launches kernels from a function, a generic function and a closure and runs them with `gpu.run_on_cpu`, prints the push constants each `launch` packs, and returns a `launch` from a function and holds one in a struct field. `testdata/run/launch_shadowed` declares its own type named `launch` and still calls the builtin. `testdata/fail/launch_type` holds the name a mismatch prints for the type. `testdata/run/launch_imported` launches a kernel of another module. The `launch_*` programs in `testdata/fail` hold each rejected `launch`, and `launch_device` a kernel the SPIR-V back end refuses. `testdata/run/launch_imported` and `testdata/run/fork_imported` also hold a `launch` and a `fork` written in an imported module, whose expansions call prelude functions from outside the root module.
+- `std/gpu/device_test_amd64.low` runs kernels on every Vulkan device the host has and compares each with `run_on_cpu`: float arithmetic, struct slices with `bool`, `f64` and `i64` fields, loops, vectors, conversions, a count above `ir.kernel_row`, a job run after a collection, an empty slice and a count of zero. Division and `sqrt` are compared within a tolerance. Infinities, NaN and negative zero must come out as on the CPU. An index outside a slice and a division by zero must give `Faulted`. Two kernels alternate on one device over slices that grow and shrink, and a module whose bytes change at one address must be built again. These tests skip on a host with no such device. One test checks the order `open` prefers devices in.
 
 ## Tests
 
@@ -9969,7 +9972,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - `.args` lists extra arguments for `low test`, one per line, after the path and `--notime`.
   - `.out` and `.err` are the expected stdout and stderr, empty when absent, with the absolute path of the directory removed. Module names are paths from the repository root. The repository root is the working directory of `lowtest`.
   - `.status` is the expected exit status, `0` when absent.
-- `bench/<name>/main.low` are the benchmark programs. The compile benchmark and the determinism test use them.
+- `bench/<name>/main.low` are the benchmark programs. The compile benchmark and the determinism test use them. `bench/blur` blurs a 3840 by 2160 image of `u32` pixels with two kernels, on the CPU and on every device, prints the time of the first round and the fastest later one, and exits with status 1 when a device's pixels differ from the CPU's.
 
 ### Checks
 
@@ -10016,6 +10019,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - stored function values, closures, callbacks and spawned threads running patched code;
   - a program with more functions than the smallest `fn_table`;
   - instances of an edited generic function patched;
+  - a kernel edit reloading the functions that launch it;
   - restarts on layout, signature and capture changes.
 - `compiler/lowfuzz` generates well-typed, terminating programs from a choice stream (`compiler/fuzz/gen`). It predicts their output with a reference interpreter (`compiler/fuzz/model`). It builds each program for the host with the release profile and with the dev profile. The profiles give the same optimisation and hot-reload code generation as `low build` and `low dev`. It runs both builds and reports any of these (`compiler/fuzz/oracle`):
   - compiler panic;

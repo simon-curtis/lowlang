@@ -2,20 +2,10 @@ import std/sync
 
 /// A Vulkan device that runs kernels. A program built for `browser/wasm32` has none: `devices` is empty and `open` fails with `NoDevice`.
 ///
-/// Releasing a `Device` waits for its queue to go idle and destroys the device and its instance. One `run` uses the device at a time; a second green thread waits.
+/// A `Device` keeps the pipeline of each kernel it has run and the buffers of its last run. Releasing it waits for its queue to go idle and destroys them, the device and its instance. One `run` uses the device at a time; a second green thread waits.
 pub struct Device {
     state: *State
     drop close(state)
-}
-
-/// One device `devices` found.
-pub struct Info {
-    /// The position to give `open_on`.
-    pub index: i64
-    /// The name the driver gives the device.
-    pub name: str
-    /// Whether the device runs a kernel that uses `f64` or `exp`.
-    pub float64: bool
 }
 
 struct State {
@@ -27,6 +17,8 @@ struct State {
     memory_types: VkMemoryType[] = []
     name: str = ""
     float64: bool = false
+    programs: [i64: *Program] = [:]
+    buffers: Buffer[] = []
     running: sync.Mutex
 }
 
@@ -47,7 +39,11 @@ fn create_instance() -> VkInstance ! Error {
     let app = pins.hold(VkApplicationInfo { apiVersion: vk_make_api_version(0, 1, 2, 0) })
     var info = VkInstanceCreateInfo { pApplicationInfo: app }
     var instance = VkInstance {}
-    check(vkCreateInstance(mut info, null, mut instance), "vkCreateInstance")?
+    let result = vkCreateInstance(mut info, null, mut instance)
+    if result == VK_ERROR_INCOMPATIBLE_DRIVER {
+        fail NoDevice
+    }
+    check(result, "vkCreateInstance")?
     instance
 }
 
@@ -92,8 +88,28 @@ fn candidate(physical: VkPhysicalDevice, index: i64) -> Candidate? {
         return none
     }
     let family = compute_family(physical) ?? return none
-    let info = Info { index, name: VkPhysicalDeviceProperties_deviceName(props), float64: features.shaderFloat64 != 0 }
+    let info = Info { index, name: VkPhysicalDeviceProperties_deviceName(props), kind: kind_of(props.deviceType), float64: features.shaderFloat64 != 0 }
     Candidate { physical, family, info }
+}
+
+fn kind_of(device_type: i32) -> Kind {
+    match device_type {
+        VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => Kind.Discrete
+        VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => Kind.Integrated
+        VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => Kind.Virtual
+        VK_PHYSICAL_DEVICE_TYPE_CPU => Kind.Software
+        _ => Kind.Other
+    }
+}
+
+fn rank(k: Kind) -> i64 {
+    match k {
+        Discrete => 0
+        Integrated => 1
+        Virtual => 2
+        Other => 3
+        Software => 4
+    }
 }
 
 fn candidates(instance: VkInstance) -> Candidate[] ! Error {
@@ -107,9 +123,12 @@ fn candidates(instance: VkInstance) -> Candidate[] ! Error {
     usable
 }
 
-/// Lists the devices that can run kernels: each has Vulkan 1.2, 64-bit integers in shaders and a compute queue.
+/// Lists the devices that can run kernels: each has Vulkan 1.2, 64-bit integers in shaders and a compute queue. The list is empty on a machine with no Vulkan driver.
 pub fn devices() -> Info[] ! Error {
-    let instance = create_instance()?
+    let instance = create_instance() catch {
+        NoDevice => return []
+        e => fail e
+    }
     defer vkDestroyInstance(instance, null)
     var found: Info[] = []
     for c in candidates(instance)? {
@@ -118,27 +137,45 @@ pub fn devices() -> Info[] ! Error {
     found
 }
 
-/// Opens the first device `devices` lists, or fails with `NoDevice`.
+/// Opens the device `devices` lists that has the first `Kind` in the order `Discrete`, `Integrated`, `Virtual`, `Other`, `Software`, and the lowest index among those. Fails with `NoDevice` when the list is empty.
 pub fn open() -> Device ! Error {
-    open_where(fn(i: Info) -> bool { true })
+    open_chosen(preferred)
 }
 
 /// Opens the device `devices` lists with `index`, or fails with `NoDevice`.
 pub fn open_on(index: i64) -> Device ! Error {
-    open_where(fn(i: Info) -> bool { i.index == index })
+    open_chosen(fn(found: Candidate[]) -> Candidate? {
+        for c in found {
+            if c.info.index == index {
+                return c
+            }
+        }
+        none
+    })
 }
 
-fn open_where(wanted: fn(Info) -> bool) -> Device ! Error {
+fn preferred(found: Candidate[]) -> Candidate? {
+    var best: Candidate? = none
+    for c in found {
+        match best {
+            some(b) => {
+                if rank(c.info.kind) < rank(b.info.kind) {
+                    best = c
+                }
+            }
+            none => { best = c }
+        }
+    }
+    best
+}
+
+fn open_chosen(choose: fn(Candidate[]) -> Candidate?) -> Device ! Error {
     let state = new(State { running: sync.mutex() })
     using d = Device { state }
     state.instance = create_instance()?
-    for c in candidates(state.instance)? {
-        if wanted(c.info) {
-            build(state, c)?
-            return d
-        }
-    }
-    fail NoDevice
+    let chosen = choose(candidates(state.instance)?) ?? fail NoDevice
+    build(state, chosen)?
+    d
 }
 
 fn build(s: *State, c: Candidate) ! Error {
@@ -165,6 +202,12 @@ fn build(s: *State, c: Candidate) ! Error {
 fn close(s: *State) {
     if s.handle.handle != null {
         let _ = vkQueueWaitIdle(s.queue)
+        for _, p in s.programs {
+            destroy_program(s, p)
+        }
+        s.programs = [:]
+        destroy_buffers(s, s.buffers)
+        s.buffers = []
         vkDestroyCommandPool(s.handle, s.pool, null)
         vkDestroyDevice(s.handle, null)
         s.handle = VkDevice {}

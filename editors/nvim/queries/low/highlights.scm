@@ -25,10 +25,10 @@
   (#match? @constructor "^[A-Z]"))
 
 ((type_identifier) @type
-  (#not-match? @type "^(i64|i32|u64|u32|u16|u8|f64|f32|bool|str|ptr|chan|u8x16|u8x32|u8x64|u16x8|u16x16|u16x32|i32x4|i32x8|i32x16|u32x4|u32x8|u32x16|i64x2|i64x4|i64x8|u64x2|u64x4|u64x8|f32x4|f32x8|f32x16|f64x2|f64x4|f64x8)$"))
+  (#not-match? @type "^(i64|i32|u64|u32|u16|u8|f64|f32|bool|str|ptr|launch|chan|u8x16|u8x32|u8x64|u16x8|u16x16|u16x32|i32x4|i32x8|i32x16|u32x4|u32x8|u32x16|i64x2|i64x4|i64x8|u64x2|u64x4|u64x8|f32x4|f32x8|f32x16|f64x2|f64x4|f64x8)$"))
 
 ((type_identifier) @type.builtin
-  (#match? @type.builtin "^(i64|i32|u64|u32|u16|u8|f64|f32|bool|str|ptr|chan|u8x16|u8x32|u8x64|u16x8|u16x16|u16x32|i32x4|i32x8|i32x16|u32x4|u32x8|u32x16|i64x2|i64x4|i64x8|u64x2|u64x4|u64x8|f32x4|f32x8|f32x16|f64x2|f64x4|f64x8)$"))
+  (#match? @type.builtin "^(i64|i32|u64|u32|u16|u8|f64|f32|bool|str|ptr|launch|chan|u8x16|u8x32|u8x64|u16x8|u16x16|u16x32|i32x4|i32x8|i32x16|u32x4|u32x8|u32x16|i64x2|i64x4|i64x8|u64x2|u64x4|u64x8|f32x4|f32x8|f32x16|f64x2|f64x4|f64x8)$"))
 
 (field_identifier) @property
 
@@ -44,11 +44,11 @@
 (call_expression
   function: (identifier) @function.call
   (#match? @function.call "^[a-z_]")
-  (#not-any-of? @function.call "print" "new" "panic" "push" "pop" "truncate" "delete" "bytes" "cstr" "view" "load" "store" "pin" "unpin" "embed" "embed_dir" "launch" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
+  (#not-any-of? @function.call "print" "new" "panic" "push" "pop" "truncate" "delete" "bytes" "cstr" "view" "load" "store" "pin" "unpin" "embed" "embed_dir" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
 
 (call_expression
   function: (identifier) @function.builtin
-  (#any-of? @function.builtin "print" "new" "panic" "push" "pop" "truncate" "delete" "bytes" "cstr" "view" "load" "store" "pin" "unpin" "embed" "embed_dir" "launch" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
+  (#any-of? @function.builtin "print" "new" "panic" "push" "pop" "truncate" "delete" "bytes" "cstr" "view" "load" "store" "pin" "unpin" "embed" "embed_dir" "sqrt" "floor" "exp" "close" "sleep" "wait_readable" "wait_writable"))
 
 (call_expression
   function: (field_expression

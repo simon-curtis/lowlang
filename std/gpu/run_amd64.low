@@ -11,19 +11,20 @@ struct Buffer {
     mapped: ptr = null
 }
 
-struct Pass {
+struct Program {
+    source: u8[]
     shader: VkShaderModule = VkShaderModule {}
     bindings: VkDescriptorSetLayout = VkDescriptorSetLayout {}
     layout: VkPipelineLayout = VkPipelineLayout {}
     pipeline: VkPipeline = VkPipeline {}
     sets: VkDescriptorPool = VkDescriptorPool {}
-    buffers: Buffer[] = []
+    set: VkDescriptorSet = VkDescriptorSet {}
 }
 
 /// Runs every invocation of `job` on the device and returns when all have finished.
 ///
 /// `job` is what `launch` gives. `run` copies each slice to the device, runs the kernel's device build once for each index below the job's count, in no defined order, and copies the `mut` slices back. An invocation that indexes outside a slice or divides by zero stops, and `run` fails with `Faulted` after the others have run. A job with a count of zero runs nothing.
-pub fn run(d: Device, job: *__Launch) ! Error {
+pub fn run(d: Device, job: launch) ! Error {
     let s = d.state
     sync.lock(s.running)
     defer sync.unlock(s.running)
@@ -36,13 +37,13 @@ pub fn run(d: Device, job: *__Launch) ! Error {
     if uses_float64(job.module) && !s.float64 {
         fail NoFloat64(s.name)
     }
-    let pass = new(Pass {})
-    defer destroy_pass(s, pass)
-    build_pass(s, pass, job)?
-    upload(pass, job)
-    dispatch(s, pass, job)?
-    download(pass, job)
-    fault(pass)?
+    let program = program_of(s, job)?
+    claim_buffers(s, job)?
+    bind_buffers(s, program)
+    upload(s, job)
+    dispatch(s, program, job)?
+    download(s, job)
+    fault(s.buffers[0])?
 }
 
 fn word(module: u8[], at: i64) -> u32 {
@@ -60,29 +61,165 @@ fn uses_float64(module: u8[]) -> bool {
     false
 }
 
-fn mapped_type(s: *State, allowed: u32) -> u32 ! Error {
-    let wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+fn address(module: u8[]) -> i64 {
+    let at = pin(module)
+    unpin(at)
+    i64(at)
+}
+
+fn same_bytes(a: u8[], b: u8[]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn program_of(s: *State, job: launch) -> *Program ! Error {
+    let key = address(job.module)
+    match s.programs[key] {
+        some(kept) => {
+            if same_bytes(kept.source, job.module) {
+                return kept
+            }
+            destroy_program(s, kept)
+            s.programs.delete(key)
+        }
+        none => {}
+    }
+    let source: u8[] = __make(job.module.len)
+    __memmove(source, job.module)
+    let built = new(Program { source })
+    build_program(s, built, job) catch {
+        e => {
+            destroy_program(s, built)
+            fail e
+        }
+    }
+    s.programs[key] = built
+    built
+}
+
+fn build_program(s: *State, p: *Program, job: launch) ! Error {
+    using var pins = new_pins()
+    let code: ptr = pins.hold_all(p.source)
+    var shader = VkShaderModuleCreateInfo { codeSize: p.source.len, pCode: code }
+    check(vkCreateShaderModule(s.handle, mut shader, null, mut p.shader), "vkCreateShaderModule")?
+    var slots: VkDescriptorSetLayoutBinding[] = []
+    for i in 0..job.operands.len + 1 {
+        slots.push(VkDescriptorSetLayoutBinding { binding: u32(i), descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: 1, stageFlags: VK_SHADER_STAGE_COMPUTE_BIT })
+    }
+    var bindings = VkDescriptorSetLayoutCreateInfo { bindingCount: u32(slots.len), pBindings: pins.hold_all(slots) }
+    check(vkCreateDescriptorSetLayout(s.handle, mut bindings, null, mut p.bindings), "vkCreateDescriptorSetLayout")?
+    let layouts = pins.hold_all([p.bindings])
+    let constants = pins.hold(VkPushConstantRange { stageFlags: VK_SHADER_STAGE_COMPUTE_BIT, size: u32(job.constants.len) })
+    var layout = VkPipelineLayoutCreateInfo { setLayoutCount: 1, pSetLayouts: layouts, pushConstantRangeCount: 1, pPushConstantRanges: constants }
+    check(vkCreatePipelineLayout(s.handle, mut layout, null, mut p.layout), "vkCreatePipelineLayout")?
+    let entry: ptr[u8] = pins.hold_all(bytes("main\0"))
+    let stage = VkPipelineShaderStageCreateInfo { stage: VK_SHADER_STAGE_COMPUTE_BIT, module: p.shader, pName: entry }
+    let made: VkPipeline[] = [VkPipeline {}]
+    let wanted = pins.hold_all([VkComputePipelineCreateInfo { stage, layout: p.layout }])
+    check(vkCreateComputePipelines(s.handle, VkPipelineCache {}, 1, wanted, null, pins.hold_all(made)), "vkCreateComputePipelines")?
+    p.pipeline = made[0]
+    let sizes = pins.hold(VkDescriptorPoolSize { type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: u32(slots.len) })
+    var pool = VkDescriptorPoolCreateInfo { maxSets: 1, poolSizeCount: 1, pPoolSizes: sizes }
+    check(vkCreateDescriptorPool(s.handle, mut pool, null, mut p.sets), "vkCreateDescriptorPool")?
+    let sets: VkDescriptorSet[] = [VkDescriptorSet {}]
+    var set = VkDescriptorSetAllocateInfo { descriptorPool: p.sets, descriptorSetCount: 1, pSetLayouts: layouts }
+    check(vkAllocateDescriptorSets(s.handle, mut set, pins.hold_all(sets)), "vkAllocateDescriptorSets")?
+    p.set = sets[0]
+}
+
+fn destroy_program(s: *State, p: *Program) {
+    vkDestroyDescriptorPool(s.handle, p.sets, null)
+    vkDestroyPipeline(s.handle, p.pipeline, null)
+    vkDestroyPipelineLayout(s.handle, p.layout, null)
+    vkDestroyDescriptorSetLayout(s.handle, p.bindings, null)
+    vkDestroyShaderModule(s.handle, p.shader, null)
+}
+
+fn memory_type(s: *State, allowed: u32, wanted: u32) -> u32? {
     for i, kind in s.memory_types {
         let bit: u32 = 1 << i
         if allowed & bit != 0 && kind.propertyFlags & wanted == wanted {
             return u32(i)
         }
     }
-    fail NoMemoryType(allowed)
+    none
 }
 
-fn add_buffer(s: *State, pass: *Pass, bytes: i64) ! Error {
-    let size = if bytes < 4 { 4 } else { (bytes + 3) / 4 * 4 }
-    pass.buffers.push(Buffer { size })
-    let at = pass.buffers.len - 1
-    var info = VkBufferCreateInfo { size, usage: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, sharingMode: VK_SHARING_MODE_EXCLUSIVE }
-    check(vkCreateBuffer(s.handle, mut info, null, mut pass.buffers[at].handle), "vkCreateBuffer")?
+fn mapped_type(s: *State, allowed: u32) -> u32 ! Error {
+    let mapped = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    memory_type(s, allowed, mapped | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ?? memory_type(s, allowed, mapped) ?? fail NoMemoryType(allowed)
+}
+
+fn fill_buffer(s: *State, mut b: Buffer) ! Error {
+    var info = VkBufferCreateInfo { size: b.size, usage: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, sharingMode: VK_SHARING_MODE_EXCLUSIVE }
+    check(vkCreateBuffer(s.handle, mut info, null, mut b.handle), "vkCreateBuffer")?
     var needs = VkMemoryRequirements {}
-    vkGetBufferMemoryRequirements(s.handle, pass.buffers[at].handle, mut needs)
+    vkGetBufferMemoryRequirements(s.handle, b.handle, mut needs)
     var wanted = VkMemoryAllocateInfo { allocationSize: needs.size, memoryTypeIndex: mapped_type(s, needs.memoryTypeBits)? }
-    check(vkAllocateMemory(s.handle, mut wanted, null, mut pass.buffers[at].memory), "vkAllocateMemory")?
-    check(vkBindBufferMemory(s.handle, pass.buffers[at].handle, pass.buffers[at].memory, 0), "vkBindBufferMemory")?
-    check(vkMapMemory(s.handle, pass.buffers[at].memory, 0, size, 0, mut pass.buffers[at].mapped), "vkMapMemory")?
+    check(vkAllocateMemory(s.handle, mut wanted, null, mut b.memory), "vkAllocateMemory")?
+    check(vkBindBufferMemory(s.handle, b.handle, b.memory, 0), "vkBindBufferMemory")?
+    check(vkMapMemory(s.handle, b.memory, 0, b.size, 0, mut b.mapped), "vkMapMemory")?
+}
+
+fn new_buffer(s: *State, size: i64) -> Buffer ! Error {
+    var b = Buffer { size }
+    fill_buffer(s, mut b) catch {
+        e => {
+            destroy_buffers(s, [b])
+            fail e
+        }
+    }
+    b
+}
+
+fn destroy_buffers(s: *State, buffers: Buffer[]) {
+    for b in buffers {
+        vkDestroyBuffer(s.handle, b.handle, null)
+        vkFreeMemory(s.handle, b.memory, null)
+    }
+}
+
+fn padded(bytes: i64) -> i64 {
+    if bytes < 4 {
+        return 4
+    }
+    (bytes + 3) / 4 * 4
+}
+
+fn fitting(spare: Buffer[], size: i64) -> i64? {
+    for i, b in spare {
+        if b.size >= size && b.size <= size * 2 {
+            return i
+        }
+    }
+    none
+}
+
+fn claim_buffers(s: *State, job: launch) ! Error {
+    var sizes = [flag_bytes]
+    for o in job.operands {
+        sizes.push(padded(o.bytes))
+    }
+    var spare = s.buffers
+    s.buffers = []
+    defer destroy_buffers(s, spare)
+    for size in sizes {
+        match fitting(spare, size) {
+            some(at) => {
+                s.buffers.push(spare[at])
+                spare[at] = spare[spare.len - 1]
+                spare.pop()
+            }
+            none => s.buffers.push(new_buffer(s, size)?)
+        }
+    }
 }
 
 fn contents(b: Buffer) -> u8[] {
@@ -95,71 +232,36 @@ fn held(o: __Operand) -> u8[] {
     view(at, o.bytes)
 }
 
-fn build_pass(s: *State, pass: *Pass, job: *__Launch) ! Error {
+fn bind_buffers(s: *State, p: *Program) {
     using var pins = new_pins()
-    let code: ptr = pins.hold_all(job.module)
-    var shader = VkShaderModuleCreateInfo { codeSize: job.module.len, pCode: code }
-    check(vkCreateShaderModule(s.handle, mut shader, null, mut pass.shader), "vkCreateShaderModule")?
-    add_buffer(s, pass, flag_bytes)?
-    for o in job.operands {
-        add_buffer(s, pass, o.bytes)?
-    }
-    var slots: VkDescriptorSetLayoutBinding[] = []
-    for i in 0..pass.buffers.len {
-        slots.push(VkDescriptorSetLayoutBinding { binding: u32(i), descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: 1, stageFlags: VK_SHADER_STAGE_COMPUTE_BIT })
-    }
-    var bindings = VkDescriptorSetLayoutCreateInfo { bindingCount: u32(slots.len), pBindings: pins.hold_all(slots) }
-    check(vkCreateDescriptorSetLayout(s.handle, mut bindings, null, mut pass.bindings), "vkCreateDescriptorSetLayout")?
-    let layouts = pins.hold_all([pass.bindings])
-    let constants = pins.hold(VkPushConstantRange { stageFlags: VK_SHADER_STAGE_COMPUTE_BIT, size: u32(job.constants.len) })
-    var layout = VkPipelineLayoutCreateInfo { setLayoutCount: 1, pSetLayouts: layouts, pushConstantRangeCount: 1, pPushConstantRanges: constants }
-    check(vkCreatePipelineLayout(s.handle, mut layout, null, mut pass.layout), "vkCreatePipelineLayout")?
-    let entry: ptr[u8] = pins.hold_all(bytes("main\0"))
-    let stage = VkPipelineShaderStageCreateInfo { stage: VK_SHADER_STAGE_COMPUTE_BIT, module: pass.shader, pName: entry }
-    let made: VkPipeline[] = [VkPipeline {}]
-    let wanted = pins.hold_all([VkComputePipelineCreateInfo { stage, layout: pass.layout }])
-    check(vkCreateComputePipelines(s.handle, VkPipelineCache {}, 1, wanted, null, pins.hold_all(made)), "vkCreateComputePipelines")?
-    pass.pipeline = made[0]
-    let sizes = pins.hold(VkDescriptorPoolSize { type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: u32(pass.buffers.len) })
-    var pool = VkDescriptorPoolCreateInfo { maxSets: 1, poolSizeCount: 1, pPoolSizes: sizes }
-    check(vkCreateDescriptorPool(s.handle, mut pool, null, mut pass.sets), "vkCreateDescriptorPool")?
-}
-
-fn bound_set(s: *State, pass: *Pass, mut pins: Pins) -> ptr[VkDescriptorSet] ! Error {
-    let sets: VkDescriptorSet[] = [VkDescriptorSet {}]
-    let at = pins.hold_all(sets)
-    var wanted = VkDescriptorSetAllocateInfo { descriptorPool: pass.sets, descriptorSetCount: 1, pSetLayouts: pins.hold_all([pass.bindings]) }
-    check(vkAllocateDescriptorSets(s.handle, mut wanted, at), "vkAllocateDescriptorSets")?
     var writes: VkWriteDescriptorSet[] = []
-    for i, b in pass.buffers {
+    for i, b in s.buffers {
         let whole = pins.hold(VkDescriptorBufferInfo { buffer: b.handle, range: b.size })
-        writes.push(VkWriteDescriptorSet { dstSet: sets[0], dstBinding: u32(i), descriptorCount: 1, descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pBufferInfo: whole })
+        writes.push(VkWriteDescriptorSet { dstSet: p.set, dstBinding: u32(i), descriptorCount: 1, descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pBufferInfo: whole })
     }
     vkUpdateDescriptorSets(s.handle, u32(writes.len), pins.hold_all(writes), 0, null)
-    at
 }
 
-fn upload(pass: *Pass, job: *__Launch) {
-    for i, b in pass.buffers {
-        var staged = contents(b)
-        for at in 0..staged.len {
-            staged[at] = 0
-        }
-        if i > 0 && job.operands[i - 1].bytes > 0 {
-            __memmove(staged[..job.operands[i - 1].bytes], held(job.operands[i - 1]))
+fn upload(s: *State, job: launch) {
+    var flag = contents(s.buffers[0])
+    for at in 0..flag.len {
+        flag[at] = 0
+    }
+    for i, o in job.operands {
+        if o.bytes > 0 {
+            __memmove(contents(s.buffers[i + 1])[..o.bytes], held(o))
         }
     }
 }
 
-fn dispatch(s: *State, pass: *Pass, job: *__Launch) ! Error {
+fn dispatch(s: *State, p: *Program, job: launch) ! Error {
     using var pins = new_pins()
-    let set = bound_set(s, pass, mut pins)?
     var begin = VkCommandBufferBeginInfo {}
     check(vkBeginCommandBuffer(s.commands, mut begin), "vkBeginCommandBuffer")?
-    vkCmdBindPipeline(s.commands, VK_PIPELINE_BIND_POINT_COMPUTE, pass.pipeline)
-    vkCmdBindDescriptorSets(s.commands, VK_PIPELINE_BIND_POINT_COMPUTE, pass.layout, 0, 1, set, 0, null)
+    vkCmdBindPipeline(s.commands, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline)
+    vkCmdBindDescriptorSets(s.commands, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, pins.hold_all([p.set]), 0, null)
     let constants: ptr = pins.hold_all(job.constants)
-    vkCmdPushConstants(s.commands, pass.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, u32(job.constants.len), constants)
+    vkCmdPushConstants(s.commands, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, u32(job.constants.len), constants)
     if job.count <= job.row {
         vkCmdDispatch(s.commands, u32((job.count + job.group - 1) / job.group), 1, 1)
     } else {
@@ -171,32 +273,19 @@ fn dispatch(s: *State, pass: *Pass, job: *__Launch) ! Error {
     check(vkQueueWaitIdle(s.queue), "vkQueueWaitIdle")?
 }
 
-fn download(pass: *Pass, job: *__Launch) {
+fn download(s: *State, job: launch) {
     for i, o in job.operands {
         if o.mutable && o.bytes > 0 {
-            __memmove(held(o), contents(pass.buffers[i + 1])[..o.bytes])
+            __memmove(held(o), contents(s.buffers[i + 1])[..o.bytes])
         }
     }
 }
 
-fn fault(pass: *Pass) ! Error {
-    match word(contents(pass.buffers[0]), 0) {
+fn fault(flag: Buffer) ! Error {
+    match word(contents(flag), 0) {
         0 => {}
         1 => fail Faulted(Fault.OutOfRange)
         2 => fail Faulted(Fault.DivideByZero)
         _ => fail Faulted(Fault.BadAddress)
-    }
-}
-
-fn destroy_pass(s: *State, pass: *Pass) {
-    let _ = vkQueueWaitIdle(s.queue)
-    vkDestroyDescriptorPool(s.handle, pass.sets, null)
-    vkDestroyPipeline(s.handle, pass.pipeline, null)
-    vkDestroyPipelineLayout(s.handle, pass.layout, null)
-    vkDestroyDescriptorSetLayout(s.handle, pass.bindings, null)
-    vkDestroyShaderModule(s.handle, pass.shader, null)
-    for b in pass.buffers {
-        vkDestroyBuffer(s.handle, b.handle, null)
-        vkFreeMemory(s.handle, b.memory, null)
     }
 }
