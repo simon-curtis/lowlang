@@ -1,0 +1,223 @@
+import ast
+import compiler
+import lsp
+import target
+import types
+import std/path
+import std/slices
+import std/text
+
+pub enum Error {
+    Front(compiler.Error)
+    Failed(message: str)
+}
+
+pub fn message(e: Error) -> str {
+    match e {
+        Front(inner) => compiler.message(inner)
+        Failed(m) => m
+    }
+}
+
+pub struct Config {
+    pub target: str
+    pub platform: target.OS
+    pub depth: i64 = 1
+    pub budget: i64 = 0
+    pub callers: bool = false
+    pub json: bool = false
+}
+
+struct Wanted {
+    module: str = ""
+    file: str = ""
+    line: i64 = 0
+    column: i64 = 0
+    names: []str = []
+}
+
+struct Session {
+    docs: *compiler.Overlay
+    std: *compiler.Std
+    program: lsp.Program
+    cwd: str
+    module: str
+    left_out: []str
+    texts: [str: lsp.Text] = [:]
+    indexes: [str: *lsp.Index] = [:]
+    keyed: [str: *Decl] = [:]
+    typed: [*types.Type: *Decl] = [:]
+    files: [str: []*Decl] = [:]
+}
+
+/// Returns the context for editing the definition that `c.target` names: its source, what it uses to `c.depth` levels, its callers under `c.callers`, and the imports, cut to `c.budget` tokens when that is positive.
+pub fn context(docs: *compiler.Overlay, c: Config) -> str ! Error {
+    let w = parse_target(c.target)?
+    let s = open(docs, w, c.platform, c.callers)?
+    let found = s.find(w)?
+    var callers: []Site = []
+    if c.callers {
+        callers = s.sites(found)
+    }
+    let gathered = s.gather(found.decl, c.depth)
+    let shown = Shown { found, uses: gathered, sites: callers, searched: c.callers, depth: c.depth, budget: c.budget }
+    if c.json {
+        return s.context_json(shown)
+    }
+    s.context_text(shown)
+}
+
+/// Returns every use of the definition that `spec` names across the project that holds it, one per line.
+pub fn refs(docs: *compiler.Overlay, spec: str, platform: target.OS, json: bool) -> str ! Error {
+    let w = parse_target(spec)?
+    let s = open(docs, w, platform, true)?
+    let found = s.find(w)?
+    let found_sites = s.sites(found)
+    if json {
+        return s.refs_json(found_sites)
+    }
+    s.refs_text(found_sites)
+}
+
+fn shape_error(spec: str) -> Error {
+    Error.Failed("{spec}: name a definition as module.name, module.Type.member or file.low:line:col")
+}
+
+fn parse_target(spec: str) -> Wanted ! Error {
+    let at = text.index(spec, ".low:")
+    if at >= 0 {
+        let parts = text.split(spec[at + 5..], ':')
+        if parts.len > 2 {
+            fail shape_error(spec)
+        }
+        var w = Wanted { file: spec[..at + 4], line: whole(spec, parts[0])? }
+        if parts.len == 2 {
+            w.column = whole(spec, parts[1])?
+        }
+        return w
+    }
+    let slash = text.last_index_byte(spec, '/') + 1
+    let dot = text.index_byte(spec[slash..], '.')
+    if dot <= 0 {
+        fail shape_error(spec)
+    }
+    let names = text.split(spec[slash + dot + 1..], '.')
+    if names.len > 2 || names.any(fn(n) n == "") {
+        fail shape_error(spec)
+    }
+    Wanted { module: spec[..slash + dot], names }
+}
+
+fn whole(spec: str, digits: str) -> i64 ! Error {
+    let n = text.parse_int(digits) catch {
+        _ => fail shape_error(spec)
+    }
+    if n < 1 {
+        fail shape_error(spec)
+    }
+    n
+}
+
+fn placement(docs: *compiler.Overlay, w: Wanted) -> compiler.Placement ! Error {
+    var spec = w.module
+    if w.file != "" {
+        spec = path.dir(path.clean(w.file))
+    }
+    if spec == "std" || text.starts_with(spec, "std/") {
+        return compiler.Placement { root: ".", name: spec }
+    }
+    let info = compiler.overlay_stat(docs, spec) catch {
+        _ => return compiler.Placement { root: ".", name: spec }
+    }
+    if !info.dir {
+        fail Error.Failed("{spec}: not a directory")
+    }
+    compiler.module_of(docs, spec) catch Front
+}
+
+fn open(docs: *compiler.Overlay, w: Wanted, platform: target.OS, whole_project: bool) -> *Session ! Error {
+    let placed = placement(docs, w)?
+    let std = compiler.new_std()
+    let survey = compiler.Survey { dir: placed.root, module: placed.name, importers: whole_project }
+    let surveyed = compiler.check_imports(survey, platform, std, docs)
+    let checked = surveyed.checked
+    match checked.error {
+        some(e) => fail Error.Front(e)
+        none => {}
+    }
+    let unit = checked.unit ?? panic("a check without an error has no unit")
+    let getcwd = docs.disk.cwd
+    let cwd = getcwd() catch {
+        e => fail Error.Failed("getwd: {compiler.reason(e)}")
+    }
+    let s = new(Session { docs, std, program: lsp.Program { unit, tables: lsp.new_tables() }, cwd, module: placed.name, left_out: surveyed.left_out })
+    for f in lsp.program_files(s.program) {
+        s.add_file(f)
+    }
+    s
+}
+
+fn find(s: *Session, w: Wanted) -> Hit ! Error {
+    if w.file != "" {
+        return s.find_at(w)?
+    }
+    let d = s.declared(w.names[0]) ?? fail Error.Failed("{w.module}: no definition named {w.names[0]}")
+    if w.names.len == 1 {
+        return Hit { decl: d }
+    }
+    let member = w.names[1]
+    if !d.has_member(member) {
+        fail Error.Failed("{s.qualified(d)}: no field or variant named {member}")
+    }
+    Hit { decl: d, member }
+}
+
+fn declared(s: *Session, name: str) -> *Decl? {
+    for f in lsp.program_files(s.program) {
+        if f.module != s.module {
+            continue
+        }
+        for d in s.files[f.path] ?? [] {
+            if d.name == name {
+                return d
+            }
+        }
+    }
+    none
+}
+
+fn find_at(s: *Session, w: Wanted) -> Hit ! Error {
+    let f = s.file_named(path.base(w.file)) ?? fail Error.Failed("{w.file}: not a source of module {s.module_label()}")
+    if w.column > 0 {
+        let x = s.index_of(f)
+        let occ = lsp.index_at(x, w.line - 1, w.column - 1)
+        match occ {
+            some(o) => {
+                let hit = s.hit_of(lsp.resolve(new(lsp.Query { program: s.program, index: x, occ: o })))
+                match hit {
+                    some(h) => return h
+                    none => {}
+                }
+            }
+            none => {}
+        }
+    }
+    let d = s.enclosing(f, w.line) ?? fail Error.Failed("{w.file}:{w.line}: no definition here")
+    Hit { decl: d }
+}
+
+fn file_named(s: *Session, base: str) -> *ast.File? {
+    for f in lsp.program_files(s.program) {
+        if f.module == s.module && path.base(f.path) == base {
+            return f
+        }
+    }
+    none
+}
+
+fn module_label(s: *Session) -> str {
+    if s.module == "" {
+        return "at the project root"
+    }
+    s.module
+}
