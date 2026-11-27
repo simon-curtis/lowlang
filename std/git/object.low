@@ -1,0 +1,169 @@
+import std/compress/deflate
+import std/crypto/hash
+import std/file
+import std/io
+import std/os
+import std/path
+import std/text
+
+/// The type of a Git object.
+pub enum Kind {
+    /// A commit: a tree, its parents, the author, the committer and a message.
+    Commit
+    /// A directory listing of names, modes and object ids.
+    Tree
+    /// The bytes of a file or the target of a symbolic link.
+    Blob
+    /// An annotated tag: an object, its type, a name, the tagger and a message.
+    Tag
+}
+
+/// An object's type and its uncompressed bytes.
+pub struct Object {
+    /// The type.
+    pub kind: Kind
+    /// The bytes after the object header.
+    pub data: u8[]
+}
+
+/// Returns the name Git gives `k` in object headers: `commit`, `tree`, `blob` or `tag`.
+pub fn kind_name(k: Kind) -> str {
+    match k {
+        Commit => "commit"
+        Tree => "tree"
+        Blob => "blob"
+        Tag => "tag"
+    }
+}
+
+fn kind_named(name: str) -> Kind? {
+    match name {
+        "commit" => some(Commit)
+        "tree" => some(Tree)
+        "blob" => some(Blob)
+        "tag" => some(Tag)
+        _ => none
+    }
+}
+
+/// Returns the id Git gives an object of kind `k` holding `data`: the SHA-1 of its header and bytes, as 40 lower case hex digits.
+pub fn hash_object(k: Kind, data: u8[]) -> str {
+    let d = hash.sha1().digest()
+    d.update(bytes("{kind_name(k)} {data.len}\0"))
+    d.update(data)
+    text.encode_hex(d.finish())
+}
+
+/// Reports whether `id` is 40 lower case hex digits.
+pub fn valid_id(id: str) -> bool {
+    if id.len != 40 {
+        return false
+    }
+    for i in 0..id.len {
+        let c = id[i]
+        if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+            return false
+        }
+    }
+    true
+}
+
+fn need_id(id: str) ! Error {
+    if !valid_id(id) {
+        fail Invalid("{id} is not a full object id")
+    }
+}
+
+fn raw_id(id: str) -> u8[] {
+    text.decode_hex(id) or []
+}
+
+fn loose_path(r: *Repository, id: str) -> str {
+    path.join([objects_dir(r), id[..2], id[2..]])
+}
+
+/// Returns the object `id` of `r`, from its loose objects or its packs.
+///
+/// Fails with `Invalid` when `id` is not a full object id, `NotFound` when the repository lacks it and `Malformed` when its data is corrupt.
+pub fn read(r: *Repository, id: str) -> Object ! Error {
+    need_id(id)?
+    match read_optional(loose_path(r, id))? {
+        some(stored) => return parse_loose(id, stored)
+        none => {}
+    }
+    match r.find_packed(id)? {
+        some(found) => return r.read_packed(found.pack, found.offset)
+        none => {}
+    }
+    fail NotFound("object {id}")
+}
+
+/// Reports whether `r` holds the object `id`.
+pub fn has(r: *Repository, id: str) -> bool {
+    if !valid_id(id) {
+        return false
+    }
+    if file.exists(loose_path(r, id)) {
+        return true
+    }
+    let found = r.find_packed(id) or return false
+    found != none
+}
+
+fn parse_loose(id: str, stored: u8[]) -> Object ! Error {
+    let data = deflate.zlib_decompress(stored, 1 << 40) catch {
+        _ => fail Malformed("object {id}")
+    }
+    let space = index_of(data, 0, ' ')
+    let nul = index_of(data, 0, 0)
+    if space < 0 || nul < space {
+        fail Malformed("object {id}")
+    }
+    let kind = kind_named(str(data[..space])) ?? fail Malformed("object {id}")
+    let size = text.parse_int(str(data[space + 1..nul])) or fail Malformed("object {id}")
+    let body = data[nul + 1..]
+    if size != body.len {
+        fail Malformed("object {id}")
+    }
+    Object { kind, data: body }
+}
+
+fn index_of(data: u8[], from: i64, c: u8) -> i64 {
+    for i in from..data.len {
+        if data[i] == c {
+            return i
+        }
+    }
+    -1
+}
+
+/// Stores `data` as a loose object of kind `k` in `r` and returns its id.
+///
+/// An object the repository already holds is not written again.
+/// Fails with `Io` when the object file cannot be written.
+pub fn write_object(r: *Repository, k: Kind, data: u8[]) -> str ! Error {
+    let id = hash_object(k, data)
+    if r.has(id) {
+        return id
+    }
+    var full: u8[] = bytes("{kind_name(k)} {data.len}\0")
+    io.append(mut full, data)
+    let target = loose_path(r, id)
+    write_atomic(target, deflate.zlib_compress(full, 1))?
+    id
+}
+
+fn write_atomic(target: str, data: u8[]) ! Error {
+    let dir = path.dir(target)
+    make_dirs(dir)?
+    let temporary = "{target}.tmp{os.pid()}"
+    file.write_file(temporary, data) catch {
+        e => fail Io(temporary, e)
+    }
+    file.rename(temporary, target) catch {
+        e => {
+            file.remove(temporary) or {}
+            fail Io(target, e)
+        }
+    }
+}

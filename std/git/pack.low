@@ -1,0 +1,373 @@
+import std/compress/deflate
+import std/file
+import std/io
+import std/path
+import std/text
+
+struct Pack {
+    name: str
+    idx: u8[]
+    count: i64
+    data: u8[]
+    loaded: bool
+}
+
+struct Located {
+    pack: *Pack
+    offset: i64
+}
+
+struct BaseCache {
+    objects: [str: Object]
+    inflater: deflate.ZlibDecoder
+}
+
+fn base_cache() -> *BaseCache {
+    new(BaseCache { objects: [:], inflater: deflate.zlib_decoder() })
+}
+
+const cache_limit = 256
+
+fn remember(c: *BaseCache, key: str, o: Object) {
+    if c.objects.len >= cache_limit {
+        c.objects = [:]
+    }
+    c.objects[key] = o
+}
+
+fn load_packs(r: *Repository) ! Error {
+    let dir = path.join([objects_dir(r), "pack"])
+    let names = file.list(dir) catch {
+        e => match e {
+            NotFound => {
+                r.packs_read = true
+                return
+            }
+            _ => fail Io(dir, e)
+        }
+    }
+    var known: [str: bool] = [:]
+    for p in r.packs {
+        known[p.name] = true
+    }
+    for name in names {
+        let stem = text.strip_suffix(name, ".idx") ?? continue
+        let base = path.join([dir, stem])
+        if known[base] != none {
+            continue
+        }
+        if !file.exists("{base}.pack") {
+            continue
+        }
+        let idx = read_bytes("{base}.idx")?
+        let count = idx_count(idx, "{base}.idx")?
+        r.packs.push(new(Pack { name: base, idx, count, data: [], loaded: false }))
+    }
+    r.packs_read = true
+}
+
+fn idx_count(idx: u8[], location: str) -> i64 ! Error {
+    if idx.len < 8 + 1024 + 40 || idx[0] != 0xff || idx[1] != 't' || idx[2] != 'O' || idx[3] != 'c' {
+        fail Unsupported("pack index {location}, which is not version 2")
+    }
+    if io.be32(idx, 4) != 2 {
+        fail Unsupported("pack index {location}, which is not version 2")
+    }
+    let count = io.be32(idx, 8 + 255 * 4)
+    if idx.len < 8 + 1024 + count * 28 + 40 {
+        fail Malformed("pack index {location}")
+    }
+    count
+}
+
+fn find_packed(r: *Repository, id: str) -> Located? ! Error {
+    if !r.packs_read {
+        r.load_packs()?
+    }
+    let key = raw_id(id)
+    for p in r.packs {
+        match p.find_offset(key) {
+            some(offset) => return some(Located { pack: p, offset })
+            none => {}
+        }
+    }
+    let before = r.packs.len
+    r.load_packs()?
+    for p in r.packs[before..] {
+        match p.find_offset(key) {
+            some(offset) => return some(Located { pack: p, offset })
+            none => {}
+        }
+    }
+    none
+}
+
+fn compare_name(idx: u8[], at: i64, key: u8[]) -> i64 {
+    for i in 0..20 {
+        let a = idx[at + i]
+        let b = key[i]
+        if a != b {
+            return if a < b { -1 } else { 1 }
+        }
+    }
+    0
+}
+
+fn find_offset(p: *Pack, key: u8[]) -> i64? {
+    let idx = p.idx
+    let first = i64(key[0])
+    var lo = if first == 0 { 0 } else { io.be32(idx, 8 + (first - 1) * 4) }
+    var hi = io.be32(idx, 8 + first * 4)
+    let names = 8 + 1024
+    for lo < hi {
+        let mid = (lo + hi) / 2
+        let c = compare_name(idx, names + mid * 20, key)
+        if c == 0 {
+            return some(p.offset_at(mid))
+        }
+        if c < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    none
+}
+
+fn offset_at(p: *Pack, n: i64) -> i64 {
+    let idx = p.idx
+    let offsets = 8 + 1024 + p.count * 24
+    let small = io.be32(idx, offsets + n * 4)
+    if small & 0x80000000 == 0 {
+        return small
+    }
+    let large = 8 + 1024 + p.count * 28 + (small & 0x7fffffff) * 8
+    io.be64(idx, large)
+}
+
+fn name_at(p: *Pack, n: i64) -> str {
+    let at = 8 + 1024 + n * 20
+    text.encode_hex(p.idx[at..at + 20])
+}
+
+fn pack_data(p: *Pack) -> u8[] ! Error {
+    if !p.loaded {
+        p.data = read_bytes("{p.name}.pack")?
+        p.loaded = true
+        if p.data.len < 32 || p.data[0] != 'P' || p.data[1] != 'A' || p.data[2] != 'C' || p.data[3] != 'K' {
+            fail Malformed("pack {p.name}.pack")
+        }
+    }
+    p.data
+}
+
+struct EntryHead {
+    kind: i64
+    size: i64
+    body: i64
+    base_offset: i64
+    base_id: str
+}
+
+fn entry_head(data: u8[], offset: i64, what: str) -> EntryHead ! Error {
+    var at = offset
+    if at >= data.len {
+        fail Malformed(what)
+    }
+    var c = i64(data[at])
+    at += 1
+    let kind = (c >> 4) & 7
+    var size = c & 15
+    var shift = 4
+    for c & 0x80 != 0 {
+        if at >= data.len || shift > 56 {
+            fail Malformed(what)
+        }
+        c = i64(data[at])
+        at += 1
+        size |= (c & 0x7f) << shift
+        shift += 7
+    }
+    var base_offset = -1
+    var base_id = ""
+    match kind {
+        6 => {
+            if at >= data.len {
+                fail Malformed(what)
+            }
+            c = i64(data[at])
+            at += 1
+            var n = c & 0x7f
+            for c & 0x80 != 0 {
+                if at >= data.len || n > (1 << 48) {
+                    fail Malformed(what)
+                }
+                c = i64(data[at])
+                at += 1
+                n = ((n + 1) << 7) | (c & 0x7f)
+            }
+            base_offset = offset - n
+            if base_offset < 0 || base_offset >= offset {
+                fail Malformed(what)
+            }
+        }
+        7 => {
+            if at + 20 > data.len {
+                fail Malformed(what)
+            }
+            base_id = text.encode_hex(data[at..at + 20])
+            at += 20
+        }
+        _ => {
+            if kind < 1 || kind > 4 {
+                fail Malformed(what)
+            }
+        }
+    }
+    EntryHead { kind, size, body: at, base_offset, base_id }
+}
+
+fn pack_kind(kind: i64) -> Kind {
+    match kind {
+        1 => Commit
+        2 => Tree
+        3 => Blob
+        _ => Tag
+    }
+}
+
+fn inflate_entry(c: *BaseCache, data: u8[], head: EntryHead, what: str) -> u8[] ! Error {
+    let out = deflate.decode_prefix(c.inflater, data[head.body..], head.size) catch {
+        _ => fail Malformed(what)
+    }
+    if out.data.len != head.size {
+        fail Malformed(what)
+    }
+    out.data
+}
+
+fn read_packed(r: *Repository, p: *Pack, offset: i64) -> Object ! Error {
+    let data = p.pack_data()?
+    let what = "pack {p.name}.pack at {offset}"
+    var chain: i64[] = []
+    var at = offset
+    var base: Object? = none
+    for base == none {
+        match r.cache.objects["{p.name}:{at}"] {
+            some(o) => {
+                base = some(o)
+                break
+            }
+            none => {}
+        }
+        if chain.len > 10000 {
+            fail Malformed(what)
+        }
+        let head = entry_head(data, at, what)?
+        match head.kind {
+            6 => {
+                chain.push(at)
+                at = head.base_offset
+            }
+            7 => {
+                chain.push(at)
+                match p.find_offset(raw_id(head.base_id)) {
+                    some(found) => {
+                        at = found
+                    }
+                    none => {
+                        base = some(r.read(head.base_id)?)
+                    }
+                }
+            }
+            _ => {
+                base = some(Object { kind: pack_kind(head.kind), data: inflate_entry(r.cache, data, head, what)? })
+            }
+        }
+    }
+    var current = base ?? fail Malformed(what)
+    var i = chain.len - 1
+    for i >= 0 {
+        let delta_at = chain[i]
+        let head = entry_head(data, delta_at, what)?
+        let delta = inflate_entry(r.cache, data, head, what)?
+        current = Object { kind: current.kind, data: apply_delta(current.data, delta, what)? }
+        if i > 0 {
+            r.cache.remember("{p.name}:{delta_at}", current)
+        }
+        i -= 1
+    }
+    current
+}
+
+fn delta_size(delta: u8[], mut at: i64, what: str) -> i64 ! Error {
+    var n = 0
+    var shift = 0
+    for {
+        if at >= delta.len || shift > 56 {
+            fail Malformed(what)
+        }
+        let c = i64(delta[at])
+        at += 1
+        n |= (c & 0x7f) << shift
+        shift += 7
+        if c & 0x80 == 0 {
+            return n
+        }
+    }
+}
+
+fn apply_delta(base: u8[], delta: u8[], what: str) -> u8[] ! Error {
+    var at = 0
+    let source = delta_size(delta, mut at, what)?
+    let target = delta_size(delta, mut at, what)?
+    if source != base.len {
+        fail Malformed(what)
+    }
+    let out = io.buffer(target)
+    var pos = 0
+    for at < delta.len {
+        let op = i64(delta[at])
+        at += 1
+        if op & 0x80 != 0 {
+            var from = 0
+            var size = 0
+            for bit in 0..7 {
+                if op & (1 << bit) == 0 {
+                    continue
+                }
+                if at >= delta.len {
+                    fail Malformed(what)
+                }
+                let b = i64(delta[at])
+                at += 1
+                if bit < 4 {
+                    from |= b << (8 * bit)
+                } else {
+                    size |= b << (8 * (bit - 4))
+                }
+            }
+            if size == 0 {
+                size = 0x10000
+            }
+            if from + size > base.len || pos + size > target {
+                fail Malformed(what)
+            }
+            io.copy(out[pos..pos + size], base[from..from + size])
+            pos += size
+        } else if op != 0 {
+            if at + op > delta.len || pos + op > target {
+                fail Malformed(what)
+            }
+            io.copy(out[pos..pos + op], delta[at..at + op])
+            at += op
+            pos += op
+        } else {
+            fail Malformed(what)
+        }
+    }
+    if pos != target {
+        fail Malformed(what)
+    }
+    out
+}

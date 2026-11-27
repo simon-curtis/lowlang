@@ -1,0 +1,310 @@
+import std/compress/deflate
+import std/crypto/hash
+import std/io
+import std/path
+import std/slices
+import std/text
+
+struct Indexed {
+    offset: i64
+    kind: i64
+    base_offset: i64
+    base_id: str
+    crc: u32
+    id: str
+}
+
+struct Pending {
+    entry: i64
+    data: u8[]
+    kind: Kind
+}
+
+/// What `add_pack` stored.
+pub struct Added {
+    /// The path of the pack file, without its `.pack` extension.
+    pub name: str
+    /// The number of objects in the pack.
+    pub count: i64
+}
+
+/// Verifies the pack file `data`, writes its index and stores both under `objects/pack` of `r`, so its objects can be read.
+///
+/// A delta may name a base the repository already holds, as a thin pack's do. Every object's id is computed from its bytes, and the pack's trailing SHA-1 is checked.
+/// Fails with `Malformed` when the pack is truncated, corrupt or names a base that neither it nor the repository holds, with `Unsupported` for a pack version other than `2` or `3`, and with `Io` when a file cannot be written.
+pub fn add_pack(r: *Repository, data: u8[]) -> Added ! Error {
+    let what = "received pack"
+    if data.len < 32 || data[0] != 'P' || data[1] != 'A' || data[2] != 'C' || data[3] != 'K' {
+        fail Malformed(what)
+    }
+    let version = io.be32(data, 4)
+    if version != 2 && version != 3 {
+        fail Unsupported("pack version {version}")
+    }
+    let count = io.be32(data, 8)
+    let body = data.len - 20
+    let sum = hash.sum(hash.sha1(), data[..body])
+    if !slices.equal(sum, data[body..]) {
+        fail Malformed("{what}, whose checksum does not match")
+    }
+    let inflater = deflate.zlib_decoder()
+    var entries: Indexed[] = []
+    var at = 12
+    for n in 0..count {
+        if at >= body {
+            fail Malformed(what)
+        }
+        let head = entry_head(data, at, what)?
+        let out = deflate.decode_prefix(inflater, data[head.body..body], head.size) catch {
+            _ => fail Malformed(what)
+        }
+        if out.data.len != head.size {
+            fail Malformed(what)
+        }
+        let end = head.body + out.used
+        var id = ""
+        if head.kind < 6 {
+            id = hash_object(pack_kind(head.kind), out.data)
+        }
+        entries.push(Indexed { offset: at, kind: head.kind, base_offset: head.base_offset, base_id: head.base_id, crc: entry_crc(data[at..end]), id })
+        at = end
+    }
+    if at != body {
+        fail Malformed("{what}, which has bytes after its last object")
+    }
+    resolve_deltas(r, data, mut entries, inflater, 0)?
+    var complete = data
+    for {
+        let before = entries.len
+        complete = complete_thin(r, complete, mut entries)?
+        if entries.len == before {
+            break
+        }
+        resolve_deltas(r, complete, mut entries, inflater, before)?
+    }
+    for e in entries {
+        if e.id == "" {
+            fail Malformed("{what}, whose delta at {e.offset} has no base")
+        }
+    }
+    write_pack_files(r, complete, entries, text.encode_hex(complete[complete.len - 20..]))
+}
+
+fn complete_thin(r: *Repository, data: u8[], mut entries: Indexed[]) -> u8[] ! Error {
+    var inside: [str: bool] = [:]
+    for e in entries {
+        if e.id != "" {
+            inside[e.id] = true
+        }
+    }
+    var outside: str[] = []
+    var named: [str: bool] = [:]
+    for e in entries {
+        if e.kind == 7 && e.id == "" && inside[e.base_id] == none && named[e.base_id] == none && r.has(e.base_id) {
+            named[e.base_id] = true
+            outside.push(e.base_id)
+        }
+    }
+    if outside.len == 0 {
+        return data
+    }
+    var out: u8[] = []
+    io.append(mut out, data[..data.len - 20])
+    for id in outside {
+        let base = r.read(id)?
+        let encoded = encode_entry(base)
+        entries.push(Indexed { offset: out.len, kind: 0, base_offset: -1, base_id: "", crc: entry_crc(encoded), id })
+        io.append(mut out, encoded)
+    }
+    io.set_be32(out, 8, entries.len)
+    io.append(mut out, hash.sum(hash.sha1(), out))
+    out
+}
+
+fn resolve_deltas(r: *Repository, data: u8[], mut entries: Indexed[], inflater: deflate.ZlibDecoder, first_root: i64) ! Error {
+    let what = "received pack"
+    var by_base_offset: [i64: i64[]] = [:]
+    var by_base_id: [str: i64[]] = [:]
+    for n in 0..entries.len {
+        let e = entries[n]
+        if e.kind == 6 {
+            var list = by_base_offset[e.base_offset] ?? []
+            list.push(n)
+            by_base_offset[e.base_offset] = list
+        } else if e.kind == 7 {
+            var list = by_base_id[e.base_id] ?? []
+            list.push(n)
+            by_base_id[e.base_id] = list
+        }
+    }
+    let c = new(BaseCache { objects: [:], inflater })
+    var stack: Pending[] = []
+    for n in first_root..entries.len {
+        let e = entries[n]
+        if e.kind >= 6 {
+            continue
+        }
+        if by_base_offset[e.offset] == none && by_base_id[e.id] == none {
+            continue
+        }
+        let base = if e.kind == 0 { r.read(e.id)? } else { Object { kind: pack_kind(e.kind), data: inflate_entry(c, data, entry_head(data, e.offset, what)?, what)? } }
+        stack.push(Pending { entry: n, data: base.data, kind: base.kind })
+        descend(data, mut entries, by_base_offset, by_base_id, c, mut stack)?
+    }
+}
+
+fn descend(data: u8[], mut entries: Indexed[], by_base_offset: [i64: i64[]], by_base_id: [str: i64[]], c: *BaseCache, mut stack: Pending[]) ! Error {
+    let what = "received pack"
+    for stack.len > 0 {
+        let top = stack.pop() ?? break
+        let parent = entries[top.entry]
+        var children: i64[] = []
+        for n in by_base_offset[parent.offset] ?? [] {
+            children.push(n)
+        }
+        for n in by_base_id[parent.id] ?? [] {
+            if entries[n].id == "" {
+                children.push(n)
+            }
+        }
+        for n in children {
+            let head = entry_head(data, entries[n].offset, what)?
+            let delta = inflate_entry(c, data, head, what)?
+            let out = apply_delta(top.data, delta, what)?
+            entries[n].id = hash_object(top.kind, out)
+            stack.push(Pending { entry: n, data: out, kind: top.kind })
+        }
+    }
+}
+
+fn write_pack_files(r: *Repository, data: u8[], entries: Indexed[], name: str) -> Added ! Error {
+    var order: i64[] = []
+    for n in 0..entries.len {
+        order.push(n)
+    }
+    slices.sort_by(mut order, fn(a: i64, b: i64) -> bool { entries[a].id < entries[b].id })
+    var idx: u8[] = [0xff, 't', 'O', 'c']
+    io.put_be32(mut idx, 2)
+    var counts: i64[] = []
+    for _ in 0..256 {
+        counts.push(0)
+    }
+    for n in order {
+        let first = text.parse_hex_at(entries[n].id, 0, 2) or 0
+        counts[first] += 1
+    }
+    var total = 0
+    for k in 0..256 {
+        total += counts[k]
+        io.put_be32(mut idx, total)
+    }
+    for n in order {
+        io.append(mut idx, raw_id(entries[n].id))
+    }
+    for n in order {
+        io.put_be32(mut idx, i64(entries[n].crc))
+    }
+    var large: i64[] = []
+    for n in order {
+        let offset = entries[n].offset
+        if offset < 0x80000000 {
+            io.put_be32(mut idx, offset)
+        } else {
+            io.put_be32(mut idx, 0x80000000 | large.len)
+            large.push(offset)
+        }
+    }
+    for offset in large {
+        io.put_be64(mut idx, offset)
+    }
+    io.append(mut idx, data[data.len - 20..])
+    io.append(mut idx, hash.sum(hash.sha1(), idx))
+    let base = path.join([objects_dir(r), "pack", "pack-{name}"])
+    write_atomic("{base}.pack", data)?
+    write_atomic("{base}.idx", idx)?
+    r.packs_read = false
+    Added { name: base, count: entries.len }
+}
+
+/// Returns a pack file holding the objects `ids` of `r`, each stored whole, in the order given.
+///
+/// Fails as `read` does for an object the repository lacks.
+pub fn write_pack(r: *Repository, ids: str[]) -> u8[] ! Error {
+    var out: u8[] = ['P', 'A', 'C', 'K']
+    io.put_be32(mut out, 2)
+    io.put_be32(mut out, ids.len)
+    for id in ids {
+        let o = r.read(id)?
+        io.append(mut out, encode_entry(o))
+    }
+    io.append(mut out, hash.sum(hash.sha1(), out))
+    out
+}
+
+fn encode_entry(o: Object) -> u8[] {
+    let kind = match o.kind {
+        Commit => 1
+        Tree => 2
+        Blob => 3
+        Tag => 4
+    }
+    var out: u8[] = []
+    var size = o.data.len
+    var first = kind << 4 | size & 15
+    size >>= 4
+    if size > 0 {
+        first |= 0x80
+    }
+    out.push(u8(first))
+    for size > 0 {
+        var b = size & 0x7f
+        size >>= 7
+        if size > 0 {
+            b |= 0x80
+        }
+        out.push(u8(b))
+    }
+    io.append(mut out, deflate.zlib_compress(o.data, 1))
+    out
+}
+
+/// Returns the ids of the objects reachable from `wants` in `r` that `have` does not report, commits, trees, blobs and tags alike, each once, every object before the objects it names.
+///
+/// The walk does not pass an object `have` reports, so `have` should report the objects reachable from anything it reports, as a repository's own `has` does. Submodule commits are not followed.
+/// Fails as `read` does for an object the repository lacks.
+pub fn missing_objects(r: *Repository, wants: str[], have: fn(str) -> bool) -> str[] ! Error {
+    var seen: [str: bool] = [:]
+    var out: str[] = []
+    var stack: str[] = []
+    for i in 0..wants.len {
+        stack.push(wants[wants.len - 1 - i])
+    }
+    for stack.len > 0 {
+        let id = stack.pop() ?? break
+        if seen[id] != none || have(id) {
+            continue
+        }
+        seen[id] = true
+        out.push(id)
+        let o = r.read(id)?
+        match o.kind {
+            Commit => {
+                let c = parse_commit(o.data, id)?
+                for p in c.parents {
+                    stack.push(p)
+                }
+                stack.push(c.tree)
+            }
+            Tree => {
+                for e in parse_tree(o.data, id)? {
+                    if e.mode != Submodule {
+                        stack.push(e.id)
+                    }
+                }
+            }
+            Tag => stack.push(parse_tag(o.data, id)?.object)
+            Blob => {}
+        }
+    }
+    out
+}

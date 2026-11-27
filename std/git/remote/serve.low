@@ -1,0 +1,241 @@
+import std/git
+import std/header
+import std/http
+import std/io
+import std/text
+
+fn advertisement() -> u8[] {
+    var out: u8[] = []
+    for line in ["version 2", agent_line(), "ls-refs", "fetch", "object-format=sha1"] {
+        io.append(mut out, pkt_line("{line}\n"))
+    }
+    io.append(mut out, flush_pkt())
+    out
+}
+
+struct Request {
+    command: str
+    args: str[]
+}
+
+fn parse_request(data: u8[]) -> Request ! Error {
+    let p = pkt_reader(data)
+    var command = ""
+    var args: str[] = []
+    var in_args = false
+    for p.more() {
+        match p.next_packet()? {
+            Data(b) => {
+                let line = line_of(b)
+                if in_args {
+                    args.push(line)
+                    continue
+                }
+                match text.strip_prefix(line, "command=") {
+                    some(c) => {
+                        command = c
+                    }
+                    none => {}
+                }
+            }
+            Delim => {
+                in_args = true
+            }
+            Flush => break
+            End => break
+        }
+    }
+    if command == "" {
+        fail Protocol("a request without a command")
+    }
+    Request { command, args }
+}
+
+fn upload_pack(r: *git.Repository, request: u8[]) -> u8[] ! Error {
+    let req = parse_request(request)?
+    match req.command {
+        "ls-refs" => answer_ls_refs(r, req.args)
+        "fetch" => answer_fetch(r, req.args)
+        _ => fail Protocol("the command {req.command}")
+    }
+}
+
+fn answer_ls_refs(r: *git.Repository, args: str[]) -> u8[] ! Error {
+    var prefixes: str[] = []
+    var peel = false
+    var symrefs = false
+    for a in args {
+        match a {
+            "peel" => {
+                peel = true
+            }
+            "symrefs" => {
+                symrefs = true
+            }
+            _ => {
+                match text.strip_prefix(a, "ref-prefix ") {
+                    some(p) => prefixes.push(p)
+                    none => {}
+                }
+            }
+        }
+    }
+    var out: u8[] = []
+    let head = git.head(r) or ""
+    if head != "" && wanted_name("HEAD", prefixes) {
+        var line = "{head} HEAD"
+        if symrefs {
+            let target = git.symbolic_target(r, "HEAD") catch {
+                e => fail Repo(e)
+            }
+            match target {
+                some(t) => {
+                    line = "{line} symref-target:{t}"
+                }
+                none => {}
+            }
+        }
+        io.append(mut out, pkt_line("{line}\n"))
+    }
+    let refs = git.refs(r, "refs/") catch {
+        e => fail Repo(e)
+    }
+    for found in refs {
+        if !wanted_name(found.name, prefixes) {
+            continue
+        }
+        var line = "{found.id} {found.name}"
+        if peel && found.peeled != "" {
+            line = "{line} peeled:{found.peeled}"
+        }
+        io.append(mut out, pkt_line("{line}\n"))
+    }
+    io.append(mut out, flush_pkt())
+    out
+}
+
+fn answer_fetch(r: *git.Repository, args: str[]) -> u8[] ! Error {
+    var wants: str[] = []
+    var haves: str[] = []
+    var done = false
+    for a in args {
+        match text.strip_prefix(a, "want ") {
+            some(id) => wants.push(id)
+            none => {}
+        }
+        match text.strip_prefix(a, "have ") {
+            some(id) => {
+                if git.has(r, id) {
+                    haves.push(id)
+                }
+            }
+            none => {}
+        }
+        if a == "done" {
+            done = true
+        }
+    }
+    for id in wants {
+        if !git.has(r, id) {
+            fail Protocol("a want of {id}, which this repository does not hold")
+        }
+    }
+    var out: u8[] = []
+    if !done {
+        io.append(mut out, pkt_line("acknowledgments\n"))
+        if haves.len == 0 {
+            io.append(mut out, pkt_line("NAK\n"))
+        }
+        for id in haves {
+            io.append(mut out, pkt_line("ACK {id}\n"))
+        }
+        io.append(mut out, pkt_line("ready\n"))
+        io.append(mut out, delim_pkt())
+    }
+    let held = have_closure(r, haves)?
+    let ids = git.missing_objects(r, wants, fn(id: str) -> bool { held[id] != none }) catch {
+        e => fail Repo(e)
+    }
+    let pack = git.write_pack(r, ids) catch {
+        e => fail Repo(e)
+    }
+    io.append(mut out, pkt_line("packfile\n"))
+    var at = 0
+    for at < pack.len {
+        let end = if at + 65515 < pack.len { at + 65515 } else { pack.len }
+        var chunk: u8[] = [1]
+        io.append(mut chunk, pack[at..end])
+        io.append(mut out, pkt_data(chunk))
+        at = end
+    }
+    io.append(mut out, flush_pkt())
+    out
+}
+
+fn have_closure(r: *git.Repository, haves: str[]) -> [str: bool] ! Error {
+    var held: [str: bool] = [:]
+    var stack: str[] = []
+    for id in haves {
+        stack.push(id)
+        let tree = git.peel(r, id, git.Kind.Tree) or continue
+        let below = git.missing_objects(r, [tree], fn(x: str) -> bool { false }) catch {
+            e => fail Repo(e)
+        }
+        for x in below {
+            held[x] = true
+        }
+    }
+    for stack.len > 0 {
+        let id = stack.pop() ?? break
+        let o = git.read(r, id) or continue
+        match o.kind {
+            Commit => {
+                if held[id] != none {
+                    continue
+                }
+                held[id] = true
+                let c = git.parse_commit(o.data, id) catch {
+                    e => fail Repo(e)
+                }
+                for p in c.parents {
+                    stack.push(p)
+                }
+            }
+            Tag => {
+                held[id] = true
+            }
+            _ => {}
+        }
+    }
+    held
+}
+
+/// Returns an HTTP handler that serves `r` to Git clients over the smart HTTP protocol, version 2: `GET <prefix>/info/refs?service=git-upload-pack` and `POST <prefix>/git-upload-pack` under any prefix.
+///
+/// Other requests get status `404`, and a request that does not parse gets `400` with the error as its body.
+pub fn http_handler(r: *git.Repository) -> fn(http.Request) -> http.Response {
+    fn(req: http.Request) -> http.Response {
+        if req.method == "GET" && text.ends_with(req.path, "/info/refs") && req.query == "service=git-upload-pack" {
+            var body: u8[] = []
+            io.append(mut body, pkt_line("# service=git-upload-pack\n"))
+            io.append(mut body, flush_pkt())
+            io.append(mut body, advertisement())
+            return git_response("application/x-git-upload-pack-advertisement", body)
+        }
+        if req.method == "POST" && text.ends_with(req.path, "/git-upload-pack") {
+            let answer = upload_pack(r, req.body) catch {
+                e => return http.response(400, message(e))
+            }
+            return git_response("application/x-git-upload-pack-result", answer)
+        }
+        http.response(404, "not found")
+    }
+}
+
+fn git_response(kind: str, body: u8[]) -> http.Response {
+    var resp = http.response(200, "")
+    resp.body = body
+    resp.headers.push(header.Header { name: "content-type", value: kind })
+    resp.headers.push(header.Header { name: "cache-control", value: "no-cache" })
+    resp
+}

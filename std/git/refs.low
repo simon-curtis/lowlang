@@ -1,0 +1,251 @@
+import std/file
+import std/path
+import std/slices
+import std/text
+
+/// A reference: its full name, the object it names and, for an annotated tag, the object the tag points at in the end.
+pub struct Ref {
+    /// The full name, such as `refs/tags/v1.0.0` or `HEAD`.
+    pub name: str
+    /// The id of the object the reference names, after following symbolic references.
+    pub id: str
+    /// For a reference to an annotated tag, the id of the first object that is not a tag, found by following the tags; `""` otherwise.
+    pub peeled: str = ""
+}
+
+struct Packed {
+    id: str
+    peeled: str
+}
+
+fn ref_dir(r: *Repository, name: str) -> str {
+    let private = !text.starts_with(name, "refs/") || text.starts_with(name, "refs/bisect/") || text.starts_with(name, "refs/worktree/") || text.starts_with(name, "refs/rewritten/")
+    if private { r.git_dir } else { r.common_dir }
+}
+
+fn loose_ref(r: *Repository, name: str) -> str? ! Error {
+    let location = path.join([ref_dir(r, name), name])
+    if file.is_dir(location) {
+        return none
+    }
+    let data = read_optional(location)? ?? return none
+    some(text.trim(str(data)))
+}
+
+fn packed_refs(r: *Repository) -> [str: Packed] ! Error {
+    var out: [str: Packed] = [:]
+    let location = path.join([r.common_dir, "packed-refs"])
+    let data = read_optional(location)? ?? return out
+    var last = ""
+    for line in text.lines(str(data)) {
+        if line.len == 0 || line[0] == '#' {
+            continue
+        }
+        if line[0] == '^' {
+            let peeled = line[1..]
+            if last == "" || !valid_id(peeled) {
+                fail Malformed("packed-refs line {line}")
+            }
+            let held = out[last] ?? fail Malformed("packed-refs line {line}")
+            out[last] = Packed { id: held.id, peeled }
+            continue
+        }
+        let space = text.index_byte(line, ' ')
+        if space != 40 || !valid_id(line[..40]) {
+            fail Malformed("packed-refs line {line}")
+        }
+        last = line[41..]
+        out[last] = Packed { id: line[..40], peeled: "" }
+    }
+    out
+}
+
+fn raw_ref(r: *Repository, name: str) -> str? ! Error {
+    match r.loose_ref(name)? {
+        some(value) => return some(value)
+        none => {}
+    }
+    if !text.starts_with(name, "refs/") {
+        return none
+    }
+    let packed = r.packed_refs()?
+    let held = packed[name] ?? return none
+    some(held.id)
+}
+
+/// Returns the id that the reference `name` names, following symbolic references such as `HEAD`.
+///
+/// `name` is a full name such as `HEAD` or `refs/heads/main`.
+/// Fails with `NotFound` when the reference, or one it points to, does not exist, and with `Malformed` when a reference file holds neither an id nor `ref: <name>` or symbolic references nest more than five deep.
+pub fn read_ref(r: *Repository, name: str) -> str ! Error {
+    var current = name
+    for _ in 0..6 {
+        let value = r.raw_ref(current)? ?? fail NotFound("reference {current}")
+        match text.strip_prefix(value, "ref: ") {
+            some(target) => {
+                current = text.trim(target)
+                continue
+            }
+            none => {}
+        }
+        if !valid_id(value) {
+            fail Malformed("reference {current}")
+        }
+        return value
+    }
+    fail Malformed("reference {name}, whose symbolic references nest too deep")
+}
+
+/// Returns the name a symbolic reference points to, such as `refs/heads/main` for `HEAD`, or `none` when `name` is not symbolic.
+///
+/// Fails with `Io` when the reference file cannot be read.
+pub fn symbolic_target(r: *Repository, name: str) -> str? ! Error {
+    let value = r.loose_ref(name)? ?? return none
+    let target = text.strip_prefix(value, "ref: ") ?? return none
+    some(text.trim(target))
+}
+
+/// Returns the id of the commit `HEAD` names.
+///
+/// Fails with `NotFound` when `HEAD` names a branch that has no commit yet.
+pub fn head(r: *Repository) -> str ! Error {
+    r.read_ref("HEAD")
+}
+
+/// Returns every reference whose full name starts with `prefix`, sorted by name, with annotated tags peeled.
+///
+/// Loose references take precedence over packed ones. A symbolic reference is listed with the id of its target; one whose target is missing is left out.
+/// Fails with `Io` when a reference file cannot be read and with `Malformed` when one is corrupt.
+pub fn refs(r: *Repository, prefix: str) -> Ref[] ! Error {
+    let packed = r.packed_refs()?
+    var names: [str: bool] = [:]
+    for name, _ in packed {
+        if text.starts_with(name, prefix) {
+            names[name] = true
+        }
+    }
+    var loose: str[] = []
+    list_loose(path.join([r.common_dir, "refs"]), "refs", mut loose)?
+    for name in loose {
+        if text.starts_with(name, prefix) {
+            names[name] = true
+        }
+    }
+    var sorted: str[] = []
+    for name, _ in names {
+        sorted.push(name)
+    }
+    slices.sort(mut sorted)
+    var out: Ref[] = []
+    for name in sorted {
+        let id = r.read_ref(name) catch {
+            e => match e {
+                NotFound(_) => continue
+                _ => fail e
+            }
+        }
+        var peeled = ""
+        match packed[name] {
+            some(held) => {
+                if held.id == id {
+                    peeled = held.peeled
+                }
+            }
+            none => {}
+        }
+        if peeled == "" {
+            peeled = r.peel_tags(id)?
+        }
+        out.push(Ref { name, id, peeled })
+    }
+    out
+}
+
+fn peel_tags(r: *Repository, id: str) -> str ! Error {
+    var current = id
+    var peeled = ""
+    for _ in 0..100 {
+        let o = r.read(current) catch {
+            e => match e {
+                NotFound(_) => return peeled
+                _ => fail e
+            }
+        }
+        match o.kind {
+            Tag => {
+                current = parse_tag(o.data, current)?.object
+                peeled = current
+            }
+            _ => return peeled
+        }
+    }
+    fail Malformed("tag {id}, whose chain of tags is too long")
+}
+
+fn list_loose(dir: str, prefix: str, mut out: str[]) ! Error {
+    let entries = file.read_dir_info(dir) catch {
+        e => match e {
+            NotFound => return
+            _ => fail Io(dir, e)
+        }
+    }
+    for entry in entries {
+        let name = "{prefix}/{entry.name}"
+        if entry.dir {
+            list_loose(path.join([dir, entry.name]), name, mut out)?
+        } else if !text.ends_with(entry.name, ".lock") {
+            out.push(name)
+        }
+    }
+}
+
+/// Reports whether `name` is a well formed full reference name: `HEAD`, or a name under `refs/` whose components are not empty, do not start with `.`, do not end with `.lock`, and hold no `..`, `@{{`, control character, space or any of `~^:?*[\`.
+pub fn valid_ref_name(name: str) -> bool {
+    if name == "HEAD" {
+        return true
+    }
+    if !text.starts_with(name, "refs/") || text.ends_with(name, "/") || text.ends_with(name, ".") || text.contains(name, "..") || text.contains(name, "@{{") {
+        return false
+    }
+    for part in text.split(name, '/') {
+        if part.len == 0 || part[0] == '.' || text.ends_with(part, ".lock") {
+            return false
+        }
+    }
+    for i in 0..name.len {
+        let c = name[i]
+        if c < 0x20 || c == 0x7f || c == ' ' || c == '~' || c == '^' || c == ':' || c == '?' || c == '*' || c == '[' || c == '\\' {
+            return false
+        }
+    }
+    true
+}
+
+/// Points the reference `name` at `id`, creating it when it does not exist. When `name` is symbolic, such as `HEAD`, the reference it points to is updated instead.
+///
+/// Fails with `Invalid` for a malformed name or id, and with `Io` when the reference file cannot be written.
+pub fn set_ref(r: *Repository, name: str, id: str) ! Error {
+    need_id(id)?
+    var target = name
+    for _ in 0..5 {
+        target = r.symbolic_target(target)? ?? break
+    }
+    write_ref(r, target, "{id}\n")?
+}
+
+/// Makes `name` a symbolic reference to `target`, as `HEAD` is to the current branch.
+///
+/// Fails with `Invalid` for a malformed name and with `Io` when the reference file cannot be written.
+pub fn set_symbolic_ref(r: *Repository, name: str, target: str) ! Error {
+    if !valid_ref_name(target) {
+        fail Invalid("{target} is not a valid reference name")
+    }
+    write_ref(r, name, "ref: {target}\n")?
+}
+
+fn write_ref(r: *Repository, name: str, content: str) ! Error {
+    if !valid_ref_name(name) {
+        fail Invalid("{name} is not a valid reference name")
+    }
+    write_atomic(path.join([ref_dir(r, name), name]), bytes(content))?
+}

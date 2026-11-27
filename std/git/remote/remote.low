@@ -1,0 +1,179 @@
+import std/git
+import std/slices
+import std/text
+
+/// How `list` and `fetch` reach a remote repository.
+pub struct Options {
+    /// The settings whose `url.<base>.insteadOf` entries rewrite a URL before it is used, as Git applies them. `defaults` fills it from `git.user_config`.
+    pub config: git.Config = git.Config { settings: [] }
+    /// Returns the user name and password for an HTTP URL that asks for them, or `none`. It is asked once per request after a `401` status. A user name and password written in the URL are tried first.
+    pub credentials: fn(str) -> Credential? = no_credentials
+    /// The reference name prefixes to list and fetch. An empty list takes every reference.
+    pub prefixes: str[] = ["refs/heads/", "refs/tags/"]
+}
+
+/// The references a remote repository holds.
+pub struct Listing {
+    /// The references whose names start with one of the prefixes asked for, sorted by name. Annotated tags carry the id they peel to.
+    pub refs: git.Ref[]
+    /// The full name of the branch the remote's `HEAD` points to, or `""` when the remote does not say.
+    pub head: str
+}
+
+/// Returns options that read the user's Git configuration for URL rewriting and ask `git credential fill` for HTTP credentials.
+///
+/// Fails with `Repo` when a configuration file does not parse.
+pub fn defaults() -> Options ! Error {
+    let config = git.user_config() catch {
+        e => fail Repo(e)
+    }
+    Options { config, credentials: git_credentials() }
+}
+
+/// Returns `url` rewritten by the longest `url.<base>.insteadOf` prefix in `c` that it starts with, or `url` unchanged when none matches.
+pub fn rewrite(c: git.Config, url: str) -> str {
+    var best = ""
+    var base = ""
+    for s in c.settings {
+        if !text.starts_with(s.key, "url.") || !text.ends_with(s.key, ".insteadof") {
+            continue
+        }
+        if text.starts_with(url, s.value) && s.value.len > best.len {
+            best = s.value
+            base = s.key[4..s.key.len - 10]
+        }
+    }
+    if best == "" {
+        return url
+    }
+    "{base}{url[best.len..]}"
+}
+
+fn session_for(url: str, o: Options, work: fn(Session) ! Error) ! Error {
+    if text.starts_with(url, "http://") || text.starts_with(url, "https://") {
+        work(http_session(url, o)?)?
+        return
+    }
+    match text.strip_prefix(url, "git://") {
+        some(rest) => {
+            let slash = text.index_byte(rest, '/')
+            if slash < 0 {
+                fail Unsupported("URL {url} without a path")
+            }
+            var host = rest[..slash]
+            var port = 9418
+            let colon = text.last_index_byte(host, ':')
+            if colon >= 0 {
+                port = text.parse_int(host[colon + 1..]) or fail Unsupported("URL {url}")
+                host = host[..colon]
+            }
+            daemon_session(host, port, rest[slash..], work)?
+            return
+        }
+        none => {}
+    }
+    if text.starts_with(url, "ssh://") || text.starts_with(url, "git+ssh://") {
+        ssh_session(url, work)?
+        return
+    }
+    if text.contains(url, "://") {
+        fail Unsupported("URL scheme of {url}")
+    }
+    ssh_session(url, work)?
+}
+
+/// Returns the references of the repository at `url` whose names start with one of `o.prefixes`, with annotated tags peeled, as `git ls-remote` lists them.
+///
+/// `url` is rewritten by `rewrite` first. It is an `http://` or `https://` URL of a smart HTTP server, an `ssh://` URL or the `user@host:path` form, a `git://` URL, or a local path or `file://` URL. Protocol version 2 is used where the server offers it and version 0 otherwise.
+/// Fails with `Connect`, `Http`, `Auth` or `HostKey` when the server cannot be reached or refuses, with `Protocol` or `Remote` when the exchange fails, and with `Repo` when a local repository cannot be read.
+pub fn list(url: str, o: Options) -> Listing ! Error {
+    let target = rewrite(o.config, url)
+    match local_path(target) {
+        some(location) => {
+            let l = local_listing(open_local(location)?, o.prefixes)?
+            return Listing { refs: l.refs, head: l.head }
+        }
+        none => {}
+    }
+    let out = new(Listing { refs: [], head: "" })
+    session_for(target, o, fn(s: Session) ! Error {
+        let l = list_refs(s, o.prefixes)?
+        out.refs = l.refs
+        out.head = l.head
+    })?
+    sorted_listing(*out)
+}
+
+fn open_local(location: str) -> *git.Repository ! Error {
+    git.open(location) catch {
+        e => fail Repo(e)
+    }
+}
+
+fn sorted_listing(l: Listing) -> Listing {
+    var refs = l.refs
+    slices.sort_by(mut refs, fn(a: git.Ref, b: git.Ref) -> bool { a.name < b.name })
+    Listing { refs, head: l.head }
+}
+
+/// Brings the objects of the references of `url` whose names start with one of `o.prefixes` into `r`, and points the references of the same names in `r` at them, replacing what they named. When the remote names the branch its `HEAD` points to, `HEAD` of `r` is made to point to it too.
+///
+/// References that `r` holds and the remote lacks are kept. The objects `r`'s references already lead to are not fetched again. A reference whose name is not valid is skipped.
+/// Fails as `list` does, and with `Repo` when the pack does not verify or `r` cannot be written.
+pub fn fetch(r: *git.Repository, url: str, o: Options) -> Listing ! Error {
+    let target = rewrite(o.config, url)
+    var haves: str[] = []
+    for held in git.refs(r, "refs/") catch { e => fail Repo(e) } {
+        haves.push(held.id)
+    }
+    let out = new(Listing { refs: [], head: "" })
+    match local_path(target) {
+        some(location) => {
+            let src = open_local(location)?
+            let l = local_listing(src, o.prefixes)?
+            local_fetch(src, r, wants_of(r, l.refs))?
+            out.refs = l.refs
+            out.head = l.head
+        }
+        none => session_for(target, o, fn(s: Session) ! Error {
+            let l = list_refs(s, o.prefixes)?
+            out.refs = l.refs
+            out.head = l.head
+            let wants = wants_of(r, l.refs)
+            if wants.len == 0 {
+                return
+            }
+            let pack = fetch_pack(s, wants, haves)?
+            git.add_pack(r, pack) catch {
+                e => fail Repo(e)
+            }
+        })?
+    }
+    for found in out.refs {
+        if !git.valid_ref_name(found.name) {
+            continue
+        }
+        git.set_ref(r, found.name, found.id) catch {
+            e => fail Repo(e)
+        }
+    }
+    if out.head != "" && git.valid_ref_name(out.head) {
+        git.set_symbolic_ref(r, "HEAD", out.head) catch {
+            e => fail Repo(e)
+        }
+    }
+    sorted_listing(*out)
+}
+
+fn wants_of(r: *git.Repository, refs: git.Ref[]) -> str[] {
+    var seen: [str: bool] = [:]
+    var out: str[] = []
+    for found in refs {
+        if seen[found.id] != none || git.has(r, found.id) {
+            continue
+        }
+        seen[found.id] = true
+        out.push(found.id)
+    }
+    out
+}
