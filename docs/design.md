@@ -3366,6 +3366,7 @@ One sentence per module. Each name links to the module's page, which holds the r
 | `std/retry` | `Policy` with attempts, base, multiplier, maximum delay, `Jitter` (`None`, `Full`, `Equal`, `Decorrelated`), a deadline, a seeded `Rng` and a cancel token. |
 | `std/ratelimit` | `Bucket` (token bucket in exact nanosecond units) with `allow`, `allow_n`, `reserve`, `wait` and `set_rate`. |
 | `std/singleflight` | `Group[K, V]` with `do`, `do_shared`, `forget` and `in_flight`, which run one call per key while the others wait for its result. |
+| `std/parallel` | `each(count, job)` calls a job once for every index on one green thread per CPU, `chunks` hands it ranges of indices, `try_each` returns the error of the lowest failing index and `map` keeps the order of its slice. |
 | `std/atomic` | `Int`, `Bool` and `Flag` built on compare-and-swap, with `load_int`, `store_int`, `add_int`, `swap_int`, `compare_and_swap_int` and `update_int`, and the same forms for `Bool`. |
 | `std/rand` | A seedable, non-cryptographic xoshiro256** generator: `seeded`, `rng` (all 256 bits of state from `std/crypto`), `next`, unbiased `below` and `between`, `float`, `chance`, `shuffle` and `pick`. |
 | `std/uuid` | Random v4 and time-ordered v7 UUIDs, `format`, `parse` (reports the offset of the first bad character), `version`, `timestamp` for v7, `equal` and `nil`. |

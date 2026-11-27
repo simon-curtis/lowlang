@@ -2301,6 +2301,19 @@ All are built on channels, so a waiting green thread parks instead of spinning.
 
 `Expiring[V]`, a value refreshed at most once per interval.
 
+## std/parallel
+
+`each`, `chunks`, `try_each` and `map` return when every call has returned. They run on at most `cpus()` green threads, one of them the caller's, so a job may call them again. `cpus()` is 1 for `browser/wasm32`, where the calls run in order.
+
+| Function | Calls | Notes |
+| --- | --- | --- |
+| `each(count, job)` | `job(i)` for every `i` in `0..count` | Hands out ranges of `count / (32 * cpus())` indices, at least 1. |
+| `chunks(count, grain, job)` | `job(start, end)` for every range of `grain` indices | The last range is shorter when `grain` does not divide `count`. Use it for a job as small as one arithmetic step, which loops over its range itself. |
+| `try_each[E](count, job)` | `job(i)` until one returns `some(e)` | Returns the error of the lowest failing index, whichever thread finishes first. Every index below it is called. |
+| `map(xs, f)` | `f(x)` for every element | The result has the order of `xs`. |
+
+A job is a closure and may write to an element of a slice it captures, as `map` does. Two calls that write one element, or change one captured variable, race: use `std/atomic` or `std/sync` there. A panic in a job ends the program.
+
 ## std/atomic
 
 Every load is a locked operation, so a loop cannot hoist it. `Value[T]` swaps a heap pointer under a lock: `load_value`, `store_value`, `swap_value`, `update_value`, `snapshot_value` and `compare_and_swap_value` (compares pointer identity).
