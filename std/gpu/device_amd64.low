@@ -1,0 +1,181 @@
+import std/sync
+
+/// A Vulkan device that runs kernels. A program built for `browser/wasm32` has none: `devices` is empty and `open` fails with `NoDevice`.
+///
+/// Releasing a `Device` waits for its queue to go idle and destroys the device and its instance. One `run` uses the device at a time; a second green thread waits.
+pub struct Device {
+    state: *State
+    drop close(state)
+}
+
+/// One device `devices` found.
+pub struct Info {
+    /// The position to give `open_on`.
+    pub index: i64
+    /// The name the driver gives the device.
+    pub name: str
+    /// Whether the device runs a kernel that uses `f64` or `exp`.
+    pub float64: bool
+}
+
+struct State {
+    instance: VkInstance = VkInstance {}
+    handle: VkDevice = VkDevice {}
+    queue: VkQueue = VkQueue {}
+    pool: VkCommandPool = VkCommandPool {}
+    commands: VkCommandBuffer = VkCommandBuffer {}
+    memory_types: VkMemoryType[] = []
+    name: str = ""
+    float64: bool = false
+    running: sync.Mutex
+}
+
+struct Candidate {
+    physical: VkPhysicalDevice
+    family: u32
+    info: Info
+}
+
+fn check(result: i32, call: str) ! Error {
+    if result != VK_SUCCESS {
+        fail Vulkan(call, result)
+    }
+}
+
+fn create_instance() -> VkInstance ! Error {
+    using var pins = new_pins()
+    let app = pins.hold(VkApplicationInfo { apiVersion: vk_make_api_version(0, 1, 2, 0) })
+    var info = VkInstanceCreateInfo { pApplicationInfo: app }
+    var instance = VkInstance {}
+    check(vkCreateInstance(mut info, null, mut instance), "vkCreateInstance")?
+    instance
+}
+
+fn physical_devices(instance: VkInstance) -> VkPhysicalDevice[] ! Error {
+    var count: u32 = 0
+    check(vkEnumeratePhysicalDevices(instance, mut count, null), "vkEnumeratePhysicalDevices")?
+    if count == 0 {
+        return []
+    }
+    let found: VkPhysicalDevice[] = __make(count)
+    using var pins = new_pins()
+    check(vkEnumeratePhysicalDevices(instance, mut count, pins.hold_all(found)), "vkEnumeratePhysicalDevices")?
+    found[..count]
+}
+
+fn compute_family(physical: VkPhysicalDevice) -> u32? {
+    var count: u32 = 0
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, mut count, null)
+    if count == 0 {
+        return none
+    }
+    let families: VkQueueFamilyProperties[] = __make(count)
+    using var pins = new_pins()
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, mut count, pins.hold_all(families))
+    for i, family in families[..count] {
+        if family.queueFlags & VK_QUEUE_COMPUTE_BIT != 0 {
+            return u32(i)
+        }
+    }
+    none
+}
+
+fn candidate(physical: VkPhysicalDevice, index: i64) -> Candidate? {
+    var props = VkPhysicalDeviceProperties {}
+    vkGetPhysicalDeviceProperties(physical, mut props)
+    if props.apiVersion < vk_make_api_version(0, 1, 2, 0) {
+        return none
+    }
+    var features = VkPhysicalDeviceFeatures {}
+    vkGetPhysicalDeviceFeatures(physical, mut features)
+    if features.shaderInt64 == 0 {
+        return none
+    }
+    let family = compute_family(physical) ?? return none
+    let info = Info { index, name: VkPhysicalDeviceProperties_deviceName(props), float64: features.shaderFloat64 != 0 }
+    Candidate { physical, family, info }
+}
+
+fn candidates(instance: VkInstance) -> Candidate[] ! Error {
+    var usable: Candidate[] = []
+    for i, physical in physical_devices(instance)? {
+        match candidate(physical, i) {
+            some(c) => usable.push(c)
+            none => {}
+        }
+    }
+    usable
+}
+
+/// Lists the devices that can run kernels: each has Vulkan 1.2, 64-bit integers in shaders and a compute queue.
+pub fn devices() -> Info[] ! Error {
+    let instance = create_instance()?
+    defer vkDestroyInstance(instance, null)
+    var found: Info[] = []
+    for c in candidates(instance)? {
+        found.push(c.info)
+    }
+    found
+}
+
+/// Opens the first device `devices` lists, or fails with `NoDevice`.
+pub fn open() -> Device ! Error {
+    open_where(fn(i: Info) -> bool { true })
+}
+
+/// Opens the device `devices` lists with `index`, or fails with `NoDevice`.
+pub fn open_on(index: i64) -> Device ! Error {
+    open_where(fn(i: Info) -> bool { i.index == index })
+}
+
+fn open_where(wanted: fn(Info) -> bool) -> Device ! Error {
+    let state = new(State { running: sync.mutex() })
+    using d = Device { state }
+    state.instance = create_instance()?
+    for c in candidates(state.instance)? {
+        if wanted(c.info) {
+            build(state, c)?
+            return d
+        }
+    }
+    fail NoDevice
+}
+
+fn build(s: *State, c: Candidate) ! Error {
+    using var pins = new_pins()
+    let weights: f32[] = [1.0]
+    let queues = pins.hold(VkDeviceQueueCreateInfo { queueFamilyIndex: c.family, queueCount: 1, pQueuePriorities: pins.hold_all(weights) })
+    let features = pins.hold(VkPhysicalDeviceFeatures { shaderInt64: 1, shaderFloat64: if c.info.float64 { 1 } else { 0 } })
+    var info = VkDeviceCreateInfo { queueCreateInfoCount: 1, pQueueCreateInfos: queues, pEnabledFeatures: features }
+    check(vkCreateDevice(c.physical, mut info, null, mut s.handle), "vkCreateDevice")?
+    s.name = c.info.name
+    s.float64 = c.info.float64
+    vkGetDeviceQueue(s.handle, c.family, 0, mut s.queue)
+    var memory = VkPhysicalDeviceMemoryProperties {}
+    vkGetPhysicalDeviceMemoryProperties(c.physical, mut memory)
+    s.memory_types = VkPhysicalDeviceMemoryProperties_memoryTypes(memory)[..memory.memoryTypeCount]
+    var pool = VkCommandPoolCreateInfo { flags: VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, queueFamilyIndex: c.family }
+    check(vkCreateCommandPool(s.handle, mut pool, null, mut s.pool), "vkCreateCommandPool")?
+    var wanted = VkCommandBufferAllocateInfo { commandPool: s.pool, level: VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount: 1 }
+    let made: VkCommandBuffer[] = [VkCommandBuffer {}]
+    check(vkAllocateCommandBuffers(s.handle, mut wanted, pins.hold_all(made)), "vkAllocateCommandBuffers")?
+    s.commands = made[0]
+}
+
+fn close(s: *State) {
+    if s.handle.handle != null {
+        let _ = vkQueueWaitIdle(s.queue)
+        vkDestroyCommandPool(s.handle, s.pool, null)
+        vkDestroyDevice(s.handle, null)
+        s.handle = VkDevice {}
+    }
+    if s.instance.handle != null {
+        vkDestroyInstance(s.instance, null)
+        s.instance = VkInstance {}
+    }
+}
+
+/// Returns the name the driver gives the device.
+pub fn name(d: Device) -> str {
+    d.state.name
+}
