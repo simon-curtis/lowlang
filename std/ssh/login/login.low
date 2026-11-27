@@ -1,0 +1,593 @@
+import std/io
+import std/net
+import std/os
+import std/os/utmp
+import std/path
+import signals = std/os/signal
+import std/process
+import std/ssh
+import std/sys
+import std/term
+import std/text
+import std/time
+
+/// The account a login session runs as.
+pub struct Account {
+    /// The login name.
+    pub name: str
+    /// The user id.
+    pub uid: i64
+    /// The primary group id.
+    pub gid: i64
+    /// The supplementary group ids.
+    pub groups: i64[] = []
+    /// The home directory, where a session starts.
+    pub home: str
+    /// The login shell, which runs the session's shell and commands.
+    pub shell: str
+}
+
+/// How `handler` runs a login session.
+pub struct Config {
+    /// Returns the account a user who authenticated logs in as, or `none` to refuse the session. The default reads the system's account files with `system_account`.
+    pub account: fn(str) -> Account? = system_account
+    /// The variables a client may set with `env` requests, as patterns where `*` matches any run of characters and `?` one character.
+    pub accept_env: str[] = ["LANG", "LC_*"]
+    /// Whether a session may have a terminal; `false` refuses `pty-req`.
+    pub terminals: bool = true
+    /// The `PATH` of a session.
+    pub path: str = "/usr/local/sbin:/usr/local/bin:/usr/bin:/bin"
+    /// The program and arguments that serve the `sftp` subsystem on standard input and output, run as the user. An empty list refuses the subsystem.
+    pub sftp: str[] = []
+    /// Opens terminals, starts children and records logins. The default does it in this process with `local`.
+    pub launcher: Launcher = local(fn(r) {})
+}
+
+/// A pty session starting or ending, as `Launcher.record` receives it.
+pub struct Record {
+    /// The account the session runs as.
+    pub account: Account
+    /// The device path of the session's terminal, such as `/dev/pts/3`.
+    pub tty: str
+    /// The process id of the session's shell or command.
+    pub pid: i64
+    /// The client's address, or `none` when the connection did not come from `ssh.serve`.
+    pub remote: net.Addr?
+    /// Whether the session ended.
+    pub ended: bool
+}
+
+/// A pseudoterminal a session runs on.
+pub struct Terminal {
+    /// The master side, which the session reads and writes.
+    pub master: i64
+    /// The slave side, which becomes the child's terminal, or `-1` when the launcher keeps it.
+    pub slave: i64
+    /// The device path of the slave side, such as `/dev/pts/3`.
+    pub path: str
+}
+
+/// What a session runs.
+pub enum Program {
+    /// The account's shell, as a login shell.
+    Shell
+    /// A command, which the account's shell runs with `-c`.
+    Command(text: str)
+    /// A subsystem by name. Only `sftp` is served, by `Config.sftp`.
+    Subsystem(name: str)
+}
+
+/// What a session asks its `Launcher` to start: the client's requests, which `prepare` turns into a `Launch` for the account.
+pub struct Request {
+    /// What to run.
+    pub program: Program
+    /// The variables the client set with `env` requests.
+    pub env: [str: str] = [:]
+    /// The terminal type of the `pty-req`, or the empty string.
+    pub term: str = ""
+    /// The terminal the launcher opened for the session, or `none` to run on pipes.
+    pub terminal: Terminal? = none
+    /// The server's end of the connection, when known.
+    pub local: net.Addr? = none
+    /// The client's end of the connection, when known.
+    pub remote: net.Addr? = none
+}
+
+/// A child to start, as `prepare` builds it from a `Request`.
+pub struct Launch {
+    /// The account the child runs as.
+    pub account: Account
+    /// The program.
+    pub program: str
+    /// The arguments after the program name.
+    pub args: str[] = []
+    /// Whether the program starts as a login shell, with `-` before its name in `argv[0]`.
+    pub login: bool = false
+    /// The complete environment.
+    pub env: [str: str]
+    /// The terminal the launcher opened for the session, or `none` to connect the child with pipes.
+    pub terminal: Terminal? = none
+    /// The descriptors of the child's standard input, output and error when it has no terminal, in place of new pipes, or empty for new pipes.
+    pub stdio: i64[] = []
+}
+
+/// A child a `Launcher` started.
+pub struct Started {
+    /// The process id.
+    pub pid: i64
+    /// The child's standard input, output and error, when it runs on pipes.
+    pub stdin: io.Stream? = none
+    /// The child's standard output when it runs on pipes.
+    pub stdout: io.Stream? = none
+    /// The child's standard error when it runs on pipes.
+    pub stderr: io.Stream? = none
+    /// Waits for the child to end and returns how it ended.
+    pub wait: fn() -> process.Exit
+    /// Sends a signal to the child's process group.
+    pub signal: fn(signals.Signal)
+}
+
+/// The operations of a session that need privilege: opening a terminal that belongs to the account, and starting the account's processes, recording each one on a terminal as a login.
+///
+/// `local` performs them in this process. A privilege-separated server passes one that asks a privileged monitor, which builds the child from the request with `prepare` for the account it authenticated rather than trusting the session's.
+pub struct Launcher {
+    /// Opens a pseudoterminal for the account.
+    pub terminal: fn(Account) -> Terminal ! io.Error
+    /// Starts what the request asks for as the account, with the session's configuration.
+    pub start: fn(Config, Account, Request) -> Started ! io.Error
+}
+
+struct Session {
+    ch: *ssh.ChannelHandle
+    conn: *ssh.ConnectionHandle
+    account: Account
+    config: Config
+    env: [str: str]
+    term: str
+    terminal: Terminal?
+    master: sys.FdHandle?
+    child: Started?
+    finished: chan[bool]
+}
+
+/// Returns the account of the system user `name`: its `/etc/passwd` entry and the groups `/etc/group` lists it in, or `none` when there is no such user.
+pub fn system_account(name: str) -> Account? {
+    let user = os.lookup_user_name(name) ?? return none
+    var groups: i64[] = [user.gid]
+    for g in os.supplementary_groups(name) {
+        if g.gid != user.gid {
+            groups.push(g.gid)
+        }
+    }
+    Account { name: user.name, uid: user.uid, gid: user.gid, groups, home: user.home, shell: user.shell }
+}
+
+/// Returns a `Launcher.record` that keeps the utmp file at `current` and the wtmp file at `history`, so `who` and `last` list the sessions. The system's files are `utmp.utmp_path` and `utmp.wtmp_path`, which only root may write. A record that cannot be written is skipped.
+pub fn records(current: str, history: str) -> fn(Record) {
+    fn(r) { keep_record(r, current, history) }
+}
+
+fn keep_record(r: Record, current: str, history: str) {
+    let line = utmp.line_of(r.tty)
+    let nanos = time.now_nanos()
+    var e = utmp.Entry {
+        kind: utmp.Kind.Dead when r.ended else utmp.Kind.User
+        pid: r.pid
+        line
+        id: utmp.id_of(line)
+        session: r.pid
+        seconds: nanos / 1000000000
+        micros: nanos % 1000000000 / 1000
+    }
+    if !r.ended {
+        e.user = r.account.name
+        match r.remote {
+            some(a) => {
+                e.address = net.unmap(a.ip)
+                e.host = net.format_ip(e.address)
+            }
+            none => {}
+        }
+    }
+    utmp.put(current, e) or {}
+    utmp.append(history, e) or {}
+}
+
+/// Returns the launcher that opens terminals and starts children in this process, as the account when the process runs as another user, and passes each pty session's start and end to `record`.
+pub fn local(record: fn(Record)) -> Launcher {
+    Launcher {
+        terminal: open_terminal_for
+        start: fn(config, account, r) { start_local(config, account, r, record) }
+    }
+}
+
+/// Opens a pseudoterminal and, when this process runs as root, gives its slave side to the account with mode 620.
+pub fn open_terminal_for(a: Account) -> Terminal ! io.Error {
+    let pair = sys.open_pty()?
+    if sys.euid() == 0 && a.uid != 0 {
+        sys.chown(pair.path, a.uid, a.gid, true) or {}
+        sys.chmod(pair.path, 0o620) or {}
+    }
+    Terminal { master: pair.master, slave: pair.slave, path: pair.path }
+}
+
+fn identity(a: Account) -> process.Credentials? {
+    if sys.euid() == a.uid {
+        return none
+    }
+    process.Credentials { uid: a.uid, gid: a.gid, groups: a.groups }
+}
+
+fn command_of(l: Launch, slave: i64) -> process.Command {
+    var c = process.command(l.program, l.args)
+    c.env = some(l.env)
+    c.dir = l.account.home
+    c.credentials = identity(l.account)
+    if l.login {
+        c.arg0 = "-{path.base(l.program)}"
+    }
+    if slave >= 0 {
+        let terminal = process.Stdio.Descriptor(slave)
+        c.stdin = terminal
+        c.stdout = terminal
+        c.stderr = terminal
+        c.session = process.Session.Terminal
+    } else if l.stdio.len == 3 {
+        c.stdin = process.Stdio.Descriptor(l.stdio[0])
+        c.stdout = process.Stdio.Descriptor(l.stdio[1])
+        c.stderr = process.Stdio.Descriptor(l.stdio[2])
+        c.session = process.Session.New
+    } else {
+        c.stdin = process.Stdio.Piped
+        c.stdout = process.Stdio.Piped
+        c.stderr = process.Stdio.Piped
+        c.session = process.Session.New
+    }
+    c
+}
+
+fn start_command(c: process.Command) -> *process.ChildHandle ! io.Error {
+    process.start_handle(c) catch {
+        e => {
+            var fallback = c
+            fallback.dir = "/"
+            process.start_handle(fallback)?
+        }
+    }
+}
+
+fn wait_recorded(child: *process.ChildHandle, l: Launch, remote: net.Addr?, record: fn(Record)) -> process.Exit {
+    let status = process.wait_on(child) or process.Exit.Exited(255)
+    match l.terminal {
+        some(t) => record(Record { account: l.account, tty: t.path, pid: child.pid, remote, ended: true })
+        none => {}
+    }
+    status
+}
+
+/// Starts the child `l` describes in this process and returns it; a child on a terminal is passed to `record` when it starts and when `wait` sees it end.
+///
+/// Fails with the error of starting it from the account's home directory and from `/`.
+pub fn start_launch(l: Launch, remote: net.Addr?, record: fn(Record)) -> Started ! io.Error {
+    let terminal = l.terminal ?? Terminal { master: -1, slave: -1, path: "" }
+    let child = start_command(command_of(l, terminal.slave))?
+    if terminal.path.len > 0 {
+        record(Record { account: l.account, tty: terminal.path, pid: child.pid, remote, ended: false })
+    }
+    Started {
+        pid: child.pid
+        stdin: child.stdin
+        stdout: child.stdout
+        stderr: child.stderr
+        wait: fn() { wait_recorded(child, l, remote, record) }
+        signal: fn(sig) { process.kill_on(child, sig) or {} }
+    }
+}
+
+fn start_local(config: Config, account: Account, r: Request, record: fn(Record)) -> Started ! io.Error {
+    let l = prepare(config, account, r) ?? fail io.Error.Denied
+    start_launch(l, r.remote, record)?
+}
+
+/// Returns a channel handler for `ssh.ServerConfig.channels` that serves `session` channels as `sshd` does and refuses the rest.
+///
+/// A session runs the account's shell, a command through `shell -c`, or the `sftp` subsystem, in the account's home directory, as the account when the server runs as another user. With a `pty-req` it runs on a new pseudoterminal that is its controlling terminal; `window-change` resizes it and `signal` signals its process group. Without one its standard streams are pipes, and standard error is the channel's extended data. When the child ends the channel gets `exit-status` or `exit-signal`, then EOF and close. Closing the channel first hangs up the child's process group.
+pub fn handler(config: Config) -> fn(ssh.Incoming) {
+    fn(inc) { open(inc, config) }
+}
+
+fn open(inc: ssh.Incoming, config: Config) {
+    if inc.kind != "session" {
+        ssh.reject(inc, ssh.open_unknown_channel_type, "only session channels are served")
+        return
+    }
+    let conn = ssh.connection_of(inc)
+    let found = config.account(conn.user)
+    if found == none {
+        ssh.reject(inc, ssh.open_administratively_prohibited, "no account")
+        return
+    }
+    let account = found ?? return
+    using ch = ssh.accept(inc) or return
+    let s = new(Session {
+        ch: ch.handle
+        conn
+        account
+        config
+        env: [:]
+        term: ""
+        terminal: none
+        master: none
+        child: none
+        finished: chan[bool](1)
+    })
+    s.serve_requests()
+    s.hang_up()
+}
+
+fn serve_requests(s: *Session) {
+    for {
+        let req = ssh.next_request_on(s.ch) ?? return
+        let ok = s.answer(req)
+        ssh.answer_on(s.ch, req, ok) or return
+    }
+}
+
+fn answer(s: *Session, req: ssh.ChannelRequest) -> bool {
+    match req.kind {
+        "pty-req" => s.open_terminal(req)
+        "env" => s.set_env(req)
+        "window-change" => s.resize(req)
+        "signal" => s.signal(req)
+        "shell" => s.start(Program.Shell)
+        "exec" => {
+            let command = ssh.parse_exec(req) or return false
+            s.start(Program.Command(command))
+        }
+        "subsystem" => {
+            let name = ssh.parse_subsystem(req) or return false
+            s.start(Program.Subsystem(name))
+        }
+        _ => false
+    }
+}
+
+fn open_terminal(s: *Session, req: ssh.ChannelRequest) -> bool {
+    if !s.config.terminals || s.terminal != none || s.child != none {
+        return false
+    }
+    let p = ssh.parse_pty(req) or return false
+    let opened = s.config.launcher.terminal(s.account) or return false
+    s.terminal = opened
+    s.master = sys.wrap(opened.master)
+    s.term = p.term
+    sys.set_nonblocking(opened.master) or return false
+    term.set_size(opened.master, term.Size { columns: p.columns, rows: p.rows }) or {}
+    true
+}
+
+fn accepted(config: Config, name: str) -> bool {
+    for pattern in config.accept_env {
+        if path.matches(pattern, name) {
+            return true
+        }
+    }
+    false
+}
+
+fn set_env(s: *Session, req: ssh.ChannelRequest) -> bool {
+    let e = ssh.parse_env(req) or return false
+    if !accepted(s.config, e.name) {
+        return false
+    }
+    s.env[e.name] = e.value
+    true
+}
+
+fn resize(s: *Session, req: ssh.ChannelRequest) -> bool {
+    let master = s.master ?? return false
+    let size = ssh.parse_window_change(req) or return false
+    term.set_size(master.fd, term.Size { columns: size[0], rows: size[1] }) or return false
+    true
+}
+
+fn signal_named(name: str) -> signals.Signal? {
+    for n in 1..32 {
+        let found = signals.from_number(n) ?? continue
+        if signals.name(found) == "SIG{name}" {
+            return found
+        }
+    }
+    none
+}
+
+fn signal(s: *Session, req: ssh.ChannelRequest) -> bool {
+    let child = s.child ?? return false
+    let name = ssh.parse_signal(req) or return false
+    let found = signal_named(name) ?? return false
+    child.signal(found)
+    true
+}
+
+fn address_text(a: net.Addr) -> str {
+    "{net.format_ip(net.unmap(a.ip))} {a.port}"
+}
+
+fn environment(config: Config, account: Account, r: Request) -> [str: str] {
+    var env: [str: str] = [:]
+    for name, value in r.env {
+        if accepted(config, name) {
+            env[name] = value
+        }
+    }
+    env["USER"] = account.name
+    env["LOGNAME"] = account.name
+    env["HOME"] = account.home
+    env["SHELL"] = account.shell
+    env["PATH"] = config.path
+    env["MAIL"] = "/var/spool/mail/{account.name}"
+    match r.terminal {
+        some(t) => {
+            env["TERM"] = r.term
+            env["SSH_TTY"] = t.path
+        }
+        none => {}
+    }
+    match r.remote {
+        some(remote) => {
+            let local = r.local ?? net.Addr { ip: [], port: 0 }
+            env["SSH_CLIENT"] = "{address_text(remote)} {local.port}"
+            env["SSH_CONNECTION"] = "{address_text(remote)} {address_text(local)}"
+        }
+        none => {}
+    }
+    env
+}
+
+/// Returns the child `r` asks for as `account`: the account's login shell, a command through its shell, or `config.sftp` for the `sftp` subsystem, with the variables `config.accept_env` admits and the session's own. Returns `none` for another subsystem, or `sftp` when `config.sftp` is empty.
+pub fn prepare(config: Config, account: Account, r: Request) -> Launch? {
+    let env = environment(config, account, r)
+    match r.program {
+        Shell => Launch { account, program: account.shell, login: true, env, terminal: r.terminal }
+        Command(text) => Launch { account, program: account.shell, args: ["-c", text], env, terminal: r.terminal }
+        Subsystem(name) => {
+            if name != "sftp" || config.sftp.len == 0 {
+                return none
+            }
+            Launch { account, program: config.sftp[0], args: config.sftp[1..], env, terminal: r.terminal }
+        }
+    }
+}
+
+fn start(s: *Session, program: Program) -> bool {
+    if s.child != none {
+        return false
+    }
+    let r = Request { program, env: s.env, term: s.term, terminal: s.terminal, local: s.conn.local, remote: s.conn.remote }
+    let child = s.config.launcher.start(s.config, s.account, r) or return false
+    s.child = child
+    match s.terminal {
+        some(t) => {
+            if t.slave >= 0 {
+                sys.close_fd(t.slave)
+                s.terminal = Terminal { master: t.master, slave: -1, path: t.path }
+            }
+            spawn run_terminal(s, child, s.master ?? sys.wrap(-1))
+        }
+        none => {
+            spawn run_pipes(s, child)
+        }
+    }
+    true
+}
+
+fn copy_to_channel(h: *ssh.ChannelHandle, from: io.Stream, extended: bool, done: chan[bool]) {
+    let buf = io.buffer(32768)
+    for {
+        let n = from.read(buf) or 0
+        if n == 0 {
+            break
+        }
+        if extended {
+            ssh.write_stderr_on(h, buf[..n]) or break
+        } else {
+            ssh.write_on(h, buf[..n]) or break
+        }
+    }
+    done <- true
+}
+
+fn copy_from_channel(h: *ssh.ChannelHandle, to: io.Stream, close_at_end: bool) {
+    let buf = io.buffer(32768)
+    for {
+        let n = ssh.read_on(h, buf) or 0
+        if n == 0 {
+            break
+        }
+        io.write_all(to, buf[..n]) or break
+    }
+    if close_at_end {
+        to.close()
+    }
+}
+
+fn run_pipes(s: *Session, child: Started) {
+    let done = chan[bool](2)
+    match child.stdin {
+        some(input) => {
+            spawn copy_from_channel(s.ch, input, true)
+        }
+        none => {}
+    }
+    var outputs = 0
+    for i, output in [child.stdout, child.stderr] {
+        match output {
+            some(stream) => {
+                spawn copy_to_channel(s.ch, stream, i == 1, done)
+                outputs += 1
+            }
+            none => {}
+        }
+    }
+    let status = child.wait()
+    for i in 0..outputs {
+        let finished = <-done
+    }
+    s.finish(status)
+}
+
+fn run_terminal(s: *Session, child: Started, master: sys.FdHandle) {
+    let done = chan[bool](1)
+    let stream = sys.stream_on(master)
+    spawn copy_from_channel(s.ch, stream, false)
+    spawn copy_to_channel(s.ch, stream, false, done)
+    let status = child.wait()
+    select {
+        finished = <-done => {}
+        after(200) => {}
+    }
+    s.finish(status)
+}
+
+fn finish(s: *Session, status: process.Exit) {
+    match status {
+        Exited(code) => ssh.send_exit_status_on(s.ch, code) or {}
+        Signaled(sig) => {
+            let name = signals.name(sig)
+            let short = name[3..] when text.starts_with(name, "SIG") else name
+            ssh.send_exit_signal_on(s.ch, short, false, "") or {}
+        }
+    }
+    ssh.close_write_on(s.ch) or {}
+    ssh.close_on(s.ch)
+    s.finished <- true
+}
+
+fn hang_up(s: *Session) {
+    match s.child {
+        some(child) => s.stop(child)
+        none => {}
+    }
+    match s.terminal {
+        some(t) => {
+            if t.slave >= 0 {
+                sys.close_fd(t.slave)
+            }
+        }
+        none => {}
+    }
+    match s.master {
+        some(master) => sys.close_on(master)
+        none => {}
+    }
+}
+
+fn stop(s: *Session, child: Started) {
+    child.signal(signals.Signal.Hangup)
+    select {
+        finished = <-s.finished => return
+        after(5000) => {}
+    }
+    child.signal(signals.Signal.Kill)
+    let finished = <-s.finished
+}

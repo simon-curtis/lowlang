@@ -1,0 +1,191 @@
+import std/crypto
+import std/crypto/x509
+import std/file
+import std/io
+import std/net
+import std/os/utmp
+import std/ssh
+import std/ssh/key
+import std/sys
+import std/testing
+import std/text
+
+fn account_in(home: str) -> Account {
+    Account { name: "tester", uid: sys.euid(), gid: sys.egid(), home, shell: "/bin/sh" }
+}
+
+fn server_config(config: Config) -> ssh.ServerConfig {
+    let host = key.signer(x509.PrivateKey.Ed25519(crypto.random(32))) or panic("host key")
+    let auth = ssh.ServerAuth { methods: ["password"], password: fn(user, password) { true } }
+    ssh.ServerConfig { host_keys: [host], auth, channels: handler(config) }
+}
+
+fn serve_one(stream: io.Stream, config: ssh.ServerConfig) {
+    using conn = ssh.serve_stream(stream, config) or return
+    ssh.wait_on(conn.handle)
+}
+
+fn connect(ends: net.ConnPair, config: Config) -> ssh.Connection {
+    spawn serve_one(net.stream(ends.second), server_config(config))
+    let client = ssh.ClientConfig { user: "tester", verify_host_key: ssh.accept_any_host_key(), auth: [ssh.AuthMethod.Password("x")] }
+    ssh.client(net.stream(ends.first), client) or panic("client")
+}
+
+fn home_config() -> Config {
+    let home = file.temp_dir("login-home") or panic("temp dir")
+    Config { account: fn(name) { account_in(home) } }
+}
+
+fn remove_home(config: Config) {
+    let account = config.account("tester") ?? return
+    file.remove_all(account.home) or {}
+}
+
+fn read_until(h: *ssh.ChannelHandle, marker: str) -> str {
+    var out: u8[] = []
+    let buf = io.buffer(4096)
+    for {
+        let n = ssh.read_on(h, buf) or 0
+        if n == 0 {
+            return text.replace(str(out), "\r", "")
+        }
+        for b in buf[..n] {
+            out.push(b)
+        }
+        let seen = text.replace(str(out), "\r", "")
+        if marker.len > 0 && text.contains(seen, marker) {
+            return seen
+        }
+    }
+}
+
+fn read_all(h: *ssh.ChannelHandle) -> str {
+    read_until(h, "")
+}
+
+fn test_exec_runs_in_the_home_directory_on_pipes(t: *testing.T) {
+    let config = home_config()
+    defer remove_home(config)
+    let home = (config.account("tester") ?? panic("account")).home
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = connect(ends, config)
+    let result = ssh.exec(conn, "echo $USER $HOME; pwd; [ -t 0 ] || echo no-tty; echo oops >&2; exit 3") or panic("exec")
+    testing.error_if(t, str(result.stdout) != "tester {home}\n{home}\nno-tty\n", "stdout {str(result.stdout)}")
+    testing.error_if(t, str(result.stderr) != "oops\n", "stderr {str(result.stderr)}")
+    testing.error_if(t, result.status.code != 3, "status {result.status.code}")
+}
+
+fn test_pty_session_gets_a_controlling_terminal(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let config = home_config()
+    defer remove_home(config)
+    using conn = connect(ends, config)
+    using ch = ssh.open_session(conn) or panic("session")
+    ssh.pty_on(ch.handle, ssh.Pty { term: "xterm", columns: 80, rows: 24 }) or panic("pty")
+    ssh.env_on(ch.handle, "LANG", "C.UTF-8") or panic("env LANG")
+    var refused = false
+    ssh.env_on(ch.handle, "SECRET", "1") or {
+        refused = true
+    }
+    testing.error_if(t, !refused, "the server accepted a variable outside accept_env")
+    ssh.exec_on(ch.handle, "echo $TERM $LANG ${{SECRET:-unset}}; stty size; tty; echo resize; read line; stty size") or panic("exec")
+    let before = read_until(ch.handle, "resize\n")
+    ssh.window_change_on(ch.handle, 100, 40, 0, 0) or panic("window change")
+    ssh.write_on(ch.handle, bytes("\n")) or panic("write")
+    let lines = text.lines(before + read_all(ch.handle))
+    testing.fatal_if(t, lines.len < 4, "short output {lines}")
+    testing.error_if(t, lines[0] != "xterm C.UTF-8 unset", "environment {lines[0]}")
+    testing.error_if(t, lines[1] != "24 80", "size {lines[1]}")
+    testing.error_if(t, !text.starts_with(lines[2], "/dev/pts/"), "tty {lines[2]}")
+    testing.error_if(t, lines[lines.len - 1] != "40 100", "size after window-change {lines}")
+    testing.error_if(t, ssh.wait_exit_on(ch.handle).code != 0, "exit status")
+}
+
+fn test_signal_reaches_the_command(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let config = home_config()
+    defer remove_home(config)
+    using conn = connect(ends, config)
+    using ch = ssh.open_session(conn) or panic("session")
+    ssh.exec_on(ch.handle, "exec sleep 30") or panic("exec")
+    ssh.signal_on(ch.handle, "TERM") or panic("signal")
+    let status = ssh.wait_exit_on(ch.handle)
+    testing.error_if(t, status.signal != "TERM", "exit signal {status.signal}, code {status.code}")
+}
+
+fn test_subsystem_runs_the_configured_command(t: *testing.T) {
+    var config = home_config()
+    defer remove_home(config)
+    config.sftp = ["/bin/cat"]
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = connect(ends, config)
+    let h = ssh.open_subsystem(conn, "sftp") or panic("subsystem")
+    ssh.write_on(h, bytes("ping")) or panic("write")
+    ssh.close_write_on(h) or panic("close write")
+    testing.error_if(t, read_all(h) != "ping", "echo")
+    ssh.close_on(h)
+}
+
+fn test_unknown_account_is_refused(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = connect(ends, Config { account: fn(name) { none } })
+    using opened = ssh.open_session(conn) catch {
+        e => return
+    }
+    testing.error(t, "a session opened without an account")
+}
+
+fn test_closing_the_channel_hangs_up_and_records_the_session(t: *testing.T) {
+    let dir = file.temp_dir("login-records") or panic("temp dir")
+    defer file.remove_all(dir) or {}
+    let keep = records("{dir}/utmp", "{dir}/wtmp")
+    let seen = chan[Record](2)
+    var config = home_config()
+    defer remove_home(config)
+    config.launcher = local(fn(r) {
+        keep(r)
+        seen <- r
+    })
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = connect(ends, config)
+    using ch = ssh.open_session(conn) or panic("session")
+    ssh.pty_on(ch.handle, ssh.Pty { term: "dumb", columns: 80, rows: 24 }) or panic("pty")
+    ssh.exec_on(ch.handle, "sleep 30") or panic("exec")
+    let started = (<-seen) ?? panic("start record")
+    let current = utmp.read_entries("{dir}/utmp") or panic("utmp")
+    testing.error_if(t, current.len != 1 || current[0].kind != utmp.Kind.User || current[0].user != "tester", "utmp while running {current}")
+    ssh.close_on(ch.handle)
+    let ended = select {
+        r = <-seen => r ?? panic("end record")
+        after(10000) => panic("the session did not end after its channel closed")
+    }
+    testing.error_if(t, !ended.ended || ended.pid != started.pid, "end record {ended.pid} {ended.ended}")
+    let after_end = utmp.read_entries("{dir}/utmp") or panic("utmp")
+    testing.error_if(t, after_end.len != 1 || after_end[0].kind != utmp.Kind.Dead, "utmp after the end {after_end}")
+    let history = utmp.read_entries("{dir}/wtmp") or panic("wtmp")
+    testing.error_if(t, history.len != 2 || history[0].kind != utmp.Kind.User || history[1].kind != utmp.Kind.Dead, "wtmp {history}")
+}
+
+fn test_terminals_off_refuses_a_pty_and_env_takes_patterns(t: *testing.T) {
+    var config = home_config()
+    defer remove_home(config)
+    config.terminals = false
+    config.accept_env = ["L?NG", "X_*_Y"]
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = connect(ends, config)
+    using ch = ssh.open_session(conn) or panic("session")
+    var refused = false
+    ssh.pty_on(ch.handle, ssh.Pty { term: "xterm", columns: 80, rows: 24 }) or {
+        refused = true
+    }
+    testing.error_if(t, !refused, "a pty was granted with terminals off")
+    ssh.env_on(ch.handle, "LANG", "C") or panic("env LANG")
+    ssh.env_on(ch.handle, "X_mid_Y", "1") or panic("env X_mid_Y")
+    var wide = false
+    ssh.env_on(ch.handle, "LAANG", "C") or {
+        wide = true
+    }
+    testing.error_if(t, !wide, "L?NG matched LAANG")
+    ssh.exec_on(ch.handle, "echo $LANG $X_mid_Y") or panic("exec")
+    testing.error_if(t, read_all(ch.handle) != "C 1\n", "environment")
+}

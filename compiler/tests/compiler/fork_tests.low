@@ -1,0 +1,211 @@
+import amd64
+import compiler
+import ir
+import native
+import target
+import std/testing
+import std/text
+
+const exit_group = 231
+const execve = 59
+const execveat = 322
+
+struct Step {
+    at: i64
+    number: i64
+}
+
+struct Instruction {
+    mnemonic: str
+    operands: str
+}
+
+struct ChildWalk {
+    lines: []str
+    labels: [str: i64]
+    returning: [str: bool]
+    syscalls: [i64: bool]
+    problems: []str
+}
+
+fn test_fork_child_calls_no_runtime_routine(t: *testing.T) {
+    let profiles = [compiler.dev(target.OS.Linux), compiler.release(target.OS.Linux)]
+    let names = ["dev", "release"]
+    for k, profile in profiles {
+        let name = names[k]
+        let prog = program_of(unit_with(t, embed("programs/fork_exec.txt"), profile))
+        let w = child_walk(prog)
+        let fork = w.fork_branch() ?? {
+            t.error("{name}: no fork followed by a branch on its result in std.sys.fork_exec")
+            continue
+        }
+        w.walk(fork)
+        for problem in w.problems {
+            t.error("{name}: the forked child {problem}")
+        }
+        if !(w.syscalls[execve] ?? false) || !(w.syscalls[execveat] ?? false) {
+            t.error("{name}: the walk from the fork reaches no execve and execveat")
+        }
+    }
+}
+
+fn child_walk(prog: *ir.Program) -> *ChildWalk {
+    let out = amd64.generate(prog, amd64.new_platform(target.OS.Linux), none, false, native.runner())
+    let lines = asm_lines(out.asm)
+    var labels: [str: i64] = [:]
+    for i, line in lines {
+        if text.ends_with(line, ":") {
+            labels[line[..line.len - 1]] = i
+        }
+    }
+    new(ChildWalk { lines, labels, returning: [:], syscalls: [:], problems: [] })
+}
+
+fn fork_branch(w: *ChildWalk) -> i64? {
+    var at = w.labels[amd64.symbol("std.sys.fork_exec", "")] ?? return none
+    for at + 1 < w.lines.len && !(w.lines[at] == "mov rax, 57" && w.lines[at + 1] == "syscall") {
+        at += 1
+    }
+    for at < w.lines.len && !text.starts_with(w.lines[at], "j") {
+        at += 1
+    }
+    if at >= w.lines.len {
+        return none
+    }
+    let branch = instruction(w.lines[at])
+    if branch.mnemonic == "jne" || branch.mnemonic == "jnz" {
+        return some(at + 1)
+    }
+    if branch.mnemonic == "je" || branch.mnemonic == "jz" {
+        return w.labels[branch.operands]
+    }
+    none
+}
+
+fn walk(w: *ChildWalk, start: i64) -> bool {
+    var returns = false
+    var seen: [i64: bool] = [:]
+    var pending: []Step = [Step { at: start, number: -1 }]
+    for pending.len > 0 {
+        let step = pending.pop() ?? break
+        if !(seen[step.at] ?? false) {
+            seen[step.at] = true
+            if w.follow(step, mut pending) {
+                returns = true
+            }
+        }
+    }
+    returns
+}
+
+fn follow(w: *ChildWalk, step: Step, mut pending: []Step) -> bool {
+    var at = step.at
+    var number = step.number
+    for at < w.lines.len {
+        let line = w.lines[at]
+        if text.ends_with(line, ":") {
+            if text.starts_with(line, "fn_") {
+                return false
+            }
+            number = -1
+            at += 1
+            continue
+        }
+        let i = instruction(line)
+        let mnemonic = i.mnemonic
+        let operands = i.operands
+        if mnemonic == "ret" {
+            return true
+        }
+        if mnemonic == "ud2" {
+            return false
+        }
+        if mnemonic == "syscall" {
+            if number >= 0 {
+                w.syscalls[number] = true
+            }
+            if number == exit_group {
+                return false
+            }
+            number = -1
+        } else if mnemonic == "call" || (mnemonic == "jmp" && !text.starts_with(operands, ".L")) {
+            if !w.callee_returns(operands) {
+                return false
+            }
+            if mnemonic == "jmp" {
+                return true
+            }
+            number = -1
+        } else if mnemonic == "jmp" {
+            pending.push(Step { at: w.labels[operands] ?? return w.lost(line), number })
+            return false
+        } else if text.starts_with(mnemonic, "j") {
+            pending.push(Step { at: w.labels[operands] ?? return w.lost(line), number })
+        } else {
+            number = rax_after(mnemonic, operands, number)
+        }
+        at += 1
+    }
+    false
+}
+
+fn callee_returns(w: *ChildWalk, target: str) -> bool {
+    let name = text.trim_prefix(target, "{{disp32}} ")
+    if !text.starts_with(name, "fn_") {
+        w.problem("calls {name}")
+        return true
+    }
+    let start = w.labels[name] ?? return w.lost("call {name}")
+    match w.returning[name] {
+        some(known) => known
+        none => {
+            w.returning[name] = true
+            let returns = w.walk(start + 1)
+            w.returning[name] = returns
+            returns
+        }
+    }
+}
+
+fn lost(w: *ChildWalk, line: str) -> bool {
+    w.problem("reaches {line}, whose target the walk cannot follow")
+    false
+}
+
+fn problem(w: *ChildWalk, message: str) {
+    for known in w.problems {
+        if known == message {
+            return
+        }
+    }
+    w.problems.push(message)
+}
+
+fn rax_after(mnemonic: str, operands: str, number: i64) -> i64 {
+    let comma = text.index(operands, ", ")
+    let first = if comma < 0 { operands } else { operands[..comma] }
+    if first == "rax" || first == "eax" {
+        if mnemonic == "mov" {
+            return text.parse_int(operands[comma + 2..]) or -1
+        }
+        if mnemonic == "xor" && operands[comma + 2..] == first {
+            return 0
+        }
+        return -1
+    }
+    let implicit = ["mul", "div", "idiv", "imul", "cqo", "cdq", "cdqe", "xchg", "cmpxchg", "rdtsc", "cpuid", "lahf"]
+    for m in implicit {
+        if m == mnemonic {
+            return -1
+        }
+    }
+    number
+}
+
+fn instruction(line: str) -> Instruction {
+    let space = text.index_byte(line, ' ')
+    if space < 0 {
+        return Instruction { mnemonic: line, operands: "" }
+    }
+    Instruction { mnemonic: line[..space], operands: text.trim(line[space + 1..]) }
+}

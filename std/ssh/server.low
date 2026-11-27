@@ -1,5 +1,7 @@
+import std/atomic
 import std/io
 import std/net
+import std/rand
 import std/ssh/key
 
 /// The settings of an SSH server.
@@ -18,6 +20,22 @@ pub struct ServerConfig {
     pub rekey_bytes: i64 = 1073741824
     /// The seconds under one set of keys that trigger a new key exchange. The default is one hour.
     pub rekey_seconds: i64 = 3600
+    /// The seconds a client has to complete the handshake and authenticate before the connection is closed, as OpenSSH's `LoginGraceTime`. `0` waits for ever. The default is two minutes.
+    pub login_grace: i64 = 120
+    /// How many connections `serve` lets wait to authenticate at once.
+    pub startups: Startups = Startups {}
+}
+
+/// The limit on connections that have not authenticated yet, as OpenSSH's `MaxStartups start:rate:full`.
+///
+/// Below `start` waiting connections every new one is served. From `start` a new one is closed at once with a chance of `rate` percent, which rises linearly to 100 at `full`.
+pub struct Startups {
+    /// The number of waiting connections from which new ones are refused at random.
+    pub start: i64 = 10
+    /// The percentage of new connections refused at `start`.
+    pub rate: i64 = 30
+    /// The number of waiting connections from which every new one is refused.
+    pub full: i64 = 100
 }
 
 fn reject_all(inc: Incoming) {
@@ -41,50 +59,109 @@ fn server_setup(config: ServerConfig) -> Setup {
 
 /// Runs the SSH handshake and authentication over `stream` as a server and returns the connection.
 ///
-/// The connection's reader runs on its own green thread and hands each channel the client opens to `config.channels`. The stream is closed when this fails and when the connection ends. Fails with `NoCommonAlgorithm`, `StrictKex`, `AuthFailed` and the other errors of the handshake.
+/// The connection's reader runs on its own green thread and hands each channel the client opens to `config.channels`. The stream is closed when this fails and when the connection ends. Fails with `NoCommonAlgorithm`, `StrictKex`, `AuthFailed` and the other errors of the handshake, and with `Handshake` and `TimedOut` when `config.login_grace` passes first, which closes `stream`, so the stream must wake a read parked on it when closed.
 pub fn serve_stream(stream: io.Stream, config: ServerConfig) -> Connection ! Error {
+    serve_from(stream, config, none, none)?
+}
+
+fn give_up(l: *Link, w: Watchdog, e: Error, phase: Phase) -> Error {
+    let expired = disarm(w)
+    close_link(l)
+    Handshake(phase, io.Error.TimedOut) when expired else e
+}
+
+/// Serves the server side of a connection on `stream` as `serve_stream` does, recording `local` and `remote` as its ends in `ConnectionHandle.local` and `remote`, which `serve` takes from the socket and a process handed the socket by another learns from it.
+pub fn serve_from(stream: io.Stream, config: ServerConfig, local: net.Addr?, remote: net.Addr?) -> Connection ! Error {
     if config.host_keys.len == 0 {
         fail Invalid
     }
     let l = new_link(stream, server_setup(config))
-    handshake(l) catch {
-        e => {
-            close_link(l)
-            fail e
-        }
+    let w = arm(stream, config.login_grace * 1000)
+    exchange_versions(l) catch {
+        e => fail give_up(l, w, e, Phase.VersionExchange)
+    }
+    exchange_keys(l) catch {
+        e => fail give_up(l, w, e, Phase.KeyExchange)
     }
     let user = server_authenticate(l, config.auth) catch {
-        e => {
-            close_link(l)
-            fail e
-        }
+        e => fail give_up(l, w, e, Phase.Authentication)
+    }
+    if disarm(w) {
+        close_link(l)
+        fail Handshake(Phase.Authentication, io.Error.TimedOut)
     }
     let c = new_connection(l, false, user, config.channels, config.global)
+    c.local = local
+    c.remote = remote
     spawn run_reader(c)
     Connection { handle: c }
 }
 
-fn serve_one(h: net.ConnHandle, config: ServerConfig) {
+fn serve_one(h: net.ConnHandle, config: ServerConfig, settled: fn()) {
     using tcp = net.adopt(h)
-    using conn = serve_stream(net.stream_on(h), config) or return
+    let local: net.Addr? = net.local_addr(tcp) or none
+    using conn = serve_from(net.stream_on(h), config, local, h.remote) catch {
+        e => {
+            settled()
+            return
+        }
+    }
+    settled()
     wait_on(conn.handle)
+}
+
+fn refuse(mut r: rand.Rng, s: Startups, waiting: i64) -> bool {
+    if waiting >= s.full {
+        return true
+    }
+    if waiting < s.start {
+        return false
+    }
+    let percent = s.rate + (100 - s.rate) * (waiting - s.start) / (s.full - s.start)
+    rand.below(mut r, 100) < percent
 }
 
 /// Accepts connections on `listener` and serves each on its own green thread with `serve_stream`, until the listener is closed.
 ///
-/// A connection that fails its handshake or authentication is closed and does not stop the loop.
+/// A connection that fails its handshake or authentication is closed and does not stop the loop. A new connection is closed at once while `config.startups` refuses it.
 pub fn serve(listener: net.Listener, config: ServerConfig) {
     serve_on(listener.handle, config)
 }
 
 /// Accepts connections on the listener view `h` as `serve` does. A green thread can run it while the `Listener` that owns the socket stays with its creator, which closes it to stop the loop.
 pub fn serve_on(h: net.ListenerHandle, config: ServerConfig) {
+    accept_on(h, config.startups, fn(c, settled) { serve_one(c, config, settled) })
+}
+
+fn settle_once(waiting: atomic.Int, done: atomic.Int) {
+    if atomic.add_int(done, 1) == 1 {
+        atomic.add_int(waiting, -1)
+    }
+}
+
+fn admitted(c: net.ConnHandle, handler: fn(net.ConnHandle, fn()), waiting: atomic.Int) {
+    let done = atomic.int(0)
+    handler(c, fn() { settle_once(waiting, done) })
+    settle_once(waiting, done)
+}
+
+/// Accepts connections on the listener view `h` until it is closed and passes each to `handler` on its own green thread, closing a new one at once while `startups` refuses it, as `serve_on` does for its own connections.
+///
+/// `handler` receives the connection, which it owns, and a function to call once the connection has authenticated; from that call, or from `handler` returning, the connection does not count as waiting. A server that authenticates elsewhere, as a privilege-separated one does, uses it to keep `MaxStartups` itself.
+pub fn accept_on(h: net.ListenerHandle, startups: Startups, handler: fn(net.ConnHandle, fn())) {
+    let waiting = atomic.int(0)
+    var r = rand.rng()
     for {
         let accepted = net.accept_handle(h) catch {
             e => {
                 return
             }
         }
-        spawn serve_one(accepted, config)
+        if refuse(mut r, startups, atomic.load_int(waiting)) {
+            using dropped = net.adopt(accepted)
+            continue
+        }
+        atomic.add_int(waiting, 1)
+        spawn admitted(accepted, handler, waiting)
     }
 }

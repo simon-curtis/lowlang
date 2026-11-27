@@ -238,6 +238,7 @@ Types: the droppable `Listener`, `Conn` and `Socket`, each with a copyable `List
 | --- | --- |
 | `adopt` and `detach` | Convert between a `ConnHandle` and a `Conn`. |
 | `adopt_socket` and `detach_socket` | Convert between a `SocketHandle` and a `Socket`. |
+| `inherit` | Makes a `Conn` of a socket descriptor the process was started with. |
 
 ### TCP
 
@@ -475,6 +476,14 @@ The proxy resolves the target name.
 
 `keepalive`, `key_exchanges`, `wait_on` and `disconnect_on` complete the connection operations.
 
+| Server function | Description |
+| --- | --- |
+| `accept_on` | Accepts from a listener and calls a handler per connection with a function to call once it has authenticated, closing connections as `ServerConfig.startups` (OpenSSH's `MaxStartups`) says. |
+| `serve_from` | Serves one connection over a stream with its local and remote addresses, which the `ConnectionHandle` and `connection_of(incoming)` give the handlers. |
+| `check_signature` | Checks a `KeySignature`, a public key login's signature over the session identifier. `ServerAuth.signed_key` defaults to it, so a server can have another process decide. |
+
+`ServerConfig.login_grace` closes a connection that has not authenticated within that many seconds.
+
 The `*ConnectionHandle` is the thread-safe, copyable view of a live connection. `spawn` takes it where it refuses the droppable `Connection`. `open_session_on`, `direct_tcpip_on` and `keepalive_on` run on it from any green thread, so a program can run its own accept loop and open one `direct-tcpip` channel per client; global requests take turns on the connection, channel opens are matched to their replies by channel number, and once the connection ends all three fail instead of hanging.
 
 ## std/ssh/wire
@@ -506,8 +515,36 @@ The operations are `stat`, `lstat`, `set_attrs`, `remove`, `mkdir`, `rmdir`, `re
 | --- | --- |
 | `serve` | Runs the server over a stream. |
 | `handler` | Returns the channel handler that serves the `sftp` subsystem for `ssh.ServerConfig`. |
+| `serve_from` | Runs the server over a stream with relative paths taken from a start directory inside the root, as a login's home directory. |
 
-Both are confined to a root directory.
+All three are confined to a root directory.
+
+## std/ssh/login
+
+`handler(Config)` returns the channel handler that serves `session` channels as `sshd` does: `pty-req`, `env`, `shell`, `exec`, `subsystem sftp`, `window-change` and `signal`. `Config` says how an `Account` is found (`system_account` reads `/etc/passwd` and `/etc/group`), which variables `accept_env` admits as patterns, whether terminals are offered, the `PATH`, the `sftp` command, and the `Launcher`.
+
+| Function | Description |
+| --- | --- |
+| `prepare` | Turns a `Request` (a `Program` of `Shell`, `Command` or `Subsystem`, the variables, the terminal) into the `Launch` of the account's login shell, `shell -c` or the sftp command, or `none`. |
+| `local` | The `Launcher` that opens terminals with `open_terminal_for` and starts each `Launch` with `start_launch` in this process, as the account when it differs from the process's user. |
+| `records` | Writes each terminal session's start and end to a utmp and a wtmp file. |
+
+A session on a terminal leads a new session whose controlling terminal it is. Without one its streams are pipes and standard error is the channel's extended data. The channel gets `exit-status` or `exit-signal` when the child ends, and closing it first hangs up the child's process group.
+
+## std/ssh/daemon
+
+`parse_config` reads an `sshd_config` file into `Settings` and fails on any keyword or value it does not implement. `prepare` loads the host keys into a `Daemon`, `server_config` builds its `ssh.ServerConfig` and `serve` listens on every `Port` and `ListenAddress`.
+
+| Function | Description |
+| --- | --- |
+| `check_password` | Checks a password against the user's `/etc/shadow` entry and the root and user policies. |
+| `authorized` | Checks a public key against each `AuthorizedKeysFile`, under `StrictModes` through `safe_path`, and refuses an entry whose options it does not enforce. |
+| `permitted` | Applies `AllowUsers`, `DenyUsers`, `AllowGroups` and `DenyGroups`. |
+| `separation_for` | Returns the `Separation` of the `sshd` or `nobody` user and `/var/empty` or `/run/sshd`. |
+| `serve_separated` | Serves one connection as the unprivileged child of a separated daemon. |
+| `serve_sftp` | Serves SFTP on standard input and output from the working directory, for `Subsystem sftp internal-sftp`. |
+
+With a `Separation`, `serve` starts the daemon's executable again for each connection as the unprivileged user inside the empty root. That child speaks SSH and asks a monitor in the daemon, over a Unix socket that carries descriptors, to sign with a host key, check a password or key, open a terminal and start or signal a session. The monitor signs the session identifier first and only hashes after it, answers for one user, counts failures, checks key signatures itself, builds each program from its own settings for the authenticated account and starts nothing before authentication.
 
 ## std/mdns
 
@@ -1710,6 +1747,8 @@ A gate takes about 0.25 s on one core and generating the cloud key about 1.3 s.
 
 `verify` handles all of them and `$2a$` and `$2y$` bcrypt strings. Argon2id hashes with `std/crypto/blake2b`.
 
+For `/etc/shadow`, `verify` reads the strings libxcrypt's `crypt(3)` writes: `$5$` and `$6$` SHA-crypt with an optional `rounds=` field, and `$y$` yescrypt in its `j` (read-write), `.` (scrypt) and `/` (write-once) flavors, refusing a yescrypt string that would need more than 1 GiB. `hash_sha512_crypt` and `hash_yescrypt` write them with a random salt.
+
 ## std/crypto/sasl
 
 `start` takes the user, the prepared secret and a nonce. `first` returns the client-first-message. `final` turns the server-first-message into the client-final-message with its proof. `verify` checks the server signature in constant time. Failures are `Malformed`, `Unsupported` (a mandatory extension) and `Rejected`. `std/sql/postgres` runs SCRAM-SHA-256 and `std/mongo` SCRAM-SHA-256 and SCRAM-SHA-1 through it. The caller prepares the secret.
@@ -2088,6 +2127,8 @@ Queries: `getcwd`, `chdir`, `hostname`, `uid`, `gid`, `euid`, `egid`, `ppid`, `e
 
 Accounts read `/etc/passwd` and `/etc/group` and return `none`, or an empty slice, on Windows: `lookup_user` and `lookup_user_name`, `lookup_group` and `lookup_group_name` and `supplementary_groups` (the groups that list a login name), over `parse_passwd` and `parse_group`. Those two skip blank lines, comments and malformed lines.
 
+`lookup_shadow` reads a user's `Shadow` entry from `/etc/shadow`, which needs root, over `parse_shadow`. `shadow_usable` refuses a locked or empty hash and an expired password or account.
+
 ### Operating system resource limits
 
 `getrlimit` and `setrlimit` take a `Resource` and an `Rlimit`:
@@ -2131,9 +2172,23 @@ For `browser/wasm32` the host supplies the streams through `low.read` and `low.w
 
 Also `ignore`, `reset`, `send` and `raise`. `Kill` and `Stop` cannot be caught and fail with `Invalid`.
 
+## std/os/utmp
+
+An `Entry` is one 384-byte record in glibc's x86-64 layout: its `Kind`, process id, terminal `line`, `id`, user, host, session, time and address. `encode` and `decode` convert a record, and `read_entries` reads a file of them.
+
+| Function | What it does |
+| --- | --- |
+| `put` | Writes a record to a utmp file in place of the one with the same `id`, as `pututline` does, without glibc's lock. |
+| `append` | Adds a record to a wtmp file. |
+| `line_of` and `id_of` | Give a terminal's line and the id OpenSSH and `login` use. |
+
+`utmp_path` and `wtmp_path` name the system's files, which only root may write.
+
 ## std/process
 
 `Command` with arguments, an optional replacement environment, a working directory, `Inherit`, `Piped` or `Null` for each standard stream, an optional new process group, which is a job object on Windows and ends its child when the parent ends (`PR_SET_PDEATHSIG` with `SIGKILL` on Linux, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` on Windows), and `windowless`, which starts a Windows console program with no console window.
+
+A `Command` also takes an `arg0` in place of the program's name, `Stdio.Descriptor(fd)` to give a stream one of the parent's descriptors, and on Linux a `Session` (`Same`, `New`, or `Terminal`, which makes its standard input the controlling terminal), `Credentials` to run as, a `root` directory to change into first and a `program_fd` to execute in place of a path. On Windows a `Session` other than `Same`, `Credentials`, a `root` and a `program_fd` fail with `Unsupported`.
 
 | Function | What it does |
 | --- | --- |

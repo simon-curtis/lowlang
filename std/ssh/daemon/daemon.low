@@ -1,0 +1,450 @@
+import std/crypto/password
+import std/file
+import std/io
+import std/net
+import std/os
+import std/os/utmp
+import std/path
+import std/process
+import signals = std/os/signal
+import std/ssh
+import std/ssh/key
+import std/ssh/login
+import std/ssh/sftp
+import std/stdio
+import std/sys
+import std/text
+import std/time
+
+/// A server ready to run: its settings, its loaded host keys and where it keeps login records.
+pub struct Daemon {
+    /// The settings.
+    pub settings: Settings
+    /// The loaded host keys.
+    pub signers: key.Signer[]
+    /// The program `Subsystem sftp internal-sftp` runs, with `sftp-server` as its argument, which calls `serve_sftp`.
+    pub executable: str
+    /// The utmp file, or the empty string to keep no records.
+    pub utmp_file: str = utmp.utmp_path
+    /// The wtmp file, or the empty string to keep no records.
+    pub wtmp_file: str = utmp.wtmp_path
+    /// Looks up a user's account.
+    pub account: fn(str) -> login.Account? = login.system_account
+    /// Looks up a user's `/etc/shadow` entry.
+    pub shadow: fn(str) -> os.Shadow? = os.lookup_shadow
+    /// How `serve` separates privilege, or `none` to serve every connection in this process.
+    pub separation: Separation? = none
+}
+
+/// How `serve` separates privilege: each connection is served by a child that runs the daemon's executable with the argument `connection`, which calls `serve_separated`, as an unprivileged user inside an empty root directory. The child speaks SSH to the client and asks a monitor in the daemon for every operation that needs privilege, so a flaw in the code that parses what a client sends before it authenticates does not reach root.
+pub struct Separation {
+    /// The user id the child runs as, such as that of the `sshd` user.
+    pub uid: i64
+    /// The group id the child runs as.
+    pub gid: i64
+    /// The directory the child makes its root, such as `/var/empty`, which should be empty and writable only by root.
+    pub root: str
+    /// A descriptor open on the daemon's executable, which the child runs since its root hides the file.
+    pub program: i64
+}
+
+/// Loads the host keys `settings` names and returns the daemon.
+///
+/// Fails with `NoHostKey` when there is none and with `HostKey` naming a key that cannot be read or used.
+pub fn prepare(settings: Settings, executable: str) -> Daemon ! Error {
+    if settings.host_keys.len == 0 {
+        fail NoHostKey
+    }
+    var signers: key.Signer[] = []
+    for path in settings.host_keys {
+        let private = key.load_private_key(path, "") or fail HostKey(path)
+        signers.push(key.signer(private) or fail HostKey(path))
+    }
+    Daemon { settings, signers, executable }
+}
+
+fn empty_root() -> str? {
+    for dir in ["/var/empty", "/run/sshd"] {
+        let info = file.stat(dir) or continue
+        if info.dir && info.uid == 0 && info.mode & 0o022 == 0 {
+            return dir
+        }
+    }
+    none
+}
+
+/// Returns the separation OpenSSH uses: the child runs as the `sshd` user, or `nobody` where there is none, inside `/var/empty` or `/run/sshd`, whichever exists, is owned by root and is writable by no one else, running `executable` through a descriptor opened here.
+///
+/// Fails with `Unseparated` naming what is missing.
+pub fn separation_for(executable: str) -> Separation ! Error {
+    let user = os.lookup_user_name("sshd") ?? os.lookup_user_name("nobody") ?? fail Unseparated("no sshd or nobody user")
+    let root = empty_root() ?? fail Unseparated("no root-owned /var/empty or /run/sshd")
+    let program = sys.open(executable, sys.Open.Read, 0) or fail Unseparated("cannot open {executable}")
+    Separation { uid: user.uid, gid: user.gid, root, program: program.fd }
+}
+
+fn listed(patterns: str[], name: str) -> bool {
+    for p in patterns {
+        if path.matches(p, name) {
+            return true
+        }
+    }
+    false
+}
+
+fn group_names(account: login.Account) -> str[] {
+    var out: str[] = []
+    for gid in account.groups {
+        match os.lookup_group(gid) {
+            some(g) => out.push(g.name)
+            none => {}
+        }
+    }
+    out
+}
+
+fn any_listed(names: str[], groups: str[]) -> bool {
+    for g in groups {
+        if listed(names, g) {
+            return true
+        }
+    }
+    false
+}
+
+/// Returns whether `AllowUsers`, `DenyUsers`, `AllowGroups` and `DenyGroups` let `account` log in.
+pub fn permitted(s: Settings, account: login.Account) -> bool {
+    if listed(s.deny_users, account.name) {
+        return false
+    }
+    if s.allow_users.len > 0 && !listed(s.allow_users, account.name) {
+        return false
+    }
+    if s.deny_groups.len == 0 && s.allow_groups.len == 0 {
+        return true
+    }
+    let groups = group_names(account)
+    if any_listed(s.deny_groups, groups) {
+        return false
+    }
+    s.allow_groups.len == 0 || any_listed(s.allow_groups, groups)
+}
+
+fn admitted(d: Daemon, user: str, by_password: bool) -> login.Account? {
+    let account = d.account(user) ?? return none
+    if !permitted(d.settings, account) {
+        return none
+    }
+    if account.uid == 0 {
+        match d.settings.root_login {
+            No => return none
+            KeyOnly => {
+                if by_password {
+                    return none
+                }
+            }
+            Yes => {}
+        }
+    }
+    account
+}
+
+/// Returns whether `password` is the password of `user` in `/etc/shadow`, and the user may log in with it.
+///
+/// Refuses a locked, empty or expired entry, and a user the settings do not admit. Reading `/etc/shadow` needs root.
+pub fn check_password(d: Daemon, user: str, secret: str) -> bool {
+    if !d.settings.password_authentication {
+        return false
+    }
+    let account = admitted(d, user, true) ?? return false
+    let entry = d.shadow(account.name) ?? return false
+    if !os.shadow_usable(entry, time.now() / 86400) {
+        return false
+    }
+    password.verify(secret, entry.hash)
+}
+
+fn expand(pattern: str, account: login.Account) -> str {
+    var out = ""
+    var i = 0
+    for i < pattern.len {
+        if pattern[i] == '%' && i + 1 < pattern.len {
+            let c = pattern[i + 1]
+            if c == 'h' {
+                out = out + account.home
+            } else if c == 'u' {
+                out = out + account.name
+            } else {
+                out = out + pattern[i + 1..i + 2]
+            }
+            i += 2
+            continue
+        }
+        out = out + pattern[i..i + 1]
+        i += 1
+    }
+    out when text.starts_with(out, "/") else "{account.home}/{out}"
+}
+
+fn safe_owner(info: file.Info, account: login.Account) -> bool {
+    (info.uid == account.uid || info.uid == 0) && info.mode & 0o022 == 0
+}
+
+/// Returns whether the file at `path` and every directory above it up to the account's home directory are owned by the account or root and writable by no one else, as OpenSSH's `StrictModes` requires of `authorized_keys`.
+pub fn safe_path(path: str, account: login.Account) -> bool {
+    let info = file.stat(path) or return false
+    if !info.regular || !safe_owner(info, account) {
+        return false
+    }
+    var dir = path
+    for {
+        let cut = text.last_index(dir, "/")
+        if cut < 0 {
+            return false
+        }
+        dir = "/" when cut == 0 else dir[..cut]
+        let d = file.stat(dir) or return false
+        if !safe_owner(d, account) {
+            return false
+        }
+        if dir == account.home || dir == "/" {
+            return true
+        }
+    }
+}
+
+fn enforced_option(s: Settings, name: str) -> bool {
+    match name {
+        "no-agent-forwarding" => true
+        "no-x11-forwarding" => true
+        "no-user-rc" => true
+        "no-port-forwarding" => !s.local_forwarding
+        "no-pty" => !s.permit_tty
+        _ => false
+    }
+}
+
+fn usable_entry(s: Settings, entry: key.Authorized) -> bool {
+    for option in entry.options {
+        if !enforced_option(s, option.name) {
+            return false
+        }
+    }
+    true
+}
+
+fn readable_keys(d: Daemon, path: str, account: login.Account) -> bool {
+    if d.settings.strict_modes {
+        return safe_path(path, account)
+    }
+    let info = file.stat(path) or return false
+    info.regular
+}
+
+/// Returns whether `k` may log in as `user` through an `AuthorizedKeysFile` of the account.
+///
+/// Only a regular file is read, and while `StrictModes` is on only one that passes `safe_path`. An entry with an option this server does not enforce, such as `command=`, `from=` or `restrict`, is refused rather than honoured in part. `no-agent-forwarding`, `no-x11-forwarding` and `no-user-rc` hold for every session, since the server offers none of them; `no-port-forwarding` holds only while forwarding is off and `no-pty` only while `PermitTTY` is off, and otherwise the entry is refused.
+pub fn authorized(d: Daemon, user: str, k: key.PublicKey) -> bool {
+    if !d.settings.pubkey_authentication {
+        return false
+    }
+    let account = admitted(d, user, false) ?? return false
+    for pattern in d.settings.authorized_keys {
+        let path = expand(pattern, account)
+        if !readable_keys(d, path, account) {
+            continue
+        }
+        let content = file.read_text(path) or continue
+        let entries = key.parse_authorized_keys(content) or continue
+        let entry = key.find_authorized(entries, k) ?? continue
+        if usable_entry(d.settings, entry) {
+            return true
+        }
+    }
+    false
+}
+
+fn methods(s: Settings) -> str[] {
+    var out: str[] = []
+    if s.pubkey_authentication {
+        out.push("publickey")
+    }
+    if s.password_authentication {
+        out.push("password")
+    }
+    out
+}
+
+fn sftp_command(d: Daemon) -> str[] {
+    let configured = d.settings.sftp
+    if configured.len == 1 && configured[0] == "internal-sftp" {
+        return [d.executable, "sftp-server"]
+    }
+    configured
+}
+
+fn record_with(d: Daemon) -> fn(login.Record) {
+    if d.utmp_file.len == 0 {
+        return fn(r) {}
+    }
+    login.records(d.utmp_file, d.wtmp_file)
+}
+
+/// Returns the `login.Config` the daemon's sessions use, with `launcher` doing their privileged operations.
+pub fn sessions(d: Daemon, launcher: login.Launcher) -> login.Config {
+    login.Config {
+        account: fn(user) { admitted(d, user, false) }
+        accept_env: d.settings.accept_env
+        terminals: d.settings.permit_tty
+        sftp: sftp_command(d)
+        launcher
+    }
+}
+
+fn channels(forwarding: bool, config: login.Config) -> fn(ssh.Incoming) {
+    let sessions_of = login.handler(config)
+    fn(inc) {
+        if inc.kind == "direct-tcpip" && forwarding {
+            ssh.serve_direct_tcpip(inc)
+            return
+        }
+        sessions_of(inc)
+    }
+}
+
+fn banner_of(d: Daemon) -> str {
+    if d.settings.banner.len == 0 {
+        return ""
+    }
+    file.read_text(d.settings.banner) or ""
+}
+
+/// Returns the `ssh.ServerConfig` of the daemon running in one process, as root: authentication reads the system's files and sessions start as their account.
+pub fn server_config(d: Daemon) -> ssh.ServerConfig {
+    let auth = ssh.ServerAuth {
+        methods: methods(d.settings)
+        password: fn(user, secret) { check_password(d, user, secret) }
+        public_key: fn(user, k) { authorized(d, user, k) }
+        banner: banner_of(d)
+        max_attempts: d.settings.max_auth_tries
+    }
+    ssh.ServerConfig {
+        host_keys: d.signers
+        auth
+        channels: channels(d.settings.local_forwarding, sessions(d, login.local(record_with(d))))
+        login_grace: d.settings.login_grace
+        startups: ssh.Startups { start: d.settings.startups[0], rate: d.settings.startups[1], full: d.settings.startups[2] }
+    }
+}
+
+fn open_listener(host: str, port: i64) -> net.ListenerHandle ! io.Error {
+    using var l = net.listen(host, port)?
+    net.detach_listener(mut l)
+}
+
+fn open_any(port: i64) -> net.ListenerHandle ! io.Error {
+    open_listener("::", port) catch {
+        e => open_listener("", port)?
+    }
+}
+
+/// Listens on every port and address of the settings and serves each until a listener fails: with `config` in this process, or under `d.separation` with a monitor and a child per connection, `config` unused. With no `ListenAddress` it listens on every IPv6 and IPv4 address through one dual-stack socket, or on every IPv4 address where IPv6 is unavailable. Writes `PidFile` once every listener is open.
+///
+/// Fails with the error of the first listener that cannot be opened.
+pub fn serve(d: Daemon, config: ssh.ServerConfig) ! io.Error {
+    var listeners: net.ListenerHandle[] = []
+    for port in d.settings.ports {
+        if d.settings.listen.len == 0 {
+            listeners.push(open_any(port)?)
+        }
+        for host in d.settings.listen {
+            listeners.push(open_listener(host, port)?)
+        }
+    }
+    if d.settings.pid_file.len > 0 {
+        file.write_text(d.settings.pid_file, "{sys.pid()}\n")?
+    }
+    let done = chan[bool](listeners.len)
+    for h in listeners {
+        spawn serve_until(d, h, config, done)
+    }
+    let first = <-done
+}
+
+fn serve_until(d: Daemon, h: net.ListenerHandle, config: ssh.ServerConfig, done: chan[bool]) {
+    match d.separation {
+        some(sep) => ssh.accept_on(h, config.startups, fn(c, settled) { serve_connection(d, sep, c, settled) })
+        none => ssh.serve_on(h, config)
+    }
+    done <- true
+}
+
+fn expire(child: *process.ChildHandle, authenticated: chan[bool], seconds: i64) {
+    if seconds == 0 {
+        return
+    }
+    select {
+        done = <-authenticated => {}
+        after(seconds * 1000 + 2000) => {
+            let kill = signals.from_number(9) ?? return
+            process.kill_on(child, kill) or {}
+        }
+    }
+}
+
+fn connection_command(d: Daemon, sep: Separation, client: i64, to_monitor: i64) -> process.Command {
+    var c = process.command(d.executable, ["connection"])
+    c.program_fd = sep.program
+    c.root = sep.root
+    c.dir = "/"
+    c.env = some([:])
+    c.credentials = process.Credentials { uid: sep.uid, gid: sep.gid, groups: [sep.gid] }
+    c.stdin = process.Stdio.Descriptor(client)
+    c.stdout = process.Stdio.Descriptor(to_monitor)
+    c.session = process.Session.New
+    c
+}
+
+fn serve_connection(d: Daemon, sep: Separation, h: net.ConnHandle, settled: fn()) {
+    var local: net.Addr? = none
+    {
+        using var tcp = net.adopt(h)
+        local = net.local_addr(tcp) or none
+        let kept = net.detach(mut tcp)
+    }
+    let ends = sys.socketpair() catch {
+        e => {
+            close_all([h.fd, h.out])
+            return
+        }
+    }
+    let child = process.start_handle(connection_command(d, sep, h.fd, ends.second)) catch {
+        e => {
+            close_all([h.fd, h.out, ends.first, ends.second])
+            return
+        }
+    }
+    close_all([h.fd, h.out, ends.second])
+    using to_child = net.inherit(ends.first, net.Addr { ip: [], port: 0 }) catch {
+        e => {
+            let killed = process.wait_on(child) or process.Exit.Exited(255)
+            return
+        }
+    }
+    let authenticated = chan[bool](1)
+    let m = monitor(d, to_child.handle, local, h.remote, record_with(d), fn() {
+        settled()
+        authenticated <- true
+    })
+    spawn expire(child, authenticated, d.settings.login_grace)
+    serve_monitor(m) or {}
+    let status = process.wait_on(child) or process.Exit.Exited(255)
+}
+
+/// Serves SFTP on standard input and output from the current directory, as `internal-sftp` does in the session child the daemon starts as the user.
+pub fn serve_sftp() ! sftp.Error {
+    let start = os.getcwd() or "/"
+    let input = stdio.stdin()
+    let output = stdio.stdout()
+    sftp.serve_from(io.Stream { read: input.read, write: output.write, close: fn() {} }, "/", start)?
+}

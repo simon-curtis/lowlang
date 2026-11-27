@@ -12,6 +12,28 @@ pub enum Stdio {
     Piped
     /// The child is connected to `/dev/null`: reads return end of input and writes are discarded.
     Null
+    /// The child receives a duplicate of the parent's descriptor `fd`, such as the slave side of a pseudoterminal. The parent keeps `fd` open and owns it.
+    Descriptor(fd: i64)
+}
+
+/// The session a child runs in.
+pub enum Session {
+    /// The child stays in the parent's session.
+    Same
+    /// The child leads a new session with no controlling terminal, which is also a new process group.
+    New
+    /// The child leads a new session whose controlling terminal is its standard input, which must be a terminal such as the slave side of a pseudoterminal. Job control, Ctrl-C and hangup on that terminal reach the child. `kill` signals the session's process group.
+    Terminal
+}
+
+/// The user and groups a child runs as.
+pub struct Credentials {
+    /// The user id.
+    pub uid: i64
+    /// The group id.
+    pub gid: i64
+    /// The supplementary group ids.
+    pub groups: i64[] = []
 }
 
 /// A program to run, with its arguments, environment, working directory and standard stream setup.
@@ -36,6 +58,16 @@ pub struct Command {
     pub group: bool = false
     /// Whether the child starts with no console window. On Windows a console program started this way gets a console that has no window, so a program built with `--subsystem gui` can run one without a window appearing; standard streams set to `Piped` or `Null` work as usual. Other targets ignore it.
     pub windowless: bool = false
+    /// The `argv[0]` the child sees, such as `-bash` for a login shell. An empty string passes the program name.
+    pub arg0: str = ""
+    /// The session the child runs in. Windows supports only `Same`.
+    pub session: Session = Same
+    /// The user and groups the child runs as, or `none` for the parent's. Changing them needs privilege, and the child fails with `Denied` before the program runs when the parent lacks it. Windows supports only `none`.
+    pub credentials: Credentials? = none
+    /// The directory the child makes its root before it changes credentials, or the empty string to keep the parent's. `dir` then names a directory inside it. Needs privilege. Windows supports only the empty string.
+    pub root: str = ""
+    /// A descriptor open on the program, which the child runs in place of looking up `program`, so it can run a program `root` hides; `program` still names it in `argv[0]`. A negative one looks `program` up. Windows supports only a negative one.
+    pub program_fd: i64 = -1
 }
 
 /// How a child process ended.
@@ -92,6 +124,11 @@ pub struct Output {
 struct Ends {
     parent: sys.Fd
     child: sys.Fd
+    given: i64 = -1
+}
+
+fn target(e: Ends) -> i64 {
+    e.given when e.given >= 0 else e.child.handle.fd
 }
 
 struct Collected {
@@ -167,6 +204,7 @@ fn ends(mode: Stdio, input: bool) -> Ends ! io.Error {
             Ends { parent: sys.own(-1), child: sys.adopt(null_device) }
         }
         Piped => piped(input)?
+        Descriptor(fd) => Ends { parent: sys.own(-1), child: sys.own(-1), given: fd }
     }
 }
 
@@ -182,8 +220,21 @@ fn environment(c: Command) -> str[] {
     out
 }
 
+fn session_of(s: Session) -> sys.Session {
+    match s {
+        Same => sys.Session.Same
+        New => sys.Session.New
+        Terminal => sys.Session.Terminal
+    }
+}
+
+fn identity_of(c: Credentials?) -> sys.Identity? {
+    let found = c ?? return none
+    sys.Identity { uid: found.uid, gid: found.gid, groups: found.groups }
+}
+
 fn arguments(c: Command) -> str[] {
-    var out: str[] = [c.program]
+    var out: str[] = [c.arg0 when c.arg0.len > 0 else c.program]
     for a in c.args {
         out.push(a)
     }
@@ -207,7 +258,10 @@ pub fn start(c: Command) -> Child ! io.Error {
 ///
 /// Resolves the program with `find`, creates the requested pipes and forks. Returns after the child has executed the program, parking the green thread while it waits for that. Fails with `NotFound` if the program is not found, with the system error if a pipe or the fork fails or the child's report cannot be read, and with the error of a failing `chdir` or `execve` in the child, such as `Denied`, `NotDir` or `NotFound`, in which case the child has been reaped. The caller must wait for the child with `wait_on` or hand the view to `adopt`.
 pub fn start_handle(c: Command) -> *ChildHandle ! io.Error {
-    let path = find(c.program) ?? ""
+    var path = c.program
+    if c.program_fd < 0 {
+        path = find(c.program) ?? ""
+    }
     if path.len == 0 {
         fail NotFound
     }
@@ -216,14 +270,29 @@ pub fn start_handle(c: Command) -> *ChildHandle ! io.Error {
     using var input = ends(c.stdin, true)?
     using var output = ends(c.stdout, false)?
     using var errors = ends(c.stderr, false)?
-    let spawned = sys.fork_exec(path, argv, envp, c.dir, c.group, c.windowless, input.child.handle.fd, output.child.handle.fd, errors.child.handle.fd)?
+    let launch = sys.Launch {
+        path
+        argv
+        envp
+        dir: c.dir
+        group: c.group
+        windowless: c.windowless
+        stdin: input.target()
+        stdout: output.target()
+        stderr: errors.target()
+        session: session_of(c.session)
+        identity: identity_of(c.credentials)
+        root: c.root
+        program: c.program_fd
+    }
+    let spawned = sys.fork_exec(launch)?
     sys.close(input.child)
     sys.close(output.child)
     sys.close(errors.child)
     let stdin = stream(sys.detach(mut input.parent))
     let stdout = stream(sys.detach(mut output.parent))
     let stderr = stream(sys.detach(mut errors.parent))
-    let handle = new(ChildHandle { pid: spawned.pid, stdin, stdout, stderr, pidfd: spawned.pidfd, members: spawned.group, group: c.group, status: none })
+    let handle = new(ChildHandle { pid: spawned.pid, stdin, stdout, stderr, pidfd: spawned.pidfd, members: spawned.group, group: c.group || c.session != Session.Same, status: none })
     match spawned.failure {
         some(e) => {
             using failed = adopt(handle)

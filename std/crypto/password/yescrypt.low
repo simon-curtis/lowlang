@@ -1,0 +1,519 @@
+import std/crypto
+import std/crypto/hash
+
+const yescrypt_worm = 1
+const yescrypt_rw = 2
+const yescrypt_rw_standard = 0xb6
+const yescrypt_prehash = 0x10000000
+const yescrypt_memory_limit = 1073741824
+const yescrypt_max_t = 64
+const sbox_words = 3072
+const sbox_mask = 0xff0
+const hash_chars = 43
+
+struct Pwxform {
+    s: u32[]
+    s0: i64
+    s1: i64
+    s2: i64
+    w: i64
+}
+
+struct Yescrypt {
+    flags: i64
+    log_n: i64
+    r: i64
+    p: i64
+    t: i64
+}
+
+fn crypt_value(c: u8) -> i64 {
+    if c >= 'a' && c <= 'z' {
+        return i64(c - 'a') + 38
+    }
+    if c >= 'A' && c <= 'Z' {
+        return i64(c - 'A') + 12
+    }
+    if c >= '.' && c <= '9' {
+        return i64(c - '.')
+    }
+    64
+}
+
+fn decode_number(s: str, mut at: i64, min: i64) -> i64? {
+    if at >= s.len {
+        return none
+    }
+    let c = crypt_value(s[at])
+    at += 1
+    if c > 63 {
+        return none
+    }
+    var value = min
+    var start = 0
+    var end = 47
+    var chars = 1
+    var bits = 0
+    for c > end {
+        value += (end + 1 - start) << bits
+        start = end + 1
+        end = start + (62 - end) / 2
+        chars += 1
+        bits += 6
+    }
+    value += (c - start) << bits
+    for _ in 1..chars {
+        if at >= s.len {
+            return none
+        }
+        let d = crypt_value(s[at])
+        at += 1
+        if d > 63 {
+            return none
+        }
+        bits -= 6
+        value += d << bits
+    }
+    if value > 0xFFFFFFFF { none } else { some(value) }
+}
+
+fn encode_number(value: i64, min: i64) -> str {
+    var rest = value - min
+    var start = 0
+    var end = 47
+    var chars = 1
+    var bits = 0
+    for rest >= (end + 1 - start) << bits {
+        rest -= (end + 1 - start) << bits
+        start = end + 1
+        end = start + (62 - end) / 2
+        chars += 1
+        bits += 6
+    }
+    var out: u8[] = [crypt_alphabet[start + (rest >> bits)]]
+    for _ in 1..chars {
+        bits -= 6
+        out.push(crypt_alphabet[(rest >> bits) & 63])
+    }
+    __str_view(out)
+}
+
+fn decode_crypt64(s: str, limit: i64) -> u8[]? {
+    var out: u8[] = []
+    var at = 0
+    for at < s.len {
+        let n = if s.len - at < 4 { s.len - at } else { 4 }
+        if n == 1 {
+            return none
+        }
+        var value = 0
+        for k in 0..n {
+            let c = crypt_value(s[at + k])
+            if c > 63 {
+                return none
+            }
+            value |= c << (6 * k)
+        }
+        at += n
+        var bits = 6 * n
+        for bits >= 8 {
+            out.push(u8(value & 255))
+            value >>= 8
+            bits -= 8
+        }
+        if value != 0 || out.len > limit {
+            return none
+        }
+    }
+    out
+}
+
+fn encode_crypt64(data: u8[]) -> str {
+    var out: u8[] = []
+    var at = 0
+    for at < data.len {
+        let n = if data.len - at < 3 { data.len - at } else { 3 }
+        var value = 0
+        for k in 0..n {
+            value |= i64(data[at + k]) << (8 * k)
+        }
+        for _ in 0..(8 * n + 5) / 6 {
+            out.push(crypt_alphabet[value & 63])
+            value >>= 6
+        }
+        at += n
+    }
+    __str_view(out)
+}
+
+fn yescrypt_params(field: str) -> Yescrypt? {
+    var at = 0
+    let flavor = decode_number(field, mut at, 0) ?? return none
+    let flags = if flavor < yescrypt_rw { flavor } else { yescrypt_rw + ((flavor - yescrypt_rw) << 2) }
+    let log_n = decode_number(field, mut at, 1) ?? return none
+    let r = decode_number(field, mut at, 1) ?? return none
+    var p = 1
+    var t = 0
+    if at < field.len {
+        let have = decode_number(field, mut at, 1) ?? return none
+        if have > 3 {
+            return none
+        }
+        if have & 1 != 0 {
+            p = decode_number(field, mut at, 2) ?? return none
+        }
+        if have & 2 != 0 {
+            t = decode_number(field, mut at, 1) ?? return none
+        }
+    }
+    if at != field.len {
+        return none
+    }
+    let y = Yescrypt { flags, log_n, r, p, t }
+    if valid_yescrypt(y) { some(y) } else { none }
+}
+
+fn valid_yescrypt(y: Yescrypt) -> bool {
+    if y.flags != 0 && y.flags != yescrypt_worm && y.flags != yescrypt_rw_standard {
+        return false
+    }
+    if y.flags == 0 && y.t != 0 {
+        return false
+    }
+    if y.log_n < 2 || y.log_n > 31 || y.r < 1 || y.p < 1 || y.r * y.p >= 1073741824 || y.t > yescrypt_max_t {
+        return false
+    }
+    let n = 1 << y.log_n
+    if y.flags & yescrypt_rw != 0 && n / y.p <= 3 {
+        return false
+    }
+    yescrypt_memory(y) <= yescrypt_memory_limit
+}
+
+fn yescrypt_memory(y: Yescrypt) -> i64 {
+    let blocks = yescrypt_memory_limit / 128 / y.r
+    let n = 1 << y.log_n
+    if n > blocks || y.p > blocks {
+        return yescrypt_memory_limit + 1
+    }
+    let sboxes = if y.flags & yescrypt_rw != 0 { 4 * sbox_words * y.p } else { 0 }
+    128 * y.r * (n + 3 * y.p + 2) + sboxes
+}
+
+fn salsa_shuffled(b: u32[], rounds: i64) {
+    var x0 = b[0]
+    var x5 = b[1]
+    var x10 = b[2]
+    var x15 = b[3]
+    var x4 = b[4]
+    var x9 = b[5]
+    var x14 = b[6]
+    var x3 = b[7]
+    var x8 = b[8]
+    var x13 = b[9]
+    var x2 = b[10]
+    var x7 = b[11]
+    var x12 = b[12]
+    var x1 = b[13]
+    var x6 = b[14]
+    var x11 = b[15]
+    for _ in 0..rounds / 2 {
+        salsa_quarter(mut x0, mut x4, mut x8, mut x12)
+        salsa_quarter(mut x5, mut x9, mut x13, mut x1)
+        salsa_quarter(mut x10, mut x14, mut x2, mut x6)
+        salsa_quarter(mut x15, mut x3, mut x7, mut x11)
+        salsa_quarter(mut x0, mut x1, mut x2, mut x3)
+        salsa_quarter(mut x5, mut x6, mut x7, mut x4)
+        salsa_quarter(mut x10, mut x11, mut x8, mut x9)
+        salsa_quarter(mut x15, mut x12, mut x13, mut x14)
+    }
+    b[0] += x0
+    b[1] += x5
+    b[2] += x10
+    b[3] += x15
+    b[4] += x4
+    b[5] += x9
+    b[6] += x14
+    b[7] += x3
+    b[8] += x8
+    b[9] += x13
+    b[10] += x2
+    b[11] += x7
+    b[12] += x12
+    b[13] += x1
+    b[14] += x6
+    b[15] += x11
+}
+
+fn xor_words(dst: u32[], src: u32[], count: i64) {
+    for i in 0..count {
+        dst[i] ^= src[i]
+    }
+}
+
+fn pwxform(x: u32[], ctx: *Pwxform) {
+    let s = ctx.s
+    var w = ctx.w
+    for i in 0..6 {
+        for j in 0..4 {
+            let p0 = ctx.s0 + (i64(x[4 * j]) & sbox_mask) / 4
+            let p1 = ctx.s1 + (i64(x[4 * j + 1]) & sbox_mask) / 4
+            for k in 0..2 {
+                let at = 4 * j + 2 * k
+                let s0 = u64(s[p0 + 2 * k + 1]) << 32 | u64(s[p0 + 2 * k])
+                let s1 = u64(s[p1 + 2 * k + 1]) << 32 | u64(s[p1 + 2 * k])
+                let v = (u64(x[at + 1]) * u64(x[at]) + s0) ^ s1
+                x[at] = u32(v)
+                x[at + 1] = u32(v >> 32)
+                if i != 0 && i != 5 {
+                    s[ctx.s2 + 2 * w] = u32(v)
+                    s[ctx.s2 + 2 * w + 1] = u32(v >> 32)
+                    w += 1
+                }
+            }
+        }
+    }
+    let s0 = ctx.s0
+    ctx.s0 = ctx.s2
+    ctx.s2 = ctx.s1
+    ctx.s1 = s0
+    ctx.w = w & 511
+}
+
+fn blockmix_pwxform(b: u32[], ctx: *Pwxform, r: i64, x: u32[]) {
+    let r1 = 2 * r
+    __memmove(x, b[(r1 - 1) * 16..r1 * 16])
+    for i in 0..r1 {
+        xor_words(x, b[i * 16..], 16)
+        pwxform(x, ctx)
+        __memmove(b[i * 16..], x)
+    }
+    salsa_shuffled(b[(r1 - 1) * 16..r1 * 16], 2)
+}
+
+fn blockmix_salsa8(b: u32[], y: u32[], r: i64, x: u32[]) {
+    __memmove(x, b[(2 * r - 1) * 16..2 * r * 16])
+    for i in 0..2 * r {
+        xor_words(x, b[i * 16..], 16)
+        salsa_shuffled(x, 8)
+        __memmove(y[i * 16..], x)
+    }
+    for i in 0..r {
+        __memmove(b[i * 16..], y[2 * i * 16..(2 * i + 1) * 16])
+        __memmove(b[(i + r) * 16..], y[(2 * i + 1) * 16..(2 * i + 2) * 16])
+    }
+}
+
+struct Mixer {
+    r: i64
+    flags: i64
+    x: u32[]
+    y: u32[]
+    block: u32[]
+    ctx: *Pwxform?
+}
+
+fn mix(m: *Mixer, x: u32[]) {
+    match m.ctx {
+        some(ctx) => blockmix_pwxform(x, ctx, m.r, m.block)
+        none => blockmix_salsa8(x, m.y, m.r, m.block)
+    }
+}
+
+fn integerify(x: u32[], r: i64) -> u64 {
+    let last = (2 * r - 1) * 16
+    u64(x[last + 13]) << 32 | u64(x[last])
+}
+
+fn wrap(x: u64, i: i64) -> i64 {
+    let n = p2floor(i)
+    i64(x & u64(n - 1)) + (i - n)
+}
+
+fn p2floor(i: i64) -> i64 {
+    var n = i
+    for n & (n - 1) != 0 {
+        n &= n - 1
+    }
+    n
+}
+
+fn shuffle_in(m: *Mixer, b: u32[]) {
+    for k in 0..2 * m.r {
+        for i in 0..16 {
+            m.x[k * 16 + i] = b[k * 16 + i * 5 % 16]
+        }
+    }
+}
+
+fn shuffle_out(m: *Mixer, b: u32[]) {
+    for k in 0..2 * m.r {
+        for i in 0..16 {
+            b[k * 16 + i * 5 % 16] = m.x[k * 16 + i]
+        }
+    }
+}
+
+fn smix1(m: *Mixer, b: u32[], n: i64, v: u32[]) {
+    let s = 32 * m.r
+    let x = m.x
+    m.shuffle_in(b)
+    for i in 0..n {
+        __memmove(v[i * s..], x[..s])
+        if m.flags & yescrypt_rw != 0 && i > 1 {
+            let j = wrap(integerify(x, m.r), i)
+            xor_words(x, v[j * s..], s)
+        }
+        m.mix(x)
+    }
+    m.shuffle_out(b)
+}
+
+fn smix2(m: *Mixer, b: u32[], n: i64, loops: i64, write: bool, v: u32[]) {
+    let s = 32 * m.r
+    let x = m.x
+    m.shuffle_in(b)
+    for _ in 0..loops {
+        let j = i64(integerify(x, m.r) & u64(n - 1))
+        xor_words(x, v[j * s..], s)
+        if write {
+            __memmove(v[j * s..], x[..s])
+        }
+        m.mix(x)
+    }
+    m.shuffle_out(b)
+}
+
+fn mixer(r: i64, flags: i64, ctx: *Pwxform?) -> *Mixer {
+    new(Mixer { r, flags, x: __make(32 * r), y: __make(32 * r), block: __make(16), ctx })
+}
+
+fn smix(b: u32[], y: Yescrypt, n: i64, v: u32[], ctxs: *Pwxform[], passwd: u8[]) -> u8[] {
+    let r = y.r
+    let p = y.p
+    let s = 32 * r
+    let rw = y.flags & yescrypt_rw != 0
+    var chunk = n / p
+    var loop_all = chunk
+    if rw {
+        if y.t <= 1 {
+            if y.t == 1 {
+                loop_all *= 2
+            }
+            loop_all = (loop_all + 2) / 3
+        } else {
+            loop_all *= y.t - 1
+        }
+    } else if y.t > 0 {
+        if y.t == 1 {
+            loop_all += (loop_all + 1) / 2
+        }
+        loop_all *= y.t
+    }
+    var loop_rw = if rw { loop_all / p } else { 0 }
+    chunk &= ~1
+    loop_all = (loop_all + 1) & ~1
+    loop_rw = (loop_rw + 1) & ~1
+    var key = passwd
+    for i in 0..p {
+        let first = i * chunk
+        let np = if i < p - 1 { chunk } else { n - first }
+        let bp = b[i * s..(i + 1) * s]
+        let vp = v[first * s..]
+        var ctx: *Pwxform? = none
+        if rw {
+            let c = ctxs[i]
+            mixer(1, 0, none).smix1(bp[..32], sbox_words / 32, c.s)
+            c.s2 = 0
+            c.s1 = 1024
+            c.s0 = 2048
+            c.w = 0
+            if i == 0 {
+                key = hash.hmac(hash.sha256(), bytes_from_words(bp[s - 16..s]), key)
+            }
+            ctx = some(c)
+        }
+        let m = mixer(r, y.flags, ctx)
+        m.smix1(bp, np, vp)
+        m.smix2(bp, p2floor(np), loop_rw, rw, vp)
+    }
+    for i in 0..p {
+        let ctx: *Pwxform? = if rw { some(ctxs[i]) } else { none }
+        mixer(r, y.flags & ~yescrypt_rw, ctx).smix2(b[i * s..(i + 1) * s], n, loop_all - loop_rw, false, v)
+    }
+    key
+}
+
+fn yescrypt_body(passwd: u8[], salt: u8[], y: Yescrypt) -> u8[] {
+    let sha = hash.sha256()
+    let n = 1 << y.log_n
+    let s = 32 * y.r
+    var key = passwd
+    if y.flags != 0 {
+        let name = if y.flags & yescrypt_prehash != 0 { "yescrypt-prehash" } else { "yescrypt" }
+        key = hash.hmac(sha, bytes(name), passwd)
+    }
+    let stretched = pbkdf2(sha, key, salt, 1, 128 * y.r * y.p)
+    let b = words_from_bytes(stretched)
+    if y.flags != 0 {
+        key = stretched[..32]
+    }
+    let v: u32[] = __make(n * s)
+    if y.flags & yescrypt_rw != 0 {
+        var ctxs: *Pwxform[] = []
+        for _ in 0..y.p {
+            ctxs.push(new(Pwxform { s: __make(sbox_words), s0: 0, s1: 0, s2: 0, w: 0 }))
+        }
+        key = smix(b, y, n, v, ctxs, key)
+    } else {
+        let single = Yescrypt { flags: y.flags, log_n: y.log_n, r: y.r, p: 1, t: y.t }
+        for i in 0..y.p {
+            smix(b[i * s..(i + 1) * s], single, n, v, [], key)
+        }
+    }
+    let out = pbkdf2(sha, key, bytes_from_words(b), 1, 32)
+    if y.flags == 0 || y.flags & yescrypt_prehash != 0 {
+        return out
+    }
+    hash.sum(sha, hash.hmac(sha, out, bytes("Client Key")))
+}
+
+fn yescrypt_kdf(passwd: u8[], salt: u8[], y: Yescrypt) -> u8[] {
+    let n = 1 << y.log_n
+    var key = passwd
+    if y.flags & yescrypt_rw != 0 && n / y.p >= 256 && n / y.p * y.r >= 131072 {
+        key = yescrypt_body(key, salt, Yescrypt { flags: y.flags | yescrypt_prehash, log_n: y.log_n - 6, r: y.r, p: y.p, t: 0 })
+    }
+    yescrypt_body(key, salt, y)
+}
+
+/// Hashes `password` with yescrypt and returns a `$y$` string in the format of libxcrypt's `crypt(3)`, the default of `/etc/shadow` on current Linux distributions.
+///
+/// The cost is `N = 2^log_n` with `log_n` in `[2, 31]` and the block size is `r`, at least 1; libxcrypt's default is `log_n = 12`, `r = 32`. The salt is 16 random bytes from `crypto.random`. The result has the form `$y$j<N><r>$<salt>$<hash, 43 characters>`, with the numbers, salt and hash in yescrypt's base64.
+///
+/// Fails with `InvalidParameters` for `log_n` or `r` out of range, with `MemoryLimit` when the hash would need more than 1 GiB, and with `PasswordTooLong` for a password over 511 bytes, which `crypt(3)` refuses.
+pub fn hash_yescrypt(password: str, log_n: i64, r: i64) -> str ! Error {
+    if log_n < 2 || log_n > 31 || r < 1 || r >= 1073741824 {
+        fail Error.InvalidParameters
+    }
+    if password.len > crypt_max_password {
+        fail Error.PasswordTooLong
+    }
+    let y = Yescrypt { flags: yescrypt_rw_standard, log_n, r, p: 1, t: 0 }
+    if yescrypt_memory(y) > yescrypt_memory_limit {
+        fail Error.MemoryLimit
+    }
+    let salt = crypto.random(16)
+    let setting = "$y${encode_number(yescrypt_rw + (yescrypt_rw_standard >> 2), 0)}{encode_number(log_n, 1)}{encode_number(r, 1)}${encode_crypt64(salt)}"
+    "{setting}${encode_crypt64(yescrypt_kdf(bytes(password), salt, y))}"
+}
+
+fn verify_yescrypt(password: str, field: str, salt_text: str, tag_text: str) -> bool {
+    if tag_text.len != hash_chars {
+        return false
+    }
+    let y = yescrypt_params(field) ?? return false
+    let salt = decode_crypt64(salt_text, 64) ?? return false
+    let computed = encode_crypt64(yescrypt_kdf(bytes(password), salt, y))
+    hash.equal(bytes(computed), bytes(tag_text))
+}

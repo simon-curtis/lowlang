@@ -1,0 +1,233 @@
+import std/file
+import std/io
+import std/net
+import signals = std/os/signal
+import std/process
+import std/ssh
+import std/ssh/key
+import std/ssh/login
+import std/ssh/wire
+import std/sys
+import std/testing
+import std/text
+
+struct Side {
+    client: *Client
+    authenticated: chan[bool]
+}
+
+fn run_monitor(m: *Monitor) {
+    serve_monitor(m) or {}
+}
+
+fn attach(d: Daemon, ends: net.ConnPair) -> Side {
+    let authenticated = chan[bool](1)
+    let m = monitor(d, ends.second.handle, none, none, fn(r) {}, fn() { authenticated <- true })
+    spawn run_monitor(m)
+    Side { client: connect_monitor(ends.first.handle) or panic("connect"), authenticated }
+}
+
+fn read_stream(s: io.Stream?) -> str {
+    let stream = s ?? return ""
+    var out: u8[] = []
+    let buf = io.buffer(4096)
+    for {
+        let n = stream.read(buf) or 0
+        if n == 0 {
+            return str(out)
+        }
+        for b in buf[..n] {
+            out.push(b)
+        }
+    }
+}
+
+fn run(c: *Client, program: login.Program, env: [str: str]) -> str ! io.Error {
+    let started = start_remote(c, login.Request { program, env })?
+    match started.stdin {
+        some(input) => input.close()
+        none => {}
+    }
+    let out = read_stream(started.stdout)
+    let status = started.wait()
+    out
+}
+
+fn refused_terminal(c: *Client) -> bool {
+    let t = open_remote_terminal(c) catch {
+        e => return true
+    }
+    sys.close_fd(t.master)
+    false
+}
+
+fn refused_run(c: *Client, program: login.Program) -> bool {
+    let out = run(c, program, [:]) catch {
+        e => return true
+    }
+    false
+}
+
+fn refused_start(c: *Client, r: login.Request) -> bool {
+    let started = start_remote(c, r) catch {
+        e => return true
+    }
+    false
+}
+
+fn refused_sign(c: *Client, data: u8[]) -> bool {
+    let signature = sign_with(c, 0, "ssh-ed25519", data) catch {
+        e => return true
+    }
+    false
+}
+
+fn answered(f: Frame) -> bool {
+    wire.read_bool(f.body) or false
+}
+
+fn test_nothing_starts_before_authentication(t: *testing.T) {
+    let f = fixture(Settings {})
+    defer file.remove_all(f.home) or {}
+    using ends = net.socketpair() or panic("socketpair")
+    let side = attach(f.daemon, ends)
+    let c = side.client
+    testing.error_if(t, !refused_terminal(c), "a terminal opened before authentication")
+    testing.error_if(t, !refused_run(c, login.Program.Command("echo ran")), "a command ran before authentication")
+    testing.error_if(t, !ask_password_of(c, "tester", "hunter2"), "the right password was refused")
+    testing.error_if(t, ((<-side.authenticated) ?? false) != true, "the monitor did not report the login")
+    testing.error_if(t, (run(c, login.Program.Command("echo ran"), [:]) or "") != "ran\n", "the command did not run after authentication")
+    testing.error_if(t, ask_password_of(c, "tester", "hunter2"), "a second login was accepted")
+}
+
+fn test_failures_are_counted_and_the_first_user_is_kept(t: *testing.T) {
+    var settings = Settings {}
+    settings.max_auth_tries = 2
+    let f = fixture(settings)
+    defer file.remove_all(f.home) or {}
+    using ends = net.socketpair() or panic("socketpair")
+    let c = attach(f.daemon, ends).client
+    testing.error_if(t, ask_key_of(c, "tester", new_signer().public), "an unlisted key was accepted")
+    testing.error_if(t, ask_password_of(c, "other", "hunter2"), "the monitor answered for a second user")
+    testing.error_if(t, ask_password_of(c, "tester", "wrong"), "a wrong password was accepted")
+    testing.error_if(t, ask_password_of(c, "tester", "wrong"), "a wrong password was accepted")
+    testing.error_if(t, ask_password_of(c, "tester", "hunter2"), "the right password was accepted after MaxAuthTries failures")
+}
+
+fn authorization(session_id: u8[], user: str, algorithm: str, blob: u8[]) -> u8[] {
+    var out: u8[] = []
+    wire.put_string(mut out, session_id)
+    out.push(50)
+    wire.put_str(mut out, user)
+    wire.put_str(mut out, "ssh-connection")
+    wire.put_str(mut out, "publickey")
+    wire.put_bool(mut out, true)
+    wire.put_str(mut out, algorithm)
+    wire.put_string(mut out, blob)
+    out
+}
+
+fn signed_attempt(user_key: key.Signer, session_id: u8[]) -> ssh.KeySignature {
+    let blob = user_key.public.blob
+    let signature = user_key.sign("ssh-ed25519", authorization(session_id, "tester", "ssh-ed25519", blob)) or panic("sign")
+    ssh.KeySignature { user: "tester", algorithm: "ssh-ed25519", blob, signature, session_id: [] }
+}
+
+fn test_key_signatures_must_cover_the_first_hash_it_signed(t: *testing.T) {
+    let f = fixture(Settings {})
+    defer file.remove_all(f.home) or {}
+    let user_key = new_signer()
+    authorize(f, key.format_line(user_key.public, "") + "\n", 0o600)
+    using ends = net.socketpair() or panic("socketpair")
+    let c = attach(f.daemon, ends).client
+    let session_id = io.buffer(32)
+    session_id[0] = 7
+    testing.error_if(t, ask_signed_key_of(c, signed_attempt(user_key, session_id)), "a signature was accepted before any exchange hash was signed")
+    testing.error_if(t, !refused_sign(c, io.buffer(33)), "the host key signed data that is not a hash")
+    sign_with(c, 0, "ssh-ed25519", session_id) or panic("host signature")
+    let other = io.buffer(32)
+    sign_with(c, 0, "ssh-ed25519", other) or panic("second host signature")
+    testing.error_if(t, ask_signed_key_of(c, signed_attempt(user_key, other)), "a signature over a later hash was accepted")
+    testing.error_if(t, !ask_signed_key_of(c, signed_attempt(user_key, session_id)), "a signature over the session id was refused")
+}
+
+fn logged_in(f: Fixture, ends: net.ConnPair) -> *Client {
+    let c = attach(f.daemon, ends).client
+    if !ask_password_of(c, "tester", "hunter2") {
+        panic("login")
+    }
+    c
+}
+
+fn test_the_monitor_builds_each_program_itself(t: *testing.T) {
+    var settings = Settings {}
+    settings.accept_env = ["LANG"]
+    let f = fixture(settings)
+    defer file.remove_all(f.home) or {}
+    using ends = net.socketpair() or panic("socketpair")
+    let c = logged_in(f, ends)
+    var env: [str: str] = [:]
+    env["LANG"] = "C"
+    env["SECRET"] = "1"
+    let out = run(c, login.Program.Command("echo ${{SECRET:-unset}} $LANG $USER $SHELL; pwd"), env) or "refused"
+    testing.error_if(t, out != "unset C tester /bin/sh\n{f.home}\n", "output {out}")
+    testing.error_if(t, !refused_run(c, login.Program.Subsystem("sftp")), "sftp started with no Subsystem configured")
+    testing.error_if(t, !refused_run(c, login.Program.Subsystem("other")), "an unknown subsystem started")
+}
+
+fn test_signals_reach_only_its_own_children(t: *testing.T) {
+    let f = fixture(Settings {})
+    defer file.remove_all(f.home) or {}
+    using ends = net.socketpair() or panic("socketpair")
+    let c = logged_in(f, ends)
+    var body: u8[] = []
+    wire.put_u32(mut body, sys.pid())
+    wire.put_u32(mut body, 15)
+    testing.error_if(t, answered(ask(c, ask_signal, body) or panic("ask")), "the monitor signalled a process it did not start")
+    let started = start_remote(c, login.Request { program: login.Program.Command("exec sleep 30") }) or panic("start")
+    started.signal(signals.from_number(15) ?? panic("TERM"))
+    match started.wait() {
+        Signaled(sig) => testing.error_if(t, signals.number(sig) != 15, "ended by {signals.name(sig)}")
+        Exited(code) => testing.error(t, "exited {code} instead of taking the signal")
+    }
+}
+
+fn test_terminals_are_issued_once_and_only_by_the_monitor(t: *testing.T) {
+    let f = fixture(Settings {})
+    defer file.remove_all(f.home) or {}
+    using ends = net.socketpair() or panic("socketpair")
+    let c = logged_in(f, ends)
+    let forged = login.Terminal { master: -1, slave: -1, path: "/dev/pts/9999" }
+    testing.error_if(t, !refused_start(c, login.Request { program: login.Program.Shell, terminal: forged }), "a session started on a terminal the monitor did not open")
+    let opened = open_remote_terminal(c) or panic("terminal")
+    defer sys.close_fd(opened.master)
+    let started = start_remote(c, login.Request { program: login.Program.Command("tty"), term: "dumb", terminal: opened }) or panic("start on the terminal")
+    let master = sys.wrap(opened.master)
+    sys.set_nonblocking(opened.master) or panic("nonblocking")
+    let out = text.replace(read_stream(sys.stream_on(master)), "\r", "")
+    testing.error_if(t, out != "{opened.path}\n", "tty printed {out}")
+    started.wait()
+    let second = open_remote_terminal(c) or panic("second terminal")
+    defer sys.close_fd(second.master)
+    testing.error_if(t, !refused_start(c, login.Request { program: login.Program.Shell, terminal: opened }), "a terminal was used twice")
+}
+
+fn test_children_are_hung_up_when_the_child_goes_away(t: *testing.T) {
+    let f = fixture(Settings {})
+    defer file.remove_all(f.home) or {}
+    var pid = 0
+    {
+        using ends = net.socketpair() or panic("socketpair")
+        let c = logged_in(f, ends)
+        let started = start_remote(c, login.Request { program: login.Program.Command("exec sleep 30") }) or panic("start")
+        pid = started.pid
+        net.close_on(ends.first.handle)
+    }
+    for i in 0..100 {
+        if !file.exists("/proc/{pid}") {
+            return
+        }
+        sleep(50)
+    }
+    testing.error(t, "the session's process outlived the connection")
+}
