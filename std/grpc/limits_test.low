@@ -1,0 +1,110 @@
+import std/http
+import std/io
+import std/net
+import std/testing
+import std/time
+
+fn held(started: chan[bool], ctx: *Context) ! Error {
+    let _ = read[Tick](ctx)?
+    started <- true
+    for {
+        if read[Tick](ctx)? == none {
+            return
+        }
+    }
+}
+
+fn capped(l: net.ListenerHandle, started: chan[bool]) -> *Server {
+    let s = server(ServerOptions { limits: http.Limits { max_connections: 2 } })
+    handle_bidi_streaming(s, "/t.T/Hold", fn(ctx: *Context) ! Error { held(started, ctx)? })
+    handle_unary[Tick, Tick](s, "/t.T/Echo", echo)
+    spawn serving(s, l)
+    s
+}
+
+fn holding(ch: Channel) -> *Stream {
+    let st = bidi_streaming(ch, "/t.T/Hold", CallOptions {}) or panic("open")
+    send[Tick](st, Tick { n: 1 }) or panic("first send")
+    st
+}
+
+fn echoed(target: str) -> bool {
+    let ch = dial(target, ChannelOptions {}) or return false
+    defer close_channel(ch)
+    let reply = unary[Tick, Tick](ch, "/t.T/Echo", Tick { n: 7 }, CallOptions {}) or return false
+    reply.value.n == 7
+}
+
+fn test_connections_share_one_cap_that_spares_a_running_call(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    let started = chan[bool](2)
+    let s = capped(l.handle, started)
+    let target = "127.0.0.1:{l.handle.addr.port}"
+    let first = dial(target, ChannelOptions {}) or panic("dial")
+    let long = holding(first)
+    <-started
+    using silent = net.connect(l.handle.addr) or panic("connect")
+    net.set_read_timeout(silent, 2000)
+    sleep(50)
+
+    let second = dial(target, ChannelOptions {}) or panic("dial")
+    let other = holding(second)
+    <-started
+    let waited = time.monotonic()
+    let n = net.read(silent, io.buffer(64)) or 0
+    let millis = (time.monotonic() - waited) / 1000000
+    testing.error_if(t, n != 0 || millis > 1500, "the silent connection stayed open at the cap")
+    testing.error_if(t, sent_code(long) != Code.Ok, "the running call ended when the cap displaced a silent connection")
+
+    testing.error_if(t, echoed(target), "a third connection was served beside two running calls")
+    testing.error_if(t, sent_code(long) != Code.Ok || sent_code(other) != Code.Ok, "a running call made way for a new connection")
+    close_stream(long)
+    close_stream(other)
+    close_channel(first)
+    close_channel(second)
+    shutdown(s, 0)
+}
+
+fn deaf(started: chan[bool], ctx: *Context) ! Error {
+    write[Tick](ctx, Tick { n: 1 })?
+    started <- true
+    sleep(1500)
+}
+
+fn answering(started: chan[bool], ctx: *Context) ! Error {
+    write[Tick](ctx, Tick { n: 1 })?
+    held(started, ctx)?
+}
+
+fn test_a_call_past_the_handler_limit_is_cancelled_and_its_connection_makes_way(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    let started = chan[bool](3)
+    let s = server(ServerOptions { limits: http.Limits { max_connections: 2, handler_timeout: 300 } })
+    handle_bidi_streaming(s, "/t.T/Answer", fn(ctx: *Context) ! Error { answering(started, ctx)? })
+    handle_bidi_streaming(s, "/t.T/Deaf", fn(ctx: *Context) ! Error { deaf(started, ctx)? })
+    handle_unary[Tick, Tick](s, "/t.T/Echo", echo)
+    spawn serving(s, l.handle)
+    let target = "127.0.0.1:{l.handle.addr.port}"
+    let first = dial(target, ChannelOptions {}) or panic("dial")
+    let stuck = bidi_streaming(first, "/t.T/Deaf", CallOptions {}) or panic("open")
+    send[Tick](stuck, Tick { n: 1 }) or panic("first send")
+    <-started
+    let long = bidi_streaming(first, "/t.T/Answer", CallOptions {}) or panic("open")
+    send[Tick](long, Tick { n: 1 }) or panic("first send")
+    <-started
+    let second = dial(target, ChannelOptions {}) or panic("dial")
+    let other = bidi_streaming(second, "/t.T/Deaf", CallOptions {}) or panic("open")
+    send[Tick](other, Tick { n: 1 }) or panic("first send")
+    <-started
+    testing.error_if(t, echoed(target), "a third connection was served beside two calls inside the limit")
+    testing.equal(t, received_code(long), Code.Ok)
+    sleep(500)
+    testing.equal(t, received_code(long), Code.Cancelled)
+    testing.error_if(t, !echoed(target), "no connection made way for a third past the limit")
+    close_stream(stuck)
+    close_stream(long)
+    close_stream(other)
+    close_channel(first)
+    close_channel(second)
+    shutdown(s, 0)
+}

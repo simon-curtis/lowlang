@@ -1,0 +1,313 @@
+import std/cancel
+import std/crypto/x509
+import std/header
+import std/http
+import std/http/qpack
+import std/io
+import std/quic
+import std/quic/wire
+import std/tls
+
+struct Parsed {
+    status: str
+    body: u8[]
+}
+
+fn server_config() -> quic.Config ! io.Error {
+    let pem = embed("std_tls_ec.pem")
+    let certificates = x509.pem_certificates(pem)
+    let key = x509.pem_private_key(pem)?
+    quic.Config { tls: tls.Config { certificates, key, alpn: ["h3"] } }
+}
+
+fn roots() -> x509.Certificate[] {
+    var out: x509.Certificate[] = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        out.push(x509.parse(der) or return out)
+    }
+    out
+}
+
+fn client_config() -> quic.Config {
+    quic.Config { tls: tls.Config { roots: roots(), alpn: ["h3"] } }
+}
+
+fn frame(kind: i64, payload: u8[]) -> u8[] {
+    var out: u8[] = []
+    wire.put_varint(mut out, kind)
+    wire.put_varint(mut out, payload.len)
+    io.append(mut out, payload)
+    out
+}
+
+fn settings_payload(id: i64) -> u8[] {
+    var out: u8[] = []
+    wire.put_varint(mut out, id)
+    wire.put_varint(mut out, 0)
+    out
+}
+
+fn open_control(h: *quic.ConnectionHandle, setting: i64) ! io.Error {
+    let s = quic.open_uni_stream_on(h)?
+    var out: u8[] = []
+    wire.put_varint(mut out, 0)
+    io.append(mut out, frame(4, settings_payload(setting)))
+    quic.write(s, out)?
+}
+
+fn dial(port: i64) -> *quic.ConnectionHandle ! io.Error {
+    quic.dial_handle("127.0.0.1", port, client_config())?
+}
+
+fn connect(port: i64) -> *quic.ConnectionHandle ! io.Error {
+    let h = dial(port)?
+    open_control(h, 1)?
+    h
+}
+
+fn request_fields(method: str, path: str, extra: header.Header[]) -> header.Header[] {
+    var fields: header.Header[] = [
+        header.Header { name: ":method", value: method }
+        header.Header { name: ":scheme", value: "https" }
+        header.Header { name: ":authority", value: "localhost" }
+        header.Header { name: ":path", value: path }
+    ]
+    for h in extra {
+        fields.push(h)
+    }
+    fields
+}
+
+fn await_close(h: *quic.ConnectionHandle) -> str {
+    for i in 0..300 {
+        quic.stats_on(h) catch {
+            _ => return "code=0x{hex(h.close_code)} by_peer={h.closed_by_peer} application={h.application_close}"
+        }
+        sleep(20)
+    }
+    "still open"
+}
+
+fn hex(n: i64) -> str {
+    let digits = "0123456789abcdef"
+    if n == 0 {
+        return "0"
+    }
+    var out = ""
+    var rest = n
+    for rest > 0 {
+        out = "{digits[rest & 15..(rest & 15) + 1]}{out}"
+        rest = rest >> 4
+    }
+    out
+}
+
+fn request(path: str, body: u8[]) -> u8[] {
+    var out = frame(1, qpack.encode(qpack.encoder(), request_fields("POST", path, [])))
+    if body.len > 0 {
+        io.append(mut out, frame(0, body))
+    }
+    out
+}
+
+fn parse_response(id: i64, raw: u8[]) -> Parsed ! io.Error {
+    let c = wire.cursor(raw)
+    let d = qpack.decoder(0, 0, 65536)
+    var out = Parsed { status: "", body: [] }
+    for wire.left(c) > 0 {
+        let kind = wire.varint(c)?
+        let length = wire.varint(c)?
+        let payload = wire.take(c, length)?
+        if kind == 0 {
+            io.append(mut out.body, payload)
+        } else if kind == 1 {
+            match qpack.decode(d, id, payload)? {
+                Fields(fields) => {
+                    out.status = header.get(fields, ":status") ?? ""
+                }
+                Blocked => fail Malformed
+            }
+        }
+    }
+    out
+}
+
+fn exchange(h: *quic.ConnectionHandle, raw: u8[], finished: bool) -> Parsed ! io.Error {
+    let s = quic.open_stream_on(h)?
+    let _ = quic.write(s, raw) or 0
+    if finished {
+        quic.finish(s) or {}
+    }
+    parse_response(s.id, io.read_all(quic.stream(s))?)?
+}
+
+fn show(label: str, h: *quic.ConnectionHandle, raw: u8[], finished: bool) {
+    let p = exchange(h, raw, finished) catch {
+        e => {
+            print("{label}: {e}")
+            return
+        }
+    }
+    print("{label}: status={p.status} body={p.body.len}")
+}
+
+fn tick(chunks: chan[u8[]], token: *cancel.Token) {
+    let gone = cancel.done(token)
+    for {
+        select {
+            chunks <- bytes("tick") => {}
+            <-gone => break
+        }
+        sleep(10)
+    }
+    close(chunks)
+}
+
+fn handle(req: http.Request) -> http.Response {
+    if req.path == "/events" {
+        let chunks = chan[u8[]](4)
+        spawn tick(chunks, req.token)
+        return http.Response { status: 200, headers: [], body: [], stream: some(chunks) }
+    }
+    if req.path == "/wait" {
+        sleep(1200)
+    }
+    if req.path == "/large" {
+        return http.Response { status: 200, headers: [], body: io.buffer(4 << 20) }
+    }
+    http.Response { status: 200, headers: [], body: req.body }
+}
+
+fn serve(l: *quic.ListenerHandle, limits: http.Limits) {
+    http.serve_quic_with(l, limits, handle) catch {
+        _ => {}
+    }
+}
+
+fn untaken(h: *quic.ConnectionHandle, path: str) -> quic.Stream ! io.Error {
+    let s = quic.open_stream_on(h)?
+    let _ = quic.write(s, request(path, []))?
+    quic.finish(s)?
+    s
+}
+
+fn closed(h: *quic.ConnectionHandle) -> bool {
+    quic.stats_on(h) catch {
+        _ => return true
+    }
+    false
+}
+
+fn senders(config: quic.Config) ! io.Error {
+    using l = quic.listen("127.0.0.1", 0, config)?
+    spawn serve(l.handle, http.Limits { head_timeout: 0, idle_timeout: 0, max_connections: 2 })
+    let port = l.handle.addr.port
+    let first = connect(port)?
+    let second = connect(port)?
+    let _ = untaken(first, "/large")?
+    let _ = untaken(second, "/large")?
+    sleep(500)
+    let third = connect(port)?
+    show("connection past two that only send", third, request("/echo", io.buffer(10)), true)
+    var gone = 0
+    for _ in 0..100 {
+        gone = 0
+        for h in [first, second] {
+            if closed(h) {
+                gone += 1
+            }
+        }
+        if gone > 0 {
+            break
+        }
+        sleep(20)
+    }
+    print("senders displaced: {gone}")
+    quic.close_on(first, 0, "")
+    quic.close_on(second, 0, "")
+    quic.close_on(third, 0, "")
+}
+
+fn requests(config: quic.Config) ! io.Error {
+    using l = quic.listen("127.0.0.1", 0, config)?
+    spawn serve(l.handle, http.Limits { head_timeout: 1000, body_timeout: 1000, body_rate: 1000, write_timeout: 1000, idle_timeout: 0, max_body: 1000 })
+    let h = connect(l.handle.addr.port)?
+    show("body within max_body", h, request("/echo", io.buffer(1000)), true)
+    show("body over max_body", h, request("/echo", io.buffer(1001)), true)
+    show("header block never finished", h, [1], false)
+    show("body never finished", h, request("/echo", io.buffer(10)), false)
+    let held = untaken(h, "/large")?
+    sleep(2500)
+    let taken = io.read_all(quic.stream(held)) catch {
+        e => bytes("{e}")
+    }
+    print("response the client does not take: {if taken.len < 100 { str(taken) } else { "{taken.len} bytes" }}")
+    show("after the cut streams", h, request("/echo", io.buffer(10)), true)
+    quic.close_on(h, 0, "")
+}
+
+fn connections(config: quic.Config) ! io.Error {
+    using l = quic.listen("127.0.0.1", 0, config)?
+    spawn serve(l.handle, http.Limits { head_timeout: 0, idle_timeout: 0, max_connections: 2, max_bodies: 1000 })
+    let port = l.handle.addr.port
+    let first = connect(port)?
+    show("first connection", first, request("/echo", io.buffer(10)), true)
+    let second = connect(port)?
+    show("second connection", second, request("/echo", io.buffer(10)), true)
+    let third = connect(port)?
+    show("third connection", third, request("/echo", io.buffer(10)), true)
+    print("first connection displaced: {await_close(first)}")
+    show("second connection kept", second, request("/echo", io.buffer(10)), true)
+    show("body within max_bodies", third, request("/echo", io.buffer(1000)), true)
+    show("body over max_bodies", third, request("/echo", io.buffer(1001)), true)
+    quic.close_on(second, 0, "")
+    quic.close_on(third, 0, "")
+}
+
+fn served(port: i64) -> bool {
+    let h = connect(port) or return false
+    defer quic.close_on(h, 0, "")
+    let p = exchange(h, request("/echo", io.buffer(10)), true) or return false
+    p.status == "200"
+}
+
+fn streams(config: quic.Config) ! io.Error {
+    using l = quic.listen("127.0.0.1", 0, config)?
+    spawn serve(l.handle, http.Limits { head_timeout: 0, idle_timeout: 0, max_connections: 2 })
+    let port = l.handle.addr.port
+    let streaming = connect(port)?
+    let _ = untaken(streaming, "/events")?
+    let working = connect(port)?
+    let slow = untaken(working, "/wait")?
+    sleep(300)
+    let third = connect(port)?
+    show("connection past a stream and a handler", third, request("/echo", io.buffer(10)), true)
+    print("stream displaced: {await_close(streaming)}")
+    let _ = untaken(third, "/wait")?
+    sleep(100)
+    print("connection past two handlers served: {served(port)}")
+    let answered = parse_response(slow.id, io.read_all(quic.stream(slow))?)?
+    print("handler kept: status={answered.status}")
+    quic.close_on(working, 0, "")
+    quic.close_on(third, 0, "")
+}
+
+fn idle(config: quic.Config) ! io.Error {
+    using l = quic.listen("127.0.0.1", 0, config)?
+    spawn serve(l.handle, http.Limits { head_timeout: 1000, idle_timeout: 1000 })
+    let port = l.handle.addr.port
+    let silent = connect(port)?
+    let rested = connect(port)?
+    show("request before it rests", rested, request("/echo", io.buffer(10)), true)
+    print("connection without a request: {await_close(silent)}")
+    print("connection at rest: {await_close(rested)}")
+}
+
+fn main() ! io.Error {
+    let config = server_config()?
+    requests(config)?
+    connections(config)?
+    senders(config)?
+    streams(config)?
+    idle(config)?
+}

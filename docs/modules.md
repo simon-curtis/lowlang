@@ -239,6 +239,7 @@ Types: the droppable `Listener`, `Conn` and `Socket`, each with a copyable `List
 | `adopt` and `detach` | Convert between a `ConnHandle` and a `Conn`. |
 | `adopt_socket` and `detach_socket` | Convert between a `SocketHandle` and a `Socket`. |
 | `inherit` | Makes a `Conn` of a socket descriptor the process was started with. |
+| `inherit_listener` | Makes a `Listener` of a listening socket a parent process left open, such as one named in `process.Command.keep`. A socket is taken once. |
 
 ### TCP
 
@@ -343,6 +344,43 @@ The caller closes the received descriptors with `sys.close_fd`.
 | `Dialer` | A function value that makes a connection. |
 | `direct_dialer` | The plain one. |
 
+## std/net/restart
+
+Starts a server again after it ends abnormally. The process that calls `serve` keeps the listeners and UDP sockets and watches; the server is the same executable, started with the same arguments, environment and standard streams, and it takes each socket by the address or path its own call asks for. Both run the same `main`:
+
+```
+fn main() ! io.Error {
+    using l = restart.listen("0.0.0.0", 8080)?
+    restart.serve(restart.Kept { listeners: [l.handle] }, fn(kept: restart.Kept) ! io.Error {
+        http.serve_on(kept.listeners[0], handler)?
+    })?
+}
+```
+
+| Name | Description |
+| --- | --- |
+| `listen` and `listen_with` | Listen as `net.listen` and `net.listen_with` do in the watching process. In the server they take the socket given to `serve` that is bound to the same address and, when the port is not 0, the same port, and fail with `Invalid` when none, more than one or an already taken one matches. |
+| `serve` and `serve_with` | Run the function on a `Kept` in the server, and in the watching process start the server with its listeners and sockets and wait for it. |
+| `listen_unix` | Listens as `net.listen_unix` does in the watching process. The server takes the listener bound to the same path. The watching process owns the socket file. |
+| `bind_udp` | Binds as `net.bind_udp` does in the watching process. The server takes the socket bound to the same address and port. Datagrams that arrive while no server runs wait in the socket's buffer. |
+| `Kept` | `listeners` and `sockets`, the handles the watching process keeps open, and `secret`, 32 bytes every server of one watching process receives alike, empty on Windows. |
+| `worker` | Whether this process is the server. Code that must run once, such as a migration, runs where it is false. |
+| `Options` | `first_pause` (100), `longest_pause` (5000), `settled` (10000) and `grace` (10000), in milliseconds. |
+
+- The server exits with status 0: `serve` returns in the watching process.
+- The server ends any other way (a panic, which exits with status 2, another status, a failing function or a signal): it is started again after a pause. The pause is `first_pause`, and doubles up to `longest_pause` while the server keeps ending before it has run for `settled`.
+- `Terminate` or `Interrupt` reaches the watching process: on Linux the server receives `Terminate`, is killed if it has not ended `grace` later, and `serve` returns.
+- The watching process ends for any other reason: the server ends with it.
+- The first server ends abnormally after a `listen`, `listen_unix` or `bind_udp` call found no socket of its own: `serve` fails with `Invalid`. A later server that does so is started again.
+
+A QUIC server runs on a kept UDP socket through `quic.listen_on(kept.sockets[0], kept.secret, config)`. The secret reaches each server on a pipe that `serve` reads and closes, so it is in no environment and no process the server starts afterwards can read it. A new connection reaches the next server. A connection the ended server held fails with `Reset` when it next sends a packet, and one that sends nothing ends at its idle timeout, which `Config.keep_alive` on the client shortens to the next ping. On Windows `serve` fails with `Unsupported` for a Unix listener or a UDP socket.
+
+The listening sockets stay open in the watching process, so a connection that arrives while no server runs waits in the listen queue and the next server accepts it.
+
+This is recovery, not isolation. A panic in one handler ends the whole server. Every request in flight in it is lost and its clients see their connections closed. The next server starts with empty memory, so sessions, caches, rate limit counts and an in-memory session revocation store are gone: a session revoked before the panic is accepted again unless the store is outside the process, as `web.file_session_store` is.
+
+The watching process writes nothing. The server's standard output and standard error are the watching process's, so a panic message appears there. The server shares the watching process's standard input. On Windows the watching process ends the server at once when it is interrupted, without `grace`. Windows support is experimental.
+
 ## std/net/sntp
 
 `request` writes the 48-byte version 4 client packet.
@@ -391,6 +429,7 @@ A `Stamp` is the 32-bit seconds and 32-bit fraction of an NTP timestamp. `to_sta
 - idle and handshake timeouts
 - keep-alive
 - the flow control and stream limits advertised to the peer
+- `max_send_buffer` (2 MiB), the unacknowledged stream data a connection holds before `write` parks, and `send_timeout` (60 seconds), the time the peer has to acknowledge 64 KiB of it before the connection is closed
 - `retry`
 
 | Function | Description |
@@ -409,6 +448,8 @@ The droppable `Connection` closes with code 0 when released. Its `*ConnectionHan
 | --- | --- |
 | Streams: `open_stream`, `open_uni_stream`, `accept_stream` and `accept_uni_stream` with `_on` forms | Return a copyable `Stream`. |
 | `read`, `write`, `finish`, `reset`, `stop` and `stream` | `stream` adapts it to an `io.Stream`. |
+
+`listen_on` starts a server on a UDP socket the caller bound, with a 32-byte reset key. A server that takes the place of another on the same socket with the same key answers the other's connections with stateless resets their clients accept.
 
 ## std/quic/wire
 
@@ -735,7 +776,9 @@ A `Pipe` owns a `Reader` and a `Writer`, each droppable so that releasing it com
 
 ### HTTP serving
 
-Serving: `serve`, `serve_tls`, `serve_conn` and `serve_stream`, and `serve_quic` for HTTP/3 over a `std/quic` listener. The `_on` forms (`serve_on`, `serve_tls_on`, `serve_conn_on`, `serve_quic_on`) take the listener's or connection's view.
+Serving: `serve`, `serve_tls`, `serve_conn` and `serve_stream`, and `serve_quic` for HTTP/3 over a `std/quic` listener. The `_on` forms (`serve_on`, `serve_tls_on`, `serve_conn_on`, `serve_quic_on`) take the listener's or connection's view, and the `_with` forms (`serve_with`, `serve_tls_with`, `serve_conn_with`, `serve_stream_with`, `serve_quic_with`) take that view and a `Limits`.
+
+`serve`, `serve_tls` and `serve_quic` close a connection that is slow to send a request, slow to read a response or idle, and bound the request bodies and the connections they hold at once. At the connection limit a connection that only sends a finished response makes way for a new one, slowest first; then one that only sends a `stream`, then one taken over through `upgrade`, then one whose handler is past `handler_timeout`; one with a handler running inside it does not; `serve` and `serve_tls` keep accepting when the process runs out of descriptors. `Limits` holds each bound as a field with a default, for example `http.serve_with(l.handle, http.Limits { max_body: 1 << 20 }, handler)`; `serve_conn` and `serve_stream` set no time limit. See HTTP server limits in the design reference.
 
 ### HTTP client
 
@@ -784,7 +827,7 @@ A `Response` whose `stream` is a `chan[u8[]]` is written as it is produced, chun
 
 ### HTTP duplex serving
 
-Duplex serving: `serve_duplex_conn_on` and `serve_duplex_tls_conn_on` serve one HTTP/2 connection whose handlers receive `Request.upload` while they answer. They stop accepting streams with a `GOAWAY` when the drain channel closes. `receive_body` and `receive_body_until` read an `Upload`.
+Duplex serving: `serve_duplex_conn_on` and `serve_duplex_tls_conn_on` serve one HTTP/2 connection whose handlers receive `Request.upload` while they answer. They stop accepting streams with a `GOAWAY` when the drain channel closes. `serve_duplex_conn_with` and `serve_duplex_tls_conn_with` take a `Limits`, which `grpc.ServerOptions.limits` passes to them. `receive_body` and `receive_body_until` read an `Upload`. `admission` makes the shared limits that `serve_duplex_conn_in` and `serve_duplex_tls_conn_in` serve under, which is how a `grpc.Server` caps its connections.
 
 ### HTTP calls
 
@@ -828,6 +871,10 @@ Every entry point fails `Malformed` on hostile input: integers are capped at 2^6
 ## std/web
 
 `static` and `static_with` serve a directory. `events` and `event_stream` serve server-sent events.
+
+`openapi` registers a route like any other, so it carries the middleware of the app or group it is registered on. Register it on a protected group to protect the document.
+
+A visitor who has never held a value in `Session.values` adds no session entry to the `SessionStore`, whatever routes they reach; what `csrf_token` and `oidc_login` keep does not count. Where the application sets its own session values for visitors who are not signed in, put `session_clear` behind `require_session`, so that only a signed-in visitor adds a day-long entry. A sign-in callback adds an entry that leaves after `OidcClient.max_login_age`, counted apart from sessions. A full table moves into a filter and signs nobody out; signing every session out takes about 17.8 million live entries, 206 sign-outs a second for a day. While a table's filters are live, up to about 0.7% of the sessions issued before them are signed out by a false match. A `SessionStore` the application supplies has neither bound. `file_session_store` keeps revocations across a restart.
 
 ## std/tls
 
@@ -1741,7 +1788,7 @@ A gate takes about 0.25 s on one core and generating the cloud key about 1.3 s.
 
 ## std/crypto/jose
 
-`asymmetric_algorithms` lists the public key algorithms and `token_kid` reads the key id from a token header. `thumbprint` returns the RFC 7638 SHA-256 thumbprint of a `Jwk`. `sign_flattened` and `verify_flattened` write and check the flattened JSON serialization of RFC 7515 section 7.2.2 for a `Protected` header (`alg`, `kid`, `nonce`, `url` and an embedded `jwk`), as ACME uses it.
+`asymmetric_algorithms` lists the public key algorithms. `token_kid` and `token_typ` read the key id and the type from a token header. `sign_typed` signs with a `typ` other than `JWT`, and `Options.typ` makes `verify` require one, compared without regard to case and with a leading `application/` dropped. `thumbprint` returns the RFC 7638 SHA-256 thumbprint of a `Jwk`. `sign_flattened` and `verify_flattened` write and check the flattened JSON serialization of RFC 7515 section 7.2.2 for a `Protected` header (`alg`, `kid`, `nonce`, `url` and an embedded `jwk`), as ACME uses it.
 
 ## std/crypto/password
 
@@ -2188,7 +2235,7 @@ An `Entry` is one 384-byte record in glibc's x86-64 layout: its `Kind`, process 
 
 `Command` with arguments, an optional replacement environment, a working directory, `Inherit`, `Piped` or `Null` for each standard stream, an optional new process group, which is a job object on Windows and ends its child when the parent ends (`PR_SET_PDEATHSIG` with `SIGKILL` on Linux, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` on Windows), and `windowless`, which starts a Windows console program with no console window.
 
-A `Command` also takes an `arg0` in place of the program's name, `Stdio.Descriptor(fd)` to give a stream one of the parent's descriptors, and on Linux a `Session` (`Same`, `New`, or `Terminal`, which makes its standard input the controlling terminal), `Credentials` to run as, a `root` directory to change into first and a `program_fd` to execute in place of a path. On Windows a `Session` other than `Same`, `Credentials`, a `root` and a `program_fd` fail with `Unsupported`.
+A `Command` also takes an `arg0` in place of the program's name, `Stdio.Descriptor(fd)` to give a stream one of the parent's descriptors, `keep` for descriptors that stay open in the child under their own numbers, which are sockets only on Windows, and on Linux a `Session` (`Same`, `New`, or `Terminal`, which makes its standard input the controlling terminal), `Credentials` to run as, a `root` directory to change into first and a `program_fd` to execute in place of a path. On Windows a `Session` other than `Same`, `Credentials`, a `root` and a `program_fd` fail with `Unsupported`.
 
 | Function | What it does |
 | --- | --- |

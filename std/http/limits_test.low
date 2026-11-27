@@ -1,0 +1,899 @@
+import std/cancel
+import std/io
+import std/net
+import std/testing
+import std/text
+import std/time
+
+fn brisk() -> Limits {
+    Limits { head_timeout: 300, body_timeout: 300, body_rate: 50, idle_timeout: 600, write_timeout: 300, max_bodies: 100000 }
+}
+
+fn slow_handler(req: Request) -> Response {
+    if req.path == "/slow" {
+        sleep(900)
+    }
+    if req.path == "/big" {
+        return response(200, text.repeat("x", big))
+    }
+    if req.path == "/size" {
+        return response(200, "{req.body.len} bytes")
+    }
+    response(200, str(req.body))
+}
+
+const big = 32 << 20
+
+struct Setup {
+    limits: Limits
+    alone: bool
+    duplex: bool
+}
+
+fn listening() -> Setup {
+    Setup { limits: brisk(), alone: false, duplex: false }
+}
+
+fn serving(l: net.ListenerHandle, setup: Setup) {
+    if !setup.alone {
+        serve_with(l, setup.limits, slow_handler) or {}
+        return
+    }
+    let h = net.accept_handle(l) or return
+    if setup.duplex {
+        serve_duplex_conn_with(h, setup.limits, chan[bool](), slow_handler)
+    } else {
+        serve_conn_with(h, setup.limits, slow_handler)
+    }
+}
+
+fn drip(c: net.ConnHandle, parts: str[], gap: i64) {
+    for part in parts {
+        net.write_all_on(c, bytes(part)) or return
+        sleep(gap)
+    }
+}
+
+struct Seen {
+    text: str
+    millis: i64
+}
+
+fn until_closed(c: net.Conn, started: i64) -> Seen {
+    net.set_read_timeout(c, 5000)
+    let all = io.read_all(net.stream(c)) or []
+    Seen { text: str(all), millis: (time.monotonic() - started) / 1000000 }
+}
+
+fn observed(parts: str[], gap: i64) -> Seen {
+    observed_under(listening(), parts, gap)
+}
+
+fn observed_under(setup: Setup, parts: str[], gap: i64) -> Seen {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, setup)
+    using c = net.connect(l.handle.addr) or panic("connect")
+    let started = time.monotonic()
+    spawn drip(c.handle, parts, gap)
+    until_closed(c, started)
+}
+
+fn test_a_silent_client_is_closed_after_the_head_limit(t: *testing.T) {
+    let seen = observed([], 0)
+    testing.equal(t, seen.text, "")
+    testing.error_if(t, seen.millis < 250 || seen.millis > 2000, "closed after {seen.millis} ms")
+}
+
+fn test_a_head_sent_in_pieces_is_closed_at_the_same_limit(t: *testing.T) {
+    let seen = observed(["GET / HT", "TP/1.1\r\n", "a: b\r\n", "c: d\r\n", "e: f\r\n", "g: h\r\n", "\r\n"], 100)
+    testing.equal(t, seen.text, "")
+    testing.error_if(t, seen.millis < 250 || seen.millis > 2000, "closed after {seen.millis} ms")
+}
+
+fn test_a_body_arriving_at_the_rate_outlasts_the_stall_limit(t: *testing.T) {
+    let piece = text.repeat("a", 20)
+    let seen = observed(["POST /size HTTP/1.1\r\nconnection: close\r\ncontent-length: 120\r\n\r\n", piece, piece, piece, piece, piece, piece], 150)
+    testing.contains(t, seen.text, "200 OK")
+    testing.contains(t, seen.text, "120 bytes")
+}
+
+fn test_a_body_arriving_below_the_rate_is_closed(t: *testing.T) {
+    let seen = observed(["POST / HTTP/1.1\r\ncontent-length: 12\r\n\r\n", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"], 100)
+    testing.equal(t, seen.text, "")
+    testing.error_if(t, seen.millis > 1000, "closed after {seen.millis} ms")
+}
+
+fn test_a_burst_earns_a_body_no_time_to_drip(t: *testing.T) {
+    var parts = ["POST / HTTP/1.1\r\ncontent-length: 1000\r\n\r\n", text.repeat("a", 200)]
+    for _ in 0..20 {
+        parts.push("a")
+    }
+    let seen = observed(parts, 100)
+    testing.equal(t, seen.text, "")
+    testing.error_if(t, seen.millis > 1500, "closed after {seen.millis} ms")
+}
+
+fn test_a_declared_body_over_the_cap_gets_413_before_it_is_sent(t: *testing.T) {
+    var setup = listening()
+    setup.limits.max_body = 1000
+    setup.limits.body_timeout = 4000
+    let seen = observed_under(setup, ["POST / HTTP/1.1\r\ncontent-length: 1001\r\n\r\n"], 0)
+    testing.contains(t, seen.text, "413 ")
+    testing.error_if(t, seen.millis > 2000, "answered after {seen.millis} ms")
+}
+
+fn test_a_chunked_body_over_the_cap_gets_413(t: *testing.T) {
+    var setup = listening()
+    setup.limits.max_body = 1000
+    let seen = observed_under(setup, ["POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n3e9\r\n{text.repeat("a", 1001)}\r\n0\r\n\r\n"], 0)
+    testing.contains(t, seen.text, "413 ")
+}
+
+fn test_a_body_at_the_cap_is_served(t: *testing.T) {
+    var setup = listening()
+    setup.limits.max_body = 1000
+    let seen = observed_under(setup, [sized("/size", 1000, "connection: close\r\n")], 0)
+    testing.contains(t, seen.text, "1000 bytes")
+}
+
+fn test_a_connection_served_alone_keeps_the_head_limit(t: *testing.T) {
+    let seen = observed_under(Setup { limits: brisk(), alone: true, duplex: false }, [], 0)
+    testing.equal(t, seen.text, "")
+    testing.error_if(t, seen.millis < 250 || seen.millis > 2000, "closed after {seen.millis} ms")
+}
+
+fn test_a_silent_duplex_connection_is_closed_after_the_head_limit(t: *testing.T) {
+    let seen = observed_under(Setup { limits: lasting(brisk()), alone: true, duplex: true }, [], 0)
+    testing.equal(t, seen.text, "")
+    testing.error_if(t, seen.millis < 250 || seen.millis > 2000, "closed after {seen.millis} ms")
+}
+
+fn opening() -> str {
+    var out: u8[] = bytes(preface)
+    put_frame(mut out, frame_settings, 0, 0, [])
+    str(out)
+}
+
+fn get_frame() -> str {
+    var head: u8[] = []
+    put_frame(mut head, frame_headers, flag_end_headers | flag_end_stream, 1, [0x82, 0x86, 0x84])
+    str(head)
+}
+
+fn test_a_duplex_connection_may_stay_idle_past_every_limit(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, Setup { limits: lasting(brisk()), alone: true, duplex: true })
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.set_read_timeout(c, 5000)
+    spawn drip(c.handle, [opening(), get_frame()], 1200)
+    let r = io.reader(net.stream(c))
+    for {
+        let f = read_frame(r) or {
+            testing.error(t, "closed before the response")
+            return
+        }
+        if f.kind == frame_headers {
+            testing.equal(t, f.stream, 1)
+            return
+        }
+    }
+}
+
+fn test_an_http2_header_block_sent_in_pieces_is_closed_at_the_head_limit(t: *testing.T) {
+    var head: u8[] = []
+    put_frame(mut head, frame_headers, 0, 1, [0x83])
+    var parts = [opening(), str(head)]
+    for _ in 0..20 {
+        var more: u8[] = []
+        put_frame(mut more, frame_continuation, 0, 1, [0x86])
+        parts.push(str(more))
+    }
+    let seen = observed(parts, 100)
+    testing.error_if(t, seen.millis > 1500, "closed after {seen.millis} ms")
+}
+
+fn hush() -> Setup {
+    var setup = listening()
+    setup.limits.head_timeout = 5000
+    setup.limits.idle_timeout = 5000
+    setup
+}
+
+fn test_silent_connections_past_the_cap_make_way_for_a_request(t: *testing.T) {
+    var setup = hush()
+    setup.limits.max_connections = 4
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, setup)
+    var silent: net.ConnHandle[] = []
+    for _ in 0..8 {
+        silent.push(net.dial_handle("127.0.0.1", l.handle.addr.port) or panic("connect"))
+        sleep(20)
+    }
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.write_all(c, bytes("GET / HTTP/1.1\r\nconnection: close\r\n\r\n")) or panic("write")
+    testing.contains(t, until_closed(c, time.monotonic()).text, "200 OK")
+    using oldest = net.adopt(silent[0])
+    let first = until_closed(oldest, time.monotonic())
+    testing.error_if(t, first.millis > 1000, "the first silent connection stayed open")
+    for s in silent {
+        net.close_on(s)
+    }
+}
+
+fn test_a_connection_past_the_cap_is_closed_while_every_handler_runs(t: *testing.T) {
+    var setup = hush()
+    setup.limits.max_connections = 2
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, setup)
+    using a = net.connect(l.handle.addr) or panic("connect")
+    using b = net.connect(l.handle.addr) or panic("connect")
+    let slow = bytes("GET /slow HTTP/1.1\r\nconnection: close\r\n\r\n")
+    net.write_all(a, slow) or panic("write")
+    net.write_all(b, slow) or panic("write")
+    sleep(200)
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.write_all(c, bytes("GET / HTTP/1.1\r\nconnection: close\r\n\r\n")) or {}
+    testing.equal(t, until_closed(c, time.monotonic()).text, "")
+    testing.contains(t, until_closed(a, time.monotonic()).text, "200 OK")
+    testing.contains(t, until_closed(b, time.monotonic()).text, "200 OK")
+}
+
+fn sized(path: str, n: i64, tail: str) -> str {
+    "POST {path} HTTP/1.1\r\n{tail}content-length: {n}\r\n\r\n{text.repeat("b", n)}"
+}
+
+fn test_a_body_past_the_budget_gets_503(t: *testing.T) {
+    let seen = observed([sized("/size", 300000, "")], 0)
+    testing.contains(t, seen.text, "503 Service Unavailable")
+}
+
+fn test_a_body_handed_to_the_handler_leaves_the_budget(t: *testing.T) {
+    let seen = observed([sized("/size", 120000, ""), sized("/size", 120000, "connection: close\r\n")], 0)
+    testing.equal(t, text.count(seen.text, "120000 bytes"), 2)
+}
+
+fn test_a_body_cut_short_by_its_client_leaves_the_budget(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, listening())
+    let cut = net.dial_handle("127.0.0.1", l.handle.addr.port) or panic("connect")
+    net.write_all_on(cut, bytes("POST /size HTTP/1.1\r\ncontent-length: 200000\r\n\r\n{text.repeat("b", 120000)}")) or panic("write")
+    sleep(100)
+    net.close_on(cut)
+    sleep(100)
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.write_all(c, bytes(sized("/size", 120000, "connection: close\r\n"))) or panic("write")
+    testing.contains(t, until_closed(c, time.monotonic()).text, "120000 bytes")
+}
+
+fn test_a_client_that_stops_reading_is_closed_after_the_write_limit(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, listening())
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.write_all(c, bytes("GET /big HTTP/1.1\r\nconnection: close\r\n\r\n")) or panic("write")
+    sleep(1500)
+    let seen = until_closed(c, time.monotonic())
+    testing.error_if(t, seen.text.len >= big, "received the whole response")
+}
+
+struct Reset {
+    code: i64
+    stream: i64
+    millis: i64
+}
+
+fn stream_reset(setup: Setup, frames: str[], gap: i64) -> Reset {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, setup)
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.set_read_timeout(c, 5000)
+    net.write_all(c, bytes(opening())) or panic("write")
+    let started = time.monotonic()
+    spawn drip(c.handle, frames, gap)
+    let r = io.reader(net.stream(c))
+    for {
+        let f = read_frame(r) or return Reset { code: -1, stream: 0, millis: 0 }
+        if f.kind == frame_reset {
+            return Reset { code: io.be32(f.payload, 0), stream: f.stream, millis: (time.monotonic() - started) / 1000000 }
+        }
+    }
+}
+
+fn post_frames(stream: i64, sizes: i64[]) -> str[] {
+    var head: u8[] = []
+    put_frame(mut head, frame_headers, flag_end_headers, stream, [0x83, 0x86, 0x84])
+    var frames: str[] = [str(head)]
+    for size in sizes {
+        var data: u8[] = []
+        put_frame(mut data, frame_data, 0, stream, io.buffer(size))
+        frames.push(str(data))
+    }
+    frames
+}
+
+fn repeated(size: i64, n: i64) -> i64[] {
+    var sizes: i64[] = []
+    for _ in 0..n {
+        sizes.push(size)
+    }
+    sizes
+}
+
+fn test_an_http2_body_past_the_budget_is_refused(t: *testing.T) {
+    testing.equal(t, stream_reset(listening(), post_frames(1, repeated(16000, 20)), 0).code, error_refused_stream)
+}
+
+fn ended(stream: i64) -> str {
+    var data: u8[] = []
+    put_frame(mut data, frame_data, flag_end_stream, stream, [])
+    str(data)
+}
+
+fn test_an_http2_body_handed_to_the_handler_leaves_the_budget(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, listening())
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.set_read_timeout(c, 5000)
+    var frames = [opening()]
+    for stream in [1, 3] {
+        for frame in post_frames(stream, repeated(15000, 8)) {
+            frames.push(frame)
+        }
+        frames.push(ended(stream))
+    }
+    spawn drip(c.handle, frames, 0)
+    let r = io.reader(net.stream(c))
+    var answered = 0
+    for answered < 2 {
+        let f = read_frame(r) or break
+        if f.kind == frame_reset {
+            break
+        }
+        if f.kind == frame_headers {
+            answered += 1
+        }
+    }
+    testing.equal(t, answered, 2)
+}
+
+fn test_an_http2_body_arriving_below_the_rate_is_reset(t: *testing.T) {
+    testing.equal(t, stream_reset(listening(), post_frames(1, repeated(1, 8)), 100).code, error_enhance_your_calm)
+}
+
+fn test_a_burst_earns_an_http2_body_no_time_to_drip(t: *testing.T) {
+    var sizes = [200]
+    for size in repeated(1, 20) {
+        sizes.push(size)
+    }
+    let reset = stream_reset(listening(), post_frames(1, sizes), 100)
+    testing.equal(t, reset.code, error_enhance_your_calm)
+    testing.error_if(t, reset.millis > 1500, "reset after {reset.millis} ms")
+}
+
+fn test_an_http2_body_over_the_cap_is_reset(t: *testing.T) {
+    var setup = listening()
+    setup.limits.max_body = 1000
+    setup.limits.body_timeout = 4000
+    let reset = stream_reset(setup, post_frames(1, [600, 401]), 0)
+    testing.equal(t, reset.code, error_enhance_your_calm)
+    testing.error_if(t, reset.millis > 2000, "reset after {reset.millis} ms")
+}
+
+fn test_the_streams_of_one_connection_share_one_body_cap_of_the_budget(t: *testing.T) {
+    var setup = listening()
+    setup.limits.max_body = 100000
+    setup.limits.max_bodies = 10000000
+    var frames = post_frames(1, repeated(15000, 6))
+    for frame in post_frames(3, repeated(15000, 6)) {
+        frames.push(frame)
+    }
+    let reset = stream_reset(setup, frames, 0)
+    testing.equal(t, reset.code, error_refused_stream)
+    testing.equal(t, reset.stream, 3)
+}
+
+fn test_a_body_that_stops_is_closed_after_the_stall_limit(t: *testing.T) {
+    let seen = observed(["POST / HTTP/1.1\r\ncontent-length: 6\r\n\r\nabc"], 0)
+    testing.equal(t, seen.text, "")
+    testing.error_if(t, seen.millis < 250 || seen.millis > 2000, "closed after {seen.millis} ms")
+}
+
+fn test_a_handler_may_run_past_every_limit(t: *testing.T) {
+    let seen = observed(["GET /slow HTTP/1.1\r\nconnection: close\r\n\r\n"], 0)
+    testing.contains(t, seen.text, "200 OK")
+}
+
+fn test_a_kept_connection_is_closed_after_the_idle_limit(t: *testing.T) {
+    let seen = observed(["GET / HTTP/1.1\r\n\r\n"], 0)
+    testing.contains(t, seen.text, "200 OK")
+    testing.error_if(t, seen.millis < 550 || seen.millis > 2500, "closed after {seen.millis} ms")
+}
+
+fn test_a_duplex_connection_without_requests_is_closed_after_its_idle_limit(t: *testing.T) {
+    let seen = observed_under(Setup { limits: brisk(), alone: true, duplex: true }, [opening()], 0)
+    testing.error_if(t, seen.millis < 550 || seen.millis > 2500, "closed after {seen.millis} ms")
+}
+
+fn answered(raw: str, limits: Limits) -> str {
+    let src = new(Fed { data: bytes(raw), at: 0, out: [] })
+    let s = io.Stream {
+        read: fn(buf: u8[]) -> i64 ! io.Error {
+            let n = io.copy(buf, src.data[src.at..])
+            src.at += n
+            n
+        }
+        write: fn(buf: u8[]) -> i64 ! io.Error {
+            io.append(mut src.out, buf)
+            buf.len
+        }
+        close: fn() {}
+    }
+    serve_stream_with(s, limits, slow_handler) or {}
+    str(src.out)
+}
+
+struct Fed {
+    data: u8[]
+    at: i64
+    out: u8[]
+}
+
+fn test_a_stream_holds_bodies_to_its_own_cap(t: *testing.T) {
+    let limits = Limits { max_body: 4 }
+    testing.contains(t, answered(sized("/size", 4, ""), limits), "4 bytes")
+    testing.contains(t, answered(sized("/size", 5, ""), limits), "413")
+}
+
+fn test_an_http2_connection_without_requests_is_closed_after_the_idle_limit(t: *testing.T) {
+    let seen = observed([opening()], 0)
+    testing.error_if(t, seen.millis < 550 || seen.millis > 2500, "closed after {seen.millis} ms")
+}
+
+struct Download {
+    reached: chan[bool]
+    resume: chan[bool]
+    total: chan[i64]
+}
+
+fn take_response(c: net.ConnHandle, mark: i64, d: Download) {
+    let buf = io.buffer(1 << 18)
+    var got = 0
+    var told = false
+    for {
+        let n = net.read_on(c, buf) or 0
+        if n <= 0 {
+            break
+        }
+        got += n
+        if !told && got >= mark {
+            told = true
+            d.reached <- true
+            <-d.resume
+        }
+    }
+    if !told {
+        d.reached <- true
+    }
+    d.total <- got
+}
+
+fn test_the_slowest_reader_at_the_cap_makes_way_and_a_fast_download_survives(t: *testing.T) {
+    var setup = hush()
+    setup.limits.max_connections = 2
+    setup.limits.write_timeout = 60000
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, setup)
+    let request = bytes("GET /big HTTP/1.1\r\nconnection: close\r\n\r\n")
+    using stalled = net.connect(l.handle.addr) or panic("connect")
+    net.write_all(stalled, request) or panic("write")
+    sleep(2000)
+    using fast = net.connect(l.handle.addr) or panic("connect")
+    net.write_all(fast, request) or panic("write")
+    let d = Download { reached: chan[bool](1), resume: chan[bool](1), total: chan[i64](1) }
+    spawn take_response(fast.handle, big / 2, d)
+    <-d.reached
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.write_all(c, bytes("GET / HTTP/1.1\r\nconnection: close\r\n\r\n")) or panic("write")
+    testing.contains(t, until_closed(c, time.monotonic()).text, "200 OK")
+    d.resume <- true
+    let total = (<-d.total) ?? 0
+    testing.error_if(t, total < big, "the fast download ended after {total} bytes")
+    let rest = until_closed(stalled, time.monotonic())
+    testing.error_if(t, rest.text.len >= big, "the stalled reader received the whole response")
+    testing.error_if(t, rest.millis > 2000, "the stalled reader stayed open")
+}
+
+fn test_an_http2_response_behind_a_closed_window_ends_the_connection(t: *testing.T) {
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving(l.handle, listening())
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.set_read_timeout(c, 5000)
+    var start: u8[] = bytes(preface)
+    put_frame(mut start, frame_settings, 0, 0, [0, u8(setting_initial_window), 0, 0, 0, 1])
+    var block: u8[] = [0x82, 0x86, 0x04, 0x04]
+    io.append(mut block, bytes("/big"))
+    put_frame(mut start, frame_headers, flag_end_headers | flag_end_stream, 1, block)
+    var ping: u8[] = []
+    put_frame(mut ping, frame_ping, 0, 0, io.buffer(8))
+    var frames = [str(start)]
+    for _ in 0..30 {
+        frames.push(str(ping))
+    }
+    let started = time.monotonic()
+    spawn drip(c.handle, frames, 100)
+    let r = io.reader(net.stream(c))
+    for {
+        let f = read_frame(r) or {
+            testing.error(t, "closed without GOAWAY")
+            return
+        }
+        if f.kind == frame_goaway {
+            let millis = (time.monotonic() - started) / 1000000
+            testing.equal(t, io.be32(f.payload, 4), error_enhance_your_calm)
+            testing.error_if(t, millis < 250 || millis > 2500, "ended after {millis} ms")
+            return
+        }
+    }
+}
+
+struct Probe {
+    lock: chan[bool]
+    live: i64
+    peak: i64
+    called_off: i64
+    ended: chan[str]
+}
+
+fn probe() -> *Probe {
+    new(Probe { lock: chan[bool](1), live: 0, peak: 0, called_off: 0, ended: chan[str](64) })
+}
+
+fn tick_until_cancelled(chunks: chan[u8[]], token: *cancel.Token, p: *Probe) {
+    let gone = cancel.done(token)
+    for {
+        select {
+            chunks <- bytes("tick\n") => {}
+            <-gone => break
+        }
+        sleep(10)
+    }
+    close(chunks)
+    p.ended <- "stream"
+}
+
+fn echo_lines(req: Request, p: *Probe) -> Response {
+    let r = upgrade(req, []) or return response(500, "no connection")
+    let out = io.reader_stream(r)
+    for {
+        let line = io.read_line(r) or break
+        io.write_str(out, "{line}\n") or break
+    }
+    p.ended <- "takeover"
+    upgraded()
+}
+
+fn deaf(req: Request, p: *Probe) -> Response {
+    p.lock <- true
+    p.live += 1
+    if p.live > p.peak {
+        p.peak = p.live
+    }
+    <-p.lock
+    sleep(1500)
+    p.lock <- true
+    p.live -= 1
+    if cancel.cancelled(req.token) {
+        p.called_off += 1
+    }
+    <-p.lock
+    response(200, "late")
+}
+
+fn tiered(req: Request, p: *Probe) -> Response {
+    if req.path == "/events" {
+        let chunks = chan[u8[]](4)
+        spawn tick_until_cancelled(chunks, req.token, p)
+        return Response { status: 200, headers: [], body: [], stream: some(chunks) }
+    }
+    if req.path == "/takeover" {
+        return echo_lines(req, p)
+    }
+    if req.path == "/deaf" {
+        return deaf(req, p)
+    }
+    if req.path == "/patient" {
+        let finished = cancel.pause(req.token, 5000)
+        return response(200, if finished { "ran out" } else { "called off" })
+    }
+    if req.path == "/slow" {
+        sleep(900)
+    }
+    response(200, "ok")
+}
+
+fn serving_tiers(l: net.ListenerHandle, limits: Limits, p: *Probe) {
+    serve_with(l, limits, fn(req: Request) -> Response { tiered(req, p) }) or {}
+}
+
+fn patient_limits() -> Limits {
+    Limits { head_timeout: 5000, idle_timeout: 5000, write_timeout: 5000 }
+}
+
+fn asking(a: net.Addr, head: str) -> net.ConnHandle {
+    let c = quiet(a)
+    net.write_all_on(c, bytes(head)) or panic("write")
+    c
+}
+
+fn quiet(a: net.Addr) -> net.ConnHandle {
+    using var c = net.connect(a) or panic("connect")
+    net.set_read_timeout(c, 2000)
+    net.detach(mut c)
+}
+
+fn streaming_from(a: net.Addr) -> net.ConnHandle {
+    let c = asking(a, "GET /events HTTP/1.1\r\n\r\n")
+    skip_head(c)
+    c
+}
+
+fn skip_head(c: net.ConnHandle) {
+    let _ = net.read_on(c, io.buffer(4096)) or 0
+}
+
+fn taken_over(a: net.Addr) -> net.ConnHandle {
+    let c = asking(a, "GET /takeover HTTP/1.1\r\nconnection: upgrade\r\nupgrade: lines\r\n\r\n")
+    skip_head(c)
+    c
+}
+
+fn ticking(c: net.ConnHandle) -> bool {
+    let buf = io.buffer(65536)
+    for _ in 0..10 {
+        let n = net.read_on(c, buf) or 0
+        if n <= 0 {
+            return false
+        }
+        sleep(20)
+    }
+    true
+}
+
+fn echoing(c: net.ConnHandle) -> bool {
+    net.write_all_on(c, bytes("ping\n")) or return false
+    let n = net.read_on(c, io.buffer(64)) or 0
+    n == 5
+}
+
+fn fetched(a: net.Addr, path: str) -> str {
+    using c = net.connect(a) or panic("connect")
+    net.write_all(c, bytes("GET {path} HTTP/1.1\r\nconnection: close\r\n\r\n")) or return ""
+    until_closed(c, time.monotonic()).text
+}
+
+fn closed_soon(c: net.ConnHandle) -> bool {
+    let buf = io.buffer(65536)
+    let started = time.monotonic()
+    for (time.monotonic() - started) / 1000000 < 1500 {
+        let n = net.read_on(c, buf) or 0
+        if n <= 0 {
+            return (time.monotonic() - started) / 1000000 < 1500
+        }
+    }
+    false
+}
+
+fn last_ended(p: *Probe) -> str {
+    select {
+        what = <-p.ended => what ?? ""
+        after(2000) => "nothing"
+    }
+}
+
+fn test_streams_and_taken_over_connections_make_way_last_and_only_at_the_cap(t: *testing.T) {
+    var limits = patient_limits()
+    limits.max_connections = 3
+    let p = probe()
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving_tiers(l.handle, limits, p)
+    let a = l.handle.addr
+    let first = streaming_from(a)
+    sleep(30)
+    let second = streaming_from(a)
+    testing.contains(t, fetched(a, "/"), "200 OK")
+    testing.error_if(t, !ticking(first) || !ticking(second), "a stream ended below the cap")
+
+    let silent = quiet(a)
+    sleep(30)
+    testing.contains(t, fetched(a, "/"), "200 OK")
+    testing.error_if(t, !closed_soon(silent), "the silent connection outlasted a stream")
+    testing.error_if(t, !ticking(first) || !ticking(second), "a stream made way before a silent connection")
+
+    let socket = taken_over(a)
+    testing.contains(t, fetched(a, "/"), "200 OK")
+    testing.error_if(t, !closed_soon(first), "the oldest stream stayed open at the cap")
+    testing.equal(t, last_ended(p), "stream")
+    testing.error_if(t, !ticking(second), "the newer stream made way before the older")
+    testing.error_if(t, !echoing(socket), "a taken over connection made way before a stream")
+
+    sleep(30)
+    let other = taken_over(a)
+    testing.contains(t, fetched(a, "/"), "200 OK")
+    testing.error_if(t, !closed_soon(second), "the last stream stayed open at the cap")
+    testing.equal(t, last_ended(p), "stream")
+    testing.error_if(t, !echoing(socket) || !echoing(other), "a taken over connection made way before the last stream")
+
+    sleep(30)
+    let third = taken_over(a)
+    testing.contains(t, fetched(a, "/"), "200 OK")
+    testing.error_if(t, !closed_soon(socket), "the oldest taken over connection stayed open at the cap")
+    testing.equal(t, last_ended(p), "takeover")
+    testing.error_if(t, !echoing(other) || !echoing(third), "a newer taken over connection made way before the oldest")
+    for c in [first, second, silent, socket, other, third] {
+        net.close_on(c)
+    }
+}
+
+fn test_handlers_that_ignore_their_token_stay_within_the_cap_and_its_eighth(t: *testing.T) {
+    var limits = patient_limits()
+    limits.max_connections = 4
+    limits.handler_timeout = 100
+    let p = probe()
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving_tiers(l.handle, limits, p)
+    var held: net.ConnHandle[] = []
+    for _ in 0..4 {
+        held.push(asking(l.handle.addr, "GET /deaf HTTP/1.1\r\n\r\n"))
+    }
+    sleep(400)
+    for _ in 0..12 {
+        held.push(asking(l.handle.addr, "GET /deaf HTTP/1.1\r\n\r\n"))
+        sleep(20)
+    }
+    sleep(1800)
+    p.lock <- true
+    let peak = p.peak
+    let called_off = p.called_off
+    <-p.lock
+    testing.equal(t, peak, 5)
+    testing.error_if(t, called_off < 4, "{called_off} handlers saw their token cancelled")
+    for c in held {
+        net.close_on(c)
+    }
+}
+
+fn test_a_handler_past_its_limit_sees_its_token_cancelled(t: *testing.T) {
+    var limits = patient_limits()
+    limits.handler_timeout = 200
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving_tiers(l.handle, limits, probe())
+    let started = time.monotonic()
+    testing.contains(t, fetched(l.handle.addr, "/patient"), "called off")
+    let millis = (time.monotonic() - started) / 1000000
+    testing.error_if(t, millis < 150 || millis > 2000, "answered after {millis} ms")
+}
+
+fn get_of(stream: i64, path: str) -> u8[] {
+    var block: u8[] = [0x82, 0x86, 0x04, u8(path.len)]
+    io.append(mut block, bytes(path))
+    var out: u8[] = []
+    put_frame(mut out, frame_headers, flag_end_headers | flag_end_stream, stream, block)
+    out
+}
+
+fn asking_http2(a: net.Addr, paths: str[]) -> net.ConnHandle {
+    let c = quiet(a)
+    var out: u8[] = bytes(opening())
+    for i, path in paths {
+        io.append(mut out, get_of(2 * i + 1, path))
+    }
+    net.write_all_on(c, out) or {}
+    c
+}
+
+fn test_an_http2_connection_that_only_streams_makes_way_before_a_taken_over_one(t: *testing.T) {
+    var limits = patient_limits()
+    limits.max_connections = 2
+    let p = probe()
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving_tiers(l.handle, limits, p)
+    let a = l.handle.addr
+    let socket = taken_over(a)
+    sleep(30)
+    let stream = asking_http2(a, ["/events"])
+    sleep(100)
+    testing.contains(t, fetched(a, "/"), "200 OK")
+    testing.equal(t, last_ended(p), "stream")
+    testing.error_if(t, !closed_soon(stream), "the streaming connection stayed open at the cap")
+    testing.error_if(t, !echoing(socket), "the taken over connection made way before the stream")
+    net.close_on(socket)
+    net.close_on(stream)
+}
+
+fn test_an_http2_connection_makes_way_once_every_handler_is_past_its_limit(t: *testing.T) {
+    var limits = patient_limits()
+    limits.max_connections = 1
+    limits.handler_timeout = 300
+    let p = probe()
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving_tiers(l.handle, limits, p)
+    let a = l.handle.addr
+    let c = asking_http2(a, ["/deaf"])
+    sleep(400)
+    net.write_all_on(c, get_of(3, "/deaf")) or panic("write")
+    sleep(100)
+    testing.equal(t, fetched(a, "/"), "")
+    sleep(400)
+    testing.contains(t, fetched(a, "/"), "200 OK")
+    net.close_on(c)
+}
+
+fn test_http2_handlers_that_ignore_their_token_stay_within_an_eighth_of_the_cap(t: *testing.T) {
+    var limits = patient_limits()
+    limits.max_connections = 16
+    limits.handler_timeout = 100
+    let p = probe()
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving_tiers(l.handle, limits, p)
+    var held: net.ConnHandle[] = []
+    for _ in 0..16 {
+        held.push(asking_http2(l.handle.addr, ["/slow", "/deaf", "/deaf"]))
+    }
+    sleep(400)
+    for _ in 0..45 {
+        held.push(asking_http2(l.handle.addr, ["/slow", "/deaf", "/deaf"]))
+        sleep(20)
+    }
+    p.lock <- true
+    let peak = p.peak
+    <-p.lock
+    testing.equal(t, peak, 34)
+    for c in held {
+        net.close_on(c)
+    }
+}
+
+fn test_an_http2_handler_past_its_limit_sees_its_token_cancelled(t: *testing.T) {
+    var limits = patient_limits()
+    limits.handler_timeout = 200
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving_tiers(l.handle, limits, probe())
+    using c = net.connect(l.handle.addr) or panic("connect")
+    net.set_read_timeout(c, 3000)
+    var start: u8[] = bytes(opening())
+    io.append(mut start, get_of(1, "/patient"))
+    net.write_all(c, start) or panic("write")
+    let r = io.reader(net.stream(c))
+    for {
+        let f = read_frame(r) or {
+            testing.error(t, "closed before the response")
+            return
+        }
+        if f.kind == frame_data {
+            testing.equal(t, str(f.payload), "called off")
+            return
+        }
+    }
+}
+
+fn test_an_address_past_its_own_limit_displaces_only_its_own_connections(t: *testing.T) {
+    var limits = patient_limits()
+    limits.max_connections = 10
+    limits.max_connections_per_address = 2
+    using l = net.listen("127.0.0.1", 0) or panic("listen")
+    spawn serving_tiers(l.handle, limits, probe())
+    let a = l.handle.addr
+    let silent = quiet(a)
+    sleep(30)
+    let slow = asking(a, "GET /slow HTTP/1.1\r\nconnection: close\r\n\r\n")
+    sleep(30)
+    testing.contains(t, fetched(a, "/"), "200 OK")
+    testing.error_if(t, !closed_soon(silent), "the address kept three connections")
+    let busy = asking(a, "GET /slow HTTP/1.1\r\nconnection: close\r\n\r\n")
+    sleep(30)
+    testing.equal(t, fetched(a, "/"), "")
+    using first = net.adopt(slow)
+    using second = net.adopt(busy)
+    testing.contains(t, until_closed(first, time.monotonic()).text, "200 OK")
+    testing.contains(t, until_closed(second, time.monotonic()).text, "200 OK")
+    net.close_on(silent)
+}

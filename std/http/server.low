@@ -2,6 +2,7 @@ import std/cancel
 import std/header
 import std/io
 import std/net
+import std/sys
 import std/tls
 
 /// Returns the response a handler returns after it has taken over the connection.
@@ -11,80 +12,200 @@ pub fn upgraded() -> Response {
     Response { status: 101, headers: [], body: [] }
 }
 
-/// Accepts connections from `l` and serves each on its own task, calling `handler` for every request.
+/// Accepts connections from `l` and serves each on its own task, calling `handler` for every request, under the default `Limits`.
 ///
-/// Blocks until accepting fails and returns that error; it never returns otherwise. The server speaks HTTP/1.1 with keep-alive and, on plain connections, HTTP/2 to a client that opens with the HTTP/2 connection preface. Requests on one HTTP/1 connection run one after another; requests on an HTTP/2 connection run concurrently. A request that cannot be parsed is answered with `400`, a body or header block that is too large with `413`, and an unsupported protocol version with `505`; any other read or write failure ends that connection without a response. Errors on one connection never reach the caller.
+/// Blocks until the listener is closed or accepting fails for good, and returns that error; it never returns otherwise. An accept that fails because the process or the system is out of descriptors, buffers or memory, or because the client aborted, is tried again after 50 milliseconds. The server speaks HTTP/1.1 with keep-alive and, on plain connections, HTTP/2 to a client that opens with the HTTP/2 connection preface. Requests on one HTTP/1 connection run one after another; requests on an HTTP/2 connection run concurrently. A request that cannot be parsed is answered with `400`, a body or header block that is too large with `413`, and an unsupported protocol version with `505`; any other read or write failure ends that connection without a response. Errors on one connection never reach the caller.
+///
+/// Every field of `Limits` applies, shared by the connections of this call. The time a handler runs is not limited. A request with a `transfer-encoding` other than `chunked`, more than one of them, one beside a `content-length`, or `content-length` headers that differ is answered with `400`, and header lines over 64 KiB together with `413`. An HTTP/2 connection is ended with `GOAWAY` and `ENHANCE_YOUR_CALM` when a header block takes more than 128 `CONTINUATION` frames or an empty one that does not end it, and when streams are reset by the client before any part of their response is sent, or by the server with an error, more than 200 of them at a rate above 20 a second.
 pub fn serve(l: net.Listener, handler: fn(Request) -> Response) ! io.Error {
     serve_on(l.handle, handler)?
 }
 
 /// Serves HTTP as `serve` does, accepting from a `ListenerHandle`.
 pub fn serve_on(l: net.ListenerHandle, handler: fn(Request) -> Response) ! io.Error {
+    serve_with(l, Limits {}, handler)?
+}
+
+/// Serves HTTP as `serve_on` does, under `limits` in place of the defaults.
+pub fn serve_with(l: net.ListenerHandle, limits: Limits, handler: fn(Request) -> Response) ! io.Error {
+    serve_guarded(l, limits, none, handler)?
+}
+
+fn serve_guarded(l: net.ListenerHandle, o: Limits, secure: tls.Config?, handler: fn(Request) -> Response) ! io.Error {
+    let w = watchdog(o)
+    defer stop(w)
+    spawn patrol(w)
+    let ordered: chan[bool]? = none
     for {
-        let h = net.accept_handle(l)?
-        spawn serve_conn_on(h, handler)
+        let h = accepted(l)?
+        match admitted(w, h) {
+            some(pace) => {
+                spawn serve_watched(h, pace, secure, ordered, handler)
+            }
+            none => net.close_on(h)
+        }
+    }
+}
+
+fn admitted(w: *Watchdog, h: net.ConnHandle) -> *Pace? {
+    admit(w, net.format_ip(h.remote.ip), fn() { net.close_on(h) })
+}
+
+/// The connections a caller accepts itself and serves under one `Limits`, as the connections of one `serve` call are.
+pub struct Admission {
+    dog: *Watchdog
+}
+
+/// Returns an `Admission` under `limits` and starts the green thread that enforces its time limits, which `stop_admission` ends.
+pub fn admission(limits: Limits) -> Admission {
+    let w = watchdog(limits)
+    spawn patrol(w)
+    Admission { dog: w }
+}
+
+/// Ends the green thread of `a`. Connections it already serves run on without time limits.
+pub fn stop_admission(a: Admission) {
+    stop(a.dog)
+}
+
+/// Serves one accepted connection as `serve_duplex_conn_with` does, as one of the connections of `a`.
+///
+/// Every field of the limits of `a` applies as `serve_duplex_conn_with` applies them, and `max_connections`, `max_connections_per_address` and `max_bodies` are shared by the connections of `a`. A connection that finds `a` full with nothing to displace is closed without being served.
+pub fn serve_duplex_conn_in(a: Admission, h: net.ConnHandle, drain: chan[bool], handler: fn(Request) -> Response) {
+    serve_admitted(a, h, none, drain, handler)
+}
+
+/// Serves one accepted connection over TLS as `serve_duplex_conn_in` does, with the handshake configured by `config`. When `config.alpn` is empty it is set to `h2`.
+pub fn serve_duplex_tls_conn_in(a: Admission, h: net.ConnHandle, config: tls.Config, drain: chan[bool], handler: fn(Request) -> Response) {
+    serve_admitted(a, h, some(h2_only(config)), drain, handler)
+}
+
+fn serve_admitted(a: Admission, h: net.ConnHandle, secure: tls.Config?, drain: chan[bool], handler: fn(Request) -> Response) {
+    match admitted(a.dog, h) {
+        some(pace) => serve_watched(h, pace, secure, some(drain), handler)
+        none => net.close_on(h)
+    }
+}
+
+fn h2_only(config: tls.Config) -> tls.Config {
+    var secured = config
+    if secured.alpn.len == 0 {
+        secured.alpn = ["h2"]
+    }
+    secured
+}
+
+fn serve_watched(h: net.ConnHandle, pace: *Pace, secure: tls.Config?, duplex: chan[bool]?, handler: fn(Request) -> Response) {
+    using c = net.adopt(h)
+    using watch = Watch { pace }
+    net.set_nodelay(c, true) or {}
+    let s = paced(net.stream(c), pace)
+    let remote = net.format_ip(h.remote.ip)
+    match secure {
+        some(config) => {
+            using t = tls.server(s, config) or return
+            serve_from(tls.stream(t), remote, duplex, some(pace), handler) or {}
+        }
+        none => serve_from(s, remote, duplex, some(pace), handler) or {}
+    }
+}
+
+fn serve_alone(h: net.ConnHandle, o: Limits, secure: tls.Config?, duplex: chan[bool]?, handler: fn(Request) -> Response) {
+    let w = watchdog(o)
+    defer stop(w)
+    if timed(o) {
+        spawn patrol(w)
+    }
+    serve_watched(h, enrol(w, net.format_ip(h.remote.ip), fn() { net.close_on(h) }), secure, duplex, handler)
+}
+
+fn transient(e: io.Error) -> bool {
+    match e {
+        Aborted => true
+        Os(code) => code == 12 || code == 23 || code == 24 || code == 105 || code == 10024 || code == 10055
+        _ => false
+    }
+}
+
+fn accepted(l: net.ListenerHandle) -> net.ConnHandle ! io.Error {
+    for {
+        let h = net.accept_handle(l) catch {
+            e => {
+                if !transient(e) {
+                    fail e
+                }
+                sleep(accept_pause_ms)
+                continue
+            }
+        }
+        return h
     }
 }
 
 /// Serves HTTPS as `serve` does, terminating TLS on every accepted connection with `config`.
 ///
-/// `config` must hold the server certificates and key. When `config.alpn` is empty it is set to `h2` and `http/1.1`. A connection whose handshake fails is closed.
+/// `config` must hold the server certificates and key. When `config.alpn` is empty it is set to `h2` and `http/1.1`. A connection whose handshake fails is closed, and the handshake counts towards `Limits.head_timeout` of the first request.
 pub fn serve_tls(l: net.Listener, config: tls.Config, handler: fn(Request) -> Response) ! io.Error {
     serve_tls_on(l.handle, config, handler)?
 }
 
 /// Serves HTTPS as `serve_tls` does, accepting from a `ListenerHandle`.
 pub fn serve_tls_on(l: net.ListenerHandle, config: tls.Config, handler: fn(Request) -> Response) ! io.Error {
+    serve_tls_with(l, config, Limits {}, handler)?
+}
+
+/// Serves HTTPS as `serve_tls_on` does, under `limits` in place of the defaults.
+pub fn serve_tls_with(l: net.ListenerHandle, config: tls.Config, limits: Limits, handler: fn(Request) -> Response) ! io.Error {
     var secured = config
     if secured.alpn.len == 0 {
         secured.alpn = ["h2", "http/1.1"]
     }
-    let plain: chan[bool]? = none
-    for {
-        let h = net.accept_handle(l)?
-        spawn serve_secure(h, secured, plain, handler)
-    }
-}
-
-fn serve_secure(h: net.ConnHandle, config: tls.Config, duplex: chan[bool]?, handler: fn(Request) -> Response) {
-    using c = net.adopt(h)
-    net.set_nodelay(c, true) or {}
-    using t = tls.server(net.stream(c), config) or return
-    serve_from(tls.stream(t), net.format_ip(c.handle.remote.ip), duplex, handler) or {}
+    serve_guarded(l, limits, some(secured), handler)?
 }
 
 /// Serves one accepted connection as `serve_conn_on` does, running the handler of each HTTP/2 request as soon as its headers arrive.
 ///
 /// Closing `drain` makes the HTTP/2 connection stop taking requests: it sends `GOAWAY`, refuses streams opened afterwards, lets the requests in progress finish, waits up to one second for the peer to close and then ends. `Request.upload` carries the body as it arrives and `Request.body` is empty. A handler may return a response whose `stream` and `finish` produce the body and trailers over time, and keeps receiving the request body meanwhile. A response sent in full before the peer has finished its request resets the stream with `NO_ERROR`. Requests over HTTP/1.1 are served as `serve_conn_on` serves them. Closes the connection when it ends.
+///
+/// Of the default `Limits`, `head_timeout` applies to the first request line or the HTTP/2 preface and to an HTTP/2 header block sent in pieces while no handler runs, and `write_timeout` applies throughout. A connection or stream that stays idle is never closed, and an HTTP/2 request body has no time or size limit, since its handler reads it. An HTTP/1 request body is held to `body_timeout`, `body_rate` and `max_body`.
 pub fn serve_duplex_conn_on(h: net.ConnHandle, drain: chan[bool], handler: fn(Request) -> Response) {
-    using c = net.adopt(h)
-    net.set_nodelay(c, true) or {}
-    serve_from(net.stream(c), net.format_ip(c.handle.remote.ip), some(drain), handler) or {}
-    net.close(c)
+    serve_duplex_conn_with(h, lasting(Limits {}), drain, handler)
 }
 
-/// Serves one accepted connection over TLS as `serve_duplex_conn_on` does, with the handshake configured by `config`. When `config.alpn` is empty it is set to `h2`. A connection whose handshake fails is closed.
+/// Serves one accepted connection as `serve_duplex_conn_on` does, under `limits`.
+///
+/// `head_timeout` and `write_timeout` apply as they do there, and `idle_timeout` closes a connection that waits that long for its next request or, on HTTP/2 with no handler running, for its next frame; zero leaves it open. `body_timeout`, `body_rate`, `max_body` and `max_bodies` bound an HTTP/1 request body. An HTTP/2 request body has no time or size limit, since its handler reads it. `max_connections` does not apply: the caller accepts the connections and decides how many to serve.
+pub fn serve_duplex_conn_with(h: net.ConnHandle, limits: Limits, drain: chan[bool], handler: fn(Request) -> Response) {
+    serve_alone(h, limits, none, some(drain), handler)
+}
+
+/// Serves one accepted connection over TLS as `serve_duplex_conn_on` does, with the handshake configured by `config`. When `config.alpn` is empty it is set to `h2`. A connection whose handshake fails is closed, and the handshake counts towards `head_timeout`.
 pub fn serve_duplex_tls_conn_on(h: net.ConnHandle, config: tls.Config, drain: chan[bool], handler: fn(Request) -> Response) {
-    var secured = config
-    if secured.alpn.len == 0 {
-        secured.alpn = ["h2"]
-    }
-    serve_secure(h, secured, some(drain), handler)
+    serve_duplex_tls_conn_with(h, config, lasting(Limits {}), drain, handler)
+}
+
+/// Serves one accepted connection over TLS as `serve_duplex_tls_conn_on` does, under `limits` as `serve_duplex_conn_with` applies them.
+pub fn serve_duplex_tls_conn_with(h: net.ConnHandle, config: tls.Config, limits: Limits, drain: chan[bool], handler: fn(Request) -> Response) {
+    serve_alone(h, limits, some(h2_only(config)), some(drain), handler)
 }
 
 /// Serves requests from one accepted connection until the connection ends, then closes it.
 ///
-/// Blocks for the lifetime of the connection. `serve` spawns this once per connection.
+/// Blocks for the lifetime of the connection. It serves requests as `serve` does. Of the default `Limits`, `max_body` applies, to one body and to the bodies of this connection together, and no time limit and no connection limit applies.
 pub fn serve_conn_on(h: net.ConnHandle, handler: fn(Request) -> Response) {
-    using c = net.adopt(h)
-    serve_conn(c, handler)
+    serve_alone(h, untimed(Limits {}), none, none, handler)
 }
 
 /// Serves requests from `c` as `serve_conn_on` does, and closes `c` when the connection ends.
 pub fn serve_conn(c: net.Conn, handler: fn(Request) -> Response) {
-    net.set_nodelay(c, true) or {}
-    serve_from(net.stream(c), net.format_ip(c.handle.remote.ip), none, handler) or {}
-    net.close(c)
+    serve_conn_on(c.handle, handler)
+}
+
+/// Serves requests from one accepted connection as `serve_conn_on` does, under `limits`.
+///
+/// Every time limit of `limits` applies. `max_body` bounds one body and the bodies of this connection together, so `max_bodies` binds only when it is the smaller. `max_connections` does not apply: the caller accepts the connections and decides how many to serve.
+pub fn serve_conn_with(h: net.ConnHandle, limits: Limits, handler: fn(Request) -> Response) {
+    serve_alone(h, limits, none, none, handler)
 }
 
 fn reject(s: io.Stream, status: i64) ! io.Error {
@@ -93,9 +214,16 @@ fn reject(s: io.Stream, status: i64) ! io.Error {
 
 /// Serves requests read from `s` and writes the responses to it, until the peer ends the stream or a response requires the connection to close.
 ///
-/// Blocks until then. `s` is not closed, and `Request.remote` is empty. Returns the error from a failed write; a read failure or end of input ends the loop and returns normally.
+/// Blocks until then. `s` is not closed, and `Request.remote` is empty. Returns the error from a failed write; a read failure or end of input ends the loop and returns normally. Of the default `Limits`, `max_body` applies, to one body and to the bodies of this stream together; no time limit applies, since the server cannot close `s`.
 pub fn serve_stream(s: io.Stream, handler: fn(Request) -> Response) ! io.Error {
-    serve_from(s, "", none, handler)?
+    serve_stream_with(s, Limits {}, handler)?
+}
+
+/// Serves requests read from `s` as `serve_stream` does, with `limits.max_body` in place of the default. No other field applies.
+pub fn serve_stream_with(s: io.Stream, limits: Limits, handler: fn(Request) -> Response) ! io.Error {
+    let w = watchdog(untimed(limits))
+    using watch = Watch { pace: enrol(w, "", fn() {}) }
+    serve_from(s, "", none, some(watch.pace), handler)?
 }
 
 /// Writes a `101 Switching Protocols` response with `headers` to the connection of `req` and returns the reader of that connection, for a handler to speak another protocol.
@@ -107,10 +235,14 @@ pub fn upgrade(req: Request, headers: header.Header[]) -> *io.Reader ! io.Error 
         none => fail Unsupported
     }
     write_response(io.reader_stream(r), "GET", Response { status: 101, headers, body: [] }, false)?
+    match req.pace {
+        some(p) => enter(p, phase_upgraded, 0)
+        none => {}
+    }
     r
 }
 
-fn serve_from(s: io.Stream, remote: str, duplex: chan[bool]?, handler: fn(Request) -> Response) ! io.Error {
+fn serve_from(s: io.Stream, remote: str, duplex: chan[bool]?, pace: *Pace?, handler: fn(Request) -> Response) ! io.Error {
     let r = io.reader(s)
     for {
         var line = io.read_line(r)?
@@ -119,42 +251,52 @@ fn serve_from(s: io.Stream, remote: str, duplex: chan[bool]?, handler: fn(Reques
         }
         if line == preface_line {
             read_preface_rest(r)?
-            return serve_h2(s, r, remote, duplex, handler)
+            return serve_h2(s, r, remote, duplex, pace, handler)
         }
-        var req = read_request_rest(r, line) catch {
+        var req = read_request_rest(r, line, pace) catch {
             Malformed => return reject(s, 400)
             TooLarge => return reject(s, 413)
             Unsupported => return reject(s, 505)
+            NoSpace => return reject(s, 503)
             _ => return
         }
+        working(pace, req.token)
+        free_body(pace, req.body.len)
         req.remote = remote
         let closing = !keep_alive(req.http10, req.headers)
         if header.has(req.headers, "upgrade") {
+            req.pace = pace
             let resp = traced(handler, req)
             cancel.cancel(req.token)
             if resp.status == 101 {
                 return
             }
+            sending(pace)
             write_response(s, req.method, resp, closing)?
             if closing {
                 return
             }
+            resting(pace)
             continue
         }
         let exchange = watched(r, handler, req)
         let resp = unstreamed(req.method, exchange.response, req.token)
         var ending = closing
         if streaming(resp) {
+            flowing(pace)
             ending = write_live(s, req.http10, req.token, resp, exchange.arrived, closing)?
         } else {
+            sending(pace)
             write_response(s, req.method, resp, closing)?
         }
         if ending {
             return
         }
+        resting(pace)
         if ((<-exchange.arrived) ?? -1) <= 0 {
             return
         }
+        heading(pace)
     }
 }
 
@@ -183,4 +325,521 @@ fn watched(r: *io.Reader, handler: fn(Request) -> Response, req: Request) -> Wat
         cancel.cancel(req.token)
     }
     Watched { response: resp, arrived }
+}
+
+const accept_pause_ms = 50
+const body_allowance = 1 << 16
+const write_piece = 1 << 16
+const descriptors = 7
+const most_derived_connections = 4096
+const least_derived_connections = 16
+
+const phase_heading = 0
+const phase_receiving = 1
+const phase_working = 2
+const phase_resting = 3
+const phase_sending = 4
+const phase_streaming = 5
+const phase_upgraded = 6
+const phase_overtime = 7
+const rate_window_ms = 4000
+
+/// What a server lets its clients hold: time, memory and connections.
+///
+/// Times are in milliseconds and sizes in bytes. A time limit of 0 is off. `serve` and `serve_tls` use the defaults; `serve_with`, `serve_tls_with` and `serve_conn_with` take a value.
+pub struct Limits {
+    /// The time a client has to send a request's line and headers, counted for the first request from the moment the connection is accepted and including the TLS handshake, and the time an HTTP/2 header block sent in pieces may take while no handler runs. The connection is closed past it. Defaults to 30 seconds.
+    pub head_timeout: i64 = 30000
+    /// The window a buffered request body is measured in: every window must bring `body_rate` bytes for each of its seconds, or the end of the body. Past it the HTTP/1 connection is closed and the HTTP/2 stream reset with `ENHANCE_YOUR_CALM`. Bytes that arrive faster earn no later window. Defaults to 30 seconds.
+    pub body_timeout: i64 = 30000
+    /// The least bytes per second of a request body, measured over `body_timeout`. Defaults to 16 KiB.
+    pub body_rate: i64 = 16384
+    /// The time a client has to take 64 KiB of a response. The connection is closed past it. On HTTP/2 the client owes 64 KiB in this time for each response whose handler has returned, counted across the connection while flow control or the socket holds any of them back, and the connection is ended with `GOAWAY` and `ENHANCE_YOUR_CALM` once it is a whole `write_timeout` behind; a response that takes bytes faster earns no later time. A response with a `stream` is not counted while its handler produces it. Defaults to 60 seconds.
+    pub write_timeout: i64 = 60000
+    /// The time an HTTP/1 connection may wait for its next request, and an HTTP/2 connection with no handler running for its next frame. The connection is closed past it. Defaults to 120 seconds.
+    pub idle_timeout: i64 = 120000
+    /// The largest buffered request body. A longer HTTP/1 body is answered with `413`, from its `content-length` when it has one, and a longer HTTP/2 body is reset with `ENHANCE_YOUR_CALM`. It is also the most that the bodies of one connection hold of `max_bodies`, so the concurrent uploads of one HTTP/2 connection share it. Defaults to 64 MiB.
+    pub max_body: i64 = 67108864
+    /// The memory the request bodies being received hold together, across the connections of one call, not counting the first 64 KiB of each connection. A body past it is answered with `503` and the connection closed on HTTP/1, and reset with `REFUSED_STREAM` on HTTP/2. A body leaves the count when its handler is called. Defaults to 256 MiB.
+    pub max_bodies: i64 = 268435456
+    /// The connections one call serves at once. At the limit, each new connection takes the place of the connection that has waited longest for its next request, or else the one longest in a request's line and headers, or else the one whose request body last met `body_rate` longest ago, or else, among the connections whose handlers have all returned and that only send their responses, the one that has sent the fewest bytes a second over the last 4 to 8 seconds, which is closed. After those come the connection that has sent a response's `stream` longest with no handler running, then the one taken over through `upgrade` longest ago, then the one whose handler has run longest past `handler_timeout`. Displacing a connection cancels the token of its requests and closes it. A handler that runs on after its connection is displaced still holds memory and a thread, so connections of the last two kinds are displaced only while the handlers still running on displaced ones number at most an eighth of the limit, and at least one, or belong to a single connection. A connection with a handler running inside `handler_timeout`, an HTTP/3 connection with a handler running and a connection served through `serve_duplex_conn_with` with a response in progress inside `handler_timeout` are never displaced; when nothing can be displaced, the new connection is closed. Below the limit no connection is displaced. 0, the default, is seven eighths of the descriptors the process may open, halved, between 16 and 4096, and 4096 where the process has no such limit.
+    pub max_connections: i64 = 0
+    /// The connections one call serves at once from one peer address, which is the address of the socket and never a header. Past it a new connection from that address takes the place of one of that address's own connections, chosen as `max_connections` chooses, or is closed when none of them can be displaced. Leave it off behind a proxy, where every client shares one address. 0, the default, is off.
+    pub max_connections_per_address: i64 = 0
+    /// The time a handler may run before its `Request.token` is cancelled. The limit is cooperative: a handler that does not watch its token runs on, and nothing ends it. Over HTTP/1 the connection of such a handler can then be displaced at `max_connections`, and over HTTP/2 a connection whose running handlers are all past it. A handler that has taken its connection over through `upgrade` is not timed. On a connection served through `serve_duplex_conn_with` or `serve_duplex_conn_in` the time runs until the response ends, so it bounds a response with a `stream` too. 0, the default, is off.
+    pub handler_timeout: i64 = 0
+}
+
+fn untimed(o: Limits) -> Limits {
+    var quiet = lasting(o)
+    quiet.head_timeout = 0
+    quiet.body_timeout = 0
+    quiet.write_timeout = 0
+    quiet.handler_timeout = 0
+    quiet
+}
+
+fn lasting(o: Limits) -> Limits {
+    var kept = o
+    kept.idle_timeout = 0
+    kept
+}
+
+fn timed(o: Limits) -> bool {
+    o.head_timeout > 0 || o.body_timeout > 0 || o.write_timeout > 0 || o.idle_timeout > 0 || o.handler_timeout > 0
+}
+
+fn interval(o: Limits) -> i64 {
+    var least = 15000
+    for limit in [o.head_timeout, o.body_timeout, o.write_timeout, o.idle_timeout, o.handler_timeout] {
+        if limit > 0 && limit < least {
+            least = limit
+        }
+    }
+    if least < 150 { 10 } else { least / 15 }
+}
+
+fn quota(o: Limits) -> i64 {
+    let n = o.body_rate * o.body_timeout / 1000
+    if n < 1 { 1 } else { n }
+}
+
+fn capacity(o: Limits) -> i64 {
+    if o.max_connections > 0 {
+        return o.max_connections
+    }
+    let open = sys.get_rlimit(descriptors) or sys.Rlimit { soft: -1, hard: -1 }
+    if open.soft < 0 {
+        return most_derived_connections
+    }
+    let derived = (open.soft - open.soft / 8) / 2
+    if derived < least_derived_connections {
+        return least_derived_connections
+    }
+    if derived > most_derived_connections { most_derived_connections } else { derived }
+}
+
+fn due(limit: i64) -> i64 {
+    if limit > 0 { now_ms() + limit } else { 0 }
+}
+
+struct Pace {
+    dog: *Watchdog
+    id: i64
+    address: str
+    cut: fn()
+    token: *cancel.Token?
+    handlers: i64
+    abandoned: i64
+    limits: Limits
+    phase: i64
+    since: i64
+    at: i64
+    fresh: i64
+    busy: i64
+    buffered: i64
+    holding: i64
+    sent: i64
+    earlier: i64
+    slot: i64
+}
+
+struct Watchdog {
+    limits: Limits
+    interval: i64
+    capacity: i64
+    spare: i64
+    abandoned: i64
+    allowance: i64
+    lock: chan[bool]
+    paces: [i64: *Pace]
+    next: i64
+    held: i64
+    stopped: bool
+}
+
+struct Watch {
+    pace: *Pace
+    drop leave(pace)
+}
+
+fn watchdog(o: Limits) -> *Watchdog {
+    let most = capacity(o)
+    new(Watchdog { limits: o, interval: interval(o), capacity: most, spare: if most < 8 { 1 } else { most / 8 }, abandoned: 0, allowance: body_allowance, lock: chan[bool](1), paces: [:], next: 0, held: 0, stopped: false })
+}
+
+fn stop(w: *Watchdog) {
+    w.stopped = true
+}
+
+fn overdue(p: *Pace, now: i64) -> bool {
+    (p.at != 0 && now >= p.at) || (p.busy != 0 && now >= p.busy)
+}
+
+fn overrun(p: *Pace, now: i64) -> bool {
+    p.phase == phase_working && p.token != none && p.limits.handler_timeout > 0 && now - p.since >= p.limits.handler_timeout
+}
+
+fn call_off(p: *Pace) {
+    match p.token {
+        some(token) => cancel.cancel(token)
+        none => {}
+    }
+}
+
+fn patrol(w: *Watchdog) {
+    for !w.stopped {
+        sleep(w.interval)
+        let now = now_ms()
+        var late: *Pace[] = []
+        var slow: *Pace[] = []
+        w.lock <- true
+        for _, p in w.paces {
+            if overdue(p, now) {
+                late.push(p)
+            } else if overrun(p, now) {
+                p.phase = phase_overtime
+                slow.push(p)
+            }
+        }
+        <-w.lock
+        for p in late {
+            p.cut()
+        }
+        for p in slow {
+            call_off(p)
+        }
+    }
+}
+
+fn enlist(w: *Watchdog, address: str, cut: fn()) -> *Pace {
+    w.next += 1
+    let now = now_ms()
+    let pace = new(Pace { dog: w, id: w.next, address, cut, token: none, handlers: 1, abandoned: 0, limits: w.limits, phase: phase_heading, since: now, at: due(w.limits.head_timeout), fresh: 0, busy: 0, buffered: 0, holding: 0, sent: 0, earlier: 0, slot: 0 })
+    w.paces[pace.id] = pace
+    pace
+}
+
+fn enrol(w: *Watchdog, address: str, cut: fn()) -> *Pace {
+    w.lock <- true
+    defer <-w.lock
+    enlist(w, address, cut)
+}
+
+fn within(p: *Pace, address: str) -> bool {
+    address.len == 0 || p.address == address
+}
+
+fn longest(w: *Watchdog, phase: i64, address: str) -> *Pace? {
+    var found: *Pace? = none
+    var since = 0
+    for _, p in w.paces {
+        if p.phase == phase && within(p, address) && (found == none || p.since < since) {
+            found = some(p)
+            since = p.since
+        }
+    }
+    found
+}
+
+fn tally(p: *Pace, n: i64) {
+    let slot = now_ms() / rate_window_ms
+    if slot != p.slot {
+        p.earlier = if slot == p.slot + 1 { p.sent } else { 0 }
+        p.sent = 0
+        p.slot = slot
+    }
+    p.sent += n
+}
+
+fn send_rate(p: *Pace, now: i64) -> i64 {
+    let slot = now / rate_window_ms
+    var taken = write_piece
+    if slot == p.slot {
+        taken += p.sent + p.earlier
+    } else if slot == p.slot + 1 {
+        taken += p.sent
+    }
+    var span = rate_window_ms + now % rate_window_ms
+    if now - p.since < span {
+        span = now - p.since
+    }
+    taken * 1000 / (span + 1000)
+}
+
+fn slowest(w: *Watchdog, address: str) -> *Pace? {
+    let now = now_ms()
+    var found: *Pace? = none
+    var least = 0
+    for _, p in w.paces {
+        if p.phase != phase_sending || !within(p, address) {
+            continue
+        }
+        let rate = send_rate(p, now)
+        if found == none || rate < least {
+            found = some(p)
+            least = rate
+        }
+    }
+    found
+}
+
+fn oldest(w: *Watchdog, phases: i64[], address: str) -> *Pace? {
+    for phase in phases {
+        match longest(w, phase, address) {
+            some(p) => return some(p)
+            none => {}
+        }
+    }
+    none
+}
+
+fn displaced(w: *Watchdog, address: str) -> *Pace? {
+    match oldest(w, [phase_resting, phase_heading, phase_receiving], address) {
+        some(p) => return some(p)
+        none => {}
+    }
+    match slowest(w, address) {
+        some(p) => return some(p)
+        none => {}
+    }
+    match longest(w, phase_streaming, address) {
+        some(p) => return some(p)
+        none => {}
+    }
+    let old = oldest(w, [phase_upgraded, phase_overtime], address) ?? return none
+    if w.abandoned > 0 && w.abandoned + old.handlers > w.spare {
+        return none
+    }
+    old.abandoned = old.handlers
+    w.abandoned += old.handlers
+    old
+}
+
+fn crowded(w: *Watchdog, address: str) -> bool {
+    let most = w.limits.max_connections_per_address
+    if most <= 0 || address.len == 0 {
+        return false
+    }
+    var held = 0
+    for _, p in w.paces {
+        if p.address == address {
+            held += 1
+        }
+    }
+    held >= most
+}
+
+fn make_room(w: *Watchdog, address: str) -> *Pace? {
+    w.lock <- true
+    defer <-w.lock
+    var scope = ""
+    if crowded(w, address) {
+        scope = address
+    } else if w.paces.len < w.capacity {
+        return none
+    }
+    let old = displaced(w, scope) ?? return none
+    w.paces.delete(old.id)
+    old
+}
+
+fn admit(w: *Watchdog, address: str, cut: fn()) -> *Pace? {
+    match make_room(w, address) {
+        some(old) => {
+            call_off(old)
+            old.cut()
+        }
+        none => {}
+    }
+    w.lock <- true
+    defer <-w.lock
+    if w.paces.len >= w.capacity || crowded(w, address) {
+        return none
+    }
+    some(enlist(w, address, cut))
+}
+
+fn leave(pace: *Pace) {
+    let w = pace.dog
+    w.lock <- true
+    w.paces.delete(pace.id)
+    w.held -= pace.holding
+    w.abandoned -= pace.abandoned
+    <-w.lock
+}
+
+fn hold(w: *Watchdog, n: i64) -> bool {
+    w.lock <- true
+    defer <-w.lock
+    if n > 0 && w.held + n > w.limits.max_bodies {
+        return false
+    }
+    w.held += n
+    true
+}
+
+fn buffer(p: *Pace, n: i64) -> bool {
+    let buffered = p.buffered + n
+    let holding = if buffered > p.dog.allowance { buffered - p.dog.allowance } else { 0 }
+    if holding > p.holding && holding > p.limits.max_body {
+        return false
+    }
+    if holding != p.holding && !hold(p.dog, holding - p.holding) {
+        return false
+    }
+    p.buffered = buffered
+    p.holding = holding
+    true
+}
+
+fn hold_body(pace: *Pace?, n: i64) ! io.Error {
+    match pace {
+        some(p) => if !buffer(p, n) {
+            fail NoSpace
+        }
+        none => {}
+    }
+}
+
+fn free_body(pace: *Pace?, n: i64) {
+    match pace {
+        some(p) => {
+            let _ = buffer(p, -n)
+        }
+        none => {}
+    }
+}
+
+fn body_limit(pace: *Pace?) -> i64 {
+    match pace {
+        some(p) => p.limits.max_body
+        none => max_body
+    }
+}
+
+fn body_due(pace: *Pace?) -> i64 {
+    match pace {
+        some(p) => due(p.limits.body_timeout)
+        none => 0
+    }
+}
+
+fn progress(pace: *Pace?, n: i64) {
+    let p = match pace {
+        some(found) => found
+        none => return
+    }
+    p.fresh += n
+    let share = quota(p.limits)
+    if p.fresh >= share {
+        p.fresh %= share
+        p.since = now_ms()
+        p.at = due(p.limits.body_timeout)
+    }
+}
+
+fn paced(s: io.Stream, pace: *Pace) -> io.Stream {
+    io.Stream {
+        read: fn(buf) {
+            s.read(buf)
+        }
+        write: fn(data) {
+            pace.busy = due(pace.limits.write_timeout)
+            let n = s.write(if data.len > write_piece { data[..write_piece] } else { data }) catch {
+                e => {
+                    pace.busy = 0
+                    fail e
+                }
+            }
+            pace.busy = 0
+            tally(pace, n)
+            n
+        }
+        close: s.close
+    }
+}
+
+fn enter(p: *Pace, phase: i64, limit: i64) {
+    if p.phase != phase {
+        p.phase = phase
+        p.since = now_ms()
+        p.sent = 0
+        p.earlier = 0
+    }
+    p.at = due(limit)
+}
+
+fn heading(pace: *Pace?) {
+    match pace {
+        some(p) => enter(p, phase_heading, p.limits.head_timeout)
+        none => {}
+    }
+}
+
+fn stalling(pace: *Pace?) {
+    match pace {
+        some(p) => {
+            enter(p, phase_receiving, p.limits.body_timeout)
+            p.fresh = 0
+        }
+        none => {}
+    }
+}
+
+fn resting(pace: *Pace?) {
+    match pace {
+        some(p) => enter(p, phase_resting, p.limits.idle_timeout)
+        none => {}
+    }
+}
+
+fn sending(pace: *Pace?) {
+    match pace {
+        some(p) => enter(p, phase_sending, 0)
+        none => {}
+    }
+}
+
+fn flowing(pace: *Pace?) {
+    match pace {
+        some(p) => enter(p, phase_streaming, 0)
+        none => {}
+    }
+}
+
+fn lagging(pace: *Pace?, handlers: i64) {
+    match pace {
+        some(p) => {
+            p.handlers = handlers
+            enter(p, phase_overtime, 0)
+        }
+        none => {}
+    }
+}
+
+fn working(pace: *Pace?, token: *cancel.Token) {
+    match pace {
+        some(p) => {
+            p.token = some(token)
+            enter(p, phase_working, 0)
+        }
+        none => {}
+    }
+}
+
+fn unbound(pace: *Pace?) {
+    match pace {
+        some(p) => enter(p, phase_working, 0)
+        none => {}
+    }
+}
+
+fn repose(pace: *Pace?, phase: i64, again: bool) {
+    match pace {
+        some(p) => if again || p.phase != phase {
+            enter(p, phase, if phase == phase_heading { p.limits.head_timeout } else { p.limits.idle_timeout })
+        }
+        none => {}
+    }
 }

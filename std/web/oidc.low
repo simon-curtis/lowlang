@@ -27,95 +27,199 @@ struct Discovery {
     jwks_uri: str
 }
 
+const key_lifetime = 3600
+const key_grace = 86400
+const retry_pause = 10
+const forced_pause = 60
+
 struct Provider {
     issuer: str
     fetcher: *http.Client
     lock: chan[bool]
+    flight: chan[bool]
+    refreshing: bool
     discovery: Discovery?
     keys: jose.Jwk[]
     fetched: i64
+    retry_at: i64
     forced: i64
+}
+
+struct Fetched {
+    discovery: Discovery
+    keys: jose.Jwk[]
+}
+
+enum Turn {
+    Cached
+    Wait
+    Fetch
 }
 
 fn trimmed(issuer: str) -> str {
     if text.ends_with(issuer, "/") { issuer[..issuer.len - 1] } else { issuer }
 }
 
-fn discover(p: *Provider) -> Discovery ! io.Error {
-    match p.discovery {
-        some(d) => return d
-        none => {}
-    }
-    let resp = retrieved(http.request(p.fetcher, "GET", "{trimmed(p.issuer)}/.well-known/openid-configuration"))?
-    if resp.status != 200 {
-        fail Refused
-    }
-    let d = json.deserialize[Discovery](resp.body) or fail Malformed
-    if trimmed(d.issuer) != trimmed(p.issuer) {
-        fail Invalid
-    }
-    p.discovery = d
-    d
-}
-
-fn refresh(p: *Provider, force: bool) -> jose.Jwk[] ! io.Error {
-    p.lock <- true
-    defer <-p.lock
-    let now = time.now()
-    let stale = now - p.fetched >= 3600
-    let allowed = force && now - p.forced >= 60
-    if p.keys.len > 0 && !stale && !allowed {
-        return p.keys
-    }
-    if allowed {
-        p.forced = now
-    }
-    let d = discover(p)?
-    let resp = retrieved(http.request(p.fetcher, "GET", d.jwks_uri))?
-    if resp.status != 200 {
-        fail Refused
-    }
-    p.keys = jose.parse_jwks(resp.body)?
-    p.fetched = now
-    p.keys
-}
-
 fn retrieved(b: http.Builder[http.Response]) -> http.Response ! io.Error {
-    http.send(b) catch {
+    let resp = http.send(b) catch {
         Timeout => fail TimedOut
         _ => fail Refused
     }
+    if resp.status != 200 {
+        fail Refused
+    }
+    resp
 }
 
 fn provider(issuer: str) -> *Provider {
-    new(Provider { issuer, fetcher: http.build(http.client()), lock: chan[bool](1), discovery: none, keys: [], fetched: 0, forced: 0 })
+    let fetcher = http.build(http.with_redirects(http.with_connect_timeout(http.with_timeout(http.client(), 5000), 2000), 0))
+    new(Provider { issuer, fetcher, lock: chan[bool](1), flight: chan[bool](1), refreshing: false, discovery: none, keys: [], fetched: 0, retry_at: 0, forced: 0 })
 }
 
-fn token_options(p: *Provider, audience: str) -> jose.Options {
-    jose.Options { algorithms: jose.asymmetric_algorithms(), issuer: p.issuer, audience }
+fn cached_discovery(p: *Provider) -> Discovery? {
+    p.lock <- true
+    defer <-p.lock
+    p.discovery
+}
+
+fn cached_keys(p: *Provider) -> jose.Jwk[] {
+    p.lock <- true
+    defer <-p.lock
+    p.keys
+}
+
+fn document(p: *Provider) -> Discovery ! io.Error {
+    let resp = retrieved(http.request(p.fetcher, "GET", "{trimmed(p.issuer)}/.well-known/openid-configuration"))?
+    let d = json.deserialize[Discovery](resp.body) or fail Malformed
+    if d.issuer != p.issuer {
+        fail Invalid
+    }
+    d
+}
+
+fn fetch(p: *Provider) -> Fetched ! io.Error {
+    let d = match cached_discovery(p) {
+        some(known) => known
+        none => document(p)?
+    }
+    let resp = retrieved(http.request(p.fetcher, "GET", d.jwks_uri))?
+    let keys = jose.parse_jwks(resp.body)?
+    if keys.len == 0 {
+        fail Invalid
+    }
+    Fetched { discovery: d, keys }
+}
+
+fn fetched(p: *Provider) -> Fetched? {
+    let f = fetch(p) or return none
+    f
+}
+
+fn claim(p: *Provider, force: bool) -> Turn {
+    p.lock <- true
+    defer <-p.lock
+    if p.refreshing {
+        return if p.keys.len == 0 || force { Turn.Wait } else { Turn.Cached }
+    }
+    let now = time.now()
+    let forced = force && now - p.forced >= forced_pause
+    if now < p.retry_at || !(p.keys.len == 0 || now - p.fetched >= key_lifetime || forced) {
+        return Turn.Cached
+    }
+    if forced {
+        p.forced = now
+    }
+    p.refreshing = true
+    p.flight <- true
+    Turn.Fetch
+}
+
+fn settle(p: *Provider, got: Fetched?) {
+    p.lock <- true
+    defer <-p.lock
+    let now = time.now()
+    match got {
+        some(f) => {
+            p.discovery = f.discovery
+            p.keys = f.keys
+            p.fetched = now
+        }
+        none => {
+            p.retry_at = now + retry_pause
+            if now - p.fetched >= key_grace {
+                p.keys = []
+            }
+        }
+    }
+    p.refreshing = false
+    <-p.flight
+}
+
+fn current_keys(p: *Provider, force: bool) -> jose.Jwk[] {
+    match claim(p, force) {
+        Fetch => settle(p, fetched(p))
+        Wait => {
+            p.flight <- true
+            <-p.flight
+        }
+        Cached => {}
+    }
+    cached_keys(p)
+}
+
+fn discover(p: *Provider) -> Discovery ! io.Error {
+    match cached_discovery(p) {
+        some(d) => return d
+        none => {}
+    }
+    let _ = current_keys(p, false)
+    match cached_discovery(p) {
+        some(d) => d
+        none => fail Refused
+    }
+}
+
+fn token_options(p: *Provider, audience: str, typ: str) -> jose.Options {
+    jose.Options { algorithms: jose.asymmetric_algorithms(), issuer: p.issuer, audience, typ, require_expiry: true }
 }
 
 fn known(keys: jose.Jwk[], kid: str) -> bool {
     keys.any(fn(k) k.kid == kid)
 }
 
-fn verify_with(p: *Provider, token: str, audience: str) -> jose.Claims? {
-    var keys = refresh(p, false) or return none
+fn verify_with(p: *Provider, token: str, audience: str, typ: str) -> jose.Claims? {
+    var keys = current_keys(p, false)
     let kid = jose.token_kid(token)
     if kid.len > 0 && !known(keys, kid) {
-        keys = refresh(p, true) or return none
+        keys = current_keys(p, true)
     }
-    let claims = jose.verify(token, keys, token_options(p, audience)) or return none
-    claims
+    let claims = jose.verify(token, keys, token_options(p, audience, typ)) or return none
+    claims when (claims.sub ?? "").len > 0
 }
 
-/// Returns a bearer middleware that accepts JWTs issued by the OpenID Connect provider at `issuer` for `audience`.
+/// The tokens the `oidc` middleware accepts.
+pub struct OidcResource {
+    /// The provider's issuer URL, from which the discovery document is fetched.
+    pub issuer: str
+    /// The value a token's `aud` must contain.
+    pub audience: str
+    /// The `typ` a token's header must carry, compared as `jose.Options.typ` compares it. Defaults to `at+jwt`, the type of a JWT access token (RFC 9068). The empty string accepts every type, an ID token included.
+    pub typ: str = "at+jwt"
+}
+
+/// Returns a bearer middleware that accepts the JWTs that `resource` describes, issued by an OpenID Connect provider.
 ///
-/// The signing keys come from the `jwks_uri` of the provider's discovery document. They are cached for an hour and refetched when a token names an unknown `kid`, at most once a minute. Only asymmetric signature algorithms are accepted. A token that fails verification, or a provider that cannot be reached, gets a `401` problem. The scheme is listed in the OpenAPI document as `openIdConnect`.
-pub fn oidc(issuer: str, audience: str) -> Middleware {
+/// Fails with `Invalid` when `resource.issuer` or `resource.audience` is empty. `resource.issuer` must equal the `issuer` of the provider's discovery document and the `iss` of every token, character for character.
+///
+/// The signing keys come from the `jwks_uri` of the provider's discovery document. They are cached for an hour and refetched when a token names an unknown `kid`, at most once a minute. One request at a time fetches them, with a five-second limit and without following redirects, while the others verify against the cached keys. When a fetch fails, the cached keys stay in use for up to a day after the last fetch that succeeded, and the next fetch waits ten seconds. Only asymmetric signature algorithms are accepted, and a token must carry `exp`, a `sub` that is not empty and the `typ` of `resource.typ`, so an ID token issued to the same client is refused. A token that fails verification, or a provider that cannot be reached while no keys are cached, gets a `401` problem. The scheme is listed in the OpenAPI document as `openIdConnect`.
+pub fn oidc(resource: OidcResource) -> Middleware ! io.Error {
+    let { issuer, audience, typ } = resource
+    if issuer.len == 0 || audience.len == 0 {
+        fail Invalid
+    }
     let p = provider(issuer)
     var m = bearer(fn(token: str) -> json.Value? {
-        match verify_with(p, token, audience) {
+        match verify_with(p, token, audience, typ) {
             some(claims) => claims.extra
             none => none
         }
@@ -142,6 +246,8 @@ pub struct OidcClient {
     pub redirect_uri: str
     /// The space-separated scopes to request. Defaults to `openid profile email`.
     pub scopes: str = "openid profile email"
+    /// The seconds a visitor has to come back from the provider. A callback that arrives later is refused. Defaults to ten minutes.
+    pub max_login_age: i64 = 600
 }
 
 struct TokenResponse {
@@ -163,11 +269,11 @@ fn exchange(p: *Provider, client: OidcClient, code: str, verifier: str) -> jose.
     }
     let body = uri.encode_form(form)
     let resp = retrieved(http.with_body(http.request(p.fetcher, "POST", d.token_endpoint), bytes(body), "application/x-www-form-urlencoded"))?
-    if resp.status != 200 {
-        fail Refused
-    }
     let tokens = json.deserialize[TokenResponse](resp.body) or fail Malformed
-    match verify_with(p, tokens.id_token, client.client_id) {
+    if jose.token_typ(tokens.id_token) == "at+jwt" {
+        fail Invalid
+    }
+    match verify_with(p, tokens.id_token, client.client_id, "") {
         some(claims) => claims
         none => fail Invalid
     }
@@ -182,8 +288,13 @@ fn sessions_missing(c: *Context) -> http.Response? {
 
 /// Registers the two routes of an authorization-code sign-in with PKCE on `a`.
 ///
-/// `login` redirects with `302` to the provider's authorization endpoint with a fresh `state`, `nonce` and code challenge, which it keeps in the session, and answers `502` when the provider cannot be reached. `callback` checks `state`, exchanges the code, verifies the ID token and its `nonce`, clears the stored values, and returns the response of `signed_in` called with the verified claims. A bad `state` or missing `code` gets a `400` problem, and a failed exchange or `nonce` mismatch a `401` problem. The `sessions` middleware must wrap both routes, and a request that reaches either route without it gets a `500` problem.
-pub fn oidc_login(a: *App, login: str, callback: str, client: OidcClient, signed_in: fn(*Context, jose.Claims) -> http.Response) {
+/// Fails with `Invalid` when `client.issuer` or `client.client_id` is empty.
+///
+/// `login` redirects with `302` to the provider's authorization endpoint with a fresh `state`, `nonce` and code challenge, which it keeps in the session with the time, and answers `502` when the provider cannot be reached. `callback` checks `state`, removes the stored values, records the `state` as spent in the `SessionStore`, exchanges the code, verifies the ID token and its `nonce`, revokes the session when its id has held a value of the application, starts an empty one under a new id, and returns the response of `signed_in` called with the verified claims. A bad `state`, a `state` that is already spent or that the store reports revoked, a callback later than `client.max_login_age`, a missing `code` or an `iss` parameter that differs from `client.issuer` gets a `400` problem, and a failed exchange, a `nonce` mismatch, or an ID token that has no `sub` or carries the `typ` of an access token, `at+jwt`, a `401` problem. The `sessions` middleware must wrap both routes, and a request that reaches either route without it gets a `500` problem.
+pub fn oidc_login(a: *App, login: str, callback: str, client: OidcClient, signed_in: fn(*Context, jose.Claims) -> http.Response) ! io.Error {
+    if client.issuer.len == 0 || client.client_id.len == 0 {
+        fail Invalid
+    }
     let p = provider(client.issuer)
     get(a, login, fn(c: *Context) -> http.Response {
         match sessions_missing(c) {
@@ -194,9 +305,10 @@ pub fn oidc_login(a: *App, login: str, callback: str, client: OidcClient, signed
         let state = base64.encode_url(crypto.random(16))
         let nonce = base64.encode_url(crypto.random(16))
         let verifier = base64.encode_url(crypto.random(32))
-        session_set(c, "oidc_state", state)
-        session_set(c, "oidc_nonce", nonce)
-        session_set(c, "oidc_verifier", verifier)
+        own_set(c, "oidc_state", state)
+        own_set(c, "oidc_nonce", nonce)
+        own_set(c, "oidc_verifier", verifier)
+        own_set(c, "oidc_started", "{time.now()}")
         let challenge = base64.encode_url(hash.sum(hash.sha256(), bytes(verifier)))
         let params = uri.encode_form([
             uri.Field { name: "response_type", value: "code" }
@@ -216,21 +328,31 @@ pub fn oidc_login(a: *App, login: str, callback: str, client: OidcClient, signed
             some(resp) => return resp
             none => {}
         }
-        let expected = session_get(c, "oidc_state") ?? ""
+        let expected = own_get(c, "oidc_state") ?? ""
         let state = query(c, "state") ?? ""
         let code = query(c, "code") ?? ""
         if expected.len == 0 || !hash.equal(bytes(expected), bytes(state)) || code.len == 0 {
             return problem_response(BadRequest("invalid sign-in response"))
         }
-        let verifier = session_get(c, "oidc_verifier") ?? ""
+        let started = text.parse_int(own_get(c, "oidc_started") ?? "") or 0
+        let deadline = started + client.max_login_age
+        if deadline < time.now() {
+            return problem_response(BadRequest("invalid sign-in response"))
+        }
+        let verifier = own_get(c, "oidc_verifier") ?? ""
+        let nonce = own_get(c, "oidc_nonce") ?? ""
+        own_remove(c, "oidc_state")
+        own_remove(c, "oidc_nonce")
+        own_remove(c, "oidc_verifier")
+        own_remove(c, "oidc_started")
+        if !spend(c, "{state_prefix}{state}", started, deadline) || (query(c, "iss") ?? client.issuer) != client.issuer {
+            return problem_response(BadRequest("invalid sign-in response"))
+        }
         let claims = exchange(p, client, code, verifier) or return problem_response(Unauthorized("sign-in failed"))
-        let nonce = session_get(c, "oidc_nonce") ?? ""
         if nonce.len == 0 || json.text_of(claims.extra, "nonce") != nonce {
             return problem_response(Unauthorized("sign-in nonce mismatch"))
         }
-        session_set(c, "oidc_state", "")
-        session_set(c, "oidc_nonce", "")
-        session_set(c, "oidc_verifier", "")
+        session_restart(c)
         signed_in(c, claims)
     })
 }

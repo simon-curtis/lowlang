@@ -11,6 +11,9 @@ struct Exchange {
     block: u8[]
     ends: bool
     body: u8[]
+    held: i64
+    due: i64
+    fresh: i64
     received: bool
     window: i64
     out: u8[]
@@ -32,6 +35,10 @@ struct Credit {
 
 const high_water = 262144
 const linger_ms = 1000
+const max_continuations = 128
+const reset_budget = 200
+const reset_refill_ms = 50
+const quiet_ms = 3600000
 
 struct Peer {
     stream: io.Stream
@@ -45,8 +52,18 @@ struct Peer {
     frame_size: i64
     last: i64
     pending: i64
+    continuations: i64
+    resets: i64
+    reset_at: i64
+    pace: *Pace?
+    swept: i64
+    owing: i64
+    behind: i64
+    accrued: i64
     settled: bool
     outstanding: i64
+    running: [i64: i64]
+    late: [i64: bool]
     failure: i64
     code: i64
     duplex: bool
@@ -55,7 +72,7 @@ struct Peer {
     complete: fn(*Peer, *Exchange) ! io.Error
 }
 
-fn new_peer(s: io.Stream, r: *io.Reader, duplex: bool, complete: fn(*Peer, *Exchange) ! io.Error) -> *Peer {
+fn new_peer(s: io.Stream, r: *io.Reader, duplex: bool, pace: *Pace?, complete: fn(*Peer, *Exchange) ! io.Error) -> *Peer {
     new(Peer {
         stream: s
         reader: r
@@ -68,8 +85,18 @@ fn new_peer(s: io.Stream, r: *io.Reader, duplex: bool, complete: fn(*Peer, *Exch
         frame_size: default_frame_size
         last: 0
         pending: 0
+        continuations: 0
+        resets: 0
+        reset_at: 0
+        pace
+        swept: 0
+        owing: 0
+        behind: 0
+        accrued: 0
         settled: false
         outstanding: 0
+        running: [:]
+        late: [:]
         failure: 0
         code: 0
         duplex
@@ -87,6 +114,9 @@ fn new_exchange(p: *Peer, id: i64) -> *Exchange {
         block: []
         ends: false
         body: []
+        held: 0
+        due: 0
+        fresh: 0
         received: false
         window: p.initial
         out: []
@@ -106,21 +136,16 @@ fn new_exchange(p: *Peer, id: i64) -> *Exchange {
 
 fn abandon_all(p: *Peer) {
     for _, e in p.exchanges {
-        abandon(p, some(e))
+        abandon(p, e)
     }
 }
 
-fn abandon(p: *Peer, e: *Exchange?) {
-    match e {
-        some(x) => {
-            match x.token {
-                some(t) => cancel.cancel(t)
-                none => {}
-            }
-            drain_exchange(p, x)
-        }
+fn abandon(p: *Peer, e: *Exchange) {
+    match e.token {
+        some(t) => cancel.cancel(t)
         none => {}
     }
+    drain_exchange(p, e)
 }
 
 fn notify_parked(e: *Exchange) {
@@ -133,7 +158,14 @@ fn notify_parked(e: *Exchange) {
     }
 }
 
+fn handed(p: *Peer, e: *Exchange) {
+    free_body(p.pace, e.held)
+    e.held = 0
+    e.due = 0
+}
+
 fn drain_exchange(p: *Peer, e: *Exchange) {
+    handed(p, e)
     notify_parked(e)
     var lost = 0
     for chunk in e.waiting {
@@ -293,7 +325,19 @@ fn on_window(p: *Peer, f: Frame) ! io.Error {
     }
 }
 
+fn charge(p: *Peer) ! io.Error {
+    let refill = (now_ms() - p.reset_at) / reset_refill_ms
+    p.reset_at += refill * reset_refill_ms
+    p.resets = p.resets - least(p.resets, refill) + 1
+    if p.resets > reset_budget {
+        fail protocol(p, error_enhance_your_calm)
+    }
+}
+
 fn reset(p: *Peer, id: i64, code: i64) ! io.Error {
+    if code != 0 {
+        charge(p)?
+    }
     var out: u8[] = []
     put_reset(mut out, id, code)
     io.write_all(p.stream, out)?
@@ -371,6 +415,7 @@ fn on_headers(p: *Peer, f: Frame) ! io.Error {
     e.ends = f.flags & flag_end_stream != 0
     if f.flags & flag_end_headers == 0 {
         p.pending = f.stream
+        p.continuations = 0
         return
     }
     finish_block(p, e)?
@@ -380,15 +425,38 @@ fn on_continuation(p: *Peer, f: Frame) ! io.Error {
     if p.pending == 0 || f.stream != p.pending {
         fail protocol(p, error_protocol)
     }
+    let ending = f.flags & flag_end_headers != 0
+    p.continuations += 1
+    if p.continuations > max_continuations || (f.payload.len == 0 && !ending) {
+        fail protocol(p, error_enhance_your_calm)
+    }
     let e = p.exchanges[f.stream] ?? new_exchange(p, f.stream)
     io.append(mut e.block, f.payload)
     if e.block.len > max_header_block {
         fail protocol(p, error_enhance_your_calm)
     }
-    if f.flags & flag_end_headers != 0 {
+    if ending {
         p.pending = 0
         finish_block(p, e)?
     }
+}
+
+fn on_reset(p: *Peer, f: Frame) ! io.Error {
+    if f.stream == 0 || idle(p, f.stream) {
+        fail protocol(p, error_protocol)
+    }
+    if f.payload.len != 4 {
+        fail protocol(p, error_frame_size)
+    }
+    let e = match p.exchanges[f.stream] {
+        some(e) => e
+        none => return
+    }
+    if !e.queued && !e.answered {
+        charge(p)?
+    }
+    abandon(p, e)
+    p.exchanges.delete(f.stream)
 }
 
 fn finish_block(p: *Peer, e: *Exchange) ! io.Error {
@@ -426,6 +494,8 @@ fn finish_block(p: *Peer, e: *Exchange) ! io.Error {
             e.duplex = true
             e.inbox = some(chan[u8[]](16))
             p.complete(p, e)?
+        } else if !e.ends {
+            e.due = body_due(p.pace)
         }
     }
     if e.ends {
@@ -447,6 +517,7 @@ fn end_remote(p: *Peer, e: *Exchange) ! io.Error {
         reset(p, e.id, error_protocol)?
         return
     }
+    handed(p, e)
     p.complete(p, e)?
 }
 
@@ -475,11 +546,18 @@ fn on_data(p: *Peer, f: Frame) ! io.Error {
                 }
                 return
             }
-            if e.body.len + data.len > max_body {
+            if e.body.len + data.len > body_limit(p.pace) {
                 reset(p, e.id, error_enhance_your_calm)?
                 credit(p, 0, f.payload.len)?
                 return
             }
+            hold_body(p.pace, data.len) or {
+                reset(p, e.id, error_refused_stream)?
+                credit(p, 0, f.payload.len)?
+                return
+            }
+            e.held += data.len
+            advance(p, e, data.len)
             io.append(mut e.body, data)
             let ends = f.flags & flag_end_stream != 0
             credit(p, if ends { 0 } else { e.id }, f.payload.len)?
@@ -521,14 +599,7 @@ fn on_frame(p: *Peer, f: Frame) ! io.Error {
             reset(p, f.stream, error_protocol)?
         }
     } else if f.kind == frame_reset {
-        if f.stream == 0 || idle(p, f.stream) {
-            fail protocol(p, error_protocol)
-        }
-        if f.payload.len != 4 {
-            fail protocol(p, error_frame_size)
-        }
-        abandon(p, p.exchanges[f.stream])
-        p.exchanges.delete(f.stream)
+        on_reset(p, f)?
     } else if f.kind == frame_settings {
         on_settings(p, f)?
     } else if f.kind == frame_push_promise {
@@ -588,9 +659,34 @@ fn sent(p: *Peer, e: *Exchange) ! io.Error {
     }
 }
 
+fn owe(p: *Peer, owing: i64, taken: i64) {
+    if owing == 0 || p.owing == 0 {
+        p.behind = 0
+        p.accrued = now_ms()
+    } else if taken >= p.behind {
+        p.behind = 0
+    } else {
+        p.behind -= taken
+    }
+    p.owing = owing
+}
+
+fn fall_behind(p: *Peer, pace: *Pace, now: i64) ! io.Error {
+    if p.owing == 0 || pace.limits.write_timeout <= 0 {
+        return
+    }
+    p.behind += p.owing * write_piece * (now - p.accrued) / pace.limits.write_timeout
+    p.accrued = now
+    if p.behind > p.owing * write_piece {
+        fail protocol(p, error_enhance_your_calm)
+    }
+}
+
 fn flush(p: *Peer) ! io.Error {
     var out: u8[] = []
     var finished: *Exchange[] = []
+    var owing = 0
+    var taken = 0
     for _, e in p.exchanges {
         for e.queued && e.out.len > 0 && p.window > 0 && e.window > 0 {
             let n = least(least(e.out.len, p.frame_size), least(p.window, e.window))
@@ -599,6 +695,7 @@ fn flush(p: *Peer) ! io.Error {
             e.out = e.out[n..]
             p.window -= n
             e.window -= n
+            taken += n
             if last {
                 if e.tail.len > 0 {
                     header_frames(p, mut out, e.id, e.tail, true)
@@ -609,11 +706,79 @@ fn flush(p: *Peer) ! io.Error {
         if e.out.len <= high_water {
             notify_parked(e)
         }
+        if e.queued && !e.open && e.out.len > 0 {
+            owing += 1
+        }
     }
+    owe(p, owing, taken)
     io.write_all(p.stream, out)?
     for e in finished {
         e.queued = false
         sent(p, e)?
+    }
+}
+
+fn advance(p: *Peer, e: *Exchange, n: i64) {
+    let pace = match p.pace {
+        some(found) => found
+        none => return
+    }
+    e.fresh += n
+    let share = quota(pace.limits)
+    if e.fresh >= share {
+        e.fresh %= share
+        e.due = due(pace.limits.body_timeout)
+        pace.since = now_ms()
+    }
+}
+
+fn expire(p: *Peer) ! io.Error {
+    let pace = match p.pace {
+        some(found) => found
+        none => return
+    }
+    let now = now_ms()
+    if now - p.swept < pace.dog.interval {
+        return
+    }
+    p.swept = now
+    var late: i64[] = []
+    for id, e in p.exchanges {
+        if e.due != 0 && now >= e.due {
+            late.push(id)
+        }
+    }
+    for id in late {
+        reset(p, id, error_enhance_your_calm)?
+    }
+    fall_behind(p, pace, now)?
+    overrun_handlers(p, pace.limits.handler_timeout, now)
+}
+
+fn overrun_handlers(p: *Peer, limit: i64, now: i64) {
+    if limit <= 0 {
+        return
+    }
+    for id, started in p.running {
+        if now - started < limit || p.late[id] != none {
+            continue
+        }
+        p.late[id] = true
+        let e = p.exchanges[id] ?? continue
+        match e.token {
+            some(token) => cancel.cancel(token)
+            none => {}
+        }
+    }
+}
+
+fn occupy(p: *Peer) {
+    if p.running.len == 0 && !p.duplex {
+        flowing(p.pace)
+    } else if p.running.len > 0 && p.late.len == p.running.len {
+        lagging(p.pace, p.running.len)
+    } else {
+        unbound(p.pace)
     }
 }
 
@@ -741,8 +906,14 @@ fn trailer_fields(trailers: header.Header[]) -> header.Header[] {
     out
 }
 
+fn finished(p: *Peer, id: i64) {
+    p.running.delete(id)
+    p.late.delete(id)
+}
+
 fn end_stream(p: *Peer, reply: Reply) ! io.Error {
     p.outstanding -= 1
+    finished(p, reply.id)
     let e = match p.exchanges[reply.id] {
         some(e) => e
         none => return
@@ -780,6 +951,9 @@ fn deliver(p: *Peer, reply: Reply) ! io.Error {
     let resp = reply.response
     if !streaming(resp) {
         p.outstanding -= 1
+        finished(p, reply.id)
+    } else if !p.duplex {
+        finished(p, reply.id)
     }
     let e = match p.exchanges[reply.id] {
         some(e) => e
@@ -802,6 +976,28 @@ fn deliver(p: *Peer, reply: Reply) ! io.Error {
     queue(p, e, fields, body, trailer_fields(resp.trailers))?
 }
 
+fn pass_over(p: *Peer, reply: Reply) {
+    match reply.phase {
+        Chunk => match reply.acks {
+            some(acks) => notify(acks)
+            none => {}
+        }
+        End => finished(p, reply.id)
+        Whole => if !p.duplex || !streaming(reply.response) {
+            finished(p, reply.id)
+        }
+    }
+}
+
+fn outlast(p: *Peer, replies: chan[Reply]) {
+    for p.running.len > 0 {
+        match <-replies {
+            some(reply) => pass_over(p, reply)
+            none => return
+        }
+    }
+}
+
 fn on_input(p: *Peer, f: Frame?) -> bool ! io.Error {
     match f {
         some(frame) => {
@@ -817,7 +1013,7 @@ fn on_input(p: *Peer, f: Frame?) -> bool ! io.Error {
     }
 }
 
-fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, mode: chan[bool]?, handler: fn(Request) -> Response) ! io.Error {
+fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, mode: chan[bool]?, pace: *Pace?, handler: fn(Request) -> Response) ! io.Error {
     let replies = chan[Reply](128)
     let complete = fn(p: *Peer, e: *Exchange) ! io.Error {
         var req = request_of(e.fields, e.body, Http2) or {
@@ -843,14 +1039,16 @@ fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, mode: chan[bool]?, handler
             none => {}
         }
         p.outstanding += 1
+        p.running[e.id] = now_ms()
         e.token = some(req.token)
         spawn respond(handler, req, e.id, replies)
     }
-    let p = new_peer(s, r, mode != none, complete)
+    let p = new_peer(s, r, mode != none, pace, complete)
     var drain: chan[bool] = match mode {
         some(c) => c
         none => chan[bool]()
     }
+    defer outlast(p, replies)
     defer abandon_all(p)
     var out: u8[] = []
     put_initial_settings(mut out, true)
@@ -858,8 +1056,20 @@ fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, mode: chan[bool]?, handler
     let frames = chan[Frame](16)
     spawn pump(p, frames)
     var reading = true
+    var fresh = true
     for reading || p.outstanding > 0 {
+        expire(p)?
         flush(p)?
+        if p.outstanding > 0 {
+            occupy(p)
+        } else if p.pending != 0 {
+            repose(pace, phase_heading, false)
+        } else if p.owing > 0 {
+            sending(pace)
+        } else {
+            repose(pace, if p.exchanges.len > 0 { phase_receiving } else { phase_resting }, fresh)
+        }
+        fresh = p.outstanding > 0
         if p.draining && p.outstanding == 0 && p.exchanges.len == 0 {
             if reading {
                 linger(frames)
@@ -876,6 +1086,10 @@ fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, mode: chan[bool]?, handler
             }
             continue
         }
+        let sweep = match pace {
+            some(found) => if p.exchanges.len > 0 || p.running.len > 0 { found.dog.interval } else { quiet_ms }
+            none => quiet_ms
+        }
         select {
             <-drain => {
                 p.draining = true
@@ -885,6 +1099,7 @@ fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, mode: chan[bool]?, handler
                 io.write_all(p.stream, out)?
             }
             f = <-frames => {
+                fresh = true
                 reading = on_input(p, f)?
                 if !reading {
                     abandon_all(p)
@@ -898,6 +1113,7 @@ fn serve_h2(s: io.Stream, r: *io.Reader, remote: str, mode: chan[bool]?, handler
                 some(x) => on_credit(p, x)?
                 none => {}
             }
+            after(sweep) => {}
         }
     }
     flush(p)?
