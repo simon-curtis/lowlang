@@ -88,6 +88,10 @@
   (block)
   (#eq? @keyword "region"))
 
+(fork_declaration
+  keyword: (identifier) @keyword
+  (#eq? @keyword "fork"))
+
 "fn" @keyword.function
 
 [
