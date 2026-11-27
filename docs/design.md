@@ -2767,6 +2767,55 @@ Channel and value expressions are evaluated first, in order. Ready arms are take
 `sleep(ms)` pauses the green thread.
 
 `wait_readable(fd)` and `wait_writable(fd)` wait until a file descriptor is ready, using epoll on Linux. On Windows `fd` is a waitable handle and both wait until it is signalled. One green thread may wait on a descriptor at a time.
+### Kernels
+
+`kernel fn` declares a kernel: a function held to the part of Low that a GPU can run. A kernel is called like any other function, once for each index of the range it works over.
+
+```low
+kernel fn saxpy(id: u32, a: f32, x: f32[], mut y: f32[]) {
+    y[id] = a * x[id] + y[id]
+}
+
+fn main() {
+    let x: f32[] = [1.0, 2.0, 3.0]
+    var y: f32[] = [10.0, 20.0, 30.0]
+    for i in 0..x.len {
+        saxpy(u32(i), 2.0, x, mut y)
+    }
+    print(y[2])
+}
+```
+
+`kernel` is a contextual keyword. It is an ordinary identifier everywhere except before `fn` at the start of a declaration, after `pub` if the kernel is public.
+
+A kernel's first parameter is the invocation index, of type `u32`. A kernel has no type parameters, returns nothing and cannot fail. Only a slice parameter can be `mut`, and a kernel cannot assign a new slice to a slice parameter.
+
+Every value in a kernel, and in each function a kernel calls, has one of these types:
+
+| Type | Notes |
+|---|---|
+| `bool`, `i32`, `u32`, `f32` | |
+| `i64`, `u64`, `f64` | |
+| A vector | As `### Vectors` describes. |
+| A struct | Every field has a type in this table. An `extern struct` is not accepted. |
+| An enum | No variant has fields. |
+| A slice | Of any type above. |
+
+A number literal that has no type from its context would be an `i64` or an `f64`, which a kernel rejects: write `let half: f32 = 0.5`. A literal used as an index, a slice bound, a range bound, a shift count or the argument of a conversion is accepted without one.
+
+A kernel and the functions it calls cannot use:
+
+- `new`, a slice literal, a map, a string, interpolation or a closure, since each allocates;
+- `push` and the other builtins outside `sqrt`, `floor`, `exp`, the conversions and the vector operations;
+- `spawn`, a channel or `select`;
+- `?`, `catch`, `fail`, or a call to a function that can fail;
+- `defer` or `region`;
+- a pointer, a function value or a call through one;
+- a C function;
+- recursion, direct or through other functions.
+
+The checker reports the first rejected construct a kernel reaches, in the kernel or in a function it calls, and names the kernel.
+
 ## Errors
 
 An error type is an enum. A function that can fail declares `-> T ! E`.
@@ -2938,6 +2987,11 @@ Every compile error and warning carries a code, printed after the message in bra
 | `infer-type` | error | A type cannot be inferred and needs an annotation. | `let xs = []` |
 | `infinite-size` | error | A struct or enum contains itself by value. | `struct Node { next: Node }` |
 | `instance-limit` | error | A generic is instantiated with too many distinct type arguments. | a generic function called at thousands of types |
+| `kernel-construct` | error | A kernel, or a function it calls, uses a construct a kernel cannot run. | `kernel fn k(id: u32, mut out: u32[]) { print(id) }` |
+| `kernel-literal` | error | A number literal in a kernel takes a 64-bit type because its context gives it none. | `kernel fn k(id: u32, mut out: f32[]) { let half = 0.5 }` |
+| `kernel-recursion` | error | A function a kernel calls reaches itself. | `fn depth(n: u32) -> u32 { depth(n) }` called from a kernel |
+| `kernel-signature` | error | A kernel has type parameters, a result, a `mut` parameter that is not a slice, or no `u32` index as its first parameter. | `kernel fn k(a: f32, mut out: f32[]) {}` |
+| `kernel-type` | error | A kernel, or a function it calls, holds a value of a type a kernel cannot hold. | `kernel fn k(id: u32, src: u8[], mut out: u32[]) {}` |
 | `label-shadow` | error | A loop label repeats the label of an enclosing loop. | `outer: for { outer: for { } }` |
 | `label-target` | error | A label is not followed by a `for` loop. | `outer: print(1)` |
 | `large-struct` | warning | A struct is large enough that every copy is costly. | a struct of 64 or more words |

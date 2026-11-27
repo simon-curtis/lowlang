@@ -75,6 +75,7 @@ module.exports = grammar({
 
     function_declaration: $ => seq(
       optional($.visibility),
+      optional(field('marker', $.identifier)),
       'fn',
       field('name', $.identifier),
       optional(field('type_parameters', $.type_parameters)),

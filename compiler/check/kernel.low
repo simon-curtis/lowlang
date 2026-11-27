@@ -1,0 +1,327 @@
+import ast
+import builtin
+import diag
+import types
+
+struct KernelScan {
+    c: *Checker
+    kernel: *ast.Func
+    checked: [*ast.Func: bool]
+    active: [*ast.Func: bool] = [:]
+    contextual: [*ast.IntLit: bool] = [:]
+    converted: [*ast.FloatLit: bool] = [:]
+    pending: []*ast.Call = []
+    refused: bool = false
+}
+
+fn check_kernels(c: *Checker) {
+    let checked: [*ast.Func: bool] = [:]
+    for k in c.kernels {
+        let s = new(KernelScan { c, kernel: k, checked })
+        if kernel_signature(s, k) {
+            kernel_function(s, k)
+        }
+    }
+}
+
+fn kernel_signature(s: *KernelScan, k: *ast.Func) -> bool {
+    if k.type_params.len > 0 {
+        return s.refuse(diag.error(k.pos, "kernel-signature", "kernel {k.name} cannot take type parameters"))
+    }
+    if k.result != none || k.error != none {
+        return s.refuse(diag.error(k.pos, "kernel-signature", "kernel {k.name} cannot return a value or an error"))
+    }
+    if k.param_types.len != k.params.len {
+        return false
+    }
+    if k.params.len == 0 || k.param_types[0] != s.c.universe.u32 || k.params[0].mutable {
+        return s.refuse(diag.error(k.pos, "kernel-signature", "kernel {k.name} must take the invocation index as its first parameter, of type u32"))
+    }
+    for i, p in k.params {
+        if p.mutable && k.param_types[i].kind != SliceKind {
+            return s.refuse(diag.error(p.pos, "kernel-signature", "parameter {p.name} of kernel {k.name} is mut; only a slice can be mut"))
+        }
+    }
+    true
+}
+
+fn refuse(s: *KernelScan, d: *diag.Diagnostic) -> bool {
+    s.c.report(d)
+    s.refused = true
+    false
+}
+
+fn forbid(s: *KernelScan, pos: diag.Pos, what: str) -> bool {
+    s.refuse(diag.error(pos, "kernel-construct", "kernel {s.kernel.name} cannot use {what}"))
+}
+
+fn kernel_function(s: *KernelScan, f: *ast.Func) {
+    if s.checked[f] != none {
+        return
+    }
+    s.checked[f] = true
+    s.active[f] = true
+    let body = f.body ?? return
+    let admitted = kernel_params(s, f)
+    if admitted {
+        ast.inspect(ast.Node.Expr(ast.Expr.Block(body)), fn(n: ast.Node) -> bool { kernel_node(s, n) })
+    }
+    let calls = s.pending
+    s.pending = []
+    for call in calls {
+        if s.refused {
+            break
+        }
+        kernel_callee(s, call)
+    }
+    s.active.delete(f)
+}
+
+fn kernel_params(s: *KernelScan, f: *ast.Func) -> bool {
+    if f.param_types.len != f.params.len {
+        return false
+    }
+    for i, p in f.params {
+        if !kernel_type(f.param_types[i]) {
+            return s.refuse(diag.error(p.pos, "kernel-type", "kernel {s.kernel.name} cannot use a value of type {f.param_types[i].text()}"))
+        }
+    }
+    let ret = f.ret_type ?? return true
+    if !kernel_type(ret) {
+        return s.refuse(diag.error(f.pos, "kernel-type", "kernel {s.kernel.name} cannot use a value of type {ret.text()}"))
+    }
+    true
+}
+
+fn kernel_callee(s: *KernelScan, call: *ast.Call) {
+    let target = call.target ?? return
+    if s.active[target] != none {
+        let _ = s.refuse(diag.error(call.pos, "kernel-recursion", "kernel {s.kernel.name} cannot recurse, and {target.name} calls itself"))
+        return
+    }
+    kernel_function(s, target)
+}
+
+fn kernel_scalar(t: *types.Type) -> bool {
+    match t.kind {
+        BoolKind => true
+        IntKind => t.bits == 32 || t.bits == 64
+        FloatKind => true
+        _ => false
+    }
+}
+
+fn kernel_value(t: *types.Type) -> bool {
+    match t.kind {
+        VectorKind => true
+        StructKind => kernel_fields(t)
+        EnumKind => !t.optional && plain_variants(t)
+        _ => kernel_scalar(t)
+    }
+}
+
+fn kernel_fields(t: *types.Type) -> bool {
+    if t.c {
+        return false
+    }
+    for f in t.fields {
+        if !kernel_value(f.type) {
+            return false
+        }
+    }
+    true
+}
+
+fn plain_variants(t: *types.Type) -> bool {
+    for v in t.variants {
+        if v.fields.len > 0 {
+            return false
+        }
+    }
+    true
+}
+
+fn kernel_type(t: *types.Type) -> bool {
+    match t.kind {
+        VoidKind => true
+        NeverKind => true
+        SliceKind => kernel_value(t.elem_of())
+        _ => kernel_value(t)
+    }
+}
+
+fn kernel_node(s: *KernelScan, n: ast.Node) -> bool {
+    if s.refused {
+        return false
+    }
+    match n {
+        Expr(e) => kernel_expr(s, e)
+        Stmt(st) => kernel_stmt(s, st)
+        _ => true
+    }
+}
+
+fn kernel_stmt(s: *KernelScan, st: ast.Stmt) -> bool {
+    match st {
+        Spawn(x) => s.forbid(x.pos, "spawn")
+        Send(x) => s.forbid(x.pos, "a channel send")
+        Defer(x) => s.forbid(x.pos, "defer")
+        Assign(a) => kernel_assign(s, a)
+        ForIn(f) => {
+            s.in_context(f.iter)
+            s.in_context_optional(f.end)
+            true
+        }
+        _ => true
+    }
+}
+
+fn kernel_assign(s: *KernelScan, a: *ast.Assign) -> bool {
+    match a.target {
+        Ident(id) => {
+            let l = id.ident_local() ?? return true
+            let t = l.type ?? return true
+            if l.param && t.kind == SliceKind {
+                return s.forbid(a.pos, "an assignment to the slice parameter {l.name}")
+            }
+        }
+        _ => {}
+    }
+    if a.op == Shl || a.op == Shr || a.op == ShlAssign || a.op == ShrAssign {
+        s.in_context(a.value)
+    }
+    true
+}
+
+fn in_context(s: *KernelScan, e: ast.Expr) {
+    match e {
+        IntLit(n) => { s.contextual[n] = true }
+        FloatLit(n) => { s.converted[n] = true }
+        _ => {}
+    }
+}
+
+fn in_context_optional(s: *KernelScan, e: ast.Expr?) {
+    match e {
+        some(x) => s.in_context(x)
+        none => {}
+    }
+}
+
+fn kernel_expr(s: *KernelScan, e: ast.Expr) -> bool {
+    match e {
+        StrLit(x) => return s.forbid(x.pos, "a string")
+        Interp(x) => return s.forbid(ast.position(e), "a string")
+        MapLit(x) => return s.forbid(x.pos, "a map")
+        SliceLit(x) => return s.forbid(x.pos, "a slice literal, which allocates")
+        Closure(x) => return s.forbid(x.pos, "a closure")
+        Select(x) => return s.forbid(ast.position(e), "select")
+        Catch(x) => return s.forbid(ast.position(e), "catch")
+        Region(x) => return s.forbid(x.pos, "region")
+        Call(x) => {
+            if !kernel_call(s, x) {
+                return false
+            }
+        }
+        IntLit(x) => {
+            if !kernel_literal(s, x.pos, x.defaulted && s.contextual[x] == none, "an integer") {
+                return false
+            }
+        }
+        FloatLit(x) => {
+            if !kernel_literal(s, x.pos, x.defaulted && s.converted[x] == none, "a float") {
+                return false
+            }
+        }
+        Index(x) => s.in_context(x.index)
+        Slicing(x) => {
+            s.in_context_optional(x.lo)
+            s.in_context_optional(x.hi)
+        }
+        Binary(x) => {
+            if x.op == Shl || x.op == Shr {
+                s.in_context(x.y)
+            }
+        }
+        Ident(x) => {
+            match x.to {
+                ToFunc(f) => return true
+                _ => {}
+            }
+        }
+        Selector(x) => {
+            match x.to {
+                ToFunc(f) => return true
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    let t = ast.type_of(e) ?? return true
+    if !kernel_type(t) {
+        return s.refuse(diag.error(ast.position(e), "kernel-type", "kernel {s.kernel.name} cannot use a value of type {t.text()}"))
+    }
+    true
+}
+
+fn kernel_literal(s: *KernelScan, pos: diag.Pos, untyped: bool, what: str) -> bool {
+    if untyped {
+        return s.refuse(diag.error(pos, "kernel-literal", "{what} literal in kernel {s.kernel.name} takes a 64-bit type here; give it a 32-bit type"))
+    }
+    true
+}
+
+fn kernel_call(s: *KernelScan, call: *ast.Call) -> bool {
+    if call.builtin != builtin.ID.None {
+        if !kernel_builtin(call.builtin) {
+            return s.forbid(call.pos, callee_name(call.callee))
+        }
+        if call.builtin == builtin.ID.Convert {
+            for arg in call.args {
+                s.in_context(arg)
+            }
+        }
+        return true
+    }
+    let target = call.target ?? return s.forbid(call.pos, "a call through a function value")
+    if target.external != none {
+        return s.forbid(call.pos, "the C function {target.name}")
+    }
+    s.pending.push(call)
+    true
+}
+
+fn kernel_builtin(id: builtin.ID) -> bool {
+    match id {
+        Sqrt => true
+        Floor => true
+        Exp => true
+        Convert => true
+        VectorCast => true
+        Bits => true
+        MulHi => true
+        Ctz => true
+        VLoad => true
+        VStore => true
+        VSplat => true
+        VMask => true
+        VShuffle => true
+        VSelect => true
+        VMin => true
+        VMax => true
+        VLane => true
+        VWith => true
+        VAny => true
+        VAll => true
+        _ => false
+    }
+}
+
+fn callee_name(e: ast.Expr) -> str {
+    match e {
+        Ident(x) => x.name
+        Selector(x) => x.name
+        Instance(x) => callee_name(x.x)
+        _ => "this builtin"
+    }
+}

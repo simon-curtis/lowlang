@@ -92,6 +92,10 @@
   keyword: (identifier) @keyword
   (#eq? @keyword "fork"))
 
+(function_declaration
+  marker: (identifier) @keyword
+  (#eq? @keyword "kernel"))
+
 "fn" @keyword.function
 
 [
