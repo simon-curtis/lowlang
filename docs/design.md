@@ -165,7 +165,7 @@ Runs the program and patches changed functions into it on save. Changing `main`,
 
 ### low ir and low asm
 
-`low ir` prints the optimised SSA form. `low asm` prints the generated assembly. Both take `--json` and `--max-errors` as [`low build`](#low-build) does.
+`low ir` prints the optimised SSA form, then the kernel build of each kernel the program reaches, each headed `kernel fn`. `low asm` prints the generated assembly. Both take `--json` and `--max-errors` as [`low build`](#low-build) does.
 
 ### low lint
 
@@ -9325,6 +9325,10 @@ Optimiser:
   - A predecessor that passes a constant skips a block that branches on a phi, or on its negation, and holds nothing else but constants that only feed its successors' phis. The predecessor jumps to the successor the constant selects. It takes a copy of each constant that successor's phis read from the block. Use counts follow each moved edge. The threaded predecessors leave the block together once all are visited. Blocks are visited successors first, so a chain of such blocks is threaded in one pass.
   - The phi that joins `a && b` takes `false` from the edge where `a` is false, and the phi that joins `a || b` takes `true` from the edge where `a` is true, so a condition built from them threads into branches on its operands.
   - The backend threads a block the same way when a predecessor copies a constant, or a value its own predecessor branched on, into the register the block branches on.
+
+#### Kernel builds
+
+A kernel is compiled like any function, and that function is what a call runs. `ir.kernel_builds` also gives each kernel the program reaches a second body, in `ir.Program.kernels`: a copy of the kernel's SSA as it was built, before the optimiser, with every call replaced by the body of its callee until none is left, then simplified. The checker has already refused recursion and calls through function values, so the loop ends. No back end reads `ir.Program.kernels`.
 
 ### Code generation
 
