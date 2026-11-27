@@ -1,0 +1,259 @@
+import ast
+import compiler
+import diag
+import lsp
+import types
+import std/math
+import std/slices
+import std/text
+
+struct Decl {
+    kind: str
+    name: str
+    module: str
+    file: *ast.File
+    pos: diag.Pos
+    doc: str
+    exported: bool
+    key: str
+    members: []str = []
+    func: *ast.Func? = none
+    first: i64 = 0
+    last: i64 = 0
+    limit: i64 = 0
+}
+
+struct Hit {
+    decl: *Decl
+    member: str = ""
+}
+
+fn decl_key(file_path: str, pos: diag.Pos) -> str {
+    "{file_path}|{pos.pos_line()}|{pos.pos_col()}"
+}
+
+fn new_decl(f: *ast.File, kind: str, name: str, pos: diag.Pos, doc: str, exported: bool) -> *Decl {
+    new(Decl { kind, name, module: f.module, file: f, pos, doc, exported, key: decl_key(f.path, pos) })
+}
+
+fn add_file(s: *Session, f: *ast.File) {
+    var found: []*Decl = []
+    for func in ast.declared_funcs(f) {
+        let d = new_decl(f, "fn", func.name, func.pos, func.doc, func.exported)
+        d.func = func
+        found.push(d)
+    }
+    for k in f.consts {
+        found.push(new_decl(f, "const", k.name, k.pos, k.doc, k.exported))
+    }
+    for st in f.structs {
+        let d = new_decl(f, "struct", st.name, st.pos, st.doc, st.exported)
+        for field in st.fields {
+            d.members.push(field.name)
+        }
+        found.push(d)
+        s.add_type(d, st.type)
+    }
+    for e in f.enums {
+        let d = new_decl(f, "enum", e.name, e.pos, e.doc, e.exported)
+        for v in e.variants {
+            d.members.push(v.name)
+        }
+        found.push(d)
+        s.add_type(d, e.type)
+    }
+    slices.sort_stable_by(mut found, fn(a: *Decl, b: *Decl) -> bool { a.pos.pos_line() < b.pos.pos_line() })
+    s.span(f, found)
+    for d in found {
+        s.keyed[d.key] = d
+    }
+    s.files[f.path] = found
+}
+
+fn add_type(s: *Session, d: *Decl, t: *types.Type?) {
+    let held = t ?? return
+    s.typed[held] = d
+}
+
+fn span(s: *Session, f: *ast.File, found: []*Decl) {
+    let lines = s.lines_of(f)
+    var starts: []i64 = []
+    for imp in f.imports {
+        starts.push(imp.pos.pos_line())
+    }
+    for x in f.externs {
+        starts.push(x.pos.pos_line())
+    }
+    for d in found {
+        starts.push(d.pos.pos_line())
+    }
+    slices.sort(mut starts)
+    for d in found {
+        let line = d.pos.pos_line()
+        var next = lines.len + 1
+        for start in starts {
+            if start > line {
+                next = start
+                break
+            }
+        }
+        var limit = next - 1
+        for limit > line && is_doc(lines, limit) {
+            limit -= 1
+        }
+        var last = limit
+        for last > line && is_trailing(lines, last) {
+            last -= 1
+        }
+        var first = line
+        for first > 1 && is_doc(lines, first - 1) {
+            first -= 1
+        }
+        d.first = first
+        d.last = last
+        d.limit = limit
+        if d.is_extern() {
+            d.last = line
+            d.limit = line
+        }
+    }
+}
+
+fn line_at(lines: []str, n: i64) -> str {
+    if n < 1 || n > lines.len {
+        return ""
+    }
+    lines[n - 1]
+}
+
+fn is_doc(lines: []str, n: i64) -> bool {
+    text.starts_with(text.trim(line_at(lines, n)), "///")
+}
+
+fn is_trailing(lines: []str, n: i64) -> bool {
+    let line = text.trim(line_at(lines, n))
+    line == "" || text.starts_with(line, "//")
+}
+
+fn lines_of(s: *Session, f: *ast.File) -> []str {
+    s.text_of(f).lines
+}
+
+fn text_of(s: *Session, f: *ast.File) -> lsp.Text {
+    match s.texts[f.path] {
+        some(held) => return held
+        none => {}
+    }
+    var src = ""
+    if text.starts_with(f.module, "std/") || f.module == "std" {
+        src = compiler.std_source(s.std, f.path) ?? ""
+    } else {
+        src = compiler.overlay_read(s.docs, f.path) or ""
+    }
+    let t = lsp.new_text(src)
+    s.texts[f.path] = t
+    t
+}
+
+fn index_of(s: *Session, f: *ast.File) -> *lsp.Index {
+    match s.indexes[f.path] {
+        some(held) => return held
+        none => {}
+    }
+    let x = lsp.new_index(f, s.text_of(f))
+    s.indexes[f.path] = x
+    x
+}
+
+fn is_extern(d: *Decl) -> bool {
+    let func = d.func ?? return false
+    func.external != none
+}
+
+fn has_member(d: *Decl, name: str) -> bool {
+    d.members.any(fn(m) m == name)
+}
+
+fn enclosing(s: *Session, f: *ast.File, line: i64) -> *Decl? {
+    for d in s.files[f.path] ?? [] {
+        if d.first <= line && line <= d.limit {
+            return d
+        }
+    }
+    none
+}
+
+fn qualified(s: *Session, d: *Decl) -> str {
+    if d.module == "" {
+        return d.name
+    }
+    "{d.module}.{d.name}"
+}
+
+fn hit_name(s: *Session, h: Hit) -> str {
+    if h.member == "" {
+        return s.qualified(h.decl)
+    }
+    "{s.qualified(h.decl)}.{h.member}"
+}
+
+fn source_of(s: *Session, d: *Decl) -> str {
+    if d.is_extern() {
+        let doc = s.doc_lines(d)
+        if doc == "" {
+            return s.header(d)
+        }
+        return "{doc}\n{s.header(d)}"
+    }
+    s.lines_between(d, d.first, d.last)
+}
+
+fn lines_between(s: *Session, d: *Decl, from: i64, to: i64) -> str {
+    let lines = s.lines_of(d.file)
+    var picked: []str = []
+    for n in from..to + 1 {
+        picked.push(line_at(lines, n))
+    }
+    text.join(picked, "\n")
+}
+
+/// The declaration as a reader of its callers sees it: a function's signature as written, or a constant's, struct's or enum's whole source, without the doc comment.
+fn header(s: *Session, d: *Decl) -> str {
+    let line = d.pos.pos_line()
+    let func = d.func ?? return s.lines_between(d, line, d.last)
+    if func.external != none {
+        return text.trim(line_at(s.lines_of(d.file), line))
+    }
+    let body = func.body ?? return s.lines_between(d, line, d.last)
+    let end = body.pos.pos_line()
+    var head = ""
+    if end > line {
+        head = "{s.lines_between(d, line, end - 1)}\n"
+    }
+    let last = line_at(s.lines_of(d.file), end)
+    let cut = math.clamp(body.pos.pos_col() - 1, 0, last.len)
+    text.trim_end("{head}{last[..cut]}")
+}
+
+fn doc_lines(s: *Session, d: *Decl) -> str {
+    if d.first == d.pos.pos_line() {
+        return ""
+    }
+    let written = s.lines_between(d, d.first, d.pos.pos_line() - 1)
+    if !d.is_extern() {
+        return written
+    }
+    var trimmed: []str = []
+    for line in text.split(written, '\n') {
+        trimmed.push(text.trim(line))
+    }
+    text.join(trimmed, "\n")
+}
+
+fn shown_path(s: *Session, file_path: str) -> str {
+    text.strip_prefix(file_path, "{s.cwd}/") ?? file_path
+}
+
+fn location(s: *Session, d: *Decl) -> str {
+    "{s.shown_path(d.file.path)}:{d.pos.pos_line()}"
+}

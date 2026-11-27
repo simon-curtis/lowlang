@@ -1,0 +1,259 @@
+import diag
+import ir
+import lint
+import target
+import std/builder
+import std/path
+import std/slices
+import std/text
+
+const generated_imports = "__imports.low"
+
+/// Names what `check_imports` loads: the module at import path `module` of the project that holds `dir`, "" for the project root, and under `importers` every module of that project that imports it, directly or through other modules of the project.
+pub struct Survey {
+    pub dir: str
+    pub module: str
+    pub importers: bool
+}
+
+/// Holds the check of a `Survey` and the importers it left out, sorted.
+pub struct Surveyed {
+    pub checked: *Checked
+    pub left_out: []str
+}
+
+struct Skipped {
+    names: []str = []
+}
+
+/// Type-checks what `s` names, with no function main required. An importer that does not parse or check as a module on its own is left out, and the check runs again without it.
+pub fn check_imports(s: Survey, platform: target.OS, std: *Std, docs: *Overlay) -> Surveyed {
+    var dropped: []str = []
+    for true {
+        let skipped = new(Skipped {})
+        let checked = check_survey(s, dropped, skipped, platform, std, docs)
+        var left_out = skipped.names
+        for name in dropped {
+            left_out.push(name)
+        }
+        slices.sort(mut left_out)
+        let done = Surveyed { checked, left_out }
+        let e = checked.error ?? return done
+        let culprit = failing_module(checked, e) ?? return done
+        if culprit == s.module || dropped.any(fn(d) d == culprit) {
+            return done
+        }
+        dropped.push(culprit)
+    }
+    panic("unreachable")
+}
+
+fn check_survey(s: Survey, dropped: []str, skipped: *Skipped, platform: target.OS, std: *Std, docs: *Overlay) -> *Checked {
+    ir.mark(docs.jobs, "load")
+    let runtime = runtime_files(platform) catch {
+        e => return rejected(e, [])
+    }
+    let modules = load_survey(s, dropped, skipped, platform, std, docs) catch {
+        e => return rejected(e, [])
+    }
+    check_modules(runtime, modules, platform, std, docs, false, lint.Rules.Compile)
+}
+
+fn failing_module(checked: *Checked, e: Error) -> str? {
+    let pos = match e {
+        Diag(d) => {
+            let found = diag.diagnostics(d)
+            if found.len == 0 {
+                return none
+            }
+            found[0].pos
+        }
+        _ => return none
+    }
+    for f in checked.files {
+        if f.path != "" && f.path == pos.pos_file() {
+            return f.module
+        }
+    }
+    none
+}
+
+fn load_survey(s: Survey, dropped: []str, skipped: *Skipped, platform: target.OS, std: *Std, docs: *Overlay) -> *Loader ! Error {
+    let l = new(Loader { platform, std, docs })
+    let at = absolute_path(docs, s.dir)?
+    l.root = root(docs, at) ?? at
+    l.manifest = project_manifest(docs, l.root)?
+    l.main_project()?
+    let root_listing = sources(tree_of(l, ""), l.root, platform, false)?
+    var root_files: []str = []
+    var wanted: []str = []
+    if s.module == "" {
+        root_files = root_listing.files
+    } else {
+        wanted.push(s.module)
+    }
+    if s.importers && s.module != "" {
+        let graph = l.import_graph(s.module, dropped, skipped)?
+        wanted = graph.reaching(s.module)
+        if !dropped.any(fn(d) d == "") && l.reaches(root_listing.files, graph, wanted) {
+            root_files = root_listing.files
+        }
+    }
+    l.module("", root_files, false)?
+    let entry = l.generated(generated_imports, "", imports_source(wanted))?
+    l.link_imports(entry, true)?
+    l.drain()?
+    l
+}
+
+struct ImportGraph {
+    names: []str = []
+    imports: [str: []str] = [:]
+}
+
+/// Parses every module of the main project but `module` and those in `dropped`, all at once, and records the imports of each whose every source parses and holds no statement outside a function. The parsed files stay for the loader.
+fn import_graph(l: *Loader, module_name: str, dropped: []str, skipped: *Skipped) -> *ImportGraph ! Error {
+    let modules = modules_dir(l.root, l.manifest)
+    var names: []str = []
+    var listed: [][]str = []
+    var wanted: []Unparsed = []
+    for name in modules_under(l.docs, modules, l.platform)? {
+        if name == module_name || dropped.any(fn(d) d == name) {
+            continue
+        }
+        let listing = sources(tree_of(l, name), path.join([modules, name]), l.platform, false)?
+        names.push(name)
+        listed.push(listing.files)
+        l.gather(tree_of(l, name), listing.files, mut wanted)
+    }
+    let root_listing = sources(tree_of(l, ""), l.root, l.platform, false)?
+    l.gather(tree_of(l, ""), root_listing.files, mut wanted)
+    l.parse_all(wanted)
+    let graph = new(ImportGraph {})
+    for i, name in names {
+        let imported = l.imports_of(listed[i]) ?? {
+            skipped.names.push(name)
+            continue
+        }
+        graph.names.push(name)
+        graph.imports[name] = imported
+    }
+    graph
+}
+
+fn imports_of(l: *Loader, files: []str) -> []str? {
+    var found: []str = []
+    for file_name in files {
+        let ready = l.prepared[file_name] ?? return none
+        let f = ready.file ?? return none
+        if top_level_code(f) != none {
+            return none
+        }
+        for imp in f.imports {
+            found.push(imp.path)
+        }
+    }
+    found
+}
+
+/// Returns `module` and every module of the graph that imports it or a module already returned, in the graph's order.
+fn reaching(g: *ImportGraph, module_name: str) -> []str {
+    var reached: [str: bool] = [module_name: true]
+    var found: []str = [module_name]
+    var grew = true
+    for grew {
+        grew = false
+        for name in g.names {
+            if reached[name] != none {
+                continue
+            }
+            let imported = g.imports[name] ?? []
+            if imported.any(fn(i) reached[i] != none) {
+                reached[name] = true
+                found.push(name)
+                grew = true
+            }
+        }
+    }
+    found
+}
+
+fn reaches(l: *Loader, files: []str, g: *ImportGraph, wanted: []str) -> bool {
+    let imported = l.imports_of(files) ?? return false
+    imported.any(fn(i) wanted.any(fn(w) w == i))
+}
+
+fn imports_source(imports: []str) -> str {
+    var b = builder.builder()
+    for i, name in imports {
+        b.write("import __import{i} = {name}\n")
+    }
+    b.to_str()
+}
+
+/// Returns the project root that holds `dir` and the import path of `dir` under that project's modules directory, "" for the root itself.
+pub fn module_of(docs: *Overlay, dir: str) -> Placement ! Error {
+    let at = absolute_path(docs, dir)?
+    let project = root(docs, at) ?? at
+    let manifest = project_manifest(docs, project)?
+    let modules = modules_dir(project, manifest)
+    if at == project || at == modules {
+        return Placement { root: project, name: "" }
+    }
+    let name = text.strip_prefix(at, "{modules}/") ?? fail Error.Failed("{dir}: outside the modules directory {modules}")
+    Placement { root: project, name }
+}
+
+pub struct Placement {
+    pub root: str
+    pub name: str
+}
+
+/// Returns the source of the embedded standard library file `name`, written `std/<module>/<file>.low`.
+pub fn std_source(s: *Std, name: str) -> str? {
+    std_file_data(s, name)
+}
+
+/// Lists the import path of every module under the modules directory `modules`, in sorted order. The directories `examples` and `testdata`, directories that start with `.` or `_` and directories that mark another project are left out with everything below them.
+fn modules_under(docs: *Overlay, modules: str, platform: target.OS) -> []str ! Error {
+    var found: []str = []
+    collect_modules(docs, modules, "", platform, mut found)?
+    found
+}
+
+fn collect_modules(docs: *Overlay, dir: str, name: str, platform: target.OS, mut found: []str) ! Error {
+    let entries = overlay_read_dir(docs, dir) catch {
+        e => fail failed("open", dir, e)
+    }
+    var sorted = entries
+    slices.sort_by(mut sorted, fn(a: Entry, b: Entry) -> bool { a.name < b.name })
+    for entry in sorted {
+        if !entry.dir || entry.name == examples_dir || entry.name == "testdata" || text.starts_with(entry.name, "_") || !import_segment(entry.name) {
+            continue
+        }
+        let child = path.join([dir, entry.name])
+        if overlay_exists(docs, path.join([child, manifest_file])) || overlay_exists(docs, path.join([child, module_file])) {
+            continue
+        }
+        var child_name = entry.name
+        if name != "" {
+            child_name = "{name}/{entry.name}"
+        }
+        if holds_sources(docs, child, platform)? {
+            found.push(child_name)
+        }
+        collect_modules(docs, child, child_name, platform, mut found)?
+    }
+}
+
+fn import_segment(name: str) -> bool {
+    if name.len == 0 || name == "std" || (name[0] >= '0' && name[0] <= '9') {
+        return false
+    }
+    for i in 0..name.len {
+        if !name_byte(name[i]) {
+            return false
+        }
+    }
+    true
+}
