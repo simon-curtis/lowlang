@@ -357,6 +357,9 @@ export class Styler {
         if (word === "after") {
             return tokens.startsLine(index) && tokens.text(next) === "(";
         }
+        if (word === "fork") {
+            return tokens.text(next) === "{" && tokens.text(tokens.before(index)) === "=";
+        }
         if (word === "region") {
             const previous = tokens.text(tokens.before(index));
             return tokens.text(next) === "{" && previous !== "if" && previous !== "match" && previous !== "in";
