@@ -1,0 +1,387 @@
+import ir
+import types
+
+const min_word = -9223372036854775807 - 1
+const single_two_63 = 0x5F000000
+const single_minus_two_63 = 0xDF000000
+const double_two_63 = 0x43E0000000000000
+const double_minus_two_63 = -4332462841530417152
+
+fn lower(l: *Lowering, v: *ir.Value) ! Error {
+    match v.op {
+        OpConst => l.set_constant(v, v.aux, 0)
+        OpUndef => l.set_constant(v, 0, 0)
+        OpParam => {
+            l.vals[v.id] = l.words[v.aux]
+        }
+        OpPhi => {}
+        OpSlot => l.set_constant(v, l.slot_region(v.aux) << 32, l.slot_region(v.aux))
+        OpAdd => l.arithmetic(v, op_i_add, op_f_add)?
+        OpSub => l.arithmetic(v, op_i_sub, op_f_sub)?
+        OpMul => l.arithmetic(v, op_i_mul, op_f_mul)?
+        OpAnd => l.bitwise(v, op_bitwise_and)?
+        OpOr => l.bitwise(v, op_bitwise_or)?
+        OpXor => l.bitwise(v, op_bitwise_xor)?
+        OpDiv => l.divide(v)?
+        OpRem => l.divide(v)?
+        OpShl => l.shift(v)?
+        OpShr => l.shift(v)?
+        OpNeg => l.negate(v)?
+        OpCompl => {
+            let flipped = l.make(op_bitwise_xor, l.get(v.args[0])?, l.whole(-1))
+            l.set(v, l.normalize(flipped, v.type), 0)
+        }
+        OpNot => l.set(v, l.make(op_bitwise_xor, l.get(v.args[0])?, l.whole(1)), 0)
+        OpMulHigh => l.multiply_high(v)?
+        OpTrailingZeros => l.set(v, l.trailing_zeros(l.get(v.args[0])?), 0)
+        OpConvert => l.convert(v)?
+        OpSqrt => l.float_unary(v, glsl_sqrt)?
+        OpFloor => l.float_unary(v, glsl_floor)?
+        OpEq => l.compare(v)?
+        OpNe => l.compare(v)?
+        OpLt => l.compare(v)?
+        OpLe => l.compare(v)?
+        OpGt => l.compare(v)?
+        OpGe => l.compare(v)?
+        OpLoad => l.read(v)?
+        OpStore => l.write(v)?
+        OpCheck => {
+            let index = l.get(v.args[0])?
+            let limit = l.get(v.args[1])?
+            l.guard(l.test(op_u_less_than, index, limit), failed_index)
+        }
+        OpRuntime => l.runtime(v)?
+        OpResult => l.result(v)?
+        OpVector => l.vector(v)?
+        OpVectorScalar => l.vector_mask(v)?
+        _ => fail Unsupported("{ir.op_name(v.op)} in kernel {l.k.name}")
+    }
+}
+
+fn is_float(t: *types.Type?) -> bool {
+    match t {
+        some(inner) => types.is_float(inner)
+        none => false
+    }
+}
+
+fn float_bits(t: *types.Type?) -> i64 {
+    match t {
+        some(inner) => inner.bits
+        none => 64
+    }
+}
+
+fn signed_type(t: *types.Type?) -> bool {
+    match t {
+        some(inner) => inner.signed
+        none => false
+    }
+}
+
+fn signed_compare(t: *types.Type?) -> bool {
+    match t {
+        some(inner) => !types.is_integer(inner) || inner.signed
+        none => true
+    }
+}
+
+fn to_float(l: *Lowering, id: u32, bits: i64) -> u32 {
+    if bits == 32 {
+        return l.m.value(op_bitcast, l.float_type(32), [l.narrow(id)])
+    }
+    l.m.value(op_bitcast, l.float_type(64), [id])
+}
+
+fn from_float(l: *Lowering, id: u32, bits: i64) -> u32 {
+    if bits == 32 {
+        return l.widen(l.m.value(op_bitcast, l.half_type, [id]), false)
+    }
+    l.m.value(op_bitcast, l.word_type, [id])
+}
+
+fn float_of(l: *Lowering, v: *ir.Value, bits: i64) -> u32 ! Error {
+    l.to_float(l.get(v)?, bits)
+}
+
+fn normalize(l: *Lowering, id: u32, t: *types.Type?) -> u32 {
+    let ty = t ?? return id
+    if ty.bits == 0 || ty.bits == 64 {
+        return id
+    }
+    if types.is_integer(ty) && ty.signed {
+        let by = l.whole(64 - ty.bits)
+        return l.make(op_shift_right_arithmetic, l.make(op_shift_left_logical, id, by), by)
+    }
+    l.make(op_bitwise_and, id, l.whole((1 << ty.bits) - 1))
+}
+
+fn address_region(l: *Lowering, v: *ir.Value) -> i64 {
+    if v.type != none {
+        return 0
+    }
+    let left = l.vals[v.args[0].id].region
+    let right = l.vals[v.args[1].id].region
+    if right == 0 {
+        return left
+    }
+    if left == 0 && v.op == ir.Op.OpAdd {
+        return right
+    }
+    0
+}
+
+fn arithmetic(l: *Lowering, v: *ir.Value, integer: u32, float: u32) ! Error {
+    if is_float(v.type) {
+        let bits = float_bits(v.type)
+        let a = l.float_of(v.args[0], bits)?
+        let b = l.float_of(v.args[1], bits)?
+        let result = l.m.value(float, l.float_type(bits), [a, b])
+        l.exact(result)
+        l.set(v, l.from_float(result, bits), 0)
+        return
+    }
+    let a = l.get(v.args[0])?
+    let b = l.get(v.args[1])?
+    l.set(v, l.normalize(l.make(integer, a, b), v.type), l.address_region(v))
+}
+
+fn bitwise(l: *Lowering, v: *ir.Value, op: u32) ! Error {
+    let a = l.get(v.args[0])?
+    let b = l.get(v.args[1])?
+    l.set(v, l.make(op, a, b), 0)
+}
+
+fn constant_of(l: *Lowering, v: *ir.Value) -> i64? {
+    let held = l.vals[v.id]
+    if held.constant {
+        return held.bits
+    }
+    none
+}
+
+fn divide(l: *Lowering, v: *ir.Value) ! Error {
+    if is_float(v.type) {
+        if v.op == ir.Op.OpRem {
+            fail Unsupported("a float remainder in kernel {l.k.name}")
+        }
+        l.arithmetic(v, op_f_div, op_f_div)?
+        return
+    }
+    let a = l.get(v.args[0])?
+    let b = l.get(v.args[1])?
+    let divisor = l.constant_of(v.args[1])
+    if divisor == none || divisor == 0 {
+        l.guard(l.test(op_i_not_equal, b, l.whole(0)), failed_divide)
+    }
+    let quotient = v.op == ir.Op.OpDiv
+    if v.type != none && !signed_type(v.type) {
+        let result = l.make(if quotient { op_u_div } else { op_u_mod }, a, b)
+        l.set(v, l.normalize(result, v.type), 0)
+        return
+    }
+    let direct = if quotient { op_s_div } else { op_s_rem }
+    if divisor != none && divisor != -1 {
+        l.set(v, l.normalize(l.make(direct, a, b), v.type), 0)
+        return
+    }
+    let negative_one = l.test(op_i_equal, b, l.whole(-1))
+    let safe = l.pick(l.word_type, negative_one, l.whole(1), b)
+    let plain = l.make(direct, a, safe)
+    var special = l.whole(0)
+    if quotient {
+        special = l.make(op_i_sub, l.whole(0), a)
+    }
+    l.set(v, l.normalize(l.pick(l.word_type, negative_one, special, plain), v.type), 0)
+}
+
+fn shift(l: *Lowering, v: *ir.Value) ! Error {
+    let a = l.get(v.args[0])?
+    let count = l.get(v.args[1])?
+    let fixed = l.constant_of(v.args[1]) ?? -1
+    let within = fixed >= 0 && fixed <= 63
+    if v.op == ir.Op.OpShr && signed_type(v.type) {
+        var by = count
+        if !within {
+            by = l.pick(l.word_type, l.test(op_u_less_than_equal, count, l.whole(63)), count, l.whole(63))
+        }
+        l.set(v, l.make(op_shift_right_arithmetic, a, by), 0)
+        return
+    }
+    let op = if v.op == ir.Op.OpShl { op_shift_left_logical } else { op_shift_right_logical }
+    var result: u32 = 0
+    if within {
+        result = l.make(op, a, count)
+    } else {
+        let inside = l.test(op_u_less_than_equal, count, l.whole(63))
+        let by = l.pick(l.word_type, inside, count, l.whole(0))
+        result = l.pick(l.word_type, inside, l.make(op, a, by), l.whole(0))
+    }
+    if v.op == ir.Op.OpShl {
+        result = l.normalize(result, v.type)
+    }
+    l.set(v, result, 0)
+}
+
+fn negate(l: *Lowering, v: *ir.Value) ! Error {
+    if is_float(v.type) {
+        let bits = float_bits(v.type)
+        let x = l.float_of(v.args[0], bits)?
+        l.set(v, l.from_float(l.m.value(op_f_negate, l.float_type(bits), [x]), bits), 0)
+        return
+    }
+    let result = l.make(op_i_sub, l.whole(0), l.get(v.args[0])?)
+    l.set(v, l.normalize(result, v.type), 0)
+}
+
+fn multiply_high(l: *Lowering, v: *ir.Value) ! Error {
+    let a = l.get(v.args[0])?
+    let b = l.get(v.args[1])?
+    let pair = l.m.declare("pair", op_type_struct, [l.word_type, l.word_type])
+    let product = l.m.value(op_u_mul_extended, pair, [a, b])
+    var high = l.m.value(op_composite_extract, l.word_type, [product, 1])
+    if signed_type(v.type) {
+        let sixty_three = l.whole(63)
+        high = l.make(op_i_sub, high, l.make(op_bitwise_and, b, l.make(op_shift_right_arithmetic, a, sixty_three)))
+        high = l.make(op_i_sub, high, l.make(op_bitwise_and, a, l.make(op_shift_right_arithmetic, b, sixty_three)))
+    }
+    l.set(v, high, 0)
+}
+
+fn trailing_zeros(l: *Lowering, x: u32) -> u32 {
+    let low = l.narrow(x)
+    let high = l.narrow(l.make(op_shift_right_logical, x, l.whole(32)))
+    let in_low = l.widen(l.extension(l.half_type, glsl_find_i_lsb, low), false)
+    let in_high = l.make(op_i_add, l.widen(l.extension(l.half_type, glsl_find_i_lsb, high), false), l.whole(32))
+    let high_empty = l.test(op_i_equal, high, l.half(0))
+    let low_empty = l.test(op_i_equal, low, l.half(0))
+    let above = l.pick(l.word_type, high_empty, l.whole(64), in_high)
+    l.pick(l.word_type, low_empty, above, in_low)
+}
+
+fn float_unary(l: *Lowering, v: *ir.Value, instruction: u32) ! Error {
+    let bits = float_bits(v.type)
+    let x = l.float_of(v.args[0], bits)?
+    l.set(v, l.from_float(l.extension(l.float_type(bits), instruction, x), bits), 0)
+}
+
+fn integer_compare(op: ir.Op, signed: bool) -> u32 {
+    match op {
+        OpEq => op_i_equal
+        OpNe => op_i_not_equal
+        OpLt => if signed { op_s_less_than } else { op_u_less_than }
+        OpLe => if signed { op_s_less_than_equal } else { op_u_less_than_equal }
+        OpGt => if signed { op_s_greater_than } else { op_u_greater_than }
+        _ => if signed { op_s_greater_than_equal } else { op_u_greater_than_equal }
+    }
+}
+
+fn float_compare(op: ir.Op) -> u32 {
+    match op {
+        OpEq => op_f_ord_equal
+        OpNe => op_f_unord_not_equal
+        OpLt => op_f_ord_less_than
+        OpLe => op_f_ord_less_than_equal
+        OpGt => op_f_ord_greater_than
+        _ => op_f_ord_greater_than_equal
+    }
+}
+
+fn compare(l: *Lowering, v: *ir.Value) ! Error {
+    var holds: u32 = 0
+    if is_float(v.type) {
+        let bits = float_bits(v.type)
+        let a = l.float_of(v.args[0], bits)?
+        let b = l.float_of(v.args[1], bits)?
+        holds = l.test(float_compare(v.op), a, b)
+    } else {
+        let a = l.get(v.args[0])?
+        let b = l.get(v.args[1])?
+        holds = l.test(integer_compare(v.op, signed_compare(v.type)), a, b)
+    }
+    l.set(v, l.pick(l.word_type, holds, l.whole(1), l.whole(0)), 0)
+    l.truths[v.id] = holds
+}
+
+fn widens(from: *types.Type, to: *types.Type) -> bool {
+    if !types.is_integer(from) || !types.is_integer(to) || to.bits == 0 || from.bits == 0 {
+        return false
+    }
+    if !from.signed && !to.signed {
+        return to.bits >= from.bits
+    }
+    if !from.signed {
+        return to.bits > from.bits
+    }
+    to.signed && to.bits >= from.bits
+}
+
+fn is_u64(t: *types.Type) -> bool {
+    types.is_integer(t) && t.bits == 64 && !t.signed
+}
+
+fn float_to_signed(l: *Lowering, x: u32, bits: i64) -> u32 {
+    let type = l.float_type(bits)
+    let low = l.float_constant(bits, if bits == 32 { single_minus_two_63 } else { double_minus_two_63 })
+    let high = l.float_constant(bits, if bits == 32 { single_two_63 } else { double_two_63 })
+    let above = l.test(op_f_ord_greater_than_equal, x, low)
+    let below = l.test(op_f_ord_less_than, x, high)
+    let fits = l.test(op_logical_and, above, below)
+    let safe = l.pick(type, fits, x, l.float_constant(bits, 0))
+    let truncated = l.m.value(op_convert_f_to_s, l.word_type, [safe])
+    l.pick(l.word_type, fits, truncated, l.whole(min_word))
+}
+
+fn float_to_unsigned(l: *Lowering, x: u32, bits: i64) -> u32 {
+    let type = l.float_type(bits)
+    let high = l.float_constant(bits, if bits == 32 { single_two_63 } else { double_two_63 })
+    let large = l.test(op_f_ord_greater_than_equal, x, high)
+    let lowered = l.m.value(op_f_sub, type, [x, high])
+    l.exact(lowered)
+    let upper = l.make(op_bitwise_xor, l.float_to_signed(lowered, bits), l.whole(min_word))
+    l.pick(l.word_type, large, upper, l.float_to_signed(x, bits))
+}
+
+fn convert(l: *Lowering, v: *ir.Value) ! Error {
+    let from = types.must(v.from)
+    let to = types.must(v.type)
+    let source = l.get(v.args[0])?
+    let integers = types.is_integer(from) && types.is_integer(to)
+    if integers && widens(from, to) {
+        l.set(v, source, 0)
+    } else if integers {
+        l.set(v, l.normalize(source, v.type), 0)
+    } else if types.is_integer(from) {
+        let op = if is_u64(from) { op_convert_u_to_f } else { op_convert_s_to_f }
+        l.set(v, l.from_float(l.m.value(op, l.float_type(to.bits), [source]), to.bits), 0)
+    } else if types.is_integer(to) {
+        let x = l.to_float(source, from.bits)
+        if is_u64(to) {
+            l.set(v, l.float_to_unsigned(x, from.bits), 0)
+        } else {
+            l.set(v, l.normalize(l.float_to_signed(x, from.bits), v.type), 0)
+        }
+    } else if to.bits != from.bits {
+        let x = l.to_float(source, from.bits)
+        l.set(v, l.from_float(l.m.value(op_f_convert, l.float_type(to.bits), [x]), to.bits), 0)
+    } else {
+        l.set(v, source, 0)
+    }
+}
+
+fn runtime(l: *Lowering, v: *ir.Value) ! Error {
+    let entry = v.runtime ?? panic("runtime call without an entry")
+    if entry != ir.Runtime.RtExp {
+        fail Unsupported("the {ir.runtime_symbol(entry)} runtime routine in kernel {l.k.name}")
+    }
+    l.results[v.id] = l.exponential(l.get(v.args[0])?)
+}
+
+fn result(l: *Lowering, v: *ir.Value) ! Error {
+    let call = v.args[0]
+    if call.block.id != l.current {
+        fail Unsupported("a result read outside the block of its call in kernel {l.k.name}")
+    }
+    let id = l.results[call.id] ?? fail Unsupported("the result of {ir.op_name(call.op)} in kernel {l.k.name}")
+    l.set(v, id, 0)
+}

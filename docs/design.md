@@ -9328,7 +9328,22 @@ Optimiser:
 
 #### Kernel builds
 
-A kernel is compiled like any function, and that function is what a call runs. `ir.kernel_builds` also gives each kernel the program reaches a second body, in `ir.Program.kernels`: a copy of the kernel's SSA as it was built, before the optimiser, with every call replaced by the body of its callee until none is left, then simplified. The checker has already refused recursion and calls through function values, so the loop ends. No back end reads `ir.Program.kernels`.
+A kernel is compiled like any function, and that function is what a call runs. `ir.kernel_builds` also gives each kernel the program reaches a second body, in `ir.Program.kernels`: a copy of the kernel's SSA as it was built, before the optimiser, with every call replaced by the body of its callee until none is left, then simplified. The checker has already refused recursion and calls through function values, so the loop ends. `low` does not build them into a program.
+
+`compiler/spirv` turns one kernel build into a SPIR-V 1.5 compute module, `spirv.generate`:
+
+- The module declares the `Shader` and `Int64` capabilities, and `Float64` when the kernel computes in `f64` or calls `exp`, so a device needs `shaderInt64` and for those kernels `shaderFloat64`. The workgroup is 64 by 1 by 1.
+- Every SSA value is a 64-bit word, as in the native build. A typed integer operation computes in 64 bits and then sign-extends or masks to its width. An `f32` is its bit pattern in the low half, and a compare gives 0 or 1.
+- Each slice parameter is a storage buffer of 32-bit words, bound in parameter order from binding 1 of set 0. Each stack slot is an array of 32-bit words local to the invocation, zero at entry. An address is a 64-bit word: the buffer or slot in the high half and a byte offset in the low half. A load or store of 8 bytes reads or writes two words. Where the SSA does not fix which buffer an address names, as with a slice an `if` picks, the load or store is an `OpSwitch` over every buffer and slot.
+- The push constants hold the invocation count, then each scalar parameter after the index, then each slice's length. A 64-bit integer or `f64` parameter takes 8 bytes and any other scalar 4. The first parameter is `GlobalInvocationId.x`, and an invocation at or past the count returns.
+- The first word of the buffer at binding 0 is the flag. A failure stores its code there and returns: 1 for a bounds check, 2 for a division by zero, 3 for an address that names no buffer or slot.
+- A value used outside its block, and each phi, is a variable of the function. The value is stored where it is defined and loaded in each block that reads it.
+- Control flow is structured from the dominator tree. A block two or more forward edges enter becomes the merge of a one-case `OpSwitch`, and a loop header becomes an `OpLoopMerge`. A branch that SPIR-V forbids, such as one that leaves two constructs at once, stores a code in a `route` variable and leaves through the merges between, each of which branches on the code.
+- Division, remainder, shifts, conversions from a float, `ctz` and `mulhi` give the native build's result for every input: a shift count of 64 or more, the lowest integer divided by -1, a float outside the integer's range. `exp` is the runtime's `rt_exp` in `f64`, with its constants, for an `f32` argument too.
+- A float add, subtract, multiply or divide is `NoContraction`, so the device cannot fuse a multiply and an add that the CPU keeps apart.
+- A vector operation works one lane at a time on the lane's 32-bit or 64-bit words.
+
+It fails with `spirv.Error.Unsupported` on a jump table, irreducible control flow, a float remainder, a load or store of 8 or 16 bits, a vector with lanes under 32 bits, a vector shuffle, a `mut` slice's header used as a value, an `if` whose two arms enter one block that holds a phi, a call's result read outside the call's block, a struct or vector passed as a scalar parameter, push constants over 128 bytes, and a runtime routine other than `rt_exp`.
 
 ### Code generation
 
@@ -9890,6 +9905,7 @@ Text areas:
   - `compiler/tests/wlgen` tests the generated signatures and checks, then builds a registry client from the vendored protocols and, when a Wayland compositor is running, runs it.
   - `compiler/tests/vkgen` tests declaration parsing, extension enum values and the selection format, and checks the shape of the generated bindings. It renders a rounded, bordered quad offscreen with the quad shaders through the bindings and dynamic rendering, comparing pixels. It skips without libvulkan or a Vulkan 1.3 device.
 - `compiler/tests/shaders` checks that the sources and the SPIR-V match the sums recorded in `shaders.sum` and validates the SPIR-V with `spirv-val` when installed.
+- `compiler/tests/spirv` generates the module of each kernel in `testdata/run/kernel.low`. One test validates each module with `spirv-val --target-env vulkan1.2`; `compiler/oracletool` pins SPIRV-Tools v2026.4, and the test skips without it. The other runs `parity.py` under `python3`, skipping without it: `interp.py` interprets each module as the fixture's `main` calls its kernel, and the values must equal the lines of `testdata/run/kernel.out`. It also checks the flag after a failed bounds check and a division by zero, and that an invocation at or past the count stores nothing.
 
 ## Tests
 

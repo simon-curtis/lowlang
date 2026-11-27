@@ -1,0 +1,468 @@
+import ir
+import types
+
+pub enum Error {
+    Unsupported(what: str)
+}
+
+pub fn message(e: Error) -> str {
+    match e {
+        Unsupported(what) => "spirv: {what}"
+    }
+}
+
+const workgroup: u32 = 64
+const constants_limit = 128
+const finished = 0
+const failed_index = 1
+const failed_divide = 2
+const failed_address = 3
+
+struct Val {
+    known: bool = false
+    id: u32 = 0
+    home: i64 = -1
+    variable: u32 = 0
+    constant: bool = false
+    bits: i64 = 0
+    region: i64 = 0
+    header: i64 = 0
+}
+
+struct Region {
+    variable: u32
+    buffer: bool
+    length: u32 = 0
+}
+
+struct Lowering {
+    m: *Module
+    k: *ir.Func
+    dom: *ir.Dominators
+    vals: []Val
+    shared: []bool
+    regions: []Region = []
+    words: []Val = []
+    current: i64 = -1
+    caching: bool = true
+    loaded: [i64: u32] = [:]
+    truths: [i64: u32] = [:]
+    results: [i64: u32] = [:]
+    void_type: u32 = 0
+    bool_type: u32 = 0
+    half_type: u32 = 0
+    word_type: u32 = 0
+    float64: bool = false
+    extended: u32 = 0
+    flag: u32 = 0
+    route: u32 = 0
+    merge: []bool = []
+    header: []bool = []
+    merges: [][]i64 = []
+    around: [][]i64 = []
+    loops: []*ir.NaturalLoop = []
+    inner: []i64 = []
+    parent: []i64 = []
+    loop_at: []i64 = []
+    frames: []*Frame = []
+    frame_at: []i64 = []
+    dests: []Dest = []
+    dest_at: [i64: i64] = [:]
+    carried: [][]i64 = []
+    tasks: []Task = []
+}
+
+fn whole(l: *Lowering, bits: i64) -> u32 {
+    let low = u32(bits & 0xFFFFFFFF)
+    let high = u32(bits >> 32 & 0xFFFFFFFF)
+    l.m.typed("whole {bits}", op_constant, l.word_type, [low, high])
+}
+
+fn half(l: *Lowering, bits: i64) -> u32 {
+    let low = u32(bits & 0xFFFFFFFF)
+    l.m.typed("half {low}", op_constant, l.half_type, [low])
+}
+
+fn float_type(l: *Lowering, bits: i64) -> u32 {
+    if bits == 32 {
+        return l.m.declare("f32", op_type_float, [32])
+    }
+    l.float64 = true
+    l.m.declare("f64", op_type_float, [64])
+}
+
+fn float_constant(l: *Lowering, width: i64, bits: i64) -> u32 {
+    let low = u32(bits & 0xFFFFFFFF)
+    if width == 32 {
+        return l.m.typed("single {low}", op_constant, l.float_type(32), [low])
+    }
+    let high = u32(bits >> 32 & 0xFFFFFFFF)
+    l.m.typed("double {bits}", op_constant, l.float_type(64), [low, high])
+}
+
+fn pointer(l: *Lowering, class: u32, type: u32) -> u32 {
+    l.m.declare("pointer {class} {type}", op_type_pointer, [class, type])
+}
+
+fn global(l: *Lowering, class: u32, type: u32) -> u32 {
+    let id = l.m.fresh()
+    l.m.declarations.put(op_variable, [l.pointer(class, type), id, class])
+    id
+}
+
+fn local(l: *Lowering, type: u32) -> u32 {
+    let id = l.m.fresh()
+    l.m.locals.put(op_variable, [l.pointer(class_function, type), id, class_function])
+    id
+}
+
+fn local_from(l: *Lowering, type: u32, initial: u32) -> u32 {
+    let id = l.m.fresh()
+    l.m.locals.put(op_variable, [l.pointer(class_function, type), id, class_function, initial])
+    id
+}
+
+fn decorate(l: *Lowering, target: u32, decoration: u32, operands: []u32) {
+    var all: []u32 = [target, decoration]
+    for w in operands {
+        all.push(w)
+    }
+    l.m.decorations.put(op_decorate, all)
+}
+
+fn exact(l: *Lowering, id: u32) {
+    l.decorate(id, decoration_no_contraction, [])
+}
+
+fn emit(l: *Lowering, op: u32, operands: []u32) {
+    l.m.code.put(op, operands)
+}
+
+fn make(l: *Lowering, op: u32, a: u32, b: u32) -> u32 {
+    l.m.value(op, l.word_type, [a, b])
+}
+
+fn test(l: *Lowering, op: u32, a: u32, b: u32) -> u32 {
+    l.m.value(op, l.bool_type, [a, b])
+}
+
+fn pick(l: *Lowering, type: u32, condition: u32, yes: u32, no: u32) -> u32 {
+    l.m.value(op_select, type, [condition, yes, no])
+}
+
+fn widen(l: *Lowering, narrow: u32, signed: bool) -> u32 {
+    l.m.value(if signed { op_s_convert } else { op_u_convert }, l.word_type, [narrow])
+}
+
+fn narrow(l: *Lowering, wide: u32) -> u32 {
+    l.m.value(op_u_convert, l.half_type, [wide])
+}
+
+fn extension(l: *Lowering, type: u32, instruction: u32, operand: u32) -> u32 {
+    if l.extended == 0 {
+        l.extended = l.m.fresh()
+    }
+    l.m.value(op_ext_inst, type, [l.extended, instruction, operand])
+}
+
+fn stop(l: *Lowering, code: i64) {
+    if code != finished {
+        let zero = l.half(0)
+        let at = l.m.value(op_access_chain, l.pointer(class_storage_buffer, l.half_type), [l.flag, zero, zero])
+        l.emit(op_store, [at, l.half(code)])
+    }
+    l.emit(op_return, [])
+}
+
+fn guard(l: *Lowering, passes: u32, code: i64) {
+    let merge = l.m.fresh()
+    let failed = l.m.fresh()
+    l.emit(op_selection_merge, [merge, 0])
+    l.emit(op_branch_conditional, [passes, merge, failed])
+    l.emit(op_label, [failed])
+    l.stop(code)
+    l.emit(op_label, [merge])
+}
+
+fn get(l: *Lowering, v: *ir.Value) -> u32 ! Error {
+    let held = l.vals[v.id]
+    if !held.known {
+        fail Unsupported("the result of {ir.op_name(v.op)} in kernel {l.k.name}")
+    }
+    if held.header != 0 {
+        fail Unsupported("the header of a mut slice used as a value in kernel {l.k.name}")
+    }
+    if held.constant {
+        return l.whole(held.bits)
+    }
+    if held.home == -1 || held.home == l.current {
+        return held.id
+    }
+    match l.loaded[v.id] {
+        some(id) => return id
+        none => {}
+    }
+    let id = l.m.value(op_load, l.word_type, [held.variable])
+    if l.caching {
+        l.loaded[v.id] = id
+    }
+    id
+}
+
+fn set(l: *Lowering, v: *ir.Value, id: u32, region: i64) {
+    var variable: u32 = 0
+    if l.shared[v.id] {
+        variable = l.local(l.word_type)
+        l.emit(op_store, [variable, id])
+    }
+    l.vals[v.id] = Val { known: true, id, home: l.current, variable, region }
+}
+
+fn set_constant(l: *Lowering, v: *ir.Value, bits: i64, region: i64) {
+    l.vals[v.id] = Val { known: true, constant: true, bits, region }
+}
+
+fn mark_shared(l: *Lowering) {
+    for b in l.k.blocks {
+        for v in b.values {
+            for i, a in v.args {
+                var reader = b.id
+                if v.op == OpPhi && i < b.preds.len {
+                    reader = b.preds[i].id
+                }
+                if a.block.id != reader {
+                    l.shared[a.id] = true
+                }
+            }
+        }
+        match b.control {
+            some(c) => {
+                if c.block.id != b.id {
+                    l.shared[c.id] = true
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+fn phi_variables(l: *Lowering) {
+    for b in l.k.blocks {
+        for v in b.values {
+            if v.op == OpPhi {
+                l.vals[v.id] = Val { known: true, home: -2, variable: l.local(l.word_type) }
+            }
+        }
+    }
+}
+
+enum Source {
+    Index
+    Member
+    Pointer
+    Length
+    Reference
+}
+
+struct Word {
+    source: Source
+    at: i64 = 0
+    signed: bool = false
+}
+
+struct Member {
+    wide: bool
+    offset: i64
+}
+
+struct Layout {
+    words: []Word = []
+    members: []Member = []
+    lengths: []i64 = []
+    buffers: i64 = 0
+    bytes: i64 = 0
+}
+
+fn add_member(layout: *Layout, wide: bool) -> i64 {
+    let size = if wide { 8 } else { 4 }
+    let offset = (layout.bytes + size - 1) / size * size
+    layout.members.push(Member { wide, offset })
+    layout.bytes = offset + size
+    layout.members.len - 1
+}
+
+fn scalar_word(l: *Lowering, layout: *Layout, t: *types.Type) -> Word ! Error {
+    match t.kind {
+        BoolKind => Word { source: Member, at: layout.add_member(false) }
+        EnumKind => Word { source: Member, at: layout.add_member(false) }
+        FloatKind => Word { source: Member, at: layout.add_member(t.bits == 64) }
+        IntKind => {
+            if t.bits != 32 && t.bits != 64 {
+                fail Unsupported("a parameter of type {t.text()} in kernel {l.k.name}")
+            }
+            Word { source: Member, at: layout.add_member(t.bits == 64), signed: t.signed }
+        }
+        _ => fail Unsupported("a parameter of type {t.text()} in kernel {l.k.name}")
+    }
+}
+
+fn parameters(l: *Lowering) -> *Layout ! Error {
+    let layout = new(Layout {})
+    let _ = layout.add_member(false)
+    layout.words.push(Word { source: Index })
+    for p in l.k.params[1..] {
+        if p.type.kind != SliceKind {
+            layout.words.push(l.scalar_word(layout, p.type)?)
+            continue
+        }
+        let buffer = layout.buffers
+        layout.buffers += 1
+        if p.mutable {
+            layout.words.push(Word { source: Reference, at: buffer })
+            continue
+        }
+        layout.words.push(Word { source: Pointer, at: buffer })
+        layout.words.push(Word { source: Length, at: buffer })
+        layout.words.push(Word { source: Length, at: buffer })
+    }
+    for _ in 0..layout.buffers {
+        layout.lengths.push(layout.add_member(false))
+    }
+    if layout.bytes > constants_limit {
+        fail Unsupported("{layout.bytes} bytes of scalar parameters and slice lengths in kernel {l.k.name}, past the {constants_limit} a device must take")
+    }
+    layout
+}
+
+fn bound_buffer(l: *Lowering, block: u32, binding: i64) -> u32 {
+    let v = l.global(class_storage_buffer, block)
+    l.decorate(v, decoration_descriptor_set, [0])
+    l.decorate(v, decoration_binding, [u32(binding)])
+    v
+}
+
+fn slot_regions(l: *Lowering) {
+    for words in l.k.slots {
+        let cells = l.half(2 * words)
+        let array = l.m.declare("array {words}", op_type_array, [l.half_type, cells])
+        let zero = l.m.typed("null {array}", op_constant_null, array, [])
+        l.regions.push(Region { variable: l.local_from(array, zero), buffer: false })
+    }
+}
+
+fn bind_words(l: *Lowering, layout: *Layout, index: u32, loaded: []u32) {
+    for i in 0..layout.buffers {
+        l.regions[i].length = l.widen(loaded[layout.lengths[i]], false)
+    }
+    for w in layout.words {
+        match w.source {
+            Index => l.words.push(Val { known: true, id: l.widen(index, false) })
+            Member => {
+                var id = loaded[w.at]
+                if !layout.members[w.at].wide {
+                    id = l.widen(id, w.signed)
+                }
+                l.words.push(Val { known: true, id })
+            }
+            Pointer => l.words.push(Val { known: true, constant: true, bits: (w.at + 1) << 32, region: w.at + 1 })
+            Length => l.words.push(Val { known: true, id: l.regions[w.at].length })
+            Reference => l.words.push(Val { known: true, header: w.at + 1 })
+        }
+    }
+}
+
+fn highest_value(k: *ir.Func) -> i64 {
+    var highest = 0
+    for b in k.blocks {
+        for v in b.values {
+            if v.id > highest {
+                highest = v.id
+            }
+        }
+    }
+    highest
+}
+
+pub fn generate(k: *ir.Func) -> []u8 ! Error {
+    let m = new_module()
+    var vals: []Val = []
+    var shared: []bool = []
+    for _ in 0..highest_value(k) + 1 {
+        vals.push(Val {})
+        shared.push(false)
+    }
+    let l = new(Lowering { m, k, dom: ir.func_dominators(k), vals, shared })
+    l.void_type = m.declare("void", op_type_void, [])
+    l.bool_type = m.declare("bool", op_type_bool, [])
+    l.half_type = m.declare("u32", op_type_int, [32, 0])
+    l.word_type = m.declare("u64", op_type_int, [64, 0])
+    let function_type = m.declare("function", op_type_function, [l.void_type])
+    let ids = m.declare("ids", op_type_vector, [l.half_type, 3])
+    let invocation = l.global(class_input, ids)
+    l.decorate(invocation, decoration_builtin, [builtin_global_invocation_id])
+    let array = m.declare("cells", op_type_runtime_array, [l.half_type])
+    l.decorate(array, decoration_array_stride, [4])
+    let block = m.declare("buffer", op_type_struct, [array])
+    l.decorate(block, decoration_block, [])
+    m.decorations.put(op_member_decorate, [block, 0, decoration_offset, 0])
+    var interface: []u32 = [invocation]
+    l.flag = l.bound_buffer(block, 0)
+    interface.push(l.flag)
+    let layout = l.parameters()?
+    for i in 0..layout.buffers {
+        let v = l.bound_buffer(block, i + 1)
+        interface.push(v)
+        l.regions.push(Region { variable: v, buffer: true })
+    }
+    l.slot_regions()
+    var members: []u32 = []
+    for member in layout.members {
+        members.push(if member.wide { l.word_type } else { l.half_type })
+    }
+    let constants_type = m.declare("constants", op_type_struct, members)
+    l.decorate(constants_type, decoration_block, [])
+    for i, member in layout.members {
+        m.decorations.put(op_member_decorate, [constants_type, u32(i), decoration_offset, u32(member.offset)])
+    }
+    let constants = l.global(class_push_constant, constants_type)
+    interface.push(constants)
+    let entry = m.fresh()
+    m.entry.put(op_function, [l.void_type, entry, 0, function_type])
+    m.entry.put(op_label, [m.fresh()])
+    let component = m.value(op_access_chain, l.pointer(class_input, l.half_type), [invocation, l.half(0)])
+    let index = m.value(op_load, l.half_type, [component])
+    var loaded: []u32 = []
+    for i, type in members {
+        let at = m.value(op_access_chain, l.pointer(class_push_constant, type), [constants, l.half(i)])
+        loaded.push(m.value(op_load, type, [at]))
+    }
+    l.guard(l.test(op_u_less_than, index, loaded[0]), finished)
+    l.bind_words(layout, index, loaded)
+    l.mark_shared()
+    l.phi_variables()
+    l.flow()?
+    l.emit(op_function_end, [])
+    m.header.put(op_capability, [capability_shader])
+    m.header.put(op_capability, [capability_int64])
+    if l.float64 {
+        m.header.put(op_capability, [capability_float64])
+    }
+    if l.extended != 0 {
+        var imported: []u32 = [l.extended]
+        for w in name_words("GLSL.std.450") {
+            imported.push(w)
+        }
+        m.header.put(op_ext_inst_import, imported)
+    }
+    m.header.put(op_memory_model, [addressing_logical, memory_glsl450])
+    var entry_point: []u32 = [model_compute, entry]
+    for w in name_words("main") {
+        entry_point.push(w)
+    }
+    for v in interface {
+        entry_point.push(v)
+    }
+    m.header.put(op_entry_point, entry_point)
+    m.header.put(op_execution_mode, [entry, mode_local_size, workgroup, 1, 1])
+    m.encode()
+}
