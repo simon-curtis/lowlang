@@ -1,0 +1,97 @@
+import std/io
+import std/net
+import std/rand
+import std/ssh/key
+import std/testing
+import std/time
+
+fn serve_failure(stream: io.Stream, config: ServerConfig) -> str {
+    using conn = serve_stream(stream, config) catch {
+        e => return describe(e)
+    }
+    ""
+}
+
+fn test_login_grace_closes_a_silent_client(t: *testing.T) {
+    using ends = net.socketpair() or panic("socketpair")
+    let config = ServerConfig { host_keys: [load_signer("ed25519")], auth: password_auth(), login_grace: 1 }
+    let started = time.monotonic()
+    let failure = serve_failure(net.stream(ends.second), config)
+    let millis = (time.monotonic() - started) / 1000000
+    testing.error_if(t, failure != "VersionExchange TimedOut", "failure {failure}")
+    testing.error_if(t, millis < 900 || millis > 5000, "gave up after {millis} ms")
+}
+
+fn test_startups_refuse_by_how_many_wait(t: *testing.T) {
+    var r = rand.seeded(1)
+    let s = Startups { start: 2, rate: 30, full: 4 }
+    testing.error_if(t, refuse(mut r, s, 0) || refuse(mut r, s, 1), "refused below start")
+    testing.error_if(t, !refuse(mut r, s, 4) || !refuse(mut r, s, 9), "admitted at full")
+    var refusals = 0
+    for i in 0..1000 {
+        if refuse(mut r, s, 3) {
+            refusals += 1
+        }
+    }
+    testing.error_if(t, refusals < 570 || refusals > 730, "{refusals} of 1000 refused halfway, where 65% should be")
+}
+
+fn hold(c: net.ConnHandle, settled: fn(), arrived: chan[bool], release: chan[bool]) {
+    using conn = net.adopt(c)
+    arrived <- true
+    let go = <-release
+    settled()
+}
+
+fn closed_at_once(port: i64) -> bool {
+    using conn = net.dial("127.0.0.1", port) or panic("dial")
+    let ended = chan[bool](1)
+    spawn read_end(conn.handle, ended)
+    select {
+        done = <-ended => true
+        after(2000) => false
+    }
+}
+
+fn read_end(h: net.ConnHandle, ended: chan[bool]) {
+    let n = net.read_on(h, io.buffer(16)) or 0
+    ended <- n == 0
+}
+
+fn test_accept_on_counts_a_connection_until_it_settles(t: *testing.T) {
+    using listener = net.listen("127.0.0.1", 0) or panic("listen")
+    let port = listener.handle.addr.port
+    let arrived = chan[bool](4)
+    let release = chan[bool](4)
+    spawn accept_on(listener.handle, Startups { start: 1, rate: 100, full: 1 }, fn(c: net.ConnHandle, settled: fn()) { hold(c, settled, arrived, release) })
+    using first = net.dial("127.0.0.1", port) or panic("dial")
+    let a = <-arrived
+    testing.error_if(t, !closed_at_once(port), "a second connection was admitted while the first waited")
+    release <- true
+    sleep(100)
+    using third = net.dial("127.0.0.1", port) or panic("dial")
+    select {
+        b = <-arrived => {}
+        after(2000) => testing.error(t, "a connection was refused after the first settled")
+    }
+    release <- true
+}
+
+fn key_client(signer: key.Signer) -> ClientConfig {
+    ClientConfig { user: "alice", verify_host_key: accept_any_host_key(), auth: [AuthMethod.PublicKey(signer)] }
+}
+
+fn test_signed_key_decides_the_signature(t: *testing.T) {
+    let user_key = load_signer("ed25519")
+    let seen = chan[i64](4)
+    var auth = ServerAuth { public_key: fn(user, k) { true } }
+    auth.signed_key = fn(s) {
+        seen <- s.session_id.len
+        false
+    }
+    let refused = connect_error(key_client(user_key), base_server([load_signer("ed25519")], auth))
+    testing.error_if(t, refused != "AuthFailed", "a refused signature logged in: {refused}")
+    testing.error_if(t, ((<-seen) ?? 0) != 32, "the hook did not receive the session id")
+    auth.signed_key = check_signature
+    testing.error_if(t, connect_error(key_client(user_key), base_server([load_signer("ed25519")], auth)) != "", "check_signature refused a valid signature")
+}

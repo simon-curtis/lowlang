@@ -1,0 +1,340 @@
+import std/io
+import std/net
+import signals = std/os/signal
+import std/process
+import std/ssh
+import std/ssh/key
+import std/ssh/login
+import std/ssh/wire
+import std/sync
+import std/sys
+
+struct Greeting {
+    keys: key.PublicKey[]
+    methods: str[]
+    banner: str
+    max_auth_tries: i64
+    login_grace: i64
+    accept_env: str[]
+    permit_tty: bool
+    local_forwarding: bool
+    sftp: bool
+    local: net.Addr?
+    remote: net.Addr?
+}
+
+struct Client {
+    link: *Link
+    guard: sync.Mutex
+    next: i64
+    waiting: [i64: chan[Frame]]
+    exits: [i64: chan[process.Exit]]
+    closed: bool
+    account: login.Account?
+    greeting: Greeting
+}
+
+fn read_greeting(r: *wire.Reader) -> Greeting ! io.Error {
+    var keys: key.PublicKey[] = []
+    for i in 0..wire.read_u32(r)? {
+        keys.push(key.parse_blob(wire.read_string(r)?) or fail io.Error.Malformed)
+    }
+    let methods = wire.read_names(r)?
+    let banner = wire.read_str(r)?
+    let max_auth_tries = wire.read_u32(r)?
+    let login_grace = wire.read_u32(r)?
+    var accept_env: str[] = []
+    for i in 0..wire.read_u32(r)? {
+        accept_env.push(wire.read_str(r)?)
+    }
+    let permit_tty = wire.read_bool(r)?
+    let local_forwarding = wire.read_bool(r)?
+    let sftp = wire.read_bool(r)?
+    let local = read_addr(r)?
+    let remote = read_addr(r)?
+    wire.finish(r)?
+    Greeting { keys, methods, banner, max_auth_tries, login_grace, accept_env, permit_tty, local_forwarding, sftp, local, remote }
+}
+
+fn connect_monitor(h: net.ConnHandle) -> *Client ! io.Error {
+    let link = link_on(h)
+    let first = next_frame(link)? ?? fail io.Error.Eof
+    if first.kind != greeting {
+        fail io.Error.Malformed
+    }
+    let c = new(Client {
+        link
+        guard: sync.mutex()
+        next: 1
+        waiting: [:]
+        exits: [:]
+        closed: false
+        account: none
+        greeting: read_greeting(first.body)?
+    })
+    spawn dispatch(c)
+    c
+}
+
+fn exit_channel(c: *Client, pid: i64) -> chan[process.Exit] {
+    sync.lock(c.guard)
+    defer sync.unlock(c.guard)
+    match c.exits[pid] {
+        some(found) => found
+        none => {
+            let made = chan[process.Exit](1)
+            c.exits[pid] = made
+            if c.closed {
+                close(made)
+            }
+            made
+        }
+    }
+}
+
+fn exit_status(r: *wire.Reader) -> process.Exit ! io.Error {
+    let signaled = wire.read_bool(r)?
+    let value = wire.read_u32(r)?
+    if !signaled {
+        return process.Exit.Exited(value)
+    }
+    let sig = signals.from_number(value) ?? fail io.Error.Malformed
+    process.Exit.Signaled(sig)
+}
+
+fn deliver(c: *Client, f: Frame) ! io.Error {
+    if f.kind == child_exited {
+        exit_channel(c, f.id) <- exit_status(f.body)?
+        return
+    }
+    if f.kind != answer {
+        fail io.Error.Malformed
+    }
+    sync.lock(c.guard)
+    let waiter = c.waiting[f.id]
+    c.waiting.delete(f.id)
+    sync.unlock(c.guard)
+    let found = waiter ?? fail io.Error.Malformed
+    found <- f
+}
+
+fn dispatch(c: *Client) {
+    for {
+        let f = next_frame(c.link) or break ?? break
+        deliver(c, f) or break
+    }
+    sync.lock(c.guard)
+    c.closed = true
+    for id, waiter in c.waiting {
+        close(waiter)
+    }
+    c.waiting = [:]
+    for pid, exit in c.exits {
+        close(exit)
+    }
+    sync.unlock(c.guard)
+    net.close_on(c.link.h)
+}
+
+fn ask(c: *Client, kind: i64, body: u8[]) -> Frame ! io.Error {
+    sync.lock(c.guard)
+    if c.closed {
+        sync.unlock(c.guard)
+        fail io.Error.NotConnected
+    }
+    let id = c.next
+    c.next += 1
+    let waiter = chan[Frame](1)
+    c.waiting[id] = waiter
+    sync.unlock(c.guard)
+    send_frame(c.link, kind, id, body, [])?
+    (<-waiter) ?? fail io.Error.NotConnected
+}
+
+fn sign_with(c: *Client, index: i64, algorithm: str, data: u8[]) -> u8[] ! key.Error {
+    var body: u8[] = []
+    wire.put_u32(mut body, index)
+    wire.put_str(mut body, algorithm)
+    wire.put_string(mut body, data)
+    let f = ask(c, ask_sign, body) catch {
+        e => fail key.Error.Io(e)
+    }
+    if !(wire.read_bool(f.body) or false) {
+        fail key.Error.Unsupported
+    }
+    wire.read_string(f.body) or fail key.Error.Malformed
+}
+
+fn remote_signer(c: *Client, index: i64, public: key.PublicKey) -> key.Signer {
+    key.Signer { public, sign: fn(algorithm, data) { sign_with(c, index, algorithm, data)? } }
+}
+
+fn authenticated_by(c: *Client, f: Frame) -> bool {
+    if !(wire.read_bool(f.body) or false) {
+        return false
+    }
+    let account = read_account(f.body) or return false
+    c.account = account
+    true
+}
+
+fn ask_password_of(c: *Client, user: str, secret: str) -> bool {
+    var body: u8[] = []
+    wire.put_str(mut body, user)
+    wire.put_str(mut body, secret)
+    let f = ask(c, ask_password, body) or return false
+    authenticated_by(c, f)
+}
+
+fn ask_key_of(c: *Client, user: str, k: key.PublicKey) -> bool {
+    var body: u8[] = []
+    wire.put_str(mut body, user)
+    wire.put_string(mut body, k.blob)
+    let f = ask(c, ask_key, body) or return false
+    wire.read_bool(f.body) or false
+}
+
+fn ask_signed_key_of(c: *Client, s: ssh.KeySignature) -> bool {
+    var body: u8[] = []
+    wire.put_str(mut body, s.user)
+    wire.put_str(mut body, s.algorithm)
+    wire.put_string(mut body, s.blob)
+    wire.put_string(mut body, s.signature)
+    let f = ask(c, ask_signed_key, body) or return false
+    authenticated_by(c, f)
+}
+
+fn open_remote_terminal(c: *Client) -> login.Terminal ! io.Error {
+    let f = ask(c, ask_terminal, [])?
+    if !wire.read_bool(f.body)? || f.fds.len != 1 {
+        close_all(f.fds)
+        fail io.Error.Denied
+    }
+    login.Terminal { master: f.fds[0], slave: -1, path: wire.read_str(f.body)? }
+}
+
+fn program_kind(p: login.Program) -> i64 {
+    match p {
+        Shell => program_shell
+        Command(text) => program_command
+        Subsystem(name) => program_subsystem
+    }
+}
+
+fn program_text(p: login.Program) -> str {
+    match p {
+        Shell => ""
+        Command(text) => text
+        Subsystem(name) => name
+    }
+}
+
+fn pipe_stream(fd: i64) -> io.Stream ! io.Error {
+    sys.set_nonblocking(fd)?
+    sys.stream_on(sys.wrap(fd))
+}
+
+fn start_remote(c: *Client, r: login.Request) -> login.Started ! io.Error {
+    var body: u8[] = []
+    wire.put_u32(mut body, program_kind(r.program))
+    wire.put_str(mut body, program_text(r.program))
+    wire.put_u32(mut body, r.env.len)
+    for name, value in r.env {
+        wire.put_str(mut body, name)
+        wire.put_str(mut body, value)
+    }
+    wire.put_str(mut body, r.term)
+    match r.terminal {
+        some(t) => wire.put_str(mut body, t.path)
+        none => wire.put_str(mut body, "")
+    }
+    let f = ask(c, ask_start, body)?
+    if !wire.read_bool(f.body)? || (r.terminal == none && f.fds.len != 3) {
+        close_all(f.fds)
+        fail io.Error.Denied
+    }
+    let pid = wire.read_u32(f.body)?
+    var stdin: io.Stream? = none
+    var stdout: io.Stream? = none
+    var stderr: io.Stream? = none
+    if f.fds.len == 3 {
+        stdin = pipe_stream(f.fds[0])?
+        stdout = pipe_stream(f.fds[1])?
+        stderr = pipe_stream(f.fds[2])?
+    }
+    login.Started {
+        pid
+        stdin
+        stdout
+        stderr
+        wait: fn() { wait_remote(c, pid) }
+        signal: fn(sig) { signal_remote(c, pid, sig) }
+    }
+}
+
+fn wait_remote(c: *Client, pid: i64) -> process.Exit {
+    let status = (<-exit_channel(c, pid)) ?? process.Exit.Exited(255)
+    sync.lock(c.guard)
+    c.exits.delete(pid)
+    sync.unlock(c.guard)
+    status
+}
+
+fn signal_remote(c: *Client, pid: i64, sig: signals.Signal) {
+    var body: u8[] = []
+    wire.put_u32(mut body, pid)
+    wire.put_u32(mut body, signals.number(sig))
+    let f = ask(c, ask_signal, body) or return
+}
+
+fn account_of(c: *Client, user: str) -> login.Account? {
+    let account = c.account ?? return none
+    if account.name != user {
+        return none
+    }
+    account
+}
+
+fn separated_config(c: *Client) -> ssh.ServerConfig {
+    let g = c.greeting
+    var signers: key.Signer[] = []
+    for i, k in g.keys {
+        signers.push(remote_signer(c, i, k))
+    }
+    let auth = ssh.ServerAuth {
+        methods: g.methods
+        password: fn(user, secret) { ask_password_of(c, user, secret) }
+        public_key: fn(user, k) { ask_key_of(c, user, k) }
+        signed_key: fn(s) { ask_signed_key_of(c, s) }
+        banner: g.banner
+        max_attempts: g.max_auth_tries
+    }
+    let sessions_of = login.Config {
+        account: fn(user) { account_of(c, user) }
+        accept_env: g.accept_env
+        terminals: g.permit_tty
+        launcher: login.Launcher {
+            terminal: fn(a) { open_remote_terminal(c)? }
+            start: fn(config, account, r) { start_remote(c, r)? }
+        }
+    }
+    ssh.ServerConfig { host_keys: signers, auth, channels: channels(g.local_forwarding, sessions_of), login_grace: g.login_grace }
+}
+
+/// Serves one client as the unprivileged half of a privilege-separated server, the process `serve` starts for each connection: standard input is the client's TCP connection and standard output the Unix socket of its monitor. Returns when the connection ends.
+///
+/// Fails with the error of the handshake or of reaching the monitor.
+pub fn serve_separated() ! ssh.Error {
+    let unnamed = net.Addr { ip: [], port: 0 }
+    using to_monitor = net.inherit(1, unnamed) catch {
+        e => fail ssh.Error.Io(e)
+    }
+    let c = connect_monitor(to_monitor.handle) catch {
+        e => fail ssh.Error.Io(e)
+    }
+    using tcp = net.inherit(0, c.greeting.remote ?? unnamed) catch {
+        e => fail ssh.Error.Io(e)
+    }
+    using conn = ssh.serve_from(net.stream(tcp), separated_config(c), c.greeting.local, c.greeting.remote)?
+    ssh.wait_on(conn.handle)
+}

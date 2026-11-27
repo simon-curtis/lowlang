@@ -1,0 +1,151 @@
+import std/crypto
+import std/crypto/password
+import std/crypto/x509
+import std/file
+import std/io
+import std/net
+import std/os
+import std/ssh
+import std/ssh/key
+import std/ssh/login
+import std/sys
+import std/testing
+import std/time
+
+fn new_signer() -> key.Signer {
+    key.signer(x509.PrivateKey.Ed25519(crypto.random(32))) or panic("key")
+}
+
+fn account_in(home: str, uid: i64) -> login.Account {
+    named_in("tester", home, uid)
+}
+
+fn named_in(name: str, home: str, uid: i64) -> login.Account {
+    login.Account { name, uid, gid: sys.egid(), groups: [sys.egid()], home, shell: "/bin/sh" }
+}
+
+struct Fixture {
+    home: str
+    daemon: Daemon
+}
+
+fn fixture(settings: Settings) -> Fixture {
+    let home = file.temp_dir("daemon-home") or panic("temp dir")
+    file.chmod(home, 0o700) or panic("chmod home")
+    let hash = password.hash_sha512_crypt("hunter2", 5000) or panic("hash")
+    let today = time.now() / 86400
+    let daemon = Daemon {
+        settings
+        signers: [new_signer()]
+        executable: "/bin/false"
+        utmp_file: ""
+        wtmp_file: ""
+        account: fn(name) {
+            match name {
+                "tester" => account_in(home, sys.euid())
+                "root" => named_in("root", home, 0)
+                "other" => named_in("other", home, sys.euid())
+                _ => none
+            }
+        }
+        shadow: fn(name) { os.Shadow { name, hash, changed: today, max_days: 30 } }
+    }
+    Fixture { home, daemon }
+}
+
+fn authorize(f: Fixture, line: str, mode: i64) {
+    file.mkdir_mode("{f.home}/.ssh", 0o700) or {}
+    file.write_text_mode("{f.home}/.ssh/authorized_keys", line, 0o600) or panic("write authorized_keys")
+    file.chmod("{f.home}/.ssh/authorized_keys", mode) or panic("chmod")
+}
+
+fn test_password_needs_the_right_secret_and_a_live_entry(t: *testing.T) {
+    let f = fixture(Settings {})
+    defer file.remove_all(f.home) or {}
+    testing.error_if(t, !check_password(f.daemon, "tester", "hunter2"), "the right password was refused")
+    testing.error_if(t, check_password(f.daemon, "tester", "hunter3"), "a wrong password was accepted")
+    testing.error_if(t, check_password(f.daemon, "nobody", "hunter2"), "an unknown user was accepted")
+    testing.error_if(t, check_password(f.daemon, "root", "hunter2"), "root logged in with a password under prohibit-password")
+    var expired = f.daemon
+    expired.shadow = fn(name) { os.Shadow { name, hash: "$6$x$y", changed: 1, max_days: 1 } }
+    testing.error_if(t, check_password(expired, "tester", "hunter2"), "an expired entry was accepted")
+    var off = f.daemon
+    off.settings.password_authentication = false
+    testing.error_if(t, check_password(off, "tester", "hunter2"), "PasswordAuthentication no was ignored")
+}
+
+fn test_user_and_group_lists_decide_who_may_log_in(t: *testing.T) {
+    let account = account_in("/", sys.euid())
+    let group = (os.lookup_group(sys.egid()) ?? panic("own group")).name
+    testing.error_if(t, !permitted(Settings {}, account), "no lists")
+    testing.error_if(t, permitted(Settings { allow_users: ["alice"] }, account), "AllowUsers without the user")
+    testing.error_if(t, permitted(Settings { deny_users: ["tester"] }, account), "DenyUsers with the user")
+    testing.error_if(t, !permitted(Settings { allow_groups: [group] }, account), "AllowGroups with the user's group")
+    testing.error_if(t, permitted(Settings { allow_groups: ["no-such-group"] }, account), "AllowGroups without the user's group")
+    testing.error_if(t, permitted(Settings { deny_groups: [group] }, account), "DenyGroups with the user's group")
+    testing.error_if(t, permitted(Settings { deny_users: ["te*"] }, account), "DenyUsers te* let tester in")
+    testing.error_if(t, !permitted(Settings { allow_users: ["?ester"] }, account), "AllowUsers ?ester kept tester out")
+    testing.error_if(t, permitted(Settings { allow_users: ["test"] }, account), "AllowUsers test matched tester")
+}
+
+fn test_authorized_keys_admit_only_listed_safe_plain_entries(t: *testing.T) {
+    let f = fixture(Settings {})
+    defer file.remove_all(f.home) or {}
+    let listed = new_signer().public
+    let other = new_signer().public
+    authorize(f, key.format_line(listed, "listed") + "\n", 0o600)
+    testing.error_if(t, !authorized(f.daemon, "tester", listed), "a listed key was refused")
+    testing.error_if(t, authorized(f.daemon, "tester", other), "an unlisted key was accepted")
+    testing.error_if(t, authorized(f.daemon, "root", listed), "root read an authorized_keys another user owns")
+    authorize(f, key.format_line(listed, "listed") + "\n", 0o620)
+    testing.error_if(t, authorized(f.daemon, "tester", listed), "a group-writable authorized_keys was read")
+    var lax = f.daemon
+    lax.settings.strict_modes = false
+    testing.error_if(t, !authorized(lax, "tester", listed), "StrictModes no still checked the mode")
+    testing.error_if(t, !authorized(lax, "root", listed), "root with a key under prohibit-password")
+    lax.settings.root_login = RootLogin.No
+    testing.error_if(t, authorized(lax, "root", listed), "root with a key under PermitRootLogin no")
+    authorize(f, "no-port-forwarding " + key.format_line(listed, "") + "\n", 0o600)
+    testing.error_if(t, !authorized(f.daemon, "tester", listed), "an entry with an enforced option was refused")
+    authorize(f, "command=\"/bin/true\" " + key.format_line(listed, "") + "\n", 0o600)
+    testing.error_if(t, authorized(f.daemon, "tester", listed), "an entry with command= was accepted")
+    var forwarding = f.daemon
+    forwarding.settings.local_forwarding = true
+    authorize(f, "no-port-forwarding " + key.format_line(listed, "") + "\n", 0o600)
+    testing.error_if(t, authorized(forwarding, "tester", listed), "no-port-forwarding was accepted while forwarding is on")
+    authorize(f, "no-pty " + key.format_line(listed, "") + "\n", 0o600)
+    testing.error_if(t, authorized(f.daemon, "tester", listed), "no-pty was accepted while PermitTTY is on")
+    var ttyless = f.daemon
+    ttyless.settings.permit_tty = false
+    testing.error_if(t, !authorized(ttyless, "tester", listed), "no-pty was refused while PermitTTY is off")
+    file.remove("{f.home}/.ssh/authorized_keys") or panic("remove")
+    file.mkdir("{f.home}/.ssh/authorized_keys") or panic("mkdir")
+    testing.error_if(t, authorized(lax, "tester", listed), "a directory was read as authorized_keys")
+}
+
+fn serve_one(stream: io.Stream, config: ssh.ServerConfig) {
+    using conn = ssh.serve_stream(stream, config) or return
+    ssh.wait_on(conn.handle)
+}
+
+fn log_in(ends: net.ConnPair, d: Daemon, method: ssh.AuthMethod) -> ssh.Connection ! ssh.Error {
+    spawn serve_one(net.stream(ends.second), server_config(d))
+    let client = ssh.ClientConfig { user: "tester", verify_host_key: ssh.accept_any_host_key(), auth: [method] }
+    ssh.client(net.stream(ends.first), client)?
+}
+
+fn test_a_key_login_runs_a_command_in_the_home_directory(t: *testing.T) {
+    let f = fixture(Settings {})
+    defer file.remove_all(f.home) or {}
+    let user_key = new_signer()
+    authorize(f, key.format_line(user_key.public, "") + "\n", 0o600)
+    using ends = net.socketpair() or panic("socketpair")
+    using conn = log_in(ends, f.daemon, ssh.AuthMethod.PublicKey(user_key)) or panic("key login")
+    let result = ssh.exec(conn, "pwd") or panic("exec")
+    testing.error_if(t, str(result.stdout) != "{f.home}\n", "stdout {str(result.stdout)}")
+    using other_ends = net.socketpair() or panic("socketpair")
+    using refused = log_in(other_ends, f.daemon, ssh.AuthMethod.PublicKey(new_signer())) catch {
+        e => return
+    }
+    testing.error(t, "an unlisted key logged in")
+}

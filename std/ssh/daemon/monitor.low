@@ -1,0 +1,512 @@
+import std/io
+import std/net
+import signals = std/os/signal
+import std/process
+import std/ssh
+import std/ssh/key
+import std/ssh/login
+import std/ssh/wire
+import std/sync
+import std/sys
+
+const ask_sign = 1
+const ask_password = 2
+const ask_key = 3
+const ask_signed_key = 4
+const ask_terminal = 5
+const ask_start = 6
+const ask_signal = 7
+const answer = 64
+const child_exited = 65
+const greeting = 66
+
+const program_shell = 0
+const program_command = 1
+const program_subsystem = 2
+
+struct Link {
+    h: net.ConnHandle
+    writing: sync.Mutex
+    pending: u8[]
+    fds: i64[]
+}
+
+struct Frame {
+    kind: i64
+    id: i64
+    body: *wire.Reader
+    fds: i64[]
+}
+
+fn link_on(h: net.ConnHandle) -> *Link {
+    new(Link { h, writing: sync.mutex(), pending: [], fds: [] })
+}
+
+fn send_frame(l: *Link, kind: i64, id: i64, body: u8[], fds: i64[]) ! io.Error {
+    var data: u8[] = []
+    wire.put_u32(mut data, body.len + 12)
+    wire.put_u32(mut data, kind)
+    wire.put_u32(mut data, fds.len)
+    wire.put_u32(mut data, id)
+    for b in body {
+        data.push(b)
+    }
+    sync.lock(l.writing)
+    defer sync.unlock(l.writing)
+    let n = net.write_with_fds_on(l.h, data, fds)?
+    net.write_all_on(l.h, data[n..])?
+}
+
+fn take_frame(l: *Link) -> Frame? ! io.Error {
+    if l.pending.len < 4 {
+        return none
+    }
+    let size = io.be32(l.pending, 0) & 0xFFFFFFFF
+    if size < 12 || size > 1048576 {
+        fail io.Error.Malformed
+    }
+    if l.pending.len < 4 + size {
+        return none
+    }
+    let r = wire.reader(l.pending[4..4 + size])
+    var rest: u8[] = []
+    for b in l.pending[4 + size..] {
+        rest.push(b)
+    }
+    l.pending = rest
+    let kind = wire.read_u32(r)?
+    let count = wire.read_u32(r)?
+    let id = wire.read_u32(r)?
+    if count > l.fds.len {
+        fail io.Error.Malformed
+    }
+    let fds = l.fds[..count]
+    var left: i64[] = []
+    for fd in l.fds[count..] {
+        left.push(fd)
+    }
+    l.fds = left
+    Frame { kind, id, body: r, fds }
+}
+
+fn next_frame(l: *Link) -> Frame? ! io.Error {
+    let buf = io.buffer(65536)
+    for {
+        match take_frame(l)? {
+            some(f) => return f
+            none => {}
+        }
+        let got = net.read_with_fds_on(l.h, buf)?
+        for fd in got.fds {
+            l.fds.push(fd)
+        }
+        if got.size == 0 {
+            return none
+        }
+        for b in buf[..got.size] {
+            l.pending.push(b)
+        }
+    }
+}
+
+fn put_account(mut out: u8[], a: login.Account) {
+    wire.put_str(mut out, a.name)
+    wire.put_u32(mut out, a.uid)
+    wire.put_u32(mut out, a.gid)
+    wire.put_u32(mut out, a.groups.len)
+    for g in a.groups {
+        wire.put_u32(mut out, g)
+    }
+    wire.put_str(mut out, a.home)
+    wire.put_str(mut out, a.shell)
+}
+
+fn read_account(r: *wire.Reader) -> login.Account ! io.Error {
+    let name = wire.read_str(r)?
+    let uid = wire.read_u32(r)?
+    let gid = wire.read_u32(r)?
+    var groups: i64[] = []
+    for i in 0..wire.read_u32(r)? {
+        groups.push(wire.read_u32(r)?)
+    }
+    let home = wire.read_str(r)?
+    let shell = wire.read_str(r)?
+    login.Account { name, uid, gid, groups, home, shell }
+}
+
+fn put_addr(mut out: u8[], a: net.Addr?) {
+    match a {
+        some(addr) => {
+            wire.put_bool(mut out, true)
+            wire.put_string(mut out, addr.ip)
+            wire.put_u32(mut out, addr.port)
+        }
+        none => wire.put_bool(mut out, false)
+    }
+}
+
+fn read_addr(r: *wire.Reader) -> net.Addr? ! io.Error {
+    if !wire.read_bool(r)? {
+        return none
+    }
+    let ip = wire.read_string(r)?
+    let port = wire.read_u32(r)?
+    net.Addr { ip, port }
+}
+
+/// The privileged half of one connection under privilege separation: it holds the host keys and the account files, and answers the unprivileged process that speaks SSH to the client.
+///
+/// The monitor decides every authentication itself, counting failures against `MaxAuthTries` and keeping the first user name it is asked about. It trusts as the session id only the first exchange hash it signs, and checks a client's signature over the data it builds from that id. Once a user has authenticated it opens terminals and starts sessions only as that user, building each child with `login.prepare` from the kind of program asked for, and signals only the children it started.
+pub struct Monitor {
+    daemon: Daemon
+    link: *Link
+    local: net.Addr?
+    remote: net.Addr?
+    record: fn(login.Record)
+    authenticated: fn()
+    session_id: u8[]
+    user: str
+    account: login.Account?
+    failures: i64
+    terminals: [str: login.Terminal]
+    children: [i64: login.Started]
+    guard: sync.Mutex
+}
+
+/// Returns the monitor of one connection that talks to the unprivileged process over `h`, a Unix socket.
+///
+/// `local` and `remote` are the ends of the client's connection, `record` keeps the logins of terminal sessions, and `authenticated` is called once when a user authenticates.
+pub fn monitor(d: Daemon, h: net.ConnHandle, local: net.Addr?, remote: net.Addr?, record: fn(login.Record), authenticated: fn()) -> *Monitor {
+    new(Monitor {
+        daemon: d
+        link: link_on(h)
+        local
+        remote
+        record
+        authenticated
+        session_id: []
+        user: ""
+        account: none
+        failures: 0
+        terminals: [:]
+        children: [:]
+        guard: sync.mutex()
+    })
+}
+
+fn greeting_body(m: *Monitor) -> u8[] {
+    let s = m.daemon.settings
+    var out: u8[] = []
+    wire.put_u32(mut out, m.daemon.signers.len)
+    for signer in m.daemon.signers {
+        wire.put_string(mut out, signer.public.blob)
+    }
+    wire.put_names(mut out, methods(s))
+    wire.put_str(mut out, banner_of(m.daemon))
+    wire.put_u32(mut out, s.max_auth_tries)
+    wire.put_u32(mut out, s.login_grace)
+    wire.put_u32(mut out, s.accept_env.len)
+    for name in s.accept_env {
+        wire.put_str(mut out, name)
+    }
+    wire.put_bool(mut out, s.permit_tty)
+    wire.put_bool(mut out, s.local_forwarding)
+    wire.put_bool(mut out, s.sftp.len > 0)
+    put_addr(mut out, m.local)
+    put_addr(mut out, m.remote)
+    out
+}
+
+/// Greets the unprivileged process and answers its requests until it closes the socket, then hangs up every child still running.
+///
+/// Fails with the error of the socket; a malformed request ends the connection the same way.
+pub fn serve_monitor(m: *Monitor) ! io.Error {
+    defer hang_up_children(m)
+    send_frame(m.link, greeting, 0, greeting_body(m), [])?
+    for {
+        let f = next_frame(m.link)? ?? return
+        let reply = m.handle(f) catch {
+            e => {
+                close_all(f.fds)
+                fail e
+            }
+        }
+        close_all(f.fds)
+        send_frame(m.link, answer, f.id, reply.body, reply.fds)?
+        close_all(reply.fds)
+    }
+}
+
+struct Reply {
+    body: u8[]
+    fds: i64[]
+}
+
+fn refused() -> Reply {
+    var out: u8[] = []
+    wire.put_bool(mut out, false)
+    Reply { body: out, fds: [] }
+}
+
+fn close_all(fds: i64[]) {
+    for fd in fds {
+        sys.close_fd(fd)
+    }
+}
+
+fn handle(m: *Monitor, f: Frame) -> Reply ! io.Error {
+    match f.kind {
+        ask_sign => m.sign(f.body)
+        ask_password => m.password(f.body)
+        ask_key => m.key_query(f.body)
+        ask_signed_key => m.signed_key(f.body)
+        ask_terminal => m.terminal()
+        ask_start => m.start(f.body)
+        ask_signal => m.signal(f.body)
+        _ => fail io.Error.Malformed
+    }
+}
+
+fn sign(m: *Monitor, r: *wire.Reader) -> Reply ! io.Error {
+    let index = wire.read_u32(r)?
+    let algorithm = wire.read_str(r)?
+    let data = wire.read_string(r)?
+    wire.finish(r)?
+    if index >= m.daemon.signers.len || (data.len != 20 && data.len != 32 && data.len != 48 && data.len != 64) {
+        return refused()
+    }
+    if m.session_id.len == 0 {
+        m.session_id = data
+    }
+    let signature = m.daemon.signers[index].sign(algorithm, data) or return refused()
+    var out: u8[] = []
+    wire.put_bool(mut out, true)
+    wire.put_string(mut out, signature)
+    Reply { body: out, fds: [] }
+}
+
+fn may_try(m: *Monitor, user: str) -> bool {
+    if m.account != none || m.failures >= m.daemon.settings.max_auth_tries {
+        return false
+    }
+    if m.user.len == 0 {
+        m.user = user
+    }
+    m.user == user
+}
+
+fn decided(m: *Monitor, user: str, ok: bool, by_password: bool) -> Reply {
+    if !ok {
+        m.failures += 1
+        return refused()
+    }
+    let account = admitted(m.daemon, user, by_password) ?? return refused()
+    m.account = account
+    m.authenticated()
+    var out: u8[] = []
+    wire.put_bool(mut out, true)
+    put_account(mut out, account)
+    Reply { body: out, fds: [] }
+}
+
+fn password(m: *Monitor, r: *wire.Reader) -> Reply ! io.Error {
+    let user = wire.read_str(r)?
+    let secret = wire.read_str(r)?
+    wire.finish(r)?
+    if !m.may_try(user) {
+        return refused()
+    }
+    m.decided(user, check_password(m.daemon, user, secret), true)
+}
+
+fn key_query(m: *Monitor, r: *wire.Reader) -> Reply ! io.Error {
+    let user = wire.read_str(r)?
+    let blob = wire.read_string(r)?
+    wire.finish(r)?
+    let parsed = key.parse_blob(blob) or return refused()
+    let current = m.account ?? login.Account { name: "", uid: -1, gid: -1, home: "", shell: "" }
+    if m.account != none && current.name != user {
+        return refused()
+    }
+    if m.account == none && !m.may_try(user) {
+        return refused()
+    }
+    var out: u8[] = []
+    wire.put_bool(mut out, authorized(m.daemon, user, parsed))
+    Reply { body: out, fds: [] }
+}
+
+fn signed_key(m: *Monitor, r: *wire.Reader) -> Reply ! io.Error {
+    let user = wire.read_str(r)?
+    let algorithm = wire.read_str(r)?
+    let blob = wire.read_string(r)?
+    let signature = wire.read_string(r)?
+    wire.finish(r)?
+    if m.session_id.len == 0 || !m.may_try(user) {
+        return refused()
+    }
+    let parsed = key.parse_blob(blob) or return m.decided(user, false, false)
+    let valid = ssh.check_signature(ssh.KeySignature { user, algorithm, blob, signature, session_id: m.session_id })
+    m.decided(user, valid && authorized(m.daemon, user, parsed), false)
+}
+
+fn terminal(m: *Monitor) -> Reply ! io.Error {
+    let account = m.account ?? return refused()
+    if !m.daemon.settings.permit_tty {
+        return refused()
+    }
+    let t = login.open_terminal_for(account) or return refused()
+    sync.lock(m.guard)
+    m.terminals[t.path] = login.Terminal { master: -1, slave: t.slave, path: t.path }
+    sync.unlock(m.guard)
+    var out: u8[] = []
+    wire.put_bool(mut out, true)
+    wire.put_str(mut out, t.path)
+    Reply { body: out, fds: [t.master] }
+}
+
+fn read_program(r: *wire.Reader) -> login.Program? ! io.Error {
+    let kind = wire.read_u32(r)?
+    let text = wire.read_str(r)?
+    match kind {
+        program_shell => login.Program.Shell
+        program_command => login.Program.Command(text)
+        program_subsystem => login.Program.Subsystem(text)
+        _ => none
+    }
+}
+
+fn claim_terminal(m: *Monitor, path: str) -> login.Terminal? {
+    sync.lock(m.guard)
+    defer sync.unlock(m.guard)
+    let t = m.terminals[path] ?? return none
+    m.terminals.delete(path)
+    t
+}
+
+struct Pipes {
+    child: i64[]
+    parent: i64[]
+}
+
+fn open_pipes() -> Pipes ! io.Error {
+    var child: i64[] = []
+    var parent: i64[] = []
+    for i in 0..3 {
+        let p = sys.pipe(false) catch {
+            e => {
+                close_all(child)
+                close_all(parent)
+                fail e
+            }
+        }
+        if i == 0 {
+            child.push(p.first)
+            parent.push(p.second)
+        } else {
+            child.push(p.second)
+            parent.push(p.first)
+        }
+    }
+    Pipes { child, parent }
+}
+
+fn start(m: *Monitor, r: *wire.Reader) -> Reply ! io.Error {
+    let program = read_program(r)? ?? return refused()
+    var env: [str: str] = [:]
+    for i in 0..wire.read_u32(r)? {
+        let name = wire.read_str(r)?
+        env[name] = wire.read_str(r)?
+    }
+    let term = wire.read_str(r)?
+    let path = wire.read_str(r)?
+    wire.finish(r)?
+    let account = m.account ?? return refused()
+    var terminal: login.Terminal? = none
+    if path.len > 0 {
+        terminal = some(m.claim_terminal(path) ?? return refused())
+    }
+    let request = login.Request { program, env, term, terminal, local: m.local, remote: m.remote }
+    var l = login.prepare(sessions(m.daemon, login.local(m.record)), account, request) ?? return m.drop_terminal(terminal)
+    var pipes = Pipes { child: [], parent: [] }
+    if terminal == none {
+        pipes = open_pipes() or return refused()
+        l.stdio = pipes.child
+    }
+    let started = login.start_launch(l, m.remote, m.record) catch {
+        e => {
+            close_all(pipes.child)
+            close_all(pipes.parent)
+            return m.drop_terminal(terminal)
+        }
+    }
+    close_all(pipes.child)
+    m.drop_terminal(terminal)
+    sync.lock(m.guard)
+    m.children[started.pid] = started
+    sync.unlock(m.guard)
+    spawn await_child(m, started)
+    var out: u8[] = []
+    wire.put_bool(mut out, true)
+    wire.put_u32(mut out, started.pid)
+    Reply { body: out, fds: pipes.parent }
+}
+
+fn drop_terminal(m: *Monitor, t: login.Terminal?) -> Reply {
+    match t {
+        some(found) => sys.close_fd(found.slave)
+        none => {}
+    }
+    refused()
+}
+
+fn await_child(m: *Monitor, started: login.Started) {
+    let status = started.wait()
+    sync.lock(m.guard)
+    m.children.delete(started.pid)
+    sync.unlock(m.guard)
+    var out: u8[] = []
+    match status {
+        Exited(code) => {
+            wire.put_bool(mut out, false)
+            wire.put_u32(mut out, code)
+        }
+        Signaled(sig) => {
+            wire.put_bool(mut out, true)
+            wire.put_u32(mut out, signals.number(sig))
+        }
+    }
+    send_frame(m.link, child_exited, started.pid, out, []) or {}
+}
+
+fn signal(m: *Monitor, r: *wire.Reader) -> Reply ! io.Error {
+    let pid = wire.read_u32(r)?
+    let number = wire.read_u32(r)?
+    wire.finish(r)?
+    let sig = signals.from_number(number) ?? return refused()
+    sync.lock(m.guard)
+    let child = m.children[pid]
+    sync.unlock(m.guard)
+    let found = child ?? return refused()
+    found.signal(sig)
+    var out: u8[] = []
+    wire.put_bool(mut out, true)
+    Reply { body: out, fds: [] }
+}
+
+fn hang_up_children(m: *Monitor) {
+    sync.lock(m.guard)
+    var live: login.Started[] = []
+    for pid, child in m.children {
+        live.push(child)
+    }
+    for path, t in m.terminals {
+        sys.close_fd(t.slave)
+    }
+    m.terminals = [:]
+    sync.unlock(m.guard)
+    let hup = signals.from_number(1) ?? return
+    for child in live {
+        child.signal(hup)
+    }
+}
