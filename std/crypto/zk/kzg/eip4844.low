@@ -1,0 +1,353 @@
+import std/crypto/hash
+import std/crypto/zk/pairing
+import std/text
+
+/// The trusted setup and evaluation domain of EIP-4844 blobs: 4096 elements of the scalar field of BLS12-381.
+///
+/// A `BlobSetup` shares scratch space with its curve, so it is not safe for concurrent use.
+pub struct BlobSetup {
+    /// The curve, BLS12-381.
+    pub curve: *pairing.Curve
+    /// The part of the setup that verification uses.
+    pub verifier: Verifier
+    lagrange: []pairing.Point
+    roots: [][]u64
+    width_inverse: []u64
+}
+
+/// The proof of a blob at a point, with the value of the blob's polynomial there.
+pub struct BlobOpening {
+    /// The 48-byte compressed proof.
+    pub proof: []u8
+    /// The 32-byte big-endian value `y`.
+    pub value: []u8
+}
+
+/// Returns the number of field elements of a blob, 4096.
+pub fn field_elements_per_blob() -> i64 {
+    4096
+}
+
+/// Returns the number of bytes of a blob, 131072.
+pub fn bytes_per_blob() -> i64 {
+    131072
+}
+
+fn reverse_bits(value: i64, bits: i64) -> i64 {
+    var out = 0
+    for k in 0..bits {
+        out |= ((value >> k) & 1) << (bits - 1 - k)
+    }
+    out
+}
+
+fn decode_line(line: str) -> []u8 ! Error {
+    text.decode_hex(text.trim(line)) catch { _ => fail Malformed }
+}
+
+/// Returns the setup of the file `contents` in the format of `trusted_setup.txt` of the Ethereum consensus specification and c-kzg-4844.
+///
+/// The file starts with the number of `G1` points (4096) and the number of `G2` points, then holds the `G1` points of the Lagrange basis in the natural order of the roots of unity, then the `G2` points `tau^i H`, as hex of the 48-byte and 96-byte compressed encodings, one per line. Lines after the `G2` points are ignored. Every `G1` point and `tau H` are checked to lie on the curve and in the subgroup, and the first `G2` point must be the generator. Fails with `Truncated`, `Malformed` and `Point`. Reading the 4096 points with their subgroup checks takes several seconds.
+pub fn blob_setup_from_text(contents: str) -> BlobSetup ! Error {
+    let c = pairing.bls12_381()
+    let lines = text.lines(contents)
+    if lines.len < 2 {
+        fail Truncated
+    }
+    let g1_count = text.parse_int(text.trim(lines[0])) catch { _ => fail Malformed }
+    let g2_count = text.parse_int(text.trim(lines[1])) catch { _ => fail Malformed }
+    let width = field_elements_per_blob()
+    if g1_count != width || g2_count < 2 {
+        fail Malformed
+    }
+    if lines.len < 2 + g1_count + g2_count {
+        fail Truncated
+    }
+    let g = pairing.g1(c)
+    let h = pairing.g2(c)
+    var natural: []pairing.Point = []
+    for i in 0..g1_count {
+        let raw = decode_line(lines[2 + i])?
+        let point = decode_g1(g, raw)?
+        push(mut natural, point)
+    }
+    var lagrange: []pairing.Point = []
+    for i in 0..width {
+        push(mut lagrange, natural[reverse_bits(i, 12)])
+    }
+    let first_raw = decode_line(lines[2 + g1_count])?
+    let first = decode_g2(h, first_raw)?
+    if !pairing.equal(h, first, h.generator) {
+        fail Malformed
+    }
+    let tau_raw = decode_line(lines[3 + g1_count])?
+    let tau_g2 = decode_g2(h, tau_raw)?
+
+    let domain = pairing.domain(c, width) catch Point
+    var powers: [][]u64 = []
+    var power = pairing.fr_one(c)
+    for _ in 0..width {
+        push(mut powers, power)
+        power = pairing.fr_mul(c, power, domain.omega)
+    }
+    var roots: [][]u64 = []
+    for i in 0..width {
+        push(mut roots, powers[reverse_bits(i, 12)])
+    }
+    BlobSetup { curve: c, verifier: Verifier { curve: c, tau_g2 }, lagrange, roots, width_inverse: domain.size_inverse }
+}
+
+fn decode_g1(g: *pairing.Group, data: []u8) -> pairing.Point ! Error {
+    if data.len != 48 {
+        fail Size
+    }
+    pairing.deserialize_zcash(g, data) catch Point
+}
+
+fn decode_g2(g: *pairing.Group, data: []u8) -> pairing.Point ! Error {
+    if data.len != 96 {
+        fail Size
+    }
+    pairing.deserialize_zcash(g, data) catch Point
+}
+
+fn blob_polynomial(s: BlobSetup, blob: []u8) -> [][]u64 ! Error {
+    if blob.len != bytes_per_blob() {
+        fail Size
+    }
+    var out: [][]u64 = []
+    for i in 0..field_elements_per_blob() {
+        let element = pairing.fr_from_bytes(s.curve, blob[i * 32..(i + 1) * 32]) catch Point
+        push(mut out, element)
+    }
+    out
+}
+
+fn field_element(s: BlobSetup, data: []u8) -> []u64 ! Error {
+    pairing.fr_from_bytes(s.curve, data) catch Point
+}
+
+fn batch_inverse(c: *pairing.Curve, values: [][]u64) -> [][]u64 {
+    var prefix: [][]u64 = []
+    var product = pairing.fr_one(c)
+    for v in values {
+        push(mut prefix, product)
+        product = pairing.fr_mul(c, product, v)
+    }
+    var inverse = pairing.fr_inv(c, product)
+    var reversed: [][]u64 = []
+    var i = values.len - 1
+    for i >= 0 {
+        push(mut reversed, pairing.fr_mul(c, inverse, prefix[i]))
+        inverse = pairing.fr_mul(c, inverse, values[i])
+        i -= 1
+    }
+    var out: [][]u64 = []
+    var k = reversed.len - 1
+    for k >= 0 {
+        push(mut out, reversed[k])
+        k -= 1
+    }
+    out
+}
+
+fn evaluate_polynomial(s: BlobSetup, polynomial: [][]u64, z: []u64) -> []u64 {
+    let c = s.curve
+    var differences: [][]u64 = []
+    for i in 0..polynomial.len {
+        let difference = pairing.fr_sub(c, z, s.roots[i])
+        if pairing.fr_is_zero(difference) {
+            return polynomial[i]
+        }
+        push(mut differences, difference)
+    }
+    let inverses = batch_inverse(c, differences)
+    var sum = pairing.fr_zero(c)
+    for i in 0..polynomial.len {
+        let numerator = pairing.fr_mul(c, polynomial[i], s.roots[i])
+        sum = pairing.fr_add(c, sum, pairing.fr_mul(c, numerator, inverses[i]))
+    }
+    let width = u64(polynomial.len)
+    let vanishing = pairing.fr_sub(c, pairing.fr_pow(c, z, [width]), pairing.fr_one(c))
+    pairing.fr_mul(c, pairing.fr_mul(c, sum, vanishing), s.width_inverse)
+}
+
+fn quotient_polynomial(s: BlobSetup, polynomial: [][]u64, z: []u64, y: []u64) -> [][]u64 {
+    let c = s.curve
+    let n = polynomial.len
+    var inside = -1
+    for i in 0..n {
+        if pairing.fr_equal(s.roots[i], z) {
+            inside = i
+        }
+    }
+    var denominators: [][]u64 = []
+    for i in 0..n {
+        if i == inside {
+            push(mut denominators, pairing.fr_one(c))
+        } else {
+            push(mut denominators, pairing.fr_sub(c, s.roots[i], z))
+        }
+    }
+    let inverses = batch_inverse(c, denominators)
+    var out: [][]u64 = []
+    var weighted = pairing.fr_zero(c)
+    for i in 0..n {
+        let shifted = pairing.fr_sub(c, polynomial[i], y)
+        if i == inside {
+            push(mut out, pairing.fr_zero(c))
+        } else {
+            push(mut out, pairing.fr_mul(c, shifted, inverses[i]))
+            let numerator = pairing.fr_mul(c, shifted, s.roots[i])
+            weighted = pairing.fr_add(c, weighted, pairing.fr_mul(c, numerator, inverses[i]))
+        }
+    }
+    if inside >= 0 {
+        let scaled = pairing.fr_mul(c, weighted, pairing.fr_inv(c, z))
+        out[inside] = pairing.fr_neg(c, scaled)
+    }
+    out
+}
+
+fn lincomb(s: BlobSetup, values: [][]u64) -> pairing.Point {
+    let g = pairing.g1(s.curve)
+    var scalars: [][]u8 = []
+    for v in values {
+        push(mut scalars, pairing.fr_bytes(s.curve, v))
+    }
+    pairing.msm(g, s.lagrange, scalars)
+}
+
+fn compress(s: BlobSetup, p: pairing.Point) -> []u8 ! Error {
+    let g = pairing.g1(s.curve)
+    pairing.serialize_zcash(g, p, true) catch Point
+}
+
+fn big_endian(value: i64, width: i64) -> []u8 {
+    var out: []u8 = []
+    for k in 0..width {
+        let shift = 8 * (width - 1 - k)
+        if shift >= 63 {
+            push(mut out, 0)
+        } else {
+            push(mut out, u8((value >> shift) & 255))
+        }
+    }
+    out
+}
+
+fn extend(mut out: []u8, data: []u8) {
+    for b in data {
+        push(mut out, b)
+    }
+}
+
+fn hash_to_field(s: BlobSetup, data: []u8) -> []u64 {
+    let digest = hash.sum(hash.sha256(), data)
+    pairing.fr_reduce(s.curve, digest)
+}
+
+fn evaluation_challenge(s: BlobSetup, blob: []u8, commitment: []u8) -> []u64 {
+    var data = bytes("FSBLOBVERIFY_V1_")
+    extend(mut data, big_endian(field_elements_per_blob(), 16))
+    extend(mut data, blob)
+    extend(mut data, commitment)
+    hash_to_field(s, data)
+}
+
+fn batch_challenge(s: BlobSetup, commitments: [][]u8, zs: [][]u8, ys: [][]u8, proofs: [][]u8) -> []u64 {
+    var data = bytes("RCKZGBATCH___V1_")
+    extend(mut data, big_endian(field_elements_per_blob(), 8))
+    extend(mut data, big_endian(commitments.len, 8))
+    for i in 0..commitments.len {
+        extend(mut data, commitments[i])
+        extend(mut data, zs[i])
+        extend(mut data, ys[i])
+        extend(mut data, proofs[i])
+    }
+    hash_to_field(s, data)
+}
+
+fn opening_at(s: BlobSetup, polynomial: [][]u64, z: []u64) -> BlobOpening ! Error {
+    let y = evaluate_polynomial(s, polynomial, z)
+    let quotient = quotient_polynomial(s, polynomial, z, y)
+    let proof = lincomb(s, quotient)
+    BlobOpening { proof: compress(s, proof)?, value: pairing.fr_bytes(s.curve, y) }
+}
+
+/// Returns the 48-byte commitment to the polynomial whose values at the evaluation domain are the 4096 elements of `blob`.
+///
+/// Each 32 bytes of the blob are a big-endian element below the scalar field's order. Fails with `Size` for a blob of another length and `Point(NotCanonical)` for an element that is not canonical.
+pub fn blob_to_commitment(s: BlobSetup, blob: []u8) -> []u8 ! Error {
+    let polynomial = blob_polynomial(s, blob)?
+    let commitment = lincomb(s, polynomial)
+    compress(s, commitment)
+}
+
+/// Returns the proof of the blob's polynomial at the 32-byte big-endian point `z`, with the value there, as `compute_kzg_proof` of the specification.
+pub fn compute_proof(s: BlobSetup, blob: []u8, z: []u8) -> BlobOpening ! Error {
+    let polynomial = blob_polynomial(s, blob)?
+    let point = field_element(s, z)?
+    opening_at(s, polynomial, point)
+}
+
+/// Returns the proof for `blob` and its `commitment` at the challenge derived from both, as `compute_blob_kzg_proof` of the specification.
+pub fn compute_blob_proof(s: BlobSetup, blob: []u8, commitment: []u8) -> []u8 ! Error {
+    let polynomial = blob_polynomial(s, blob)?
+    let g = pairing.g1(s.curve)
+    decode_g1(g, commitment)?
+    let challenge = evaluation_challenge(s, blob, commitment)
+    let opening = opening_at(s, polynomial, challenge)?
+    opening.proof
+}
+
+/// Returns whether `proof` shows that the polynomial committed to by `commitment` has the value `y` at `z`, as `verify_kzg_proof` of the specification.
+///
+/// The commitment and proof are 48-byte compressed points and `z` and `y` 32-byte big-endian elements; a failure to decode any of them fails with `Size` or `Point` and is not the same as a proof that does not verify. The running time depends on the inputs, which are public.
+pub fn verify_proof(s: BlobSetup, commitment: []u8, z: []u8, y: []u8, proof: []u8) -> bool ! Error {
+    let g = pairing.g1(s.curve)
+    let commitment_point = decode_g1(g, commitment)?
+    let proof_point = decode_g1(g, proof)?
+    let point = field_element(s, z)?
+    let value = field_element(s, y)?
+    verify(s.verifier, commitment_point, point, value, proof_point)
+}
+
+/// Returns whether `proof` is a proof for `blob` and `commitment` at the challenge derived from both, as `verify_blob_kzg_proof` of the specification. Fails as `verify_proof` does.
+pub fn verify_blob_proof(s: BlobSetup, blob: []u8, commitment: []u8, proof: []u8) -> bool ! Error {
+    let polynomial = blob_polynomial(s, blob)?
+    let g = pairing.g1(s.curve)
+    let commitment_point = decode_g1(g, commitment)?
+    let proof_point = decode_g1(g, proof)?
+    let challenge = evaluation_challenge(s, blob, commitment)
+    let value = evaluate_polynomial(s, polynomial, challenge)
+    verify(s.verifier, commitment_point, challenge, value, proof_point)
+}
+
+/// Returns whether every `proofs[i]` is a proof for `blobs[i]` and `commitments[i]`, as `verify_blob_kzg_proof_batch` of the specification, with the random combination derived by hashing the inputs. Fails with `Length` when the lists differ in length and as `verify_proof` does. An empty batch is valid.
+pub fn verify_blob_proof_batch(s: BlobSetup, blobs: [][]u8, commitments: [][]u8, proofs: [][]u8) -> bool ! Error {
+    let n = blobs.len
+    if commitments.len != n || proofs.len != n {
+        fail Length
+    }
+    let g = pairing.g1(s.curve)
+    var commitment_points: []pairing.Point = []
+    var proof_points: []pairing.Point = []
+    var challenges: [][]u64 = []
+    var values: [][]u64 = []
+    var challenge_bytes: [][]u8 = []
+    var value_bytes: [][]u8 = []
+    for i in 0..n {
+        let polynomial = blob_polynomial(s, blobs[i])?
+        push(mut commitment_points, decode_g1(g, commitments[i])?)
+        push(mut proof_points, decode_g1(g, proofs[i])?)
+        let challenge = evaluation_challenge(s, blobs[i], commitments[i])
+        let value = evaluate_polynomial(s, polynomial, challenge)
+        push(mut challenges, challenge)
+        push(mut values, value)
+        push(mut challenge_bytes, pairing.fr_bytes(s.curve, challenge))
+        push(mut value_bytes, pairing.fr_bytes(s.curve, value))
+    }
+    let combination = batch_challenge(s, commitments, challenge_bytes, value_bytes, proofs)
+    verify_batch(s.verifier, commitment_points, challenges, values, proof_points, combination)
+}

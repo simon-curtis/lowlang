@@ -1,0 +1,195 @@
+import std/crypto/zk/pairing
+
+/// The reason a commitment operation, setup file or blob was rejected.
+pub enum Error {
+    /// A file ends before its declared contents.
+    Truncated
+    /// A file does not start with the magic bytes of its format.
+    Magic
+    /// A file has a version, section or curve this module does not read.
+    Unsupported
+    /// A file or setup is inconsistent: a section is missing, a count is wrong or a number is malformed.
+    Malformed
+    /// A polynomial or blob does not fit the setup.
+    Size
+    /// The lists of a batch have different lengths.
+    Length
+    /// A point or field element failed its checks.
+    Point(error: pairing.Error)
+}
+
+/// What a verifier needs of a setup: `tau * H` for the generator `H` of `G2`.
+pub struct Verifier {
+    /// The curve of the setup.
+    pub curve: *pairing.Curve
+    /// `tau * H`.
+    pub tau_g2: pairing.Point
+}
+
+/// A structured reference string in the monomial basis: `tau^i * G` for `i` below `g1.len`, with `G` the generator of `G1`.
+pub struct Srs {
+    /// The curve of the setup.
+    pub curve: *pairing.Curve
+    /// `tau^i * G` for `i = 0, 1, ...`.
+    pub g1: []pairing.Point
+    /// The part of the setup a verifier uses.
+    pub verifier: Verifier
+}
+
+/// An evaluation of a committed polynomial with the proof of it.
+pub struct Opening {
+    /// The value `p(z)` of the polynomial at the point, an element of `Fr`.
+    pub value: []u64
+    /// The proof, `(p(tau) - p(z)) / (tau - z) * G`.
+    pub proof: pairing.Point
+}
+
+struct Division {
+    quotient: [][]u64
+    value: []u64
+}
+
+fn byte_list(c: *pairing.Curve, values: [][]u64) -> [][]u8 {
+    var out: [][]u8 = []
+    for v in values {
+        push(mut out, pairing.fr_bytes(c, v))
+    }
+    out
+}
+
+/// Returns the setup for the secret `tau` with `size` powers in `G1`. Whoever knows `tau` can forge every proof, so use it for tests and for protocols whose parties trust each other.
+pub fn srs_from_tau(c: *pairing.Curve, size: i64, tau: []u64) -> Srs {
+    let g = pairing.g1(c)
+    let h = pairing.g2(c)
+    var points: []pairing.Point = []
+    var power = pairing.fr_one(c)
+    for _ in 0..size {
+        let scalar = pairing.fr_bytes(c, power)
+        let point = pairing.scalar_mul(g, g.generator, scalar)
+        push(mut points, point)
+        power = pairing.fr_mul(c, power, tau)
+    }
+    let tau_scalar = pairing.fr_bytes(c, tau)
+    let tau_g2 = pairing.scalar_mul(h, h.generator, tau_scalar)
+    Srs { curve: c, g1: points, verifier: Verifier { curve: c, tau_g2 } }
+}
+
+/// Returns the commitment `p(tau) * G` to the polynomial with the given coefficients, lowest degree first.
+///
+/// The running time depends on the coefficients: use it for public polynomials. Fails with `Size` when the polynomial has more coefficients than the setup has powers.
+pub fn commit(srs: Srs, coefficients: [][]u64) -> pairing.Point ! Error {
+    if coefficients.len > srs.g1.len {
+        fail Size
+    }
+    let g = pairing.g1(srs.curve)
+    if coefficients.len == 0 {
+        return pairing.identity(g)
+    }
+    let scalars = byte_list(srs.curve, coefficients)
+    pairing.msm(g, srs.g1[0..coefficients.len], scalars)
+}
+
+/// Returns the commitment to the polynomial with the given coefficients, with a running time and memory accesses that do not depend on the coefficients. Fails with `Size`.
+pub fn commit_secret(srs: Srs, coefficients: [][]u64) -> pairing.Point ! Error {
+    if coefficients.len > srs.g1.len {
+        fail Size
+    }
+    let g = pairing.g1(srs.curve)
+    if coefficients.len == 0 {
+        return pairing.identity(g)
+    }
+    let scalars = byte_list(srs.curve, coefficients)
+    pairing.msm_secret(g, srs.g1[0..coefficients.len], scalars)
+}
+
+fn divide(c: *pairing.Curve, coefficients: [][]u64, z: []u64) -> Division ! Error {
+    let n = coefficients.len
+    if n == 0 {
+        fail Size
+    }
+    var reversed: [][]u64 = []
+    var carry = coefficients[n - 1]
+    var i = n - 2
+    for i >= 0 {
+        push(mut reversed, carry)
+        carry = pairing.fr_add(c, coefficients[i], pairing.fr_mul(c, z, carry))
+        i -= 1
+    }
+    var quotient: [][]u64 = []
+    var k = reversed.len - 1
+    for k >= 0 {
+        push(mut quotient, reversed[k])
+        k -= 1
+    }
+    Division { quotient, value: carry }
+}
+
+/// Returns the value of the polynomial at `z` and the proof of it, `(p(tau) - p(z)) / (tau - z) * G`, which is the commitment to the quotient polynomial.
+///
+/// The running time depends on the coefficients: use it for public polynomials. Fails with `Size`.
+pub fn open(srs: Srs, coefficients: [][]u64, z: []u64) -> Opening ! Error {
+    let division = divide(srs.curve, coefficients, z)?
+    let proof = commit(srs, division.quotient)?
+    Opening { value: division.value, proof }
+}
+
+/// Returns the opening at `z` of a polynomial held secret, with a running time and memory accesses that do not depend on its coefficients. Fails with `Size`.
+pub fn open_secret(srs: Srs, coefficients: [][]u64, z: []u64) -> Opening ! Error {
+    let division = divide(srs.curve, coefficients, z)?
+    let proof = commit_secret(srs, division.quotient)?
+    Opening { value: division.value, proof }
+}
+
+/// Returns whether `proof` shows that the polynomial committed to by `commitment` has the value `y` at `z`.
+///
+/// It checks `e(C - y G + z proof, H) = e(proof, tau H)` as one product of two pairings. The points must come from a decoder of `std/crypto/zk/pairing`, which has checked that they lie on the curve and in the subgroup. The running time depends on the inputs, which are public.
+pub fn verify(v: Verifier, commitment: pairing.Point, z: []u64, y: []u64, proof: pairing.Point) -> bool {
+    let c = v.curve
+    let g = pairing.g1(c)
+    let h = pairing.g2(c)
+    let y_scalar = pairing.fr_bytes(c, y)
+    let z_scalar = pairing.fr_bytes(c, z)
+    let y_point = pairing.scalar_mul_vartime(g, g.generator, y_scalar)
+    let numerator = pairing.sub(g, commitment, y_point)
+    let z_point = pairing.scalar_mul_vartime(h, h.generator, z_scalar)
+    let shifted = pairing.sub(h, v.tau_g2, z_point)
+    let minus_h = pairing.negate(h, h.generator)
+    pairing.pairing_check(c, [numerator, proof], [minus_h, shifted])
+}
+
+/// Returns whether every `proofs[i]` shows that the polynomial committed to by `commitments[i]` has the value `ys[i]` at `zs[i]`, with one product of two pairings for the whole list.
+///
+/// The lists are combined with the powers of `challenge`, which the proofs' author must not be able to choose: derive it by hashing every commitment, point, value and proof, as `verify_blob_proof_batch` does. Fails with `Length` when the lists differ in length. An empty batch is valid.
+pub fn verify_batch(v: Verifier, commitments: []pairing.Point, zs: [][]u64, ys: [][]u64, proofs: []pairing.Point, challenge: []u64) -> bool ! Error {
+    let n = commitments.len
+    if zs.len != n || ys.len != n || proofs.len != n {
+        fail Length
+    }
+    if n == 0 {
+        return true
+    }
+    let c = v.curve
+    let g = pairing.g1(c)
+    let h = pairing.g2(c)
+    var powers: [][]u64 = []
+    var power = pairing.fr_one(c)
+    var y_sum = pairing.fr_zero(c)
+    var z_scaled: [][]u64 = []
+    for i in 0..n {
+        push(mut powers, power)
+        y_sum = pairing.fr_add(c, y_sum, pairing.fr_mul(c, power, ys[i]))
+        push(mut z_scaled, pairing.fr_mul(c, power, zs[i]))
+        power = pairing.fr_mul(c, power, challenge)
+    }
+    let power_bytes = byte_list(c, powers)
+    let z_bytes = byte_list(c, z_scaled)
+    let proof_sum = pairing.msm(g, proofs, power_bytes)
+    let proof_z_sum = pairing.msm(g, proofs, z_bytes)
+    let commitment_sum = pairing.msm(g, commitments, power_bytes)
+    let y_scalar = pairing.fr_bytes(c, y_sum)
+    let y_point = pairing.scalar_mul_vartime(g, g.generator, y_scalar)
+    let shifted = pairing.sub(g, commitment_sum, y_point)
+    let left = pairing.add(g, shifted, proof_z_sum)
+    let minus_proof = pairing.negate(g, proof_sum)
+    pairing.pairing_check(c, [left, minus_proof], [h.generator, v.tau_g2])
+}

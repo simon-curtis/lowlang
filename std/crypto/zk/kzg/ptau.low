@@ -1,0 +1,168 @@
+import std/crypto/limb
+import std/crypto/nistec
+import std/crypto/zk/pairing
+
+struct Sections {
+    header: i64
+    g1: i64
+    g2: i64
+    g1_end: i64
+    g2_end: i64
+}
+
+fn read_u32(data: []u8, at: i64) -> i64 ! Error {
+    if at < 0 || at + 4 > data.len {
+        fail Truncated
+    }
+    var out = 0
+    for k in 0..4 {
+        out |= i64(data[at + k]) << (8 * k)
+    }
+    out
+}
+
+fn read_u64(data: []u8, at: i64) -> i64 ! Error {
+    if at < 0 || at + 8 > data.len {
+        fail Truncated
+    }
+    var out: u64 = 0
+    for k in 0..8 {
+        out |= u64(data[at + k]) << u64(8 * k)
+    }
+    if out > 0x7fffffffffffffff {
+        fail Unsupported
+    }
+    i64(out)
+}
+
+fn locate(data: []u8) -> Sections ! Error {
+    if data.len < 12 {
+        fail Truncated
+    }
+    let magic = bytes("ptau")
+    for k in 0..4 {
+        if data[k] != magic[k] {
+            fail Magic
+        }
+    }
+    if read_u32(data, 4)? != 1 {
+        fail Unsupported
+    }
+    let count = read_u32(data, 8)?
+    var out = Sections { header: -1, g1: -1, g2: -1, g1_end: 0, g2_end: 0 }
+    var at = 12
+    for _ in 0..count {
+        let kind = read_u32(data, at)?
+        let size = read_u64(data, at + 4)?
+        let start = at + 12
+        if size > data.len - start {
+            fail Truncated
+        }
+        match kind {
+            1 => { out.header = start }
+            2 => {
+                out.g1 = start
+                out.g1_end = start + size
+            }
+            3 => {
+                out.g2 = start
+                out.g2_end = start + size
+            }
+            _ => {}
+        }
+        at = start + size
+    }
+    if at != data.len {
+        fail Truncated
+    }
+    if out.header < 0 || out.g1 < 0 || out.g2 < 0 {
+        fail Malformed
+    }
+    out
+}
+
+fn element(c: *pairing.Curve, data: []u8, at: i64) -> []u8 {
+    let n = c.n
+    let montgomery: []u64 = __make(n)
+    for i in 0..n {
+        var limb_value: u64 = 0
+        for k in 0..8 {
+            limb_value |= u64(data[at + 8 * i + k]) << u64(8 * k)
+        }
+        montgomery[i] = limb_value
+    }
+    let plain: []u64 = __make(n)
+    nistec.from_mont(c.q, plain, montgomery)
+    limb.to_bytes(plain, n * 8)
+}
+
+fn padded(slot: i64, value: []u8) -> []u8 {
+    var out: []u8 = []
+    for _ in 0..slot - value.len {
+        push(mut out, 0)
+    }
+    for b in value {
+        push(mut out, b)
+    }
+    out
+}
+
+fn point_at(g: *pairing.Group, data: []u8, at: i64) -> pairing.Point ! Error {
+    let c = g.curve
+    let size = c.n * 8
+    let slot = pairing.evm_size(g) / (2 * g.degree)
+    var coordinates: [][]u8 = []
+    for k in 0..2 * g.degree {
+        push(mut coordinates, element(c, data, at + k * size))
+    }
+    let imaginary_first = match c.kind {
+        Bn254 => true
+        Bls12381 => false
+    }
+    let order = if g.degree == 1 {
+        [0, 1]
+    } else if imaginary_first {
+        [1, 0, 3, 2]
+    } else {
+        [0, 1, 2, 3]
+    }
+    var encoded: []u8 = []
+    for k in order {
+        for b in padded(slot, coordinates[k]) {
+            push(mut encoded, b)
+        }
+    }
+    pairing.decode_evm(g, encoded) catch Point
+}
+
+/// Returns the setup of the snarkjs `.ptau` file `data` with its first `size` powers `tau^i G` in `G1` and `tau H` in `G2`.
+///
+/// The file is the iden3 powers of tau format, version 1: the header gives the curve's base field, whose prime must be that of `c`, and the sections of `tau^i G1` and `tau^i G2` hold the points as little-endian Montgomery coordinates. Every point read is checked to lie on the curve and in the subgroup. Fails with `Truncated`, `Magic`, `Unsupported`, `Malformed` when a section is missing or the prime differs, `Size` when the file holds fewer than `size` powers, and `Point` for a point that fails its checks.
+pub fn srs_from_ptau(c: *pairing.Curve, data: []u8, size: i64) -> Srs ! Error {
+    let sections = locate(data)?
+    let element_size = c.n * 8
+    let width = read_u32(data, sections.header)?
+    if width != element_size || sections.header + 4 + width + 8 > data.len {
+        fail Malformed
+    }
+    let prime = nistec.encode(c.q.m)
+    for k in 0..width {
+        if data[sections.header + 4 + k] != prime[width - 1 - k] {
+            fail Malformed
+        }
+    }
+    let g1_available = (sections.g1_end - sections.g1) / (2 * element_size)
+    let g2_available = (sections.g2_end - sections.g2) / (4 * element_size)
+    if size < 1 || size > g1_available || g2_available < 2 {
+        fail Size
+    }
+    let g = pairing.g1(c)
+    let h = pairing.g2(c)
+    var points: []pairing.Point = []
+    for i in 0..size {
+        let at = sections.g1 + i * 2 * element_size
+        push(mut points, point_at(g, data, at)?)
+    }
+    let tau_g2 = point_at(h, data, sections.g2 + 4 * element_size)?
+    Srs { curve: c, g1: points, verifier: Verifier { curve: c, tau_g2 } }
+}
