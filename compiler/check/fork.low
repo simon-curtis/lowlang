@@ -1,0 +1,253 @@
+import ast
+import diag
+import lexer
+import types
+
+struct ForkBranch {
+    slot: str
+    name: *ast.Binding
+    ok: *types.Type
+    err: *types.Type? = none
+    pos: diag.Pos
+}
+
+fn valued(b: *ForkBranch) -> bool {
+    !b.ok.is_void() && !b.ok.is_never()
+}
+
+fn fork_ident(name: str, pos: diag.Pos) -> ast.Expr {
+    ast.Expr.Ident(new(ast.Ident { name, pos }))
+}
+
+fn fork_call(name: str, args: []ast.Expr, pos: diag.Pos) -> ast.Expr {
+    ast.Expr.Call(new(ast.Call { callee: fork_ident(name, pos), args, pos }))
+}
+
+fn fork_set(name: str, value: ast.Expr, pos: diag.Pos) -> ast.Stmt {
+    ast.Stmt.Assign(new(ast.Assign { target: fork_ident(name, pos), op: lexer.Kind.Assign, value, pos }))
+}
+
+fn fork_run(x: ast.Expr) -> ast.Stmt {
+    ast.Stmt.ExprStmt(new(ast.ExprStmt { x }))
+}
+
+fn fork_stmt(c: *Checker, s: *ast.Fork) ! diag.Error {
+    c.forks += 1
+    let frame = "__fork{c.forks}"
+    s.stmts = []
+    var branches: []*ForkBranch = []
+    for i, x in s.branches {
+        let b = fork_branch(c, s, x, s.names[i], "{frame}_{i}")?
+        branches.push(b)
+    }
+    for b in branches {
+        fork_results(c, s, b)?
+    }
+    let spawned: ast.Expr = ast.Expr.IntLit(new(ast.IntLit { value: branches.len - 1, pos: s.pos }))
+    fork_bind(c, s, frame, false, fork_call("__fork", [spawned], s.pos))?
+    for i, b in branches {
+        fork_bind(c, s, "{b.slot}_run", false, fork_job(b))?
+        if i < branches.len - 1 {
+            fork_on(c, s, "__fork_start", [fork_ident(frame, b.pos), fork_ident("{b.slot}_run", b.pos)], b.pos)?
+        } else {
+            fork_do(c, s, fork_run(fork_call("{b.slot}_run", [], b.pos)))?
+        }
+    }
+    fork_on(c, s, "__fork_wait", [fork_ident(frame, s.pos)], s.pos)?
+    for b in branches {
+        fork_raise(c, s, b)?
+    }
+    for b in branches {
+        if valued(b) {
+            let l = new(ast.Let { name: b.name.name, mutable: s.mutable, value: fork_ident(b.slot, b.pos), pos: b.name.pos })
+            fork_do(c, s, ast.Stmt.Let(l))?
+            l.mutable = false
+            b.name.local = l.local
+        }
+    }
+}
+
+fn fork_branch(c: *Checker, s: *ast.Fork, x: ast.Expr, name: *ast.Binding, slot: str) -> *ForkBranch ! diag.Error {
+    let pos = ast.position(x)
+    let closure_node = new(ast.Closure { body: new(ast.Block { tail: x, pos }), inline: true, pos })
+    c.forked[closure_node] = true
+    let l = new(ast.Let { name: "{slot}_fn", value: ast.Expr.Closure(closure_node), pos })
+    let seen = c.reported.len
+    let _ = bind(c, l) catch {
+        e => fail fork_sibling(s, c.reported[seen..], e)
+    }
+    s.stmts.push(ast.Stmt.Let(l))
+    let f = closure_node.func ?? panic("fork branch has no function")
+    let b = new(ForkBranch { slot, name, ok: ret_type_of(f), err: f.fork_error, pos })
+    match b.err {
+        some(err) => {
+            fork_propagates(c, pos, err)?
+            f.ret_type = c.universe.result(b.ok, err)?
+            let signature = signature_of(c, f, false)?
+            closure_node.type = signature
+            let local = l.local ?? panic("fork branch is unbound")
+            local.type = signature
+        }
+        none => {}
+    }
+    if !valued(b) && name.name != "_" {
+        fail At(name.pos, "fork-void", "{name.name} names a branch that produces no value; name it _")
+    }
+    if droppable(c, b.ok) {
+        fail At(pos, "has-drop", "a fork branch cannot produce {b.ok.text()}; it has drop")
+    }
+    b
+}
+
+fn fork_sibling(s: *ast.Fork, reported: []*diag.Diagnostic, e: diag.Error) -> diag.Error {
+    for d in reported {
+        if is_sibling(s, d.code, d.msg) {
+            d.msg = sibling_message(d.msg)
+            d.code = "fork-sibling"
+        }
+    }
+    match e {
+        At(pos, code, msg) => {
+            if is_sibling(s, code, msg) {
+                return At(pos, "fork-sibling", sibling_message(msg))
+            }
+        }
+        Reported(list) => {}
+    }
+    e
+}
+
+fn is_sibling(s: *ast.Fork, code: str, msg: str) -> bool {
+    if code != "unknown-name" {
+        return false
+    }
+    for name in s.names {
+        if name.name != "_" && msg == "undefined: {name.name}" {
+            return true
+        }
+    }
+    false
+}
+
+fn sibling_message(msg: str) -> str {
+    "{msg["undefined: ".len..]} is bound when the fork ends, so a branch cannot read it"
+}
+
+fn fork_propagates(c: *Checker, pos: diag.Pos, err: *types.Type) ! diag.Error {
+    leaving(c, pos, "?")?
+    if c.ctx.forking {
+        fork_adopt(c, pos, err)?
+        return
+    }
+    require_result(c, pos, "?")?
+    if adopts_error(c) {
+        return
+    }
+    let ret_type = ret_type_of(current(c))
+    if ret_type.kind != ResultKind {
+        fail At(pos, "no-error-type", "? requires {subject(c)} to declare an error type")
+    }
+    if ret_type.err_of() != err {
+        fail At(pos, "propagate-type", "cannot propagate {err.text()} from function with error type {ret_type.err_of().text()}")
+    }
+}
+
+fn fork_adopt(c: *Checker, pos: diag.Pos, err: *types.Type) ! diag.Error {
+    let f = current(c)
+    let first = f.fork_error ?? {
+        f.fork_error = err
+        return
+    }
+    if first != err {
+        fail At(pos, "propagate-type", "cannot propagate {err.text()} from a fork branch that propagates {first.text()}")
+    }
+}
+
+fn fork_hint(c: *Checker) -> *types.Type? {
+    if c.ctx.forking {
+        return current(c).fork_error ?? c.ctx.fork_hint
+    }
+    let enclosing = c.ctx.func ?? return none
+    let ret_type = enclosing.ret_type ?? return none
+    if ret_type.kind != ResultKind {
+        return none
+    }
+    ret_type.err_of()
+}
+
+fn fork_fail(c: *Checker, s: *ast.Fail) ! diag.Error {
+    let t = plain(c, s.value, current(c).fork_error ?? c.ctx.fork_hint)?
+    if t.kind != EnumKind {
+        fail At(ast.position(s.value), "error-type", "error type must be an enum, found {t.text()}")
+    }
+    fork_adopt(c, s.pos, t)?
+}
+
+fn fork_try(c: *Checker, e: *ast.Try, want: *types.Type?) ! diag.Error {
+    let t = error_result(c, e.x, "?", e.pos, want)?
+    fork_adopt(c, e.pos, t.err_of())?
+    e.type = t.ok_of()
+}
+
+fn fork_results(c: *Checker, s: *ast.Fork, b: *ForkBranch) ! diag.Error {
+    if valued(b) {
+        fork_slot(c, s, b.slot, b.ok, b.pos)?
+    }
+    let err = b.err ?? return
+    fork_bind(c, s, "{b.slot}_failed", true, ast.Expr.BoolLit(new(ast.BoolLit { value: false, pos: b.pos })))?
+    fork_slot(c, s, "{b.slot}_err", err, b.pos)?
+}
+
+fn fork_slot(c: *Checker, s: *ast.Fork, name: str, t: *types.Type, pos: diag.Pos) ! diag.Error {
+    let l = new(ast.Let { name, mutable: true, value: fork_call("__zero", [], pos), pos })
+    expect_type(c, l.value, t)?
+    l.local = declare(c, name, t, true)
+    s.stmts.push(ast.Stmt.Let(l))
+}
+
+fn fork_bind(c: *Checker, s: *ast.Fork, name: str, mutable: bool, value: ast.Expr) ! diag.Error {
+    let l = new(ast.Let { name, mutable, value, pos: ast.position(value) })
+    let _ = bind(c, l)?
+    s.stmts.push(ast.Stmt.Let(l))
+}
+
+fn fork_do(c: *Checker, s: *ast.Fork, x: ast.Stmt) ! diag.Error {
+    let _ = stmt(c, x)?
+    s.stmts.push(x)
+}
+
+fn fork_on(c: *Checker, s: *ast.Fork, name: str, args: []ast.Expr, pos: diag.Pos) ! diag.Error {
+    let call = new(ast.Call { callee: fork_ident(name, pos), args, pos })
+    fork_do(c, s, fork_run(ast.Expr.Call(call)))?
+    call.prepended = true
+}
+
+fn fork_job(b: *ForkBranch) -> ast.Expr {
+    let pos = b.pos
+    var outcome = fork_call("{b.slot}_fn", [], pos)
+    if b.err != none {
+        let caught = new(ast.Block { pos })
+        caught.stmts.push(fork_set("{b.slot}_failed", ast.Expr.BoolLit(new(ast.BoolLit { value: true, pos })), pos))
+        caught.stmts.push(fork_set("{b.slot}_err", fork_ident("caught", pos), pos))
+        caught.stmts.push(ast.Stmt.Return(new(ast.Return { pos })))
+        let arm = new(ast.Arm { pattern: new(ast.Pattern { name: "caught", pos }), body: ast.Expr.Block(caught) })
+        outcome = ast.Expr.Catch(new(ast.Catch { x: outcome, arms: [arm], pos }))
+    }
+    let body = new(ast.Block { pos })
+    if valued(b) {
+        body.stmts.push(fork_set(b.slot, outcome, pos))
+    } else {
+        body.stmts.push(fork_run(outcome))
+    }
+    ast.Expr.Closure(new(ast.Closure { body, pos }))
+}
+
+fn fork_raise(c: *Checker, s: *ast.Fork, b: *ForkBranch) ! diag.Error {
+    if b.err == none {
+        return
+    }
+    let then = new(ast.Block { pos: b.pos })
+    then.stmts.push(ast.Stmt.Fail(new(ast.Fail { value: fork_ident("{b.slot}_err", b.pos), pos: b.pos })))
+    let raise = new(ast.If { cond: fork_ident("{b.slot}_failed", b.pos), then, pos: b.pos })
+    fork_do(c, s, fork_run(ast.Expr.If(raise)))?
+}

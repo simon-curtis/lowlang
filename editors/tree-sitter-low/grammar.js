@@ -234,6 +234,7 @@ module.exports = grammar({
 
     _statement: $ => choice(
       $.let_declaration,
+      $.fork_declaration,
       $.using_declaration,
       $.assignment_statement,
       $.send_statement,
@@ -261,6 +262,17 @@ module.exports = grammar({
         field('value', $._expression),
       ),
     ),
+
+    fork_declaration: $ => seq(
+      choice('let', 'var'),
+      field('name', $.identifier),
+      repeat1(seq(',', field('name', $.identifier))),
+      '=',
+      field('keyword', $.identifier),
+      field('body', $.fork_body),
+    ),
+
+    fork_body: $ => seq('{', separated($, $._expression), '}'),
 
     struct_pattern: $ => seq('{', separated($, $.field_pattern), '}'),
 

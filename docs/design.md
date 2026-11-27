@@ -2171,7 +2171,7 @@ The standard functions come from `compiler/lint/std_index.low`. `compiler/tableg
 
 `prefer-loop-label` flags a `break` out of an inner loop that sets a boolean flag to a literal. It does so when the statement right after that loop is `if flag { break }` or `if flag { continue }` (or `if !flag` for a flag set to `false`), with no `else`.
 
-It suggests labelling the loop that `if` acts on and jumping to it with `break name` or `continue name`, reusing the label the `if` already names. Breaks inside a nested loop, closure, `spawn` or `defer` are not counted.
+It suggests labelling the loop that `if` acts on and jumping to it with `break name` or `continue name`, reusing the label the `if` already names. Breaks inside a nested loop, closure, `spawn`, `fork` or `defer` are not counted.
 
 #### Lint: one-letter-name
 
@@ -2629,7 +2629,7 @@ Values of different kinds that share behaviour, such as the elements of a UI tre
 
 ### Concurrency
 
-`spawn` starts a green thread, and green threads pass values to each other over channels.
+`spawn` starts a green thread, and green threads pass values to each other over channels. `fork` runs several expressions at once and binds their values.
 
 <!-- prelude
 let fd: i32 = 0
@@ -2673,6 +2673,64 @@ A program ends when `main` returns, whatever other green threads are doing.
 | --- | --- |
 | Every green thread is waiting and nothing can wake one | `every green thread is blocked forever` |
 | A green thread exhausts its stack | `stack overflow` |
+
+#### Fork
+
+`let a, b = fork { f(), g() }` runs each branch on its own green thread, waits for all of them and then binds one name to each branch's value.
+
+```low
+enum LoadError {
+    Missing(path: str)
+}
+
+fn size(path: str) -> i64 ! LoadError {
+    if path.len == 0 {
+        fail Missing(path)
+    }
+    path.len
+}
+
+fn sum(xs: i64[]) -> i64 {
+    if xs.len < 4 {
+        var n = 0
+        for x in xs {
+            n += x
+        }
+        return n
+    }
+    let mid = xs.len / 2
+    let left, right = fork { sum(xs[..mid]), sum(xs[mid..]) }
+    left + right
+}
+
+fn sizes(a: str, b: str) -> i64 ! LoadError {
+    let first, second = fork { size(a)?, size(b)? }
+    first + second
+}
+
+print(sum([1, 2, 3, 4, 5, 6, 7, 8]))
+print(sizes("base", "local") catch { Missing(path) => -1 })
+```
+
+| Part | Rule |
+| --- | --- |
+| Names | One for each branch, at least two. `_` discards a value, and a branch that produces no value takes `_`. `var` makes every name assignable. The names take no type annotation. |
+| Branches | Expressions separated by commas or newlines. |
+| Scope | The names are bound when the fork ends. A branch reads the locals around the `let`, never a name of the same `let` (`fork-sibling`). |
+| Threads | A fork of n branches starts n-1 green threads and runs the last branch on the forking one, which then waits. |
+| Writes | A branch cannot change a local it captures (`fork-write`), under the same rule as a spawned closure. Writes through a pointer and stores into a slice element are not checked. |
+| Errors | `?` or `fail` in a branch ends that branch with an error. Every branch still runs to its end. The statement then fails with the error of the first failing branch in source order, so the result does not depend on timing. The enclosing function needs that error type. |
+| Exits | `return`, `break`, `continue` and a `catch` mapping cannot leave a branch (`fork-exit`). A closure inside a branch returns for itself, and a loop inside a branch takes its own `break` and `continue`. |
+| Values | A branch cannot produce a value with `drop`. |
+| Panics | A panic in a branch ends the process, as in any green thread. |
+
+`fork` is a contextual keyword. It is an ordinary identifier except where an expression begins and `{` follows, outside the head of an `if`, `for` or `match`. There it must follow a `let` or `var` with one name for each branch (`fork-let`).
+
+Inside a `region`, the last branch allocates in the region and the other branches allocate on the garbage-collected heap, as `spawn` does. Their values stay alive while the region does and are copied with the region's value.
+
+On `browser/wasm32` the branches interleave on one thread. The results are the same.
+
+Forking has no sequential cutoff. A recursive function stops forking below a size it chooses, as `sum` does above.
 
 #### Channels
 
@@ -2863,6 +2921,12 @@ Every compile error and warning carries a code, printed after the message in bra
 | `extern-type` | error | An `extern` declaration uses a type C cannot pass. | `extern "c" { fn puts(s: str) -> i32 }` |
 | `field-tag` | error | A field tag is not a plain string literal. | `struct P { x: i64 "{1}" }` |
 | `float-literal` | error | A float literal cannot be read or does not fit `f64`. | `1e999` |
+| `fork-arity` | error | A `fork` has more or fewer branches than the `let` has names. | `let a, b = fork { 1, 2, 3 }` |
+| `fork-exit` | error | `return`, `break`, `continue` or a `catch` mapping leaves a fork branch. | a branch that runs `return 1` |
+| `fork-let` | error | `fork` is written without a `let` of one name for each branch, or such a `let` has no `fork`. | `let a = fork { 1, 2 }` |
+| `fork-sibling` | error | A fork branch reads a name the same `let` binds. | `let a, b = fork { 1, a + 1 }` |
+| `fork-void` | error | A name other than `_` is given to a fork branch that produces no value. | `let a, b = fork { print(1), 2 }` |
+| `fork-write` | error | A fork branch changes a local it captures. | `var n = 0` then a branch that runs `n = 5` |
 | `format-spec` | error | A format spec in an interpolation is malformed. | `"{x:q}"` |
 | `format-type` | error | A value cannot be formatted with the given spec. | `"{true:x}"` |
 | `has-drop` | error | A value with `drop` is copied where it would be dropped twice: captured, spawned, stored or destructured. | `spawn worker(conn)` where `conn` has `drop` |
