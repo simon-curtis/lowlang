@@ -91,7 +91,7 @@ $ low run -c debug app/ -v
 - Options come before the program. Every argument after the program goes to the program, so the `-v` above goes to `app`.
 - With none named, a directory that holds no `.low` file runs the one program its project declares (see [Projects](#projects)).
 - `--target browser/wasm32` runs it as WebAssembly under `node`.
-- `-c`, `--trace` and `--json` work as they do for [`low build`](#low-build). `--json` covers the compilation, not the program's output.
+- `-c`, `--trace`, `--json` and `--max-errors` work as they do for [`low build`](#low-build). `--json` covers the compilation, not the program's output.
 
 ### low test
 
@@ -111,6 +111,7 @@ Writes a native binary, or a WebAssembly module for `browser/wasm32`, from a fil
 | `--trace file.json` | Writes a Chrome trace of the compilation. |
 | `--map file` | Writes the address of every symbol. |
 | `--json` | Writes each error and warning to standard error as one JSON object per line (see [JSON diagnostics](#json-diagnostics)). |
+| `--max-errors n` | Stops after `n` errors, 50 by default (see [Compile errors](#compile-errors)). |
 
 **Which program is built.** With no program named, the current directory is built when it holds `.low` files. Otherwise the one program the project declares is built, an error naming them when there are several.
 
@@ -160,11 +161,11 @@ Runs the program and patches changed functions into it on save. Changing `main`,
 
 ### low ir and low asm
 
-`low ir` prints the optimised SSA form. `low asm` prints the generated assembly. Both take `--json` as [`low build`](#low-build) does.
+`low ir` prints the optimised SSA form. `low asm` prints the generated assembly. Both take `--json` and `--max-errors` as [`low build`](#low-build) does.
 
 ### low lint
 
-Type-checks a program or a library module and prints its warnings. `--json` writes them as [JSON diagnostics](#json-diagnostics).
+Type-checks a program or a library module and prints its warnings. `--json` writes them as [JSON diagnostics](#json-diagnostics), and `--max-errors` works as it does for [`low build`](#low-build).
 
 ### low doc
 
@@ -1846,6 +1847,7 @@ If a `dir`, `dir/...` or `path/name_test.low:LINE` names nothing below the curre
 | `-j n`, `--jobs n` | Runs at most `n` processes at once (default `os.cpu_count()`). |
 | `--update` | Passes `-update` to the child, which rewrites golden files. |
 | `--nocache` | Builds every program and runs every test instead of reusing cached programs and replaying cached passes, and stores nothing. |
+| `--max-errors n` | Stops checking a module's build after `n` errors, 50 by default. |
 
 #### How a test run builds and runs
 
@@ -2684,6 +2686,16 @@ When `main` declares `! E`, or top-level statements give it one, and returns an 
 ### Result layout
 
 A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
+
+### Compile errors
+
+The checker reports every error it finds in one run, up to 50, sorted by file, line and column. A syntax error, an import error or an error in a declaration's signature, fields or variants stops the build alone.
+
+- An error inside a function ends the check of its statement. The checker goes on with the next statement, so two mistakes in one function are both reported. Checking the function stops at its end: a function with an error gets no return check, and the move and read-only passes leave it out.
+- A `let` whose statement failed still binds its names, as poisoned locals. A later use of a poisoned name fails quietly, so one root mistake gives one error, not one per use.
+- A block with a failed statement fails quietly too, after its tail is checked, so its type never reaches the expression around it.
+- `--max-errors n` stops after `n` errors. `--max-errors 1` stops at the first error.
+- Instances of a generic function whose body failed are not checked, and an error repeated with the same position, code and message is reported once.
 
 ### Diagnostic codes
 
@@ -9643,7 +9655,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - `.tags` declares what the runner cannot learn from the program. `simd` marks a program that compiles to vector code and runs a second time with `LOW_SIMD=sse2`, and a third time with `LOW_SIMD=avx512` on a host whose `/proc/cpuinfo` lists `avx512f`, `avx512vl`, `avx512bw` and `avx512dq` (the `run` suite prints whether it does). `linux-only` marks a program that uses operating system services the Windows standard library lacks, such as signals, pseudo-terminals, inotify, Unix sockets, file modes or `/proc`. It marks a program that relies on a Linux kernel guarantee, such as appends from concurrent threads landing whole. Such a program has no Windows build. `debug` builds the program with `-c debug`. The runner builds each program with `--map` and fails when `simd` and the build it runs disagree: a program has vector code when the map lists a function's `.avx512`, `.avx2` and `.sse2` versions beside its stub.
 - `testdata/windows` holds programs that only run on Windows, with `.out`, `.err` and `.maxtime`.
 - `std/<module>/examples` holds the module's examples, with `.out`. An example with no Windows build has a `.tags` of `linux-only`. The runner does not check `simd` for them.
-- `testdata/fail` holds programs that must fail to compile with the message in `.err`, which ends with the diagnostic code in brackets. File paths in the message are shown relative to the fixture. `.target` names the target to build for, such as `browser/wasm32`. `fixture.read_target` reads it. Without it the program builds for `linux/amd64`.
+- `testdata/fail` holds programs that must fail to compile with the errors in `.err`, one per line, each ending with its diagnostic code in brackets. `two_independent_errors` reports two errors from one file, and `root_error_no_cascade` one error for a root mistake its later statements use. File paths in the message are shown relative to the fixture. `.target` names the target to build for, such as `browser/wasm32`. `fixture.read_target` reads it. Without it the program builds for `linux/amd64`.
 - `testdata/lint` holds programs and library modules without a `main`. The `low lint` warnings of each must equal `.warn`, one per line with relative paths. A program without a `.warn` file has none.
 - `testdata/test` holds directories whose tests run with `low test`:
   - `.module` names the path to test, joined to the directory's path from the repository root. The path is a submodule of a project, `...` for every module below the directory, or `name_test.low:LINE`. Without it the directory itself is tested.

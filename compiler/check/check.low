@@ -60,6 +60,11 @@ pub struct Checker {
     unpropagated: *types.Type? = none
     main_unsettled: bool = false
     reported: []*diag.Diagnostic = []
+    errors: i64 = 0
+    max_errors: i64
+    stopped: bool = false
+    failed: [*ast.Func: bool] = [:]
+    poisoned: [*ast.Local: bool] = [:]
 }
 
 pub struct Embedded {
@@ -78,7 +83,7 @@ struct Link {
 }
 
 pub fn check(files: []*ast.File, platform: targets.OS, main_required: bool, resolve: fn(*ast.File, str) -> Embedded ! EmbedError, list: fn(*ast.File, str) -> []str ! EmbedError) -> *types.Universe ! diag.Error {
-    check_with(files, platform, main_required, resolve, list, in_order)?.universe
+    check_with(files, platform, main_required, resolve, list, in_order, diag.error_limit)?.universe
 }
 
 fn in_order(count: i64, job: fn(i64)) {
@@ -88,7 +93,7 @@ fn in_order(count: i64, job: fn(i64)) {
 }
 
 /// Checks `files` as `check` does, running the passes that take one checked function at a time through `each`.
-pub fn check_with(files: []*ast.File, platform: targets.OS, main_required: bool, resolve: fn(*ast.File, str) -> Embedded ! EmbedError, list: fn(*ast.File, str) -> []str ! EmbedError, each: fn(i64, fn(i64))) -> Outcome ! diag.Error {
+pub fn check_with(files: []*ast.File, platform: targets.OS, main_required: bool, resolve: fn(*ast.File, str) -> Embedded ! EmbedError, list: fn(*ast.File, str) -> []str ! EmbedError, each: fn(i64, fn(i64)), max_errors: i64) -> Outcome ! diag.Error {
     let link = new(Link {})
     let u = types.new_universe(fn(t: *types.Type) ! diag.Error {
         let c = link.checker ?? panic("the universe announced a type before the checker existed")
@@ -102,22 +107,14 @@ pub fn check_with(files: []*ast.File, platform: targets.OS, main_required: bool,
         embedder: resolve
         lister: list
         unresolved: new(types.Type { kind: ParamKind, name: "?" })
+        max_errors
     })
     link.checker = c
     var fatal: diag.Error? = none
     check_files(c, files, main_required) catch {
-        e => {
-            fatal = e
-            settle_in_order(c) catch {
-                settled => { fatal = settled }
-            }
-        }
+        e => { fatal = e }
     }
-    if fatal == none {
-        settle(c, each) catch {
-            e => { fatal = e }
-        }
-    }
+    settle(c, each)
     let warnings = finish(c, fatal)?
     Outcome { universe: u, warnings }
 }
@@ -318,16 +315,18 @@ fn check_files(c: *Checker, files: []*ast.File, main_required: bool) ! diag.Erro
     check_defaults(c, files)?
     check_main(c, files, main_required)?
     for f in top_level {
-        function(c, f)?
+        checked_function(c, f)?
     }
     c.main_unsettled = false
     for f in funcs {
-        function(c, f)?
+        checked_function(c, f)?
     }
     for c.pending.len > 0 {
         let f = c.pending[0]
         c.pending = c.pending[1..]
-        function(c, f)?
+        if !template_failed(c, f) {
+            checked_function(c, f)?
+        }
     }
 }
 
@@ -842,6 +841,9 @@ fn lookup(c: *Checker, name: str, pos: diag.Pos) -> *ast.Local ! diag.Error {
 }
 
 fn capture(c: *Checker, l: *ast.Local, pos: diag.Pos) ! diag.Error {
+    if c.poisoned[l] != none {
+        fail reported()
+    }
     var i = c.ctx.closures.len - 1
     for i >= 0 && c.ctx.closures[i].func != l.owner {
         if l.ref {
@@ -873,15 +875,40 @@ fn pop_scope(c: *Checker) {
 fn block(c: *Checker, b: *ast.Block, want: *types.Type?) -> *types.Type ! diag.Error {
     push_scope(c)
     var diverges = false
+    var broken = false
     for s in b.stmts {
-        if stmt(c, s)? {
+        let saved = mark(c)
+        let ends = stmt(c, s) catch {
+            e => {
+                recovered(c, saved, e)?
+                poison(c, s)
+                broken = true
+                continue
+            }
+        }
+        if ends {
             diverges = true
         }
     }
     b.type = c.universe.void
     match b.tail {
-        some(tail) => { b.type = expr(c, tail, want)? }
+        some(tail) => {
+            if broken {
+                let saved = mark(c)
+                expr(c, tail, want) catch {
+                    e => {
+                        recovered(c, saved, e)?
+                        c.universe.void
+                    }
+                }
+                fail reported()
+            }
+            b.type = expr(c, tail, want)?
+        }
         none => {}
+    }
+    if broken {
+        fail reported()
     }
     if diverges {
         b.type = c.universe.never
