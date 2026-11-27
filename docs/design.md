@@ -15,6 +15,7 @@ Low is a small compiled language, about the size of Go's core. It has a tracing 
 | [`low ir`](#low-ir-and-low-asm) | Prints the optimised SSA form. |
 | [`low asm`](#low-ir-and-low-asm) | Prints the generated assembly. |
 | [`low lint`](#low-lint) | Type-checks a program or a library module and prints its warnings. |
+| [`low fix`](#low-fix) | Applies the safe fixes of errors and warnings. |
 | [`low doc`](#low-doc) | Prints the public API of modules as JSON. |
 | [`low names`](#low-names) | Prints every name in a file as JSON. |
 | [`low explain`](#low-explain) | Prints the meaning of a diagnostic code. |
@@ -166,6 +167,22 @@ Runs the program and patches changed functions into it on save. Changing `main`,
 ### low lint
 
 Type-checks a program or a library module and prints its warnings. `--json` writes them as [JSON diagnostics](#json-diagnostics), and `--max-errors` works as it does for [`low build`](#low-build).
+
+### low fix
+
+`low fix [path]...` checks each program or library module, the current directory when none is named, and applies the safe fixes of its errors and warnings in place. It prints one line per changed file, `main.low: applied 3 fixes`. `--dry-run` writes nothing and prints the changes as a unified diff. `--target` checks for another target, as [`low build`](#low-build) does.
+
+- A diagnostic may carry fixes: a title and edits to the source. A safe fix keeps the program's meaning and has one result, so `low fix` applies it unasked. An unsafe fix chooses something for the author, such as an error type or a handler, and only the language server offers it. [JSON diagnostics](#json-diagnostics) carry both.
+- Fixes apply in rounds of at most ten, each checking the program again, until a round applies none. Two fixes whose edits overlap in one round apply one at a time. A second `low fix` on its output changes nothing.
+- Only files whose text on disk is the text that was checked change. Files in the module cache never do, and files of the standard library change only when a path given is under `std`.
+
+| Code | Safe fix |
+| --- | --- |
+| `drop-binding` | Binds the value with `using` or `let`, whichever the type needs. |
+| `unused-label` | Removes the label. |
+| `missing-mut` | Writes `mut` before a local passed to a `mut` parameter. |
+| `method-call` | Calls a slice or map builtin as a method. |
+| `no-error-type` | None. The language server offers `Add ! E to f`, `Catch the error` and `Ignore the error with or`. |
 
 ### low doc
 

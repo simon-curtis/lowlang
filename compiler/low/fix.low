@@ -1,0 +1,198 @@
+import compiler
+import diag
+import native
+import target
+import std/file
+import std/path
+import std/slices
+import std/text
+
+const fix_rounds = 10
+
+struct Fixing {
+    platform: target.OS
+    cache: str
+    std: bool
+    original: [str: str] = [:]
+    current: [str: str] = [:]
+    applied: [str: i64] = [:]
+}
+
+struct Splice {
+    start: i64
+    end: i64
+    text: str
+}
+
+struct Planned {
+    file: str
+    start: i64
+    edits: []Splice
+}
+
+fn fix_command(paths: []str, platform: target.OS, dry_run: bool) ! Error {
+    let fixing = new(Fixing { platform, cache: native.disk().cache, std: names_std(paths) })
+    for p in paths {
+        fixing.fix_path(p)?
+    }
+    var names: []str = []
+    for name in fixing.current {
+        if fixing.current[name] != fixing.original[name] {
+            names.push(name)
+        }
+    }
+    slices.sort(mut names)
+    for name in names {
+        let before = fixing.original[name] ?? ""
+        let after = fixing.current[name] ?? ""
+        if dry_run {
+            write_all(1, bytes(unified_diff(name, before, after)))
+            continue
+        }
+        file.write_text(name, after) catch {
+            e => fail Failed("write {name}: {e}")
+        }
+        let count = fixing.applied[name] ?? 0
+        let noun = if count == 1 { "fix" } else { "fixes" }
+        write_all(1, bytes("{name}: applied {count} {noun}\n"))
+    }
+}
+
+fn names_std(paths: []str) -> bool {
+    for p in paths {
+        let cleaned = path.clean(p)
+        if cleaned == "std" || text.starts_with(cleaned, "std/") {
+            return true
+        }
+    }
+    false
+}
+
+fn fix_path(f: *Fixing, source: str) ! Error {
+    for _ in 0..fix_rounds {
+        let found = f.diagnose(source)?
+        if f.apply_round(found) == 0 {
+            return
+        }
+    }
+}
+
+fn diagnose(f: *Fixing, source: str) -> []*diag.Diagnostic ! Error {
+    let docs = native.overlay()
+    for name in f.current {
+        compiler.overlay_put(docs, name, f.current[name] ?? "")
+    }
+    docs.max_errors = 1000000
+    let unit = compiler.check_library(source, f.platform, docs) catch {
+        e => {
+            match e {
+                Diag(inner) => return diag.diagnostics(inner)
+                _ => fail Front(e)
+            }
+        }
+    }
+    unit.warnings
+}
+
+fn apply_round(f: *Fixing, found: []*diag.Diagnostic) -> i64 {
+    var planned: []Planned = []
+    for d in found {
+        for fix in d.fixes {
+            if fix.safe {
+                match f.plan(fix) {
+                    some(p) => planned.push(p)
+                    none => {}
+                }
+            }
+        }
+    }
+    slices.sort_stable_by(mut planned, fn(a: Planned, b: Planned) -> bool { a.file < b.file || (a.file == b.file && a.start > b.start) })
+    var count = 0
+    var file_name = ""
+    var limit = 0
+    for p in planned {
+        let src = f.current[p.file] ?? continue
+        if p.file != file_name {
+            file_name = p.file
+            limit = src.len + 1
+        }
+        if p.edits[p.edits.len - 1].end > limit {
+            continue
+        }
+        var edited = src
+        var i = p.edits.len - 1
+        for i >= 0 {
+            let edit = p.edits[i]
+            edited = "{edited[..edit.start]}{edit.text}{edited[edit.end..]}"
+            i -= 1
+        }
+        f.current[p.file] = edited
+        f.applied[p.file] = (f.applied[p.file] ?? 0) + 1
+        limit = p.start
+        count += 1
+    }
+    count
+}
+
+fn plan(f: *Fixing, fix: diag.Fix) -> Planned? {
+    if fix.edits.len == 0 {
+        return none
+    }
+    let at = fix.edits[0].pos
+    let name = at.pos_file()
+    let src = f.writable(name, diag.origin(at).text) ?? return none
+    var edits: []Splice = []
+    for edit in fix.edits {
+        if edit.pos.pos_file() != name || edit.end.pos_file() != name {
+            return none
+        }
+        let start = offset_of(src, edit.pos) ?? return none
+        let end = offset_of(src, edit.end) ?? return none
+        if end < start {
+            return none
+        }
+        edits.push(Splice { start, end, text: edit.text })
+    }
+    slices.sort_stable_by(mut edits, fn(a: Splice, b: Splice) -> bool { a.start < b.start })
+    for i in 1..edits.len {
+        if edits[i].start < edits[i - 1].end {
+            return none
+        }
+    }
+    Planned { file: name, start: edits[0].start, edits }
+}
+
+fn writable(f: *Fixing, name: str, compiled: str) -> str? {
+    if name == "" || compiled == "" || (f.cache != "" && text.starts_with(name, f.cache)) || (!f.std && text.starts_with(name, "std/")) {
+        return none
+    }
+    match f.current[name] {
+        some(held) => return if held == compiled { held } else { none }
+        none => {}
+    }
+    let disk = file.read_text(name) or return none
+    if disk != compiled {
+        return none
+    }
+    f.original[name] = disk
+    f.current[name] = disk
+    disk
+}
+
+fn offset_of(src: str, p: diag.Pos) -> i64? {
+    var line = 1
+    var at = 0
+    for line < p.pos_line() {
+        let next = text.index_byte(src[at..], '\n')
+        if next < 0 {
+            return none
+        }
+        at += next + 1
+        line += 1
+    }
+    let offset = at + p.pos_col() - 1
+    if offset > src.len {
+        return none
+    }
+    offset
+}
