@@ -15,8 +15,10 @@ Low is a small compiled language, about the size of Go's core. It has a tracing 
 | [`low ir`](#low-ir-and-low-asm) | Prints the optimised SSA form. |
 | [`low asm`](#low-ir-and-low-asm) | Prints the generated assembly. |
 | [`low lint`](#low-lint) | Type-checks a program or a library module and prints its warnings. |
+| [`low fix`](#low-fix) | Applies the safe fixes of errors and warnings. |
 | [`low doc`](#low-doc) | Prints the public API of modules as JSON. |
 | [`low names`](#low-names) | Prints every name in a file as JSON. |
+| [`low explain`](#low-explain) | Prints the meaning of a diagnostic code. |
 | [`low context`](#low-context) | Prints what an edit to one definition needs. |
 | [`low refs`](#low-refs) | Prints every place that names a definition. |
 | [`low prof`](#low-prof) | Runs a program and reports where its cycles go. |
@@ -93,7 +95,7 @@ $ low run -c debug app/ -v
 - Options come before the program. Every argument after the program goes to the program, so the `-v` above goes to `app`.
 - With none named, a directory that holds no `.low` file runs the one program its project declares (see [Projects](#projects)).
 - `--target browser/wasm32` runs it as WebAssembly under `node`.
-- `-c` and `--trace` work as they do for [`low build`](#low-build).
+- `-c`, `--trace`, `--json` and `--max-errors` work as they do for [`low build`](#low-build). `--json` covers the compilation, not the program's output.
 
 ### low test
 
@@ -112,6 +114,8 @@ Writes a native binary, or a WebAssembly module for `browser/wasm32`, from a fil
 | `--subsystem console\|gui` | Picks the PE subsystem of a Windows executable. |
 | `--trace file.json` | Writes a Chrome trace of the compilation. |
 | `--map file` | Writes the address of every symbol. |
+| `--json` | Writes each error and warning to standard error as one JSON object per line (see [JSON diagnostics](#json-diagnostics)). |
+| `--max-errors n` | Stops after `n` errors, 50 by default (see [Compile errors](#compile-errors)). |
 
 **Which program is built.** With no program named, the current directory is built when it holds `.low` files. Otherwise the one program the project declares is built, an error naming them when there are several.
 
@@ -161,11 +165,31 @@ Runs the program and patches changed functions into it on save. Changing `main`,
 
 ### low ir and low asm
 
-`low ir` prints the optimised SSA form. `low asm` prints the generated assembly.
+`low ir` prints the optimised SSA form. `low asm` prints the generated assembly. Both take `--json` and `--max-errors` as [`low build`](#low-build) does.
 
 ### low lint
 
-Type-checks a program or a library module and prints its warnings.
+Type-checks a program or a library module and prints its warnings. `--json` writes them as [JSON diagnostics](#json-diagnostics), and `--max-errors` works as it does for [`low build`](#low-build).
+
+### low fix
+
+`low fix [path]...` checks each program or library module, the current directory when none is named, and applies the safe fixes of its errors and warnings in place. It prints one line per changed file, `main.low: applied 3 fixes`. `--dry-run` writes nothing and prints the changes as a unified diff. `--target` checks for another target, as [`low build`](#low-build) does.
+
+- A diagnostic may carry fixes: a title and edits to the source. A safe fix keeps the program's meaning and has one result, so `low fix` applies it unasked. An unsafe fix chooses something for the author, such as an error type or a handler, and only the language server offers it. [JSON diagnostics](#json-diagnostics) carry both.
+- Fixes apply in rounds of at most ten, each checking the program again, until a round applies none. Two fixes whose edits overlap in one round apply one at a time. A second `low fix` on its output changes nothing.
+- Only files whose text on disk is the text that was checked change. Files in the module cache never do, and files of the standard library change only when a path given is under `std`.
+
+| Code | Safe fix |
+| --- | --- |
+| `drop-binding` | Binds the value with `using` or `let`, whichever the type needs. |
+| `unused-label` | Removes the label. |
+| `missing-mut` | Writes `mut` before a local passed to a `mut` parameter. |
+| `method-call` | Calls a slice or map builtin as a method. |
+| `no-error-type` | None. The language server offers `Add ! E to f`, `Catch the error` and `Ignore the error with or`. |
+| `unused-import` | Removes the import line. |
+| `unused-local` | Binds the value with `let _`, when nothing assigns the local afterwards. |
+| `prefer-let` | Declares the binding with `let`. |
+| `unused-function` | None. The language server offers `Remove f`, which deletes the declaration with its `///` comment. |
 
 ### low doc
 
@@ -174,6 +198,10 @@ Prints the public API of every module under a directory, of the standard library
 ### low names
 
 Prints every name in a file as JSON, with its hover text, definition and reference group.
+
+### low explain
+
+Prints the severity, meaning and example of a diagnostic code, the word in brackets that ends an error or warning. `low explain break-outside` prints the `break-outside` row of the table in [Diagnostic codes](#diagnostic-codes).
 
 ### low context
 
@@ -267,9 +295,27 @@ A binding gives a value a name. `let` is immutable, `var` is mutable.
 let name = "lowlang"
 var count = 0
 count += 1
+print("{name} {count}")
 ```
 
 Types are inferred and may be written as `let x: i64 = 1`.
+
+A binding must be read, and a scope binds a name once. Nothing reads `_`, and a name that starts with `_` may go unread.
+
+<!-- prelude
+fn twice(n: i64) -> i64 {
+    n * 2
+}
+-->
+```low
+let _ = twice(1)
+let _later = 2
+```
+
+These are errors:
+
+- a local that nothing reads (`unused-local`)
+- a second binding of a name in the same scope (`rebound`); a block inside that scope may bind the name again
 
 #### Struct patterns
 
@@ -293,6 +339,7 @@ let { x, y } = rect.max
 var { x: min_x, y: min_y } = cells[0]
 var { x: max_x, y: max_y } = cells[0]
 let { min: { x: left }, max, label } = rect
+print("{x} {y} {min_x} {min_y} {max_x} {max_y} {left} {max.x} {label}")
 ```
 
 | Pattern | Binds |
@@ -409,6 +456,7 @@ let shouted = "hi"
     |> text.repeat(3)
     |> first
 let n = input |> parse()?
+print("{ops.len} {square(2)} {cube(2)} {lengths.len} {shouted} {n}")
 ```
 
 #### Function types
@@ -582,6 +630,7 @@ let ratio: f32 = 0.5
 let length = sqrt(3.0 * 3.0 + 4.0 * 4.0)
 let whole = i64(floor(length))
 let byte = u8(300)
+print("{mode} {shifted} {ratio} {whole} {byte}")
 ```
 
 | Kind | Types |
@@ -699,7 +748,7 @@ var squares: i64[] = []
 squares.push(9)
 let middle = xs[1..3]
 xs[0] = 10
-print(xs.len)
+print(xs.len + middle.len)
 ```
 
 #### Slice types
@@ -873,6 +922,7 @@ let full = name + " Lovelace"
 for c in "héllo" { print(c) }
 let first: u8 = name[0]
 let copy = str(bytes(name))
+print("{line} {row} {full} {first} {copy}")
 ```
 
 | Expression | Gives |
@@ -1065,6 +1115,7 @@ let page = Div { padding: 8.0 } {
         button("cancel")
     })
 }
+print(page.children.len)
 ```
 
 #### Struct declarations
@@ -1152,6 +1203,7 @@ let c = new(Counter { hits: 0 })
 c.hits += 1
 bump(mut *c)
 let copy = *c
+print(copy.hits)
 ```
 
 | Expression | Meaning |
@@ -1300,6 +1352,7 @@ enum Colour {
 }
 
 let index = Colour.Red.index
+print(index)
 ```
 
 - The index is an integer literal that fits in an `i64`, with an optional leading `-`.
@@ -1357,6 +1410,7 @@ fn first(xs: i64[]) -> i64? {
 
 let index = find(xs, 7) ?? -1
 let head = xs[0] when xs.len > 0 else 0
+print("{index} {head}")
 match find(xs, 4) {
     some(i) => print("at {i}")
     none => print("missing")
@@ -1435,7 +1489,7 @@ The result is a `T?` for a `value` of type `T` or `T?`, so `find(xs, 7) when xs.
 ```low
 let shader = embed("shaders/quad.spv")
 let font = embed("fonts/fallback.ttf")
-print(shader.len)
+print(shader.len + font.len)
 ```
 
 The path must be a string literal. It is relative to the directory of the file that calls `embed`, so a module carries its own assets.
@@ -1482,6 +1536,7 @@ print(str(buf))
 var end: ptr = null
 let n = strtol(cstr("123abc"), mut end, 10)
 let pixels = view(buf, 64)
+print(n + pixels.len)
 ```
 
 #### Declaring C functions
@@ -1741,7 +1796,7 @@ pub fn area(c: Circle) -> f64 {
 fn main() {
     let c = geometry.circle(2.0)
     print(geometry.area(c))
-    let s: geometry.Shape = Square(3)
+    let _: geometry.Shape = Square(3)
     print(t.shout("hi"))
 }
 ```
@@ -1767,10 +1822,11 @@ A path starting with `std/` names a module of the standard library, which is com
 
 Declarations and struct fields are private to their module unless marked `pub`. A `pub` enum's variants are public. A struct with private fields without defaults cannot be built with a literal outside its module.
 
-Two things are errors:
+These are errors:
 
 - An import cycle, except through the imports of test files.
 - Importing two modules under one name.
+- An import that nothing in its file uses (`unused-import`).
 
 #### The project root and the entry module
 
@@ -1859,6 +1915,7 @@ If a `dir`, `dir/...` or `path/name_test.low:LINE` names nothing below the curre
 | `-j n`, `--jobs n` | Runs at most `n` processes at once (default `os.cpu_count()`). |
 | `--update` | Passes `-update` to the child, which rewrites golden files. |
 | `--nocache` | Builds every program and runs every test instead of reusing cached programs and replaying cached passes, and stores nothing. |
+| `--max-errors n` | Stops checking a module's build after `n` errors, 50 by default. |
 
 #### How a test run builds and runs
 
@@ -2017,11 +2074,27 @@ The time is the span from the module's first test start to its last test end. `<
 | `event` | Members |
 | --- | --- |
 | `shuffle` | `seed`, written first when `--shuffle` is given. |
+| `diagnostic` | One per error of a module whose build failed, before its `build` event, as in [JSON diagnostics](#json-diagnostics) with `module` added. |
 | `build` | `module`, `ok`, `cached` (`true` when the program was reused), and `error` when the build or the listing failed. Not written for a module with no test files. |
 | `test` | `module`, `test`, `file`, `line`, `result` (`pass`, `fail`, `skip`, `crash`, `timeout` or `not_run`), `cached` (`true` for a test replayed from the cache), `detail` for a crash or timeout, `output` (the child's standard output then standard error) and `elapsed_ns`. |
 | `module` | `module`, `result` (`ok`, `fail`, `build_failed` or `no_test_files`), the counts `failed`, `crashed`, `timed_out`, `build_failed`, `passed`, `skipped`, `not_run` and `cached`, and `elapsed_ns`. |
 | `summary` | `result` (`pass` or `fail`), the same counts and `elapsed_ns`. |
 | `list` | `module`, `test`, `file` and `line`, written instead of the others by `--list`. |
+
+#### JSON diagnostics
+
+`--json` on `low build`, `low run`, `low asm`, `low ir` and `low lint` writes each error and warning to standard error as one JSON object on its own line, sorted by file, line and column, in place of the text lines. A build that fails exits with status 1. `low test --json` writes the same objects as `diagnostic` events in its report.
+
+| Member | Value |
+| --- | --- |
+| `event` | `diagnostic`. |
+| `code` | The code, a row of [Diagnostic codes](#diagnostic-codes). |
+| `severity` | `error` or `warning`. |
+| `file`, `line`, `column` | Where the diagnostic starts. Lines and columns count from 1, and a column counts bytes. |
+| `end_line`, `end_column` | The position just past the token at the start: a name, a string literal or one character. |
+| `message` | The text the text line shows between the position and the code. |
+| `related` | Other places the diagnostic names, each with `label`, `file`, `line` and `column`. |
+| `fixes` | Each fix's `title`, `safe` (`true` when `low fix` applies it) and `edits`, each edit with `file`, `line`, `column`, `end_line`, `end_column` and the replacement `text`. |
 
 #### Test files in the language server
 
@@ -2059,6 +2132,10 @@ The ordinary program's diagnostics for ordinary files do not change.
 | `method-call` | `push`, `pop`, `truncate` and `delete` called as `push(mut x, v)` rather than as `x.push(v)`. |
 | `large-struct` | A struct of at least 64 words. Only `low lint` applies it. |
 | `prefer-const` | A function that a constant could stand in for. |
+| `unused-function` | A private function, constant, struct or enum that nothing in its module uses. A name in a file of the module that the target leaves out counts as a use. |
+| `prefer-let` | A `var` that is never assigned or passed as `mut`. |
+| `dropped-result` | A call whose result is neither `void` nor an error, written as a statement. `let _ = f()` drops it on purpose. |
+| `unreachable` | A statement or tail after one that always leaves the block: `return`, `fail`, `break`, `continue` or a call that never returns. |
 
 #### Lint: prefer-match
 
@@ -2509,10 +2586,11 @@ fn sort[T](mut xs: T[], less: fn(T, T) -> bool) { ... }
 
 print(max(3, 9))
 print(max[u8](200, 100))
-var s = Stack[str] { items: [] }
+let s = Stack[str] { items: [] }
 let p = Pair { first: 1, second: "x" }
-let t: Tree[i64] = Leaf
+let _: Tree[i64] = Leaf
 let pick: fn(i64, i64) -> i64 = max
+print(s.items.len + p.first + pick(1, 2))
 ```
 
 Generic types are written with arguments: `Stack[i64]`, `geometry.Labelled[str]`.
@@ -2575,6 +2653,7 @@ let next = select {
     after(100) => -2
     else => -3
 }
+print(next)
 sleep(10)
 wait_readable(fd)
 ```
@@ -2586,6 +2665,7 @@ wait_readable(fd)
 - The function value and the arguments are evaluated before it starts.
 - `mut` arguments are not allowed.
 - A function that can fail must have its error handled inside the spawned call.
+- A spawned closure, or a closure written inside one or passed to `spawn`, cannot change a local it captures (`spawn-write`). Assigning it, passing it as `mut`, calling `push`, `pop`, `truncate` or `delete` on it, storing into a map it holds and setting one of its fields are all changes. Writes through a pointer and stores into a slice element are not checked. Send values back over a channel.
 
 A program ends when `main` returns, whatever other green threads are doing.
 
@@ -2723,6 +2803,170 @@ When `main` declares `! E`, or top-level statements give it one, and returns an 
 ### Result layout
 
 A result is a tag word (0 ok, 1 error) followed by the larger of the ok value and the error enum.
+
+### Compile errors
+
+The checker reports every error it finds in one run, up to 50, sorted by file, line and column. A syntax error, an import error or an error in a declaration's signature, fields or variants stops the build alone.
+
+- An error inside a function ends the check of its statement. The checker goes on with the next statement, so two mistakes in one function are both reported. Checking the function stops at its end: a function with an error gets no return check, and the move and read-only passes leave it out.
+- A `let` whose statement failed still binds its names, as poisoned locals. A later use of a poisoned name fails quietly, so one root mistake gives one error, not one per use.
+- A block with a failed statement fails quietly too, after its tail is checked, so its type never reaches the expression around it.
+- A file with a failed function or a poisoned local gets no `unused-import` or `unused-local` error, because a use that a failed statement never reached is still a use. Lint warnings, `unused-function` and `prefer-let` among them, run only on a program that checks.
+- `--max-errors n` stops after `n` errors. `--max-errors 1` stops at the first error.
+- Instances of a generic function whose body failed are not checked, and an error repeated with the same position, code and message is reported once.
+
+### Diagnostic codes
+
+Every compile error and warning carries a code, printed after the message in brackets: `main.low:2:5: break outside of a loop [break-outside]`. The code names one kind of mistake and keeps its name when the message is reworded, so a tool can act on it without reading the message. `low explain <code>` prints its row.
+
+`compiler/diag/codes.low` holds the same table. `compiler/tests/check` fails when the two tables differ, when the compiler emits a code with no row, and when no part of the compiler emits a row's code.
+
+| Code | Severity | Meaning | Example |
+| --- | --- | --- | --- |
+| `ambiguous` | error | A method call matches functions in more than one imported module. | `xs.first()` where two imported modules declare `first` for `xs`'s type |
+| `argument-type` | error | A builtin is given an argument of a type it does not take. | `str(42)` |
+| `arity` | error | A call, variant or pattern has the wrong number of arguments or fields. | `fn f(a: i64) {}` then `f(1, 2)` |
+| `bind-type` | error | A binding is given a value that cannot be stored, such as `void`. | `let x = print("a")` |
+| `bound-twice` | error | A destructuring pattern binds one name twice. | `let { x: v, y: v } = point`, where `point` has fields `x` and `y` |
+| `break-outside` | error | `break` or `continue` appears outside a loop. | `fn main() { break }` |
+| `builtin-name` | error | A function or constant takes the name of a builtin. | `fn print(x: i64) {}` |
+| `c-callback` | error | A function passed to C as a callback has a parameter or result C cannot pass. | `extern` callback taking a `str` |
+| `capture` | error | A closure captures a `mut` parameter. | `fn f(mut n: i64) { let g = fn() { n += 1 } }` |
+| `catch-form` | error | `catch` is followed by something other than arms or a mapper. | `parse(s) catch 0` |
+| `char-literal` | error | A character literal is empty, invalid UTF-8 or holds more than one character. | `'ab'` |
+| `closure-result` | error | A closure that uses `?` or `fail` does not declare its result. | `import std/text` then `let f = fn(s: str) text.parse_int(s)?` |
+| `const-cycle` | error | A constant's value refers to itself. | `const a = a + 1` |
+| `const-in-function` | error | `const` appears inside a function body. | `fn main() { const n = 1 }` |
+| `const-pattern` | error | A match arm names a constant and binds fields. | `limit(x) => x` where `limit` is a constant |
+| `const-type` | error | A constant's value is not a number, bool or str. | `const xs = [1, 2]` |
+| `constraint` | error | A type argument does not satisfy the constraint on its parameter. | `max[bool](a, b)` where `max` needs `Ordered` |
+| `conversion` | error | A value cannot be converted to the requested type. | `i64("a")` |
+| `default-cycle` | error | A field default refers to itself. | `struct S { a: i64 = S {}.a }` |
+| `defer` | error | A deferred statement nests `defer`, leaves its scope or returns. | `defer { return }` |
+| `dependency` | error | A `build.low` dependency is missing, unfetched or clashes with another. | `build.local("vendor/shapes")` in `build.low` with no `vendor/shapes` directory |
+| `derive` | error | Derived serialization cannot be generated for a type or field. | `json.encode(f)` where `f` is a function value |
+| `destructure` | error | A destructuring pattern is applied to a value that is not a struct. | `let { x } = 1` |
+| `division-by-zero` | error | A constant expression divides by zero. | `const n = 1 / 0` |
+| `doc-comment` | error | A `///` comment is not followed by a declaration, field or variant. | `/// note` at the end of a file |
+| `drop-binding` | error | A value with `drop` is bound with `let`, or a value without `drop` with `using`. | `let f = file.open(p)?` where the file has `drop` |
+| `dropped-result` | warning | A call's result is dropped without `let _ =`. | `text.trim(s)` written as a statement |
+| `duplicate-arm` | error | A match has two arms for one variant. | `A => 1` written twice in one `match` |
+| `duplicate-field` | error | A struct literal or pattern names one field twice. | `struct P { x: i64 }` then `let p = P { x: 1, x: 2 }` |
+| `duplicate-import` | error | Two imports in one file use the same name. | `import std/text` then `import text = std/path` |
+| `embed` | error | `embed` or `embed_dir` is given something other than an existing path literal. | `embed("missing.txt")` |
+| `empty-interpolation` | error | A string holds `{}` with nothing inside. | `"a {} b"` |
+| `empty-pattern` | error | A destructuring pattern has no fields. | `struct P { x: i64 }` then `let {} = P { x: 1 }` |
+| `empty-type` | error | A struct has no fields or an enum has no variants. | `struct Empty {}` |
+| `error-type` | error | An error type is not an enum. | `fn f() ! i64 {}` |
+| `escape` | error | An escape sequence in a string or character literal is malformed. | `"\q"` |
+| `extern-name` | error | An `extern` library or C symbol name is invalid. | `extern "lib c" { }` |
+| `extern-type` | error | An `extern` declaration uses a type C cannot pass. | `extern "c" { fn puts(s: str) -> i32 }` |
+| `field-tag` | error | A field tag is not a plain string literal. | `struct P { x: i64 "{1}" }` |
+| `float-literal` | error | A float literal cannot be read or does not fit `f64`. | `1e999` |
+| `format-spec` | error | A format spec in an interpolation is malformed. | `"{x:q}"` |
+| `format-type` | error | A value cannot be formatted with the given spec. | `"{true:x}"` |
+| `has-drop` | error | A value with `drop` is copied where it would be dropped twice: captured, spawned, stored or destructured. | `spawn worker(conn)` where `conn` has `drop` |
+| `immutable` | error | A `let`, `const` or non-`mut` parameter is assigned or passed as `mut`. | `let n = 1` then `n = 2` |
+| `import-cycle` | error | Modules import each other in a cycle. | `a` imports `b` and `b` imports `a` |
+| `import-examples` | error | An import names a directory under `examples`. | `import examples/hello` |
+| `import-order` | error | An import follows a declaration. | `fn f() {}` then `import std/text` |
+| `import-path` | error | An import path or name is not written as identifiers. | `import color-names` |
+| `infer-type` | error | A type cannot be inferred and needs an annotation. | `let xs = []` |
+| `infinite-size` | error | A struct or enum contains itself by value. | `struct Node { next: Node }` |
+| `instance-limit` | error | A generic is instantiated with too many distinct type arguments. | a generic function called at thousands of types |
+| `label-shadow` | error | A loop label repeats the label of an enclosing loop. | `outer: for { outer: for { } }` |
+| `label-target` | error | A label is not followed by a `for` loop. | `outer: print(1)` |
+| `large-struct` | warning | A struct is large enough that every copy is costly. | a struct of 64 or more words |
+| `loop-bindings` | error | A `for` loop binds more names than its iterable gives. | `for a, b in 0..3 {}` |
+| `main-signature` | error | `main` takes parameters or returns a value. | `fn main(x: i64) {}` |
+| `main-use` | error | A function, drop or field default uses what the statements outside a function produce. | `fn f() { main() }` beside top-level statements |
+| `manifest` | error | A `build.low` holds something its reader does not accept. | `version("one")` in `build.low` |
+| `map-key` | error | A map key type is not an integer, bool, str or pointer. | `let m: [f64: i64] = [:]` |
+| `match-pattern` | error | A match arm's pattern does not fit the subject. | `enum E { A }` then `match E.A { _(x) => 1 }` |
+| `match-subject` | error | The match subject is used outside a match arm. | a value arm written outside `match` |
+| `match-type` | error | A `match` subject has no value. | `match print("a") { _ => 1 }` |
+| `method-call` | warning | `push`, `pop`, `truncate` or `delete` is called as a function on a `mut` argument. | `var xs = [1]` then `push(mut xs, 2)` |
+| `missing-arms` | error | A `match` does not cover every variant. | `match c { Red => 1 }` on a three-colour enum |
+| `missing-fields` | error | A struct literal leaves out fields that have no default. | `struct P { x: i64 }` then `let p = P {}` |
+| `missing-main` | error | A program has no `main` and no statements outside a function. | `fn f() {}` as the whole program |
+| `missing-mut` | error | An argument to a `mut` parameter is not written with `mut`. | `xs.push(1)` written as `push(xs, 1)` |
+| `missing-return` | error | `return` without a value in a function that returns one. | `fn f() -> i64 { return }` |
+| `module-shadowed` | error | A local hides a module of the same name. | `import std/time` then `fn stamp(time: i64) -> i64 { time.now_nanos() }` |
+| `move-borrowed` | error | A value is moved while it is borrowed. | moving `buf` while a slice of it is alive |
+| `move-field` | error | A field with `drop` is moved out of its struct. | `using f = owner.file` where `owner` is bound with `using` and `file` has `drop` |
+| `mut-aliased` | error | One variable is passed as `mut` twice in one call. | `fn swap(mut a: i64, mut b: i64) {}` then `var n = 1` then `swap(mut n, mut n)` |
+| `mut-position` | error | `mut` appears where it is not an argument to a `mut` parameter. | `var n = 1` then `print(mut n)` |
+| `name-clash` | error | A function or constant has the name of a type or function. | `fn i64() {}` |
+| `no-error-type` | error | `fail`, `?` or a `catch` mapper is used in a function without an error type. | `import std/text` then `fn main() { text.parse_int("1")? }` |
+| `not-assignable` | error | An assignment target or `mut` argument is not a place. | `fn f() -> i64 { 1 }` then `f() = 2` |
+| `not-callable` | error | A value that is not a function is called. | `let n = 1` then `n()` |
+| `not-constant` | error | A constant uses something other than literals, constants, operators and numeric conversions. | `fn three() -> i64 { 3 }` then `const x = three()` |
+| `not-generic` | error | Type arguments are given to something that is not generic. | `let x: i64[str] = 1` |
+| `not-indexable` | error | A value that cannot be indexed or sliced is indexed. | `let n = 1` then `print(n[0])` |
+| `not-iterable` | error | A `for` loop iterates over a value that is not a range, slice, str, map or channel. | `for x in true {}` |
+| `not-pointer` | error | A value that is not a pointer is dereferenced. | `*1` |
+| `not-result` | error | `?`, `catch` or `or` is applied to a value that cannot fail. | `1?` |
+| `not-struct` | error | A struct literal names a type that is not a struct. | `i64 { a: 1 }` |
+| `number-separator` | error | A `_` in a number is not between two digits. | `1__000` |
+| `one-letter-name` | warning | A binding has a one-letter name. | `let n = 1` |
+| `operand-type` | error | An operator is applied to a type it does not support. | `print(true + true)` |
+| `optional-optional` | error | `??` ends a line, which continues the expression. | `let x: i64? = none ??` with the right side on the next line |
+| `overflow` | error | A literal or constant does not fit its type. | `let b: u8 = 256` |
+| `pattern-annotation` | error | A destructuring pattern has a type annotation. | `struct P { x: i64 }` then `let { x }: P = P { x: 1 }` |
+| `pipe-target` | error | The right side of `\|>` is not a function or a call. | `x \|> 1` |
+| `prefer-const` | warning | A function returns the same value on every call. | `fn limit() -> i64 { 10 }` |
+| `prefer-let` | warning | A `var` is never assigned or passed as `mut`. | `var n = 1` then `print(n)` |
+| `prefer-loop-label` | warning | A flag relays a `break` to an enclosing loop. | `done = true` then `break`, tested by the outer loop |
+| `prefer-match` | warning | An `if` chain compares one subject against several values. | `let c = 1` then `if c == 1 { print(1) } else if c == 2 { print(2) } else { print(3) }` |
+| `private` | error | A private name of another module is used. | `import std/text` then `text.first_in_range("a", 0, 1)` |
+| `propagate-type` | error | `?` passes an error of one enum from a function whose error type is another. | `parse(s)?` in a function declared `! ReadError` |
+| `pub-extern` | error | An `extern` block is marked `pub`. | `pub extern "c" {}` |
+| `rebound` | error | A binding repeats a name already bound in the same scope. | `let n = 1` then `let n = 2` |
+| `receiver-call` | warning | A function that changes its first argument is not called on that argument. | `fn grow(mut xs: i64[]) { xs.push(1) }` then `var xs = [1]` then `grow(mut xs)` |
+| `redeclared` | error | A name is declared twice in one scope: a type, function, constant, field, variant, parameter or drop. | `fn f() {}` then `fn f() {}` |
+| `regex` | error | A generated regex call is not given one valid pattern literal. | `import std/regex` then `let re = regex.generated("(a")` |
+| `region-exit` | error | `return`, `break`, `continue` or `?` leaves a region. | `region { return 1 }` |
+| `region-result` | error | A region returns a value that holds region memory it cannot copy out. | `let f = region { fn() -> i64 { 1 } }` |
+| `reserved-name` | error | A name starts with `__`. | `fn __f() {}` |
+| `return-type` | error | A function body produces a type other than its declared result. | `fn f() -> i64 { "a" }` |
+| `return-value` | error | `return` has a value in a function that returns nothing. | `fn f() { return 1 }` |
+| `select-else` | error | A `select` has more than one `else`. | two `else` arms in one `select` |
+| `spawn-call` | error | `spawn` is not followed by a function call. | `spawn 1` |
+| `spawn-mut` | error | `spawn` is given a `mut` argument. | `spawn fill(mut xs)` |
+| `spawn-write` | error | A spawned closure changes a local it captures. | `var n = 0` then `spawn fn() { n = 5 }()` |
+| `target-unsupported` | error | The target lacks what the program uses: system calls, `std/sys` or a C library. | `__syscall(1)` built for `browser/wasm32` |
+| `test-signature` | error | A test function is not declared `fn test_name(t: *testing.T)`. | `fn test_add() {}` in a `_test.low` file |
+| `top-level` | error | Statements outside a function are in the wrong place or beside `fn main`. | top-level statements in a file that also declares `fn main` |
+| `type-arguments` | error | Type arguments are not followed by a call. | `id[i64]` used as a value |
+| `type-arity` | error | A generic type or function is given the wrong number of type arguments. | `let c = chan[i64, str](1)` |
+| `type-as-value` | error | A generic type is used as a value. | `struct Box[T] { v: T }` then `let b = Box.v` |
+| `type-mismatch` | error | A value has a type other than the one expected. | `let n: i64 = "a"` |
+| `unexpected-character` | error | The source holds a character no token starts with. | `1 $ 2` |
+| `unexpected-token` | error | The parser expected one token and found another. | `fn main( {}` |
+| `unhandled-error` | error | A result that can fail is used without `?`, `catch` or `or`. | `parse(s)` as a statement |
+| `unknown-constraint` | error | A type parameter names a constraint that does not exist. | `fn f[T: Sortable](x: T) {}` |
+| `unknown-field` | error | A struct has no field of the given name. | `struct P { x: i64 }` then `print(P { x: 1 }.z)` |
+| `unknown-label` | error | `break` or `continue` names a label no enclosing loop has. | `for i in 0..3 { break outer }` |
+| `unknown-module` | error | An import or qualified name refers to a module that does not exist. | `import std/nope` |
+| `unknown-name` | error | A name is not declared. | `print(y)` |
+| `unknown-type` | error | A type is not declared. | `fn f(x: Nope) {}` |
+| `unknown-variant` | error | An enum has no variant of the given name. | `enum Color { Red }` then `print(Color.Purple)` |
+| `unmatched-brace` | error | A `}` in a string has no `{` before it. | `"a } b"` |
+| `unreachable` | warning | A statement follows one that always leaves the block. | `return 1` then `print(2)` |
+| `unreachable-arm` | error | A match arm follows an arm that matches everything. | `_ => 0` followed by `A => 1` in one `match` |
+| `unterminated-interpolation` | error | A `{` in a string is not closed. | `"a {1 + 2"` |
+| `unterminated-string` | error | A string literal is not closed on its line. | `"abc` |
+| `unused-function` | warning | A private function, constant, struct or enum is not used anywhere in its module. | `fn helper() {}` that nothing calls |
+| `unused-import` | error | An imported module is never used in the file. | `import std/text` with no use of `text` |
+| `unused-label` | error | A loop label is never used. | `outer: for i in 0..3 { print(i) }` |
+| `unused-local` | error | A local binding is never read; `_` and names starting with `_` are exempt. | `let n = 1` and nothing reads `n` |
+| `use-after-move` | error | A value with `drop` is used after it was moved, or may have been. | `take(f)` twice, where `f` has `drop` |
+| `use-std` | warning | A function repeats one in the standard library. | a hand-written `trim` that matches `text.trim` |
+| `using-pattern` | error | `using` is followed by a destructuring pattern. | `using { x } = p` |
+| `using-position` | error | `using` appears in a deferred statement or a drop. | `defer { using f = open() }` where `open` returns a value with `drop` |
+| `variadic-position` | error | `...` is not the last parameter of an `extern` function. | `extern "c" { fn printf(..., fmt: ptr) -> i32 }` |
+| `variadic-value` | error | A variadic `extern` function is used as a value. | `extern "c" { fn printf(fmt: ptr, ...) -> i32 }` then `let f = printf` |
+| `variant-index` | error | Variant indexes are missing on some variants, or `.index` is used without them. | `enum E { A = 1, B }` |
 
 ## Builtins
 
@@ -2902,6 +3146,7 @@ fn handle(req: http.Request) -> http.Response {
 fn main() ! io.Error {
     let client = http.client().with_bearer_token("token").with_timeout(5000).build()
     let page = client.get("https://example.com/") or return
+    print(page.status)
     using l = net.listen("", 8080)?
     http.serve(l, handle)?
 }
@@ -9537,7 +9782,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
   - `.tags` declares what the runner cannot learn from the program. `simd` marks a program that compiles to vector code and runs a second time with `LOW_SIMD=sse2`, and a third time with `LOW_SIMD=avx512` on a host whose `/proc/cpuinfo` lists `avx512f`, `avx512vl`, `avx512bw` and `avx512dq` (the `run` suite prints whether it does). `linux-only` marks a program that uses operating system services the Windows standard library lacks, such as signals, pseudo-terminals, inotify, Unix sockets, file modes or `/proc`. It marks a program that relies on a Linux kernel guarantee, such as appends from concurrent threads landing whole. Such a program has no Windows build. `debug` builds the program with `-c debug`. The runner builds each program with `--map` and fails when `simd` and the build it runs disagree: a program has vector code when the map lists a function's `.avx512`, `.avx2` and `.sse2` versions beside its stub.
 - `testdata/windows` holds programs that only run on Windows, with `.out`, `.err` and `.maxtime`.
 - `std/<module>/examples` holds the module's examples, with `.out`. An example with no Windows build has a `.tags` of `linux-only`. The runner does not check `simd` for them.
-- `testdata/fail` holds programs that must fail to compile with the message in `.err`. File paths in the message are shown relative to the fixture. `.target` names the target to build for, such as `browser/wasm32`. `fixture.read_target` reads it. Without it the program builds for `linux/amd64`.
+- `testdata/fail` holds programs that must fail to compile with the errors in `.err`, one per line, each ending with its diagnostic code in brackets. `two_independent_errors` reports two errors from one file, and `root_error_no_cascade` one error for a root mistake its later statements use, with no unused error for the local and the import that only the failed statement reads. File paths in the message are shown relative to the fixture. `.target` names the target to build for, such as `browser/wasm32`. `fixture.read_target` reads it. Without it the program builds for `linux/amd64`.
 - `testdata/lint` holds programs and library modules without a `main`. The `low lint` warnings of each must equal `.warn`, one per line with relative paths. A program without a `.warn` file has none.
 - `testdata/test` holds directories whose tests run with `low test`:
   - `.module` names the path to test, joined to the directory's path from the repository root. The path is a submodule of a project, `...` for every module below the directory, or `name_test.low:LINE`. Without it the directory itself is tested.
@@ -9551,7 +9796,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
 - The `run` and `examples` suites compile every `testdata/run` program and std example for Linux. They run each one with a one-minute limit. They compare stdout with `.out` and stderr with `.err`. They apply `.maxrss`, `.maxtime`, `.needed` and `.tags`. These suites skip on a Windows host.
 - The `windows` suite builds every `testdata/run` program and std example that has a Windows build, and every `testdata/windows` program, for Windows. It compares stdout, stderr and `.maxtime` the same way. It runs a program with a `.maxtime` or `.maxrss` on its own. It runs only on a Windows host.
 - The `fail` and `lint` suites check every `testdata/fail` and `testdata/lint` program against its sidecar.
-- The `test` suite runs `low test --notime --nocache` on every `testdata/test` directory. It compares stdout, stderr and the exit status with the directory's sidecars. It runs on both hosts. A test build cannot be expressed in a `testdata/fail` program, so the rejected test shapes are fixtures here. The fixtures also cover these cases: a crashing test, a test that times out, skipped tests, `--run` on a subtest, `--skip`, `--failfast`, `--count`, `--shuffle`, `--json`, `--list`, selection by `file:line`, a test file for each operating system that defines the same test, a `...` walk that leaves out `testdata`, `examples`, dot and underscore directories while another module fails to build, a module with no test files and a test that reads a file beside its module. `testdata/run/test_files_left_out` holds a test file that does not compile, which shows that `low build` and `low run` leave test files out.
+- The `test` suite runs `low test --notime --nocache` on every `testdata/test` directory. It compares stdout, stderr and the exit status with the directory's sidecars. It runs on both hosts. A test build cannot be expressed in a `testdata/fail` program, so the rejected test shapes are fixtures here. The fixtures also cover these cases: a crashing test, a test that times out, skipped tests, `--run` on a subtest, `--skip`, `--failfast`, `--count`, `--shuffle`, `--json` on a passing module and on one that fails to build, `--list`, selection by `file:line`, a test file for each operating system that defines the same test, a `...` walk that leaves out `testdata`, `examples`, dot and underscore directories while another module fails to build, a module with no test files and a test that reads a file beside its module. `testdata/run/test_files_left_out` holds a test file that does not compile, which shows that `low build` and `low run` leave test files out.
 - `low test std/...` runs the unit tests in the `_test.low` files of the standard library modules, built against the standard library embedded in `low`. Each file tests one module through its private code, so it uses the module's names without an import. Each file covers one area of its module:
   - `std/testing`: `selected` for each `/` level of a filter, `settings_from` for every flag and each flag error, the failure message of each assertion that returns, and `sub`, `table` and `table_of` against a `T` the test builds.
   - `std/path`: `clean`, `join`, `base`, `dir`, `ext`, `stem`, `is_absolute` and `matches` over empty paths, `.`, `..`, repeated and trailing separators and the root.

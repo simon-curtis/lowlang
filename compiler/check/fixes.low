@@ -1,0 +1,224 @@
+import ast
+import diag
+import types
+import std/math
+import std/text
+
+const default_indent = "    "
+
+/// Builds the fixes that handle the error of the `?` at `at` in place: a `catch` block and an `or`. `body` is the block of the function or closure around it, `ok` the success type of the result when it is known, and `declares_result` whether that function names a result type.
+pub fn handling_fixes(at: diag.Pos, body: diag.Pos, ok: *types.Type?, declares_result: bool) -> []diag.Fix {
+    let line = diag.line_text(at) ?? return []
+    if at.pos_col() > line.len || line[at.pos_col() - 1] != '?' {
+        return []
+    }
+    let arm = arm_for(ok, declares_result)
+    let indent = leading_space(line)
+    let unit = indent_unit(body)
+    let block = " catch {{\n{indent}{unit}e => {arm}\n{indent}}}"
+    [
+        diag.Fix { title: "Catch the error", edits: [replace_try(at, block)], placeholder: arm }
+        diag.Fix { title: "Ignore the error with or", edits: [replace_try(at, " or {arm}")], placeholder: arm }
+    ]
+}
+
+fn arm_for(ok: *types.Type?, declares_result: bool) -> str {
+    match ok {
+        some(value) => {
+            if types.is_void(value) {
+                return "{{}}"
+            }
+        }
+        none => {}
+    }
+    if declares_result { "{{}}" } else { "return" }
+}
+
+fn replace_try(at: diag.Pos, replacement: str) -> diag.Edit {
+    diag.Edit { pos: at, end: at.at_col(at.pos_col() + 1), text: replacement }
+}
+
+fn indent_unit(body: diag.Pos) -> str {
+    let opening = diag.line_text(body) ?? return default_indent
+    let outer = leading_space(opening)
+    var n = body.pos_line() + 1
+    for {
+        let line = diag.line_text(diag.pos_in(diag.origin(body), n, 1)) ?? return default_indent
+        n += 1
+        if text.trim(line) == "" {
+            continue
+        }
+        let inner = leading_space(line)
+        if inner.len > outer.len && text.starts_with(inner, outer) {
+            return inner[outer.len..]
+        }
+        return default_indent
+    }
+    default_indent
+}
+
+fn leading_space(line: str) -> str {
+    var n = 0
+    for n < line.len && (line[n] == ' ' || line[n] == '\t') {
+        n += 1
+    }
+    line[..n]
+}
+
+fn fixed(d: *diag.Diagnostic, fix: diag.Fix?) -> diag.Error {
+    offer(d, fix)
+    diag.Error.Reported([d])
+}
+
+fn offer(d: *diag.Diagnostic, fix: diag.Fix?) {
+    match fix {
+        some(f) => d.fixes.push(f)
+        none => {}
+    }
+}
+
+fn discard_fix(b: Bound) -> diag.Fix? {
+    if b.local.assigned {
+        return none
+    }
+    let line = diag.line_text(b.pos) ?? return none
+    let rest = line[math.min(b.pos.pos_col() - 1, line.len)..]
+    let name = b.local.name
+    if !text.starts_with(rest, "let {name}") && !text.starts_with(rest, "var {name}") {
+        return none
+    }
+    let end = 4 + name.len
+    if end < rest.len && diag.is_word(rest[end]) {
+        return none
+    }
+    let edit = diag.Edit { pos: b.pos, end: b.pos.at_col(b.pos.pos_col() + end), text: "let _" }
+    diag.Fix { title: "Discard it with let _", safe: true, edits: [edit] }
+}
+
+fn import_fix(imp: *ast.Import) -> diag.Fix? {
+    let line = diag.line_text(imp.pos) ?? return none
+    if imp.pos.pos_col() != 1 || !text.starts_with(line, "import ") || !text.ends_with(text.trim_end(line), imp.path) {
+        return none
+    }
+    let n = imp.pos.pos_line()
+    let after = if blank_line(imp.pos, n + 1) && (n == 1 || blank_line(imp.pos, n - 1)) { n + 2 } else { n + 1 }
+    let end = diag.pos_in(diag.origin(imp.pos), after, 1)
+    diag.Fix { title: "Remove the import of {imp.path}", safe: true, edits: [diag.Edit { pos: imp.pos.at_col(1), end, text: "" }] }
+}
+
+fn blank_line(p: diag.Pos, n: i64) -> bool {
+    let line = diag.line_text(diag.pos_in(diag.origin(p), n, 1)) ?? return false
+    text.trim(line) == ""
+}
+
+fn keyword_fix(at: diag.Pos, written: str, wanted: str) -> diag.Fix? {
+    let line = diag.line_text(at) ?? return none
+    let rest = line[math.min(at.pos_col() - 1, line.len)..]
+    if !text.starts_with(rest, "{written} ") {
+        return none
+    }
+    let edit = diag.Edit { pos: at, end: at.at_col(at.pos_col() + written.len), text: wanted }
+    diag.Fix { title: "Bind it with {wanted}", safe: true, edits: [edit] }
+}
+
+fn label_fix(loop_at: diag.Pos, label: str) -> diag.Fix? {
+    let line = diag.line_text(loop_at) ?? return none
+    let before = text.trim_end(line[..math.min(loop_at.pos_col() - 1, line.len)])
+    if !text.ends_with(before, "{label}:") {
+        return none
+    }
+    let start = loop_at.at_col(before.len - label.len)
+    diag.Fix { title: "Remove the label {label}", safe: true, edits: [diag.Edit { pos: start, end: loop_at, text: "" }] }
+}
+
+fn mut_fix(arg: ast.Expr) -> diag.Fix? {
+    let at = match arg {
+        Ident(id) => id.pos
+        _ => return none
+    }
+    if diag.line_text(at) == none {
+        return none
+    }
+    diag.Fix { title: "Write mut before the argument", safe: true, edits: [diag.Edit { pos: at, end: at, text: "mut " }] }
+}
+
+fn unpropagated(c: *Checker, e: *ast.Try, t: *types.Type) -> diag.Error {
+    let d = diag.error(e.pos, "no-error-type", "? requires {subject(c)} to declare an error type")
+    let f = current(c)
+    let body = f.body ?? return diag.Error.Reported([d])
+    match lift_fix(c, f, body.pos, t.err_of()) {
+        some(lift) => d.fixes.push(lift)
+        none => {}
+    }
+    for fix in handling_fixes(e.pos, body.pos, t.ok_of(), f.result != none) {
+        d.fixes.push(fix)
+    }
+    diag.Error.Reported([d])
+}
+
+fn lift_fix(c: *Checker, f: *ast.Func, body: diag.Pos, failed: *types.Type) -> diag.Fix? {
+    match f.closure {
+        some(closure) => {
+            if closure.inline {
+                return none
+            }
+        }
+        none => {}
+    }
+    let line = diag.line_text(body) ?? return none
+    let spelled = spell(c.ctx.file, failed.name) ?? return none
+    var clause = "! {spelled.name} "
+    let before = line[..math.min(body.pos_col() - 1, line.len)]
+    if !text.ends_with(before, " ") {
+        clause = " {clause}"
+    }
+    var edits: []diag.Edit = []
+    if spelled.module != "" {
+        edits.push(import_edit(c.ctx.file, body, spelled.module))
+    }
+    edits.push(diag.Edit { pos: body, end: body, text: clause })
+    let owner = if f.closure == none { f.name } else { "the closure" }
+    some(diag.Fix { title: "Add ! {spelled.name} to {owner}", edits })
+}
+
+pub struct Spelled {
+    pub name: str
+    pub module: str = ""
+}
+
+pub fn spell(file: *ast.File, qualified: str) -> Spelled? {
+    if text.contains(qualified, "[") {
+        return none
+    }
+    let dot = text.last_index_byte(qualified, '.')
+    if dot < 0 {
+        return Spelled { name: qualified }
+    }
+    let module = qualified[..dot]
+    let name = qualified[dot + 1..]
+    if module == file.module {
+        return Spelled { name }
+    }
+    for imp in file.imports {
+        if imp.path == module {
+            return Spelled { name: "{imp.alias}.{name}" }
+        }
+    }
+    let slash = text.last_index_byte(module, '/')
+    let alias = module[slash + 1..]
+    if ast.imported(file, alias) != none {
+        return none
+    }
+    Spelled { name: "{alias}.{name}", module }
+}
+
+fn import_edit(file: *ast.File, body: diag.Pos, module: str) -> diag.Edit {
+    let line = "import {module}\n"
+    let n = file.imports.len
+    if n > 0 {
+        let after = diag.pos_in(diag.origin(body), file.imports[n - 1].pos.pos_line() + 1, 1)
+        return diag.Edit { pos: after, end: after, text: line }
+    }
+    let start = diag.pos_in(diag.origin(body), 1, 1)
+    diag.Edit { pos: start, end: start, text: "{line}\n" }
+}

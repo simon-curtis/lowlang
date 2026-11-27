@@ -1,0 +1,212 @@
+import ast
+import diag
+import std/text
+
+struct Decl {
+    name: str
+    pos: diag.Pos
+    private: bool
+    names: []str
+}
+
+struct Reach {
+    decls: []Decl = []
+    private: [str: []Decl] = [:]
+    reached: [str: bool] = [:]
+}
+
+fn unused_decls(files: []*ast.File, decls: [][]Decl, each: fn(i64, fn(i64)), unloaded: fn(str) -> [str: bool]) -> []*diag.Diagnostic {
+    let index: [str: i64] = [:]
+    var modules: []str = []
+    var members: [][]i64 = []
+    for i, f in files {
+        let at = index[f.module] ?? modules.len
+        if at == modules.len {
+            index[f.module] = at
+            modules.push(f.module)
+            members.push([])
+        }
+        members[at].push(i)
+    }
+    var reaches: []*Reach = []
+    for _ in modules {
+        reaches.push(new(Reach {}))
+    }
+    each(modules.len, fn(m: i64) {
+        let r = reaches[m]
+        for i in members[m] {
+            for d in decls[i] {
+                r.decls.push(d)
+            }
+        }
+        r.walk_module()
+    })
+    var warnings: []*diag.Diagnostic = []
+    let sources: [str: []str] = [:]
+    for m, r in reaches {
+        if !r.any_unreached() {
+            continue
+        }
+        var pending: []str = []
+        for name, _ in unloaded(modules[m]) {
+            pending.push(name)
+        }
+        r.walk(mut pending)
+        for d in r.decls {
+            if d.private && r.reached[d.name] == none {
+                let w = diag.warning(d.pos, "unused-function", "nothing in this module uses {d.name}; remove it")
+                match removal_fix(sources, d) {
+                    some(fix) => w.fixes.push(fix)
+                    none => {}
+                }
+                warnings.push(w)
+            }
+        }
+    }
+    warnings
+}
+
+fn removal_fix(sources: [str: []str], d: Decl) -> diag.Fix? {
+    let src = diag.origin(d.pos)
+    if src.text == "" {
+        return none
+    }
+    let lines = sources[src.name] ?? text.split(src.text, '\n')
+    sources[src.name] = lines
+    let at = d.pos.pos_line() - 1
+    let last = closing_line(lines, at) ?? return none
+    var first = at
+    for first > 0 && annotation(lines[first - 1]) {
+        first -= 1
+    }
+    let count = if text.ends_with(src.text, "\n") { lines.len - 1 } else { lines.len }
+    var after = last + 1
+    if after < count && text.trim(lines[after]) == "" {
+        after += 1
+    } else if first > 0 && text.trim(lines[first - 1]) == "" {
+        first -= 1
+    }
+    let edit = diag.Edit { pos: diag.pos_in(src, first + 1, 1), end: diag.pos_in(src, after + 1, 1), text: "" }
+    diag.Fix { title: "Remove {d.name}", edits: [edit] }
+}
+
+fn closing_line(lines: []str, at: i64) -> i64? {
+    var depth = 0
+    var inner = 0
+    let line = lines[at]
+    for i in 0..line.len {
+        let ch = line[i]
+        if ch == '{' {
+            depth += 1
+        } else if ch == '}' {
+            depth -= 1
+        } else if ch == '(' || ch == '[' {
+            inner += 1
+        } else if ch == ')' || ch == ']' {
+            inner -= 1
+        }
+    }
+    if inner != 0 {
+        return none
+    }
+    if depth <= 0 {
+        return at
+    }
+    var n = 0
+    for n < line.len && (line[n] == ' ' || line[n] == '\t') {
+        n += 1
+    }
+    let closing = "{line[..n]}}}"
+    for i in at + 1..lines.len {
+        if lines[i] == closing {
+            return i
+        }
+    }
+    none
+}
+
+fn annotation(line: str) -> bool {
+    let t = text.trim(line)
+    text.starts_with(t, "///") || text.starts_with(t, "@")
+}
+
+fn walk_module(r: *Reach) {
+    var pending: []str = []
+    for d in r.decls {
+        if d.private {
+            var same = r.private[d.name] ?? []
+            same.push(d)
+            r.private[d.name] = same
+        } else {
+            for name in d.names {
+                pending.push(name)
+            }
+        }
+    }
+    r.walk(mut pending)
+}
+
+fn walk(r: *Reach, mut pending: []str) {
+    for pending.len > 0 {
+        let name = pending.pop() ?? break
+        if r.reached[name] != none {
+            continue
+        }
+        r.reached[name] = true
+        for d in r.private[name] ?? [] {
+            for used in d.names {
+                pending.push(used)
+            }
+        }
+    }
+}
+
+fn any_unreached(r: *Reach) -> bool {
+    for d in r.decls {
+        if d.private && r.reached[d.name] == none {
+            return true
+        }
+    }
+    false
+}
+
+fn file_decls(f: *ast.File) -> []Decl {
+    var decls: []Decl = []
+    for func in f.funcs {
+        if func.closure != none || func.template != none || func.body == none || text.contains(func.name, "..") {
+            continue
+        }
+        let private = !func.exported && !func.derived && !func.top_level && !func.callback && func.name != "main"
+        decls.push(Decl { name: func.name, pos: func.pos, private, names: names_in(ast.Node.Func(func)) })
+    }
+    for k in f.consts {
+        decls.push(Decl { name: k.name, pos: k.pos, private: !k.exported, names: names_in(ast.Node.Const(k)) })
+    }
+    for s in f.structs {
+        decls.push(Decl { name: s.name, pos: s.pos, private: !s.exported && !s.c, names: names_in(ast.Node.StructDecl(s)) })
+    }
+    for e in f.enums {
+        decls.push(Decl { name: e.name, pos: e.pos, private: !e.exported, names: names_in(ast.Node.EnumDecl(e)) })
+    }
+    decls
+}
+
+fn names_in(n: ast.Node) -> []str {
+    var out: []str = []
+    ast.inspect(n, fn(node: ast.Node) -> bool {
+        match node {
+            TypeName(t) => out.push(t.name)
+            Expr(e) => {
+                match e {
+                    Ident(id) => out.push(id.name)
+                    Selector(s) => out.push(s.name)
+                    StructLit(s) => out.push(s.name)
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        true
+    })
+    out
+}
