@@ -2816,6 +2816,25 @@ A kernel and the functions it calls cannot use:
 
 The checker reports the first rejected construct a kernel reaches, in the kernel or in a function it calls, and names the kernel.
 
+`launch(kernel, count, arguments)` binds a kernel to the number of invocations to run and to its arguments after the index. It runs nothing: a function of `std/gpu` runs what it gives, once for each index below `count`.
+
+```low
+import std/gpu
+
+kernel fn saxpy(id: u32, a: f32, x: f32[], mut y: f32[]) {
+    y[id] = a * x[id] + y[id]
+}
+
+fn main() {
+    let x: f32[] = [1.0, 2.0, 3.0]
+    var y: f32[] = [10.0, 20.0, 30.0]
+    gpu.run_on_cpu(launch(saxpy, 3, 2.0, x, mut y))
+    print(y[2])
+}
+```
+
+The arguments are checked as a call checks them, and a `mut` parameter takes `mut` before its slice. `launch` evaluates `count` and then each argument once, and a run reads and writes the elements of the slices it was given. The invocations of one run have no order, so each one writes elements no other invocation reads or writes. A kernel cannot call `launch`.
+
 ## Errors
 
 An error type is an enum. A function that can fail declares `-> T ! E`.
@@ -2988,6 +3007,7 @@ Every compile error and warning carries a code, printed after the message in bra
 | `infinite-size` | error | A struct or enum contains itself by value. | `struct Node { next: Node }` |
 | `instance-limit` | error | A generic is instantiated with too many distinct type arguments. | a generic function called at thousands of types |
 | `kernel-construct` | error | A kernel, or a function it calls, uses a construct a kernel cannot run. | `kernel fn k(id: u32, mut out: u32[]) { print(id) }` |
+| `kernel-device` | error | A kernel given to `launch` uses something its device build cannot hold. | `launch(k, 1, pair, mut out)` where `k` takes the struct `pair` by value |
 | `kernel-literal` | error | A number literal in a kernel takes a 64-bit type because its context gives it none. | `kernel fn k(id: u32, mut out: f32[]) { let half = 0.5 }` |
 | `kernel-recursion` | error | A function a kernel calls reaches itself. | `fn depth(n: u32) -> u32 { depth(n) }` called from a kernel |
 | `kernel-signature` | error | A kernel has type parameters, a result, a `mut` parameter that is not a slice, or no `u32` index as its first parameter. | `kernel fn k(a: f32, mut out: f32[]) {}` |
@@ -2995,6 +3015,7 @@ Every compile error and warning carries a code, printed after the message in bra
 | `label-shadow` | error | A loop label repeats the label of an enclosing loop. | `outer: for { outer: for { } }` |
 | `label-target` | error | A label is not followed by a `for` loop. | `outer: print(1)` |
 | `large-struct` | warning | A struct is large enough that every copy is costly. | a struct of 64 or more words |
+| `launch-kernel` | error | The first argument of `launch` is not the name of a kernel. | `fn plain(id: u32) {}` then `launch(plain, 4)` |
 | `loop-bindings` | error | A `for` loop binds more names than its iterable gives. | `for a, b in 0..3 {}` |
 | `main-signature` | error | `main` takes parameters or returns a value. | `fn main(x: i64) {}` |
 | `main-use` | error | A function, drop or field default uses what the statements outside a function produce. | `fn f() { main() }` beside top-level statements |
@@ -3088,7 +3109,7 @@ Every compile error and warning carries a code, printed after the message in bra
 
 ## Builtins
 
-Every module sees these names without an import. A function in the program named `pop`, `truncate`, `close`, `sleep`, `wait_readable` or `wait_writable` takes precedence over the builtin. `compiler/check/builtins.low` is the only table of builtin names, parameters, `mut` markers, receivers and handlers. `compiler/tests/check` requires an entry here for each public one.
+Every module sees these names without an import. A function in the program named `launch`, `pop`, `truncate`, `close`, `sleep`, `wait_readable` or `wait_writable` takes precedence over the builtin. `compiler/check/builtins.low` is the only table of builtin names, parameters, `mut` markers, receivers and handlers. `compiler/tests/check` requires an entry here for each public one.
 
 ### `bytes`
 
@@ -3129,6 +3150,10 @@ Every module sees these names without an import. A function in the program named
 ### `len`
 
 `xs.len` is an `i64`: the number of elements in a slice, the number of entries in a map, or the number of bytes in a `str`.
+
+### `launch`
+
+`launch(kernel, count: u32, arguments) -> *__Launch` binds a kernel to an invocation count and to one argument for each of its parameters after the index, and runs nothing. `kernel` is the name of a `kernel fn`. Each argument is checked against its parameter as in a call, with `mut` before the slice a `mut` parameter takes, and is evaluated once, after `count`. The result holds what a run needs: the kernel's SPIR-V module, the bytes of its push constants, each slice with its size in bytes, and a function that calls the kernel's CPU build with one index. `std/gpu` runs it.
 
 ### `load`
 
@@ -3485,6 +3510,7 @@ One sentence per module. Each name links to the module's page, which holds the r
 | `std/ratelimit` | `Bucket` (token bucket in exact nanosecond units) with `allow`, `allow_n`, `reserve`, `wait` and `set_rate`. |
 | `std/singleflight` | `Group[K, V]` with `do`, `do_shared`, `forget` and `in_flight`, which run one call per key while the others wait for its result. |
 | `std/parallel` | `each(count, job)` calls a job once for every index on one green thread per CPU, `chunks` hands it ranges of indices, `try_each` returns the error of the lowest failing index and `map` keeps the order of its slice. |
+| `std/gpu` | `run_on_cpu(job)` runs every invocation of what `launch` gives on the CPU, through `std/parallel`. |
 | `std/atomic` | `Int`, `Bool` and `Flag` built on compare-and-swap, with `load_int`, `store_int`, `add_int`, `swap_int`, `compare_and_swap_int` and `update_int`, and the same forms for `Bool`. |
 | `std/rand` | A seedable, non-cryptographic xoshiro256** generator: `seeded`, `rng` (all 256 bits of state from `std/crypto`), `next`, unbiased `below` and `between`, `float`, `chance`, `shuffle` and `pick`. |
 | `std/uuid` | Random v4 and time-ordered v7 UUIDs, `format`, `parse` (reports the offset of the first bad character), `version`, `timestamp` for v7, `equal` and `nil`. |
@@ -9343,6 +9369,13 @@ A kernel is compiled like any function, and that function is what a call runs. `
 - A float add, subtract, multiply or divide is `NoContraction`, so the device cannot fuse a multiply and an add that the CPU keeps apart.
 - A vector operation works one lane at a time on the lane's 32-bit or 64-bit words.
 
+The push constant layout is `ir.kernel_layout`, which `compiler/spirv` and the lowering of `launch` both read: a member sits at the next multiple of its own size, 8 bytes for a 64-bit integer or `f64` and 4 for anything else.
+
+`launch` is lowered from an expansion the checker builds, `ast.Launch`: one binding for the count and one for each argument, and a call of the prelude's `__launch` with the count and a closure that calls the kernel with an index and the bound arguments. The lowering then gives the `__Launch` its module and writes its operands:
+
+- The module is an `embed` value named by `ir.kernel_module_path`. `native` generates the module of each kernel a `launch` names and holds it with the embedded files, behind its length in 8 bytes. A kernel no `launch` names gets no module, so a kernel only called on the CPU builds whatever the back end refuses. A refusal of a launched kernel is the error `kernel-device` at the kernel. `compiler/wasm` holds an empty module, since `browser/wasm32` has no device.
+- `__launch_scalar` writes each scalar argument at its member's offset, and `__launch_slice` writes each slice's length and records its pointer, its size in bytes and whether the parameter is `mut`.
+
 It fails with `spirv.Error.Unsupported` on a jump table, irreducible control flow, a float remainder, a load or store of 8 or 16 bits, a vector with lanes under 32 bits, a vector shuffle, a `mut` slice's header used as a value, an `if` whose two arms enter one block that holds a phi, a call's result read outside the call's block, a struct or vector passed as a scalar parameter, push constants over 128 bytes, and a runtime routine other than `rt_exp`.
 
 ### Code generation
@@ -9906,6 +9939,7 @@ Text areas:
   - `compiler/tests/vkgen` tests declaration parsing, extension enum values and the selection format, and checks the shape of the generated bindings. It renders a rounded, bordered quad offscreen with the quad shaders through the bindings and dynamic rendering, comparing pixels. It skips without libvulkan or a Vulkan 1.3 device.
 - `compiler/tests/shaders` checks that the sources and the SPIR-V match the sums recorded in `shaders.sum` and validates the SPIR-V with `spirv-val` when installed.
 - `compiler/tests/spirv` generates the module of each kernel in `testdata/run/kernel.low`. One test validates each module with `spirv-val --target-env vulkan1.2`; `compiler/oracletool` pins SPIRV-Tools v2026.4, and the test skips without it. The other runs `parity.py` under `python3`, skipping without it: `interp.py` interprets each module as the fixture's `main` calls its kernel, and the values must equal the lines of `testdata/run/kernel.out`. It also checks the flag after a failed bounds check and a division by zero, and that an invocation at or past the count stores nothing.
+- `testdata/run/launch.low` launches kernels from a function, a generic function and a closure and runs them with `gpu.run_on_cpu`, and prints the push constants each `launch` packs. `testdata/run/launch_imported` launches a kernel of another module. The `launch_*` programs in `testdata/fail` hold each rejected `launch`, and `launch_device` a kernel the SPIR-V back end refuses.
 
 ## Tests
 

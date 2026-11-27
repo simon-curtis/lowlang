@@ -2330,6 +2330,10 @@ Every load is a locked operation, so a loop cannot hoist it. `Value[T]` swaps a 
 
 `parse` and `read` return a map from `NAME=value` lines. They allow `export`, blank lines, `#` comments (inline after whitespace in unquoted values), single quotes taken literally, and double quotes with `\n`, `\t` and `\r` escapes that may span lines. Errors carry the line.
 
+## std/gpu
+
+`run_on_cpu(job)` takes what `launch(kernel, count, arguments)` gives and calls the kernel's CPU build once for every index below `count`, through `parallel.each`. It returns when every call has returned. The calls have no order, so a kernel writes only elements that no other invocation reads or writes. An out-of-range access panics, as it does in any function.
+
 ## std/flag
 
 `get`, `enabled`, `number`, the remaining arguments, and `usage`.
