@@ -1270,6 +1270,33 @@ A panic ends the process without freeing regions.
 
 A pointer, slice or string that points into the region and is stored outside it dangles once the block ends. Storing it outside means keeping it in a variable, a heap object or a channel.
 
+The checker rejects the stores it can see with `region-escape`. A place is outside the region when the variable it starts from is declared outside the block, whatever fields, elements and pointers lead from that variable to the place.
+
+| Inside the region | Checked as |
+| --- | --- |
+| Assigning to an outside place whose type holds no pointer, string, slice, map, channel or function | Allowed. |
+| Assigning an outside place, `none`, a string literal or `[]` to an outside place | Allowed, since none of them is made in the region. |
+| Assigning any other value to an outside place | Rejected. |
+| `+=` on an outside string, a store into an outside map, and passing an outside place that holds memory as `mut`, which includes `push`, `pop`, `truncate` and `delete` | Rejected, since the callee may store or grow it. |
+| Sending a value that holds memory on an outside channel, unless the value is one of the allowed ones above | Rejected. |
+
+A closure written in the region is checked as the region is. A nested region treats the variables of the region around it as outside.
+
+```low
+var total = 0
+var longest = ""
+let words = ["low", "region"]
+let n = region {
+    let padded = "{words[1]}!"
+    total += padded.len
+    longest = words[1]
+    padded.len
+}
+print("{n} {total} {longest}")
+```
+
+The checker does not follow calls. A function called in the region that stores its argument through a pointer it was given, a `spawn` in the region and C code can still keep region memory, and reading it behaves as follows.
+
 | Build | Reading the dangling value |
 | --- | --- |
 | `-c debug` | Panics with `region: use of freed memory` until a later region on the same OS thread reuses that memory. After that it reads the later region's data. |
@@ -3068,6 +3095,7 @@ Every compile error and warning carries a code, printed after the message in bra
 | `receiver-call` | warning | A function that changes its first argument is not called on that argument. | `fn grow(mut xs: i64[]) { xs.push(1) }` then `var xs = [1]` then `grow(mut xs)` |
 | `redeclared` | error | A name is declared twice in one scope: a type, function, constant, field, variant, parameter or drop. | `fn f() {}` then `fn f() {}` |
 | `regex` | error | A generated regex call is not given one valid pattern literal. | `import std/regex` then `let re = regex.generated("(a")` |
+| `region-escape` | error | Code in a region stores a value made there in a place declared outside it, or grows such a place. | `var kept: i64[] = []` then `region { kept.push(1) }` |
 | `region-exit` | error | `return`, `break`, `continue` or `?` leaves a region. | `region { return 1 }` |
 | `region-result` | error | A region returns a value that holds region memory it cannot copy out. | `let f = region { fn() -> i64 { 1 } }` |
 | `reserved-name` | error | A name starts with `__`. | `fn __f() {}` |
