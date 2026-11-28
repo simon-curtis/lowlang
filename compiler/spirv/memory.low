@@ -1,0 +1,168 @@
+import ir
+import types
+
+struct Place {
+    region: i64
+    selector: u32 = 0
+    offset: u32
+}
+
+fn slot_region(l: *Lowering, slot: i64) -> i64 {
+    l.regions.len - l.k.slots.len + slot + 1
+}
+
+fn place(l: *Lowering, address: *ir.Value, delta: i64) -> Place ! Error {
+    let held = l.vals[address.id]
+    if held.constant && held.region != 0 {
+        return Place { region: held.region, offset: l.half(held.bits + delta) }
+    }
+    let wide = l.get(address)?
+    var offset = l.narrow(wide)
+    if delta != 0 {
+        offset = l.m.value(op_i_add, l.half_type, [offset, l.half(delta)])
+    }
+    if held.region != 0 {
+        return Place { region: held.region, offset }
+    }
+    Place { region: 0, selector: l.narrow(l.make(op_shift_right_logical, wide, l.whole(32))), offset }
+}
+
+fn cell(l: *Lowering, region: i64, p: Place, delta: i64) -> u32 {
+    var bytes = p.offset
+    if delta != 0 {
+        bytes = l.m.value(op_i_add, l.half_type, [bytes, l.half(delta)])
+    }
+    let index = l.m.value(op_shift_right_logical, l.half_type, [bytes, l.half(2)])
+    let r = l.regions[region - 1]
+    if r.buffer {
+        return l.m.value(op_access_chain, l.pointer(class_storage_buffer, l.half_type), [r.variable, l.half(0), index])
+    }
+    l.m.value(op_access_chain, l.pointer(class_function, l.half_type), [r.variable, index])
+}
+
+struct Cases {
+    merge: u32
+    labels: []u32 = []
+}
+
+fn open_cases(l: *Lowering, selector: u32) -> Cases {
+    var cases = Cases { merge: l.m.fresh() }
+    let unknown = l.m.fresh()
+    var operands: []u32 = [selector, unknown]
+    for i in 0..l.regions.len {
+        let label = l.m.fresh()
+        cases.labels.push(label)
+        operands.push(u32(i + 1))
+        operands.push(label)
+    }
+    l.emit(op_selection_merge, [cases.merge, 0])
+    l.emit(op_switch, operands)
+    l.emit(op_label, [unknown])
+    l.stop(failed_address)
+    cases
+}
+
+fn read_cells(l: *Lowering, p: Place, deltas: []i64) -> []u32 {
+    var out: []u32 = []
+    if p.region != 0 {
+        for delta in deltas {
+            out.push(l.m.value(op_load, l.half_type, [l.cell(p.region, p, delta)]))
+        }
+        return out
+    }
+    let cases = l.open_cases(p.selector)
+    var joined: [][]u32 = []
+    for _ in deltas {
+        joined.push([])
+    }
+    for i, label in cases.labels {
+        l.emit(op_label, [label])
+        for j, delta in deltas {
+            joined[j].push(l.m.value(op_load, l.half_type, [l.cell(i + 1, p, delta)]))
+            joined[j].push(label)
+        }
+        l.emit(op_branch, [cases.merge])
+    }
+    l.emit(op_label, [cases.merge])
+    for pairs in joined {
+        out.push(l.m.value(op_phi, l.half_type, pairs))
+    }
+    out
+}
+
+fn write_cells(l: *Lowering, p: Place, deltas: []i64, values: []u32) {
+    if p.region != 0 {
+        for j, delta in deltas {
+            l.emit(op_store, [l.cell(p.region, p, delta), values[j]])
+        }
+        return
+    }
+    let cases = l.open_cases(p.selector)
+    for i, label in cases.labels {
+        l.emit(op_label, [label])
+        for j, delta in deltas {
+            l.emit(op_store, [l.cell(i + 1, p, delta), values[j]])
+        }
+        l.emit(op_branch, [cases.merge])
+    }
+    l.emit(op_label, [cases.merge])
+}
+
+fn join(l: *Lowering, low: u32, high: u32) -> u32 {
+    let upper = l.make(op_shift_left_logical, l.widen(high, false), l.whole(32))
+    l.make(op_bitwise_or, l.widen(low, false), upper)
+}
+
+fn upper_half(l: *Lowering, wide: u32) -> u32 {
+    l.narrow(l.make(op_shift_right_logical, wide, l.whole(32)))
+}
+
+fn memory_bits(l: *Lowering, t: *types.Type?) -> i64 ! Error {
+    let ty = t ?? return 64
+    if ty.bits == 0 || ty.bits == 64 {
+        return 64
+    }
+    if ty.bits != 32 {
+        fail Unsupported("a load or store of {ty.bits} bits in kernel {l.k.name}")
+    }
+    32
+}
+
+fn read_header(l: *Lowering, v: *ir.Value, buffer: i64) ! Error {
+    if v.aux == 0 {
+        l.set_constant(v, buffer << 32, buffer)
+        return
+    }
+    if v.aux != 8 && v.aux != 16 {
+        fail Unsupported("a load at {v.aux} of a slice header in kernel {l.k.name}")
+    }
+    l.vals[v.id] = Val { known: true, id: l.regions[buffer - 1].length }
+}
+
+fn read(l: *Lowering, v: *ir.Value) ! Error {
+    let base = l.vals[v.args[0].id]
+    if base.header != 0 {
+        l.read_header(v, base.header)?
+        return
+    }
+    let bits = l.memory_bits(v.type)?
+    let p = l.place(v.args[0], v.aux)?
+    if bits == 32 {
+        let cells = l.read_cells(p, [0])
+        l.set(v, l.widen(cells[0], signed_type(v.type) && !is_float(v.type)), 0)
+        return
+    }
+    let cells = l.read_cells(p, [0, 4])
+    l.set(v, l.join(cells[0], cells[1]), 0)
+}
+
+fn write(l: *Lowering, v: *ir.Value) ! Error {
+    let bits = l.memory_bits(v.type)?
+    let stored = l.get(v.args[1])?
+    let p = l.place(v.args[0], v.aux)?
+    if bits == 32 {
+        l.write_cells(p, [0], [l.narrow(stored)])
+        return
+    }
+    l.write_cells(p, [0, 4], [l.narrow(stored), l.upper_half(stored)])
+}

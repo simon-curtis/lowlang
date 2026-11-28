@@ -90,6 +90,7 @@ Each `bench/<name>/` holds one program as `main.low` and, for most, `main.ts`. T
 | sort | generic quicksort with a closure comparator |
 | hof | function values passed to higher-order functions |
 | jsonpar | JSON parsing and tree walking |
+| blur | two kernels over a 4K image, on the CPU through `std/parallel` and on every Vulkan device |
 | channels | unbuffered ping-pong and a buffered worker pool |
 
 `low abbench` compares two programs running the same command, such as two compilers building one project:

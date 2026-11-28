@@ -1,0 +1,399 @@
+import std/sync
+
+const capability: u32 = 17
+const capability_float64: u32 = 10
+const flag_bytes = 16
+
+struct Storage {
+    handle: VkBuffer = VkBuffer {}
+    memory: VkDeviceMemory = VkDeviceMemory {}
+    size: i64 = 0
+    mapped: ptr = null
+}
+
+struct Bound {
+    storage: Storage
+    offset: i64 = 0
+    range: i64
+    copied: bool = true
+}
+
+struct Program {
+    source: u8[]
+    shader: VkShaderModule = VkShaderModule {}
+    bindings: VkDescriptorSetLayout = VkDescriptorSetLayout {}
+    layout: VkPipelineLayout = VkPipelineLayout {}
+    pipeline: VkPipeline = VkPipeline {}
+    sets: VkDescriptorPool = VkDescriptorPool {}
+    set: VkDescriptorSet = VkDescriptorSet {}
+}
+
+/// Runs every invocation of `job` on the device and returns when all have finished.
+///
+/// `job` is what `launch` gives. `run` copies each slice to the device, runs the kernel's device build once for each index below the job's count, in no defined order, and copies the `mut` slices back. An invocation that indexes outside a slice or divides by zero stops, and `run` fails with `Faulted` after the others have run. A job with a count of zero runs nothing.
+pub fn run(d: Device, job: launch) ! Error {
+    let s = d.state
+    sync.lock(s.running)
+    defer sync.unlock(s.running)
+    if s.handle.handle == null {
+        fail NoDevice
+    }
+    if job.count == 0 {
+        return
+    }
+    if uses_float64(job.module) && !s.float64 {
+        fail NoFloat64(s.name)
+    }
+    let program = program_of(s, job)?
+    let bound = bind_operands(s, job)?
+    write_bindings(s, program, bound)
+    upload(bound, job)
+    dispatch(s, program, job)?
+    download(bound, job)
+    fault(bound[0].storage)?
+}
+
+fn word(module: u8[], at: i64) -> u32 {
+    u32(module[at]) | u32(module[at + 1]) << 8 | u32(module[at + 2]) << 16 | u32(module[at + 3]) << 24
+}
+
+fn uses_float64(module: u8[]) -> bool {
+    var at = 20
+    for at + 8 <= module.len && word(module, at) & 0xFFFF == capability {
+        if word(module, at + 4) == capability_float64 {
+            return true
+        }
+        at += 8
+    }
+    false
+}
+
+fn same_bytes(a: u8[], b: u8[]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn program_of(s: *State, job: launch) -> *Program ! Error {
+    let key = i64(__slice_ptr(job.module))
+    match s.programs[key] {
+        some(kept) => {
+            if same_bytes(kept.source, job.module) {
+                return kept
+            }
+            destroy_program(s, kept)
+            s.programs.delete(key)
+        }
+        none => {}
+    }
+    let source: u8[] = __make(job.module.len)
+    __memmove(source, job.module)
+    let built = new(Program { source })
+    build_program(s, built, job) catch {
+        e => {
+            destroy_program(s, built)
+            fail e
+        }
+    }
+    s.programs[key] = built
+    built
+}
+
+fn build_program(s: *State, p: *Program, job: launch) ! Error {
+    using var pins = new_pins()
+    let code: ptr = pins.hold_all(p.source)
+    var shader = VkShaderModuleCreateInfo { codeSize: p.source.len, pCode: code }
+    check(vkCreateShaderModule(s.handle, mut shader, null, mut p.shader), "vkCreateShaderModule")?
+    var slots: VkDescriptorSetLayoutBinding[] = []
+    for i in 0..job.operands.len + 1 {
+        slots.push(VkDescriptorSetLayoutBinding { binding: u32(i), descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: 1, stageFlags: VK_SHADER_STAGE_COMPUTE_BIT })
+    }
+    var bindings = VkDescriptorSetLayoutCreateInfo { bindingCount: u32(slots.len), pBindings: pins.hold_all(slots) }
+    check(vkCreateDescriptorSetLayout(s.handle, mut bindings, null, mut p.bindings), "vkCreateDescriptorSetLayout")?
+    let layouts = pins.hold_all([p.bindings])
+    let constants = pins.hold(VkPushConstantRange { stageFlags: VK_SHADER_STAGE_COMPUTE_BIT, size: u32(job.constants.len) })
+    var layout = VkPipelineLayoutCreateInfo { setLayoutCount: 1, pSetLayouts: layouts, pushConstantRangeCount: 1, pPushConstantRanges: constants }
+    check(vkCreatePipelineLayout(s.handle, mut layout, null, mut p.layout), "vkCreatePipelineLayout")?
+    let entry: ptr[u8] = pins.hold_all(bytes("main\0"))
+    let stage = VkPipelineShaderStageCreateInfo { stage: VK_SHADER_STAGE_COMPUTE_BIT, module: p.shader, pName: entry }
+    let made: VkPipeline[] = [VkPipeline {}]
+    let wanted = pins.hold_all([VkComputePipelineCreateInfo { stage, layout: p.layout }])
+    check(vkCreateComputePipelines(s.handle, VkPipelineCache {}, 1, wanted, null, pins.hold_all(made)), "vkCreateComputePipelines")?
+    p.pipeline = made[0]
+    let sizes = pins.hold(VkDescriptorPoolSize { type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: u32(slots.len) })
+    var pool = VkDescriptorPoolCreateInfo { maxSets: 1, poolSizeCount: 1, pPoolSizes: sizes }
+    check(vkCreateDescriptorPool(s.handle, mut pool, null, mut p.sets), "vkCreateDescriptorPool")?
+    let sets: VkDescriptorSet[] = [VkDescriptorSet {}]
+    var set = VkDescriptorSetAllocateInfo { descriptorPool: p.sets, descriptorSetCount: 1, pSetLayouts: layouts }
+    check(vkAllocateDescriptorSets(s.handle, mut set, pins.hold_all(sets)), "vkAllocateDescriptorSets")?
+    p.set = sets[0]
+}
+
+fn destroy_program(s: *State, p: *Program) {
+    vkDestroyDescriptorPool(s.handle, p.sets, null)
+    vkDestroyPipeline(s.handle, p.pipeline, null)
+    vkDestroyPipelineLayout(s.handle, p.layout, null)
+    vkDestroyDescriptorSetLayout(s.handle, p.bindings, null)
+    vkDestroyShaderModule(s.handle, p.shader, null)
+}
+
+fn memory_type(s: *State, allowed: u32, wanted: u32) -> u32? {
+    for i, kind in s.memory_types {
+        let bit: u32 = 1 << i
+        if allowed & bit != 0 && kind.propertyFlags & wanted == wanted {
+            return u32(i)
+        }
+    }
+    none
+}
+
+fn mapped_type(s: *State, allowed: u32) -> u32 ! Error {
+    let mapped = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    memory_type(s, allowed, mapped | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ?? memory_type(s, allowed, mapped) ?? fail NoMemoryType(allowed)
+}
+
+fn fill_buffer(s: *State, mut b: Storage) ! Error {
+    var info = VkBufferCreateInfo { size: b.size, usage: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, sharingMode: VK_SHARING_MODE_EXCLUSIVE }
+    check(vkCreateBuffer(s.handle, mut info, null, mut b.handle), "vkCreateBuffer")?
+    var needs = VkMemoryRequirements {}
+    vkGetBufferMemoryRequirements(s.handle, b.handle, mut needs)
+    var wanted = VkMemoryAllocateInfo { allocationSize: needs.size, memoryTypeIndex: mapped_type(s, needs.memoryTypeBits)? }
+    check(vkAllocateMemory(s.handle, mut wanted, null, mut b.memory), "vkAllocateMemory")?
+    check(vkBindBufferMemory(s.handle, b.handle, b.memory, 0), "vkBindBufferMemory")?
+    check(vkMapMemory(s.handle, b.memory, 0, b.size, 0, mut b.mapped), "vkMapMemory")?
+}
+
+fn new_buffer(s: *State, size: i64) -> Storage ! Error {
+    var b = Storage { size }
+    fill_buffer(s, mut b) catch {
+        e => {
+            destroy_buffers(s, [b])
+            fail e
+        }
+    }
+    b
+}
+
+fn destroy_buffers(s: *State, buffers: Storage[]) {
+    for b in buffers {
+        vkDestroyBuffer(s.handle, b.handle, null)
+        vkFreeMemory(s.handle, b.memory, null)
+    }
+}
+
+fn padded(bytes: i64) -> i64 {
+    if bytes < 4 {
+        return 4
+    }
+    (bytes + 3) / 4 * 4
+}
+
+fn fitting(spare: Storage[], size: i64) -> i64? {
+    for i, b in spare {
+        if b.size >= size && b.size <= size * 2 {
+            return i
+        }
+    }
+    none
+}
+
+fn held_operand(s: *State, o: __Operand) -> Bound? {
+    let at = i64(o.data)
+    for h in s.held {
+        let base = i64(h.storage.mapped)
+        if o.bytes > 0 && at >= base && at + o.bytes <= base + h.storage.size {
+            let offset = at - base
+            if offset % s.alignment != 0 {
+                return none
+            }
+            return Bound { storage: h.storage, offset, range: o.bytes, copied: false }
+        }
+    }
+    none
+}
+
+fn claim_buffers(s: *State, sizes: i64[]) ! Error {
+    var spare = s.buffers
+    s.buffers = []
+    defer destroy_buffers(s, spare)
+    for size in sizes {
+        match fitting(spare, size) {
+            some(at) => {
+                s.buffers.push(spare[at])
+                spare[at] = spare[spare.len - 1]
+                spare.pop()
+            }
+            none => s.buffers.push(new_buffer(s, size)?)
+        }
+    }
+}
+
+fn bind_operands(s: *State, job: launch) -> Bound[] ! Error {
+    var direct: Bound?[] = []
+    var sizes = [flag_bytes]
+    for o in job.operands {
+        let held = held_operand(s, o)
+        direct.push(held)
+        if held == none {
+            sizes.push(padded(o.bytes))
+        }
+    }
+    claim_buffers(s, sizes)?
+    var bound = [Bound { storage: s.buffers[0], range: s.buffers[0].size }]
+    var taken = 1
+    for held in direct {
+        match held {
+            some(b) => bound.push(b)
+            none => {
+                bound.push(Bound { storage: s.buffers[taken], range: s.buffers[taken].size })
+                taken += 1
+            }
+        }
+    }
+    bound
+}
+
+fn contents(b: Storage) -> u8[] {
+    let at: ptr[u8] = b.mapped
+    view(at, b.size)
+}
+
+fn operand_bytes(o: __Operand) -> u8[] {
+    let at: ptr[u8] = o.data
+    view(at, o.bytes)
+}
+
+fn write_bindings(s: *State, p: *Program, bound: Bound[]) {
+    using var pins = new_pins()
+    var writes: VkWriteDescriptorSet[] = []
+    for i, b in bound {
+        let part = pins.hold(VkDescriptorBufferInfo { buffer: b.storage.handle, offset: b.offset, range: b.range })
+        writes.push(VkWriteDescriptorSet { dstSet: p.set, dstBinding: u32(i), descriptorCount: 1, descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pBufferInfo: part })
+    }
+    vkUpdateDescriptorSets(s.handle, u32(writes.len), pins.hold_all(writes), 0, null)
+}
+
+fn upload(bound: Bound[], job: launch) {
+    var flag = contents(bound[0].storage)
+    for at in 0..flag.len {
+        flag[at] = 0
+    }
+    for i, o in job.operands {
+        if bound[i + 1].copied && o.bytes > 0 {
+            __memmove(contents(bound[i + 1].storage)[..o.bytes], operand_bytes(o))
+        }
+    }
+}
+
+fn dispatch(s: *State, p: *Program, job: launch) ! Error {
+    using var pins = new_pins()
+    var begin = VkCommandBufferBeginInfo {}
+    check(vkBeginCommandBuffer(s.commands, mut begin), "vkBeginCommandBuffer")?
+    vkCmdBindPipeline(s.commands, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline)
+    vkCmdBindDescriptorSets(s.commands, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, pins.hold_all([p.set]), 0, null)
+    let constants: ptr = pins.hold_all(job.constants)
+    vkCmdPushConstants(s.commands, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, u32(job.constants.len), constants)
+    if job.count <= job.row {
+        vkCmdDispatch(s.commands, u32((job.count + job.group - 1) / job.group), 1, 1)
+    } else {
+        vkCmdDispatch(s.commands, u32(job.row / job.group), u32((job.count + job.row - 1) / job.row), 1)
+    }
+    check(vkEndCommandBuffer(s.commands), "vkEndCommandBuffer")?
+    let submit = pins.hold(VkSubmitInfo { commandBufferCount: 1, pCommandBuffers: pins.hold_all([s.commands]) })
+    check(vkQueueSubmit(s.queue, 1, submit, VkFence {}), "vkQueueSubmit")?
+    check(vkQueueWaitIdle(s.queue), "vkQueueWaitIdle")?
+}
+
+fn download(bound: Bound[], job: launch) {
+    for i, o in job.operands {
+        if bound[i + 1].copied && o.mutable && o.bytes > 0 {
+            __memmove(operand_bytes(o), contents(bound[i + 1].storage)[..o.bytes])
+        }
+    }
+}
+
+fn fault(flag: Storage) ! Error {
+    match word(contents(flag), 0) {
+        0 => {}
+        1 => fail Faulted(Fault.OutOfRange)
+        2 => fail Faulted(Fault.DivideByZero)
+        _ => fail Faulted(Fault.BadAddress)
+    }
+}
+
+struct Held {
+    state: *State
+    storage: Storage
+    live: bool = true
+}
+
+/// Device memory that a kernel reads and writes in place, which releases itself when dropped.
+///
+/// `data` is the elements, all zero at first: a slice over memory the device owns, so the collector neither scans nor moves it. A `launch` given `data`, or a part of it that starts where the device can bind one, runs on the buffer's device with no copy in either direction, and the kernel's writes are in `data` when `run` returns. On another device, on the CPU, and for a part that starts elsewhere, `data` is an ordinary slice. Dropping the `Buffer`, or releasing its device, frees the memory, and a slice copied out of `data` and used afterwards reads or writes unmapped memory, which panics with `invalid memory access`. A `data` slice has no spare capacity, so `push` onto a copy reallocates on the heap and leaves the buffer alone.
+pub struct Buffer[T: Plain] {
+    /// The elements, whose count is the count that was asked for.
+    pub data: T[]
+    held: *Held?
+    drop release(held)
+}
+
+fn release(held: *Held?) {
+    let h = held ?? return
+    let s = h.state
+    sync.lock(s.running)
+    defer sync.unlock(s.running)
+    if !h.live {
+        return
+    }
+    h.live = false
+    var kept: *Held[] = []
+    for other in s.held {
+        if other != h {
+            kept.push(other)
+        }
+    }
+    s.held = kept
+    let _ = vkQueueWaitIdle(s.queue)
+    destroy_buffers(s, [h.storage])
+}
+
+fn stride[T]() -> i64 {
+    let pair: T[] = __make(2)
+    i64(__slice_ptr(pair[1..])) - i64(__slice_ptr(pair))
+}
+
+fn allocate(s: *State, bytes: i64) -> *Held ! Error {
+    sync.lock(s.running)
+    defer sync.unlock(s.running)
+    if s.handle.handle == null {
+        fail NoDevice
+    }
+    let h = new(Held { state: s, storage: new_buffer(s, padded(bytes))? })
+    var zeroed = contents(h.storage)
+    let zeros: u8[] = __make(65536)
+    for zeroed.len > 0 {
+        let step = if zeroed.len < zeros.len { zeroed.len } else { zeros.len }
+        __memmove(zeroed[..step], zeros[..step])
+        zeroed = zeroed[step..]
+    }
+    s.held.push(h)
+    h
+}
+
+/// Allocates `count` zeroed elements of device memory on `d` and returns the buffer that owns them.
+///
+/// The memory is mapped into the program, cached by the host where the device has such memory. A negative `count` panics. Fails with `NoDevice` when `d` has been released.
+pub fn buffer[T: Plain](d: Device, count: i64) -> Buffer[T] ! Error {
+    if count < 0 {
+        panic("gpu: a buffer cannot hold {count} elements")
+    }
+    let h = allocate(d.state, count * stride[T]())?
+    let at: ptr[T] = h.storage.mapped
+    Buffer[T] { data: view(at, count), held: h }
+}

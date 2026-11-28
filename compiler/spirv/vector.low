@@ -1,0 +1,182 @@
+import ir
+import types
+
+struct Lanes {
+    count: i64
+    width: i64
+    bits: i64
+    signed: bool
+    float: bool
+}
+
+fn lanes_of(t: *types.Type) -> Lanes {
+    let elem = types.elem_of(t)
+    Lanes { count: t.lanes, width: types.lane_bytes(t), bits: elem.bits, signed: elem.signed, float: types.is_float(elem) }
+}
+
+fn words_of(t: *types.Type) -> Lanes {
+    Lanes { count: types.vector_bytes(t) / 8, width: 8, bits: 64, signed: false, float: false }
+}
+
+fn lane_shape(kind: ir.VectorOp, t: *types.Type) -> Lanes {
+    match kind {
+        VAnd => words_of(t)
+        VOr => words_of(t)
+        VXor => words_of(t)
+        VAndNot => words_of(t)
+        VNot => words_of(t)
+        VSelect => words_of(t)
+        _ => lanes_of(t)
+    }
+}
+
+fn address_operands(kind: ir.VectorOp) -> i64 {
+    match kind {
+        VSplat => 0
+        VShl => 1
+        VShr => 1
+        VNot => 1
+        VNeg => 1
+        VSelect => 3
+        _ => 2
+    }
+}
+
+fn lane_read(l: *Lowering, p: Place, s: Lanes, k: i64) -> u32 {
+    if s.width == 4 {
+        return l.widen(l.read_cells(p, [4 * k])[0], s.signed && !s.float)
+    }
+    let cells = l.read_cells(p, [8 * k, 8 * k + 4])
+    l.join(cells[0], cells[1])
+}
+
+fn lane_write(l: *Lowering, p: Place, s: Lanes, k: i64, lane: u32) {
+    if s.width == 4 {
+        l.write_cells(p, [4 * k], [l.narrow(lane)])
+        return
+    }
+    l.write_cells(p, [8 * k, 8 * k + 4], [l.narrow(lane), l.upper_half(lane)])
+}
+
+fn vector(l: *Lowering, v: *ir.Value) ! Error {
+    let t = types.must(v.type)
+    let kind = ir.vector_op(v.aux)
+    if kind == ir.VectorOp.VShuffle {
+        fail Unsupported("a vector shuffle in kernel {l.k.name}")
+    }
+    let into = l.place(v.args[0], 0)?
+    if kind == ir.VectorOp.VCopy {
+        var deltas: []i64 = []
+        for i in 0..types.vector_bytes(t) / 4 {
+            deltas.push(4 * i)
+        }
+        l.write_cells(into, deltas, l.read_cells(l.place(v.args[1], 0)?, deltas))
+        return
+    }
+    let s = lane_shape(kind, t)
+    if s.width < 4 {
+        fail Unsupported("a vector of {s.bits}-bit lanes in kernel {l.k.name}")
+    }
+    var from: []Place = []
+    for i in 0..address_operands(kind) {
+        from.push(l.place(v.args[i + 1], 0)?)
+    }
+    var scalar: u32 = 0
+    if kind == ir.VectorOp.VSplat {
+        scalar = l.get(v.args[1])?
+    }
+    if kind == ir.VectorOp.VShl || kind == ir.VectorOp.VShr {
+        scalar = l.get(v.args[2])?
+    }
+    for k in 0..s.count {
+        var operands: []u32 = []
+        for p in from {
+            operands.push(l.lane_read(p, s, k))
+        }
+        l.lane_write(into, s, k, l.lane_value(kind, s, operands, scalar))
+    }
+}
+
+fn lane_value(l: *Lowering, kind: ir.VectorOp, s: Lanes, a: []u32, scalar: u32) -> u32 {
+    match kind {
+        VAdd => l.lane_arithmetic(s, a, op_i_add, op_f_add)
+        VSub => l.lane_arithmetic(s, a, op_i_sub, op_f_sub)
+        VMul => l.lane_arithmetic(s, a, op_i_mul, op_f_mul)
+        VDiv => l.lane_arithmetic(s, a, op_i_mul, op_f_div)
+        VAnd => l.make(op_bitwise_and, a[0], a[1])
+        VOr => l.make(op_bitwise_or, a[0], a[1])
+        VXor => l.make(op_bitwise_xor, a[0], a[1])
+        VAndNot => l.make(op_bitwise_and, a[0], l.make(op_bitwise_xor, a[1], l.whole(-1)))
+        VMin => l.pick(l.word_type, l.lane_test(ir.Op.OpLt, s, a), a[0], a[1])
+        VMax => l.pick(l.word_type, l.lane_test(ir.Op.OpGt, s, a), a[0], a[1])
+        VEq => l.lane_flag(ir.Op.OpEq, s, a)
+        VNe => l.lane_flag(ir.Op.OpNe, s, a)
+        VLt => l.lane_flag(ir.Op.OpLt, s, a)
+        VLe => l.lane_flag(ir.Op.OpLe, s, a)
+        VGt => l.lane_flag(ir.Op.OpGt, s, a)
+        VGe => l.lane_flag(ir.Op.OpGe, s, a)
+        VShl => l.lane_shift(s, a[0], scalar, true)
+        VShr => l.lane_shift(s, a[0], scalar, false)
+        VNot => l.make(op_bitwise_xor, a[0], l.whole(-1))
+        VNeg => {
+            if s.float {
+                return l.make(op_bitwise_xor, a[0], l.whole(1 << (s.bits - 1)))
+            }
+            l.make(op_i_sub, l.whole(0), a[0])
+        }
+        VSplat => scalar
+        VSelect => {
+            let chosen = l.make(op_bitwise_and, a[1], a[0])
+            let other = l.make(op_bitwise_and, a[2], l.make(op_bitwise_xor, a[0], l.whole(-1)))
+            l.make(op_bitwise_or, chosen, other)
+        }
+        _ => panic("spirv: vector {ir.vector_op_name(kind)} has no lane code")
+    }
+}
+
+fn lane_arithmetic(l: *Lowering, s: Lanes, a: []u32, integer: u32, float: u32) -> u32 {
+    if !s.float {
+        return l.make(integer, a[0], a[1])
+    }
+    let result = l.m.value(float, l.float_type(s.bits), [l.to_float(a[0], s.bits), l.to_float(a[1], s.bits)])
+    l.exact(result)
+    l.from_float(result, s.bits)
+}
+
+fn lane_test(l: *Lowering, op: ir.Op, s: Lanes, a: []u32) -> u32 {
+    if s.float {
+        return l.test(float_compare(op), l.to_float(a[0], s.bits), l.to_float(a[1], s.bits))
+    }
+    l.test(integer_compare(op, s.signed), a[0], a[1])
+}
+
+fn lane_flag(l: *Lowering, op: ir.Op, s: Lanes, a: []u32) -> u32 {
+    l.pick(l.word_type, l.lane_test(op, s, a), l.whole(-1), l.whole(0))
+}
+
+fn lane_shift(l: *Lowering, s: Lanes, lane: u32, count: u32, left: bool) -> u32 {
+    if !left && s.signed {
+        let last = l.whole(s.bits - 1)
+        let by = l.pick(l.word_type, l.test(op_u_less_than_equal, count, last), count, last)
+        return l.make(op_shift_right_arithmetic, lane, by)
+    }
+    let inside = l.test(op_u_less_than, count, l.whole(s.bits))
+    let by = l.pick(l.word_type, inside, count, l.whole(0))
+    let op = if left { op_shift_left_logical } else { op_shift_right_logical }
+    l.pick(l.word_type, inside, l.make(op, lane, by), l.whole(0))
+}
+
+fn vector_mask(l: *Lowering, v: *ir.Value) ! Error {
+    let s = lanes_of(types.must(v.from))
+    if s.width < 4 {
+        fail Unsupported("a vector of {s.bits}-bit lanes in kernel {l.k.name}")
+    }
+    let from = l.place(v.args[0], 0)?
+    let sign = l.whole(if s.signed { 63 } else { s.bits - 1 })
+    var mask = l.whole(0)
+    for k in 0..s.count {
+        let bit = l.make(op_shift_right_logical, l.lane_read(from, s, k), sign)
+        mask = l.make(op_bitwise_or, mask, l.make(op_shift_left_logical, bit, l.whole(k)))
+    }
+    l.set(v, mask, 0)
+}
