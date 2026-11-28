@@ -530,3 +530,159 @@ fn test_open_prefers_hardware_then_the_lowest_index(t: *testing.T) {
         t.fatal("chose a device from none")
     }
 }
+
+fn copied_buffers(d: Device) -> i64 {
+    d.state.buffers.len - 1
+}
+
+fn held_saxpy(t: *testing.T, d: Device, hold_input: bool, hold_output: bool) {
+    let n = 1000
+    using input = buffer[f32](d, n) catch {
+        e => return t.fatal("{name(d)}: {describe(e)}")
+    }
+    using output = buffer[f32](d, n) catch {
+        e => return t.fatal("{name(d)}: {describe(e)}")
+    }
+    let x = if hold_input { input.data } else { ramp(n, 0.5) }
+    var y = if hold_output { output.data } else { ramp(n, 0.25) }
+    var want = ramp(n, 0.25)
+    for i in 0..n {
+        x[i] = f32(i % 97) * 0.5 - 3.0
+        y[i] = want[i]
+    }
+    ran(t, d, launch(saxpy, u32(n), 2.0, x, mut y))
+    run_on_cpu(launch(saxpy, u32(n), 2.0, x, mut want))
+    for i in 0..n {
+        if y[i] != want[i] {
+            t.fatal("{name(d)}: held input {hold_input}, held output {hold_output}: y[{i}] = {y[i]}, want {want[i]}")
+        }
+    }
+    var copies = 0
+    if !hold_input {
+        copies += 1
+    }
+    if !hold_output {
+        copies += 1
+    }
+    if copied_buffers(d) != copies {
+        t.fatal("{name(d)}: held input {hold_input}, held output {hold_output}: {copied_buffers(d)} operands copied, want {copies}")
+    }
+}
+
+fn test_held_slices_run_in_place_and_match_cpu(t: *testing.T) {
+    on_each(t, fn(t: *testing.T, d: Device) {
+        held_saxpy(t, d, true, true)
+        held_saxpy(t, d, true, false)
+        held_saxpy(t, d, false, true)
+        held_saxpy(t, d, false, false)
+    })
+}
+
+fn test_one_held_buffer_is_read_and_written(t: *testing.T) {
+    on_each(t, fn(t: *testing.T, d: Device) {
+        using both = buffer[f32](d, 500) catch {
+            e => return t.fatal("{name(d)}: {describe(e)}")
+        }
+        var cells = both.data
+        for i in 0..cells.len {
+            cells[i] = f32(i)
+        }
+        ran(t, d, launch(saxpy, u32(cells.len), 2.0, cells, mut cells))
+        for i in 0..cells.len {
+            if cells[i] != f32(i) * 3.0 {
+                t.fatal("{name(d)}: cells[{i}] = {cells[i]}, want {f32(i) * 3.0}")
+            }
+        }
+        if copied_buffers(d) != 0 {
+            t.fatal("{name(d)}: {copied_buffers(d)} operands copied, want 0")
+        }
+    })
+}
+
+fn part_fills(t: *testing.T, d: Device, first: i64) {
+    using whole = buffer[u32](d, 4096) catch {
+        e => return t.fatal("{name(d)}: {describe(e)}")
+    }
+    var part = whole.data[first..first + 100]
+    ran(t, d, launch(fill, 100, mut part))
+    for i in 0..whole.data.len {
+        let want = if i >= first && i < first + 100 { u32(i - first) * 3 + 1 } else { u32(0) }
+        if whole.data[i] != want {
+            t.fatal("{name(d)}: part at {first}: element {i} = {whole.data[i]}, want {want}")
+        }
+    }
+    let copies = if first * 4 % d.state.alignment == 0 { 0 } else { 1 }
+    if copied_buffers(d) != copies {
+        t.fatal("{name(d)}: part at {first}: {copied_buffers(d)} operands copied, want {copies}")
+    }
+}
+
+fn test_a_part_of_a_held_slice_is_bound_where_the_device_allows(t: *testing.T) {
+    on_each(t, fn(t: *testing.T, d: Device) {
+        part_fills(t, d, 0)
+        part_fills(t, d, d.state.alignment)
+        part_fills(t, d, 1)
+        part_fills(t, d, 3996)
+    })
+}
+
+fn test_a_dropped_buffer_leaves_the_device(t: *testing.T) {
+    on_each(t, fn(t: *testing.T, d: Device) {
+        for _ in 0..3 {
+            using gone = buffer[u32](d, 64) catch {
+                e => return t.fatal("{name(d)}: {describe(e)}")
+            }
+            if d.state.held.len != 1 {
+                t.fatal("{name(d)}: the device holds {d.state.held.len} buffers, want 1")
+            }
+        }
+        if d.state.held.len != 0 {
+            t.fatal("{name(d)}: the device holds {d.state.held.len} buffers after they were dropped")
+        }
+        fill_matches(t, d, 64)
+    })
+}
+
+fn outliving() -> Buffer[u32] ! Error {
+    using d = open()?
+    buffer[u32](d, 16)?
+}
+
+fn test_a_buffer_dropped_after_its_device_frees_nothing_twice(t: *testing.T) {
+    using late = outliving() catch {
+        NoDevice => return t.skip("no Vulkan device runs kernels")
+        e => return t.fatal(describe(e))
+    }
+    let h = late.held ?? return t.fatal("the buffer holds nothing")
+    if h.live {
+        t.fatal("the buffer is live after its device was released")
+    }
+}
+
+fn test_a_slice_held_by_one_device_is_copied_on_another(t: *testing.T) {
+    let found = devices() catch {
+        e => return t.skip(describe(e))
+    }
+    if found.len < 2 {
+        return t.skip("fewer than two Vulkan devices run kernels")
+    }
+    using owner = open_on(found[0].index) catch {
+        e => return t.fatal("{found[0].name}: {describe(e)}")
+    }
+    using other = open_on(found[1].index) catch {
+        e => return t.fatal("{found[1].name}: {describe(e)}")
+    }
+    using held = buffer[u32](owner, 300) catch {
+        e => return t.fatal("{name(owner)}: {describe(e)}")
+    }
+    var cells = held.data
+    ran(t, other, launch(fill, u32(cells.len), mut cells))
+    for i in 0..cells.len {
+        if cells[i] != u32(i) * 3 + 1 {
+            t.fatal("{name(other)}: cells[{i}] = {cells[i]}, want {u32(i) * 3 + 1}")
+        }
+    }
+    if copied_buffers(other) != 1 {
+        t.fatal("{name(other)}: {copied_buffers(other)} operands copied, want 1")
+    }
+}
