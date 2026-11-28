@@ -2448,9 +2448,10 @@ rt_lookup_map:
 	jae 3f
 	lea rdx, [rax+rcx]
 	shr rdx, 1
-	mov r9, rdx
-	shl r9, 4
-	cmp rdi, [r8+r9]
+	movsxd r9, dword ptr [r8+8*rdx]
+	lea r9, [r9+8*rdx]
+	add r9, r8
+	cmp rdi, r9
 	je 2f
 	jb 4f
 	lea rax, [rdx+1]
@@ -2459,7 +2460,9 @@ rt_lookup_map:
 	mov rcx, rdx
 	jmp 1b
 2:
-	mov rax, [r8+r9+8]
+	mov eax, [r8+8*rdx+4]
+	lea r8, [rip+rt_maps]
+	add rax, r8
 	ret
 3:
 	xor eax, eax
