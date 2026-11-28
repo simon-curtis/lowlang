@@ -2607,6 +2607,7 @@ A constraint lists what a type parameter supports, joined with `+`.
 | `Number` | Adds arithmetic, numeric literals, conversion with `T(x)` and the `f`, `e` and `n` formats and pictures of interpolation. | |
 | `Integer` | Adds bitwise operators and shifts and the `d`, `x`, `X` and `b` formats. It implies `Hash`. | |
 | `Float` | | `f64` and `f32`. |
+| `Plain` | Nothing more. It says a value holds no reference, so its bytes can live in memory the collector does not scan. | Numbers, `bool`, vectors, and structs, enums and optionals whose fields and payloads are all `Plain`. |
 
 An unconstrained parameter can only be moved, stored, passed, printed and interpolated, with a width but no format, each instance rendering its own type. Anything else a generic function needs, such as an ordering of its elements, is passed in as a function value.
 
