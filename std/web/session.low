@@ -12,8 +12,267 @@ import std/time
 pub struct Session {
     /// The stored values. Writing to the map directly does not mark the session as changed, so use `session_set` and `session_clear` to change it.
     pub values: [str: str]
+    own: [str: str]
     changed: bool
     cleared: bool
+    kept: bool
+    id: str
+    issued: i64
+    lifetime: i64
+    store: SessionStore?
+}
+
+/// Remembers what `sessions` and `oidc_login` have revoked: the ids of signed-out sessions and the states of finished sign-ins.
+///
+/// `memory_session_store` keeps them in the process. `file_session_store` keeps them in a file, across a restart. An application that runs several processes supplies its own over a shared database. The key of a session is its id, 22 characters of URL-safe base64, and the key of a sign-in state starts with `oidc_state:`.
+pub struct SessionStore {
+    /// Records `key` as revoked until the Unix time `until`, and reports whether this call recorded it. Of two calls for one key at the same moment, only one gets `true`.
+    pub revoke: fn(str, i64) -> bool
+    /// Reports whether `key`, which belongs to a session issued or a sign-in started at the Unix time `issued`, is revoked. A store that cannot answer reports `true`.
+    pub revoked: fn(str, i64) -> bool
+}
+
+const revocation_limit = 1 << 20
+const generation_limit = 16
+const filter_bits_per_entry = 16
+const filter_hashes = 11
+const least_filter_bits = 1 << 16
+const sweep_interval = 60
+const id_draws = 8
+const state_prefix = "oidc_state:"
+
+struct Generation {
+    bits: u8[]
+    at: i64
+    until: i64
+}
+
+struct Revoked {
+    name: str
+    until: [str: i64]
+    floor: i64
+    spilled: Generation[]
+    aside: [str: i64]
+    settling: bool
+    settled: chan[bool]
+}
+
+struct Marks {
+    first: i64
+    step: i64
+}
+
+struct Revocations {
+    lock: chan[bool]
+    limit: i64
+    generations: i64
+    sessions: *Revoked
+    states: *Revoked
+    swept: i64
+    journal: *Journal?
+    failed: bool
+}
+
+fn table_of(r: *Revocations, key: str) -> *Revoked {
+    if text.starts_with(key, state_prefix) { r.states } else { r.sessions }
+}
+
+fn sweep(t: *Revoked, now: i64) {
+    var expired: str[] = []
+    for key, until in t.until {
+        if until < now {
+            expired.push(key)
+        }
+    }
+    for key in expired {
+        t.until.delete(key)
+    }
+    var live: Generation[] = []
+    for g in t.spilled {
+        if g.until >= now {
+            live.push(g)
+        }
+    }
+    t.spilled = live
+}
+
+fn marks_of(key: str) -> Marks {
+    let digest = hash.sum(hash.sha256(), bytes(key))
+    var first = 0
+    var step = 0
+    for i in 0..7 {
+        first = first << 8 | i64(digest[i])
+        step = step << 8 | i64(digest[i + 7])
+    }
+    Marks { first, step: step | 1 }
+}
+
+fn mark(mut bits: u8[], m: Marks) {
+    let size = bits.len * 8
+    for i in 0..filter_hashes {
+        let bit = (m.first + i * m.step) % size
+        bits[bit >> 3] = u8(i64(bits[bit >> 3]) | (1 << (bit & 7)))
+    }
+}
+
+fn marked(g: Generation, m: Marks) -> bool {
+    let size = g.bits.len * 8
+    for i in 0..filter_hashes {
+        let bit = (m.first + i * m.step) % size
+        if (i64(g.bits[bit >> 3]) >> (bit & 7)) & 1 == 0 {
+            return false
+        }
+    }
+    true
+}
+
+fn spilled_before(t: *Revoked, key: str, issued: i64, now: i64) -> bool {
+    if t.spilled.len == 0 {
+        return false
+    }
+    let m = marks_of(key)
+    for g in t.spilled {
+        if issued <= g.at && g.until >= now && marked(g, m) {
+            return true
+        }
+    }
+    false
+}
+
+fn filter_of(aside: [str: i64], limit: i64, at: i64) -> Generation {
+    let wanted = (if aside.len > limit { aside.len } else { limit }) * filter_bits_per_entry
+    var bits = io.buffer((if wanted < least_filter_bits { least_filter_bits } else { wanted }) / 8)
+    var latest = at
+    for key, until in aside {
+        mark(mut bits, marks_of(key))
+        if until > latest {
+            latest = until
+        }
+    }
+    Generation { bits, at, until: latest }
+}
+
+fn spill(r: *Revocations, t: *Revoked, at: i64) {
+    let g = filter_of(t.aside, r.limit, at)
+    let line = if r.journal == none { "" } else { filter_line(t.name, g) }
+    r.lock <- true
+    t.spilled.push(g)
+    t.aside = [:]
+    t.settling = false
+    match r.journal {
+        some(j) => {
+            let _ = written(r, j, line, true)
+        }
+        none => {}
+    }
+    close(t.settled)
+    <-r.lock
+}
+
+fn freeze(r: *Revocations, t: *Revoked, now: i64) {
+    t.aside = t.until
+    t.until = [:]
+    t.settling = true
+    t.settled = chan[bool]()
+    spawn spill(r, t, now)
+}
+
+fn full(t: *Revoked, limit: i64, now: i64) -> bool {
+    if t.until.len < limit {
+        return false
+    }
+    sweep(t, now)
+    t.until.len >= limit
+}
+
+fn enter(r: *Revocations, t: *Revoked) {
+    for {
+        r.lock <- true
+        if !t.settling || !full(t, r.limit, time.now()) {
+            return
+        }
+        let settled = t.settled
+        <-r.lock
+        <-settled
+    }
+}
+
+fn made_room(r: *Revocations, t: *Revoked, now: i64) -> str {
+    if !full(t, r.limit, now) {
+        return ""
+    }
+    if t.spilled.len < r.generations {
+        freeze(r, t, now)
+        return freeze_line(t.name)
+    }
+    t.until = [:]
+    t.spilled = []
+    t.floor = now
+    header_line(r)
+}
+
+fn revoke(r: *Revocations, key: str, until: i64) -> bool {
+    let t = table_of(r, key)
+    enter(r, t)
+    defer <-r.lock
+    if r.failed {
+        return false
+    }
+    let now = time.now()
+    if now - r.swept >= sweep_interval {
+        sweep(r.sessions, now)
+        sweep(r.states, now)
+        r.swept = now
+    }
+    let moved = made_room(r, t, now)
+    if (t.until[key] ?? -1) >= now || (t.aside[key] ?? -1) >= now {
+        return false
+    }
+    let fresh = !spilled_before(t, key, 0, now)
+    t.until[key] = until
+    let kept = match r.journal {
+        some(j) => written(r, j, "{moved}{entry_line(key, until)}", moved.len > 0 && !t.settling)
+        none => true
+    }
+    kept && fresh
+}
+
+fn revoked(r: *Revocations, key: str, issued: i64) -> bool {
+    r.lock <- true
+    defer <-r.lock
+    let t = table_of(r, key)
+    let now = time.now()
+    r.failed || issued <= t.floor || (t.until[key] ?? -1) >= now || (t.aside[key] ?? -1) >= now || spilled_before(t, key, issued, now)
+}
+
+/// Returns a `SessionStore` that keeps revocations in the memory of this process.
+///
+/// An entry leaves at its expiry. Sessions and sign-in states are counted apart, in a table of 1,048,576 entries each. When a new entry finds its table full of entries that have not expired, the store sets the table aside, starts an empty one and builds a Bloom filter of 2 MiB from the one set aside on a green thread, so it never forgets a revocation, signs nobody out and makes no lookup wait for the filter. A filter leaves once its last entry has expired, and it reports about 1 in 2,000 keys it never held as revoked, among sessions issued and sign-ins started before it was made; `revoke` reports `false` for such a key and records it. A table holds 16 filters at most, 32 MiB. When a full table finds all 16 in use, the store revokes every session issued up to that moment, or for sign-in states refuses every sign-in started up to that moment and signs nobody out, and starts that table without filters. The store holds nothing a process before it recorded, so it refuses every session issued and every sign-in started more than a second before it was made: a restart signs every user out, and no cookie revoked before the restart is accepted. `file_session_store` keeps users signed in across a restart. It is not shared between processes.
+pub fn memory_session_store() -> SessionStore {
+    let r = tables(revocation_limit, none)
+    let started = time.now() - 1
+    r.sessions.floor = started
+    r.states.floor = started
+    store_of(r)
+}
+
+fn revocations(limit: i64) -> SessionStore {
+    store_of(tables(limit, none))
+}
+
+fn tables(limit: i64, journal: *Journal?) -> *Revocations {
+    new(Revocations { lock: chan[bool](1), limit, generations: generation_limit, sessions: table("sessions"), states: table("states"), swept: time.now(), journal, failed: false })
+}
+
+fn table(name: str) -> *Revoked {
+    new(Revoked { name, until: [:], floor: 0, spilled: [], aside: [:], settling: false, settled: chan[bool]() })
+}
+
+fn store_of(r: *Revocations) -> SessionStore {
+    SessionStore {
+        revoke: fn(key: str, until: i64) -> bool { revoke(r, key, until) }
+        revoked: fn(key: str, issued: i64) -> bool { revoked(r, key, issued) }
+    }
 }
 
 /// Configures the `sessions` middleware.
@@ -30,11 +289,17 @@ pub struct SessionOptions {
     pub same_site: http.SameSite = http.SameSite.Lax
     /// The `Path` attribute of the cookie. Defaults to `/`.
     pub path: str = "/"
+    /// Where revoked sessions are recorded. Defaults to a `memory_session_store` of its own for each `sessions` call, so two `sessions` middlewares that share a key and a cookie name must be given one store.
+    pub store: SessionStore? = none
 }
 
 struct Stored {
     expires: i64
+    id: str = ""
+    issued: i64 = 0
+    kept: bool = false
     values: [str: str]
+    own: [str: str] = [:]
 }
 
 /// Returns the cookies of the request as a map of names to values.
@@ -51,56 +316,116 @@ pub fn set_cookie(c: *Context, cookie: http.Cookie) {
     set_header(c, "set-cookie", http.format_set_cookie(cookie))
 }
 
-fn open_session(cipher: aead.Aead, name: str, raw: str) -> [str: str]? {
+fn open_session(cipher: aead.Aead, name: str, raw: str) -> Stored? {
     let data = base64.decode_url(raw) or return none
     if data.len < 12 + 16 {
         return none
     }
     let plain = cipher.open(data[..12], data[12..], bytes(name)) or return none
     let stored = json.deserialize[Stored](plain) or return none
-    stored.values when stored.expires >= time.now()
+    stored when stored.id.len > 0 && stored.expires >= time.now()
 }
 
-fn seal_session(cipher: aead.Aead, name: str, values: [str: str], max_age: i64) -> str {
+fn seal_session(cipher: aead.Aead, name: str, s: *Session) -> str {
     let nonce = crypto.random(12)
-    let plain = bytes(json.serialize(Stored { expires: time.now() + max_age, values }))
+    let now = time.now()
+    if s.id.len == 0 {
+        s.id = unrevoked_id(s.store, now)
+        s.issued = now
+    }
+    s.kept = carries(s)
+    let plain = bytes(json.serialize(Stored { expires: now + s.lifetime, id: s.id, issued: s.issued, kept: s.kept, values: s.values, own: s.own }))
     var out: u8[] = []
     io.append(mut out, nonce)
     io.append(mut out, cipher.seal(nonce, plain, bytes(name)))
     base64.encode_url(out)
 }
 
+fn live(store: SessionStore, opened: Stored?) -> Stored? {
+    match opened {
+        some(stored) => stored when !store.revoked(stored.id, stored.issued)
+        none => none
+    }
+}
+
+fn withdrawn(s: *Session) -> bool {
+    match s.store {
+        some(store) => s.id.len > 0 && store.revoked(s.id, s.issued)
+        none => false
+    }
+}
+
+fn unrevoked_id(store: SessionStore?, issued: i64) -> str {
+    var id = base64.encode_url(crypto.random(16))
+    let known = store ?? return id
+    for _ in 0..id_draws {
+        if !known.revoked(id, issued) {
+            break
+        }
+        id = base64.encode_url(crypto.random(16))
+    }
+    id
+}
+
+fn carries(s: *Session) -> bool {
+    s.kept || s.values.len > 0
+}
+
+fn retire(s: *Session) {
+    match s.store {
+        some(store) => {
+            if s.id.len > 0 && carries(s) {
+                store.revoke(s.id, time.now() + s.lifetime)
+            }
+        }
+        none => {}
+    }
+    s.id = ""
+    s.kept = false
+}
+
 /// Returns a middleware that keeps a `Session` for each visitor in an encrypted cookie.
 ///
-/// Fails with `Invalid` when `o.key` is not 32 bytes. The cookie holds the values and an expiry, sealed with AES-256-GCM and bound to the cookie name. A cookie that is missing, altered or expired gives an empty session. A cookie is sent only when the request changed the session, which restarts its lifetime, or cleared it, which deletes the cookie. A session that is cleared stays cleared even if values are set afterwards. The scheme is listed in the OpenAPI document as an `apiKey` in a cookie.
+/// Fails with `Invalid` when `o.key` is not 32 bytes. The cookie holds the values, what `csrf_token` and `oidc_login` keep, an expiry, a random session id, the time the id was issued and whether the id has held a value of the application, sealed with AES-256-GCM and bound to the cookie name. A new session takes an id the store does not report revoked, drawing up to eight more. A cookie that is missing, altered, expired or revoked in `o.store` gives an empty session. The store is asked when the cookie is opened, when a new id is drawn and again before the cookie is sent, and a session revoked in between sends no cookie. A cookie is sent only when the request changed the session, which restarts its lifetime, or cleared it, which deletes the cookie. A session that is cleared stays cleared even if values are set afterwards. The scheme is listed in the OpenAPI document as an `apiKey` in a cookie.
 pub fn sessions(o: SessionOptions) -> Middleware ! io.Error {
     if o.key.len != 32 {
         fail Invalid
     }
     let cipher = aead.aes_gcm(o.key)?
+    let store = o.store ?? memory_session_store()
+    let expired = http.Cookie { name: o.cookie, value: "", path: o.path, max_age: 0, secure: o.secure, same_site: o.same_site }
     Middleware {
         run: fn(c: *Context, next: fn() -> http.Response) -> http.Response {
-            var values: [str: str] = [:]
+            let s = new(Session { values: [:], own: [:], changed: false, cleared: false, kept: false, id: "", issued: 0, lifetime: o.max_age, store })
             match cookies(c)[o.cookie] {
                 some(raw) => {
-                    match open_session(cipher, o.cookie, raw) {
-                        some(v) => {
-                            values = v
+                    match live(store, open_session(cipher, o.cookie, raw)) {
+                        some(stored) => {
+                            s.values = stored.values
+                            s.own = stored.own
+                            s.id = stored.id
+                            s.issued = stored.issued
+                            s.kept = stored.kept
                         }
                         none => {}
                     }
                 }
                 none => {}
             }
-            let s = new(Session { values, changed: false, cleared: false })
             c.session = s
             let resp = next()
             if s.cleared {
-                set_cookie(c, http.Cookie { name: o.cookie, value: "", path: o.path, max_age: 0, secure: o.secure, same_site: o.same_site })
-            } else if s.changed {
-                let sealed = seal_session(cipher, o.cookie, s.values, o.max_age)
-                set_cookie(c, http.Cookie { name: o.cookie, value: sealed, path: o.path, max_age: o.max_age, secure: o.secure, same_site: o.same_site })
+                set_cookie(c, expired)
+                return resp
             }
+            if !s.changed {
+                return resp
+            }
+            let sealed = seal_session(cipher, o.cookie, s)
+            if withdrawn(s) {
+                return resp
+            }
+            set_cookie(c, http.Cookie { name: o.cookie, value: sealed, path: o.path, max_age: o.max_age, secure: o.secure, same_site: o.same_site })
             resp
         }
         security: Security {
@@ -118,7 +443,7 @@ fn current(c: *Context) -> *Session {
     match c.session {
         some(s) => s
         none => {
-            let s = new(Session { values: [:], changed: false, cleared: false })
+            let s = new(Session { values: [:], own: [:], changed: false, cleared: false, kept: false, id: "", issued: 0, lifetime: 0, store: none })
             c.session = s
             s
         }
@@ -141,10 +466,45 @@ pub fn session_set(c: *Context, key: str, value: str) {
     s.changed = true
 }
 
-/// Removes every value from the session and deletes the cookie.
+fn own_get(c: *Context, key: str) -> str? {
+    current(c).own[key]
+}
+
+fn own_set(c: *Context, key: str, value: str) {
+    let s = current(c)
+    s.own[key] = value
+    s.changed = true
+}
+
+fn own_remove(c: *Context, key: str) {
+    let s = current(c)
+    s.own.delete(key)
+    s.changed = true
+}
+
+fn session_restart(c: *Context) {
+    let s = current(c)
+    retire(s)
+    s.values = [:]
+    s.own = [:]
+    s.changed = true
+}
+
+fn spend(c: *Context, key: str, started: i64, until: i64) -> bool {
+    match current(c).store {
+        some(store) => !store.revoked(key, started) && store.revoke(key, until)
+        none => true
+    }
+}
+
+/// Removes every value from the session, deletes the cookie and revokes the session.
+///
+/// The session's id is recorded in the `SessionStore` until the cookie would have expired, so a copy of the cookie gives an empty session, and a request that was running when this one cleared the session cannot set the cookie again. A session whose id has never held a value in `Session.values` is not recorded, so a visitor who never held a value of the application adds nothing to the store. What `csrf_token` and `oidc_login` keep for a visitor is held apart from `Session.values`, under no name an application can set.
 pub fn session_clear(c: *Context) {
     let s = current(c)
+    retire(s)
     s.values = [:]
+    s.own = [:]
     s.cleared = true
 }
 
@@ -152,11 +512,11 @@ pub fn session_clear(c: *Context) {
 ///
 /// Send it to the client for the `x-csrf-token` header that `csrf` checks.
 pub fn csrf_token(c: *Context) -> str {
-    match session_get(c, "csrf") {
+    match own_get(c, "csrf") {
         some(t) => t
         none => {
             let t = text.encode_hex(crypto.random(32))
-            session_set(c, "csrf", t)
+            own_set(c, "csrf", t)
             t
         }
     }
@@ -173,7 +533,7 @@ pub fn csrf() -> Middleware {
     Middleware {
         run: fn(c: *Context, next: fn() -> http.Response) -> http.Response {
             if unsafe_method(c.request.method) {
-                let expected = session_get(c, "csrf") ?? ""
+                let expected = own_get(c, "csrf") ?? ""
                 let given = header(c, "x-csrf-token") ?? ""
                 if expected.len == 0 || !hash.equal(bytes(expected), bytes(given)) {
                     return problem_response(Forbidden("missing or invalid CSRF token"))
@@ -185,19 +545,18 @@ pub fn csrf() -> Middleware {
     }
 }
 
-/// Returns a middleware that requires the session value `key` to be set.
+/// Returns a middleware that requires the session value `key` to be set and not empty.
 ///
 /// The value is stored in `Context.user`. Otherwise the response is a `401` problem.
 pub fn require_session(key: str) -> Middleware {
     Middleware {
         run: fn(c: *Context, next: fn() -> http.Response) -> http.Response {
-            match session_get(c, key) {
-                some(user) => {
-                    c.user = user
-                    next()
-                }
-                none => problem_response(Unauthorized("sign in required"))
+            let user = session_get(c, key) ?? ""
+            if user.len == 0 {
+                return problem_response(Unauthorized("sign in required"))
             }
+            c.user = user
+            next()
         }
         security: none
     }

@@ -3240,6 +3240,7 @@ One sentence per module. Each name links to the module's page, which holds the r
 | `std/file` | Opening: `open`, `create`, `append` and `update` return a droppable `File` whose `handle` is a copyable `FileHandle`. |
 | `std/file/watch` | inotify. |
 | `std/net` | Addresses: IPv4 and IPv6 `Addr`, `parse_ip`, `format_ip`, `unmap` (the IPv4 bytes of an IPv4-mapped IPv6 address), `parse_addr`, `format`, `in_network` (tests an address against a CIDR prefix) and `is_global` (false for addresses the IANA special-purpose registries mark as not globally reachable, and for multicast). |
+| `std/net/restart` | Starts a server again after it ends abnormally: a watching process keeps the TCP and Unix listeners and the UDP sockets and runs the server as a child of the same executable, which takes each one by its address or path. |
 | `std/net/sntp` | An SNTP client (RFC 4330). |
 | `std/net/punycode` | Punycode (RFC 3492): `encode` writes a string as ASCII digits without the `xn--` prefix. |
 | `std/net/idna` | Internationalised domain names by UTS #46 (Unicode 16.0.0): `to_ascii(domain, Options)` returns the `xn--` form and fails with an `Error` that names the failed check. |
@@ -3613,6 +3614,50 @@ A server speaks HTTP/1.1 and HTTP/2 on the same port.
 
 Over TLS, ALPN offers `h2` and `http/1.1` and the same detection applies. The `h2c` upgrade from HTTP/1.1, deprecated by RFC 9113, is not offered.
 
+#### HTTP server limits
+
+`serve` and `serve_tls` bound what a client can hold open with the defaults of `http.Limits`; `serve_with`, `serve_tls_with` and `serve_conn_with` take a `Limits` value. Times are in milliseconds and sizes in bytes, and a time limit of 0 is off.
+
+| Field | Default | What happens past it |
+| --- | --- | --- |
+| `head_timeout`: a request's line and headers, from the accept for the first request and including the TLS handshake, and an HTTP/2 header block sent in pieces while no handler runs | 30 seconds | The connection is closed. |
+| `body_timeout` and `body_rate`: every `body_timeout` of a buffered request body must bring `body_rate` bytes for each of its seconds, or the end of the body. Bytes that arrive faster earn no later window. | 30 seconds, 16 KiB a second | The HTTP/1 connection is closed, and the HTTP/2 stream is reset with `ENHANCE_YOUR_CALM`. |
+| `write_timeout`: the client takes 64 KiB of a response | 60 seconds | The connection is closed. On HTTP/2 the client owes 64 KiB in this time for each response whose handler has returned, counted across the connection, which is 1.1 KiB a second for each such response with the default, and a connection a whole `write_timeout` behind is ended with `GOAWAY` and `ENHANCE_YOUR_CALM`. |
+| `idle_timeout`: the next HTTP/1 request, or a frame on an HTTP/2 connection with no handler running | 120 seconds | The connection is closed. |
+| `max_body`: one buffered request body, and what the bodies of one connection hold of `max_bodies` | 64 MiB | `413`, from the `content-length` when there is one; the HTTP/2 stream is reset with `ENHANCE_YOUR_CALM`, or with `REFUSED_STREAM` for the connection's share. |
+| `max_bodies`: the request bodies being received across the connections of one call, not counting the first 64 KiB of each connection | 256 MiB | `503` and the HTTP/1 connection is closed, and the HTTP/2 stream is reset with `REFUSED_STREAM`. |
+| `max_connections`: the connections of one call | Seven eighths of the descriptors the process may open, halved, between 16 and 4096; 4096 where there is no such limit | The connection that has waited longest for its next request is closed, or else the one longest in a request's line and headers, or else the one whose request body last met `body_rate` longest ago, or else, among the connections whose handlers have all returned and that only send their responses, the one that has sent the fewest bytes a second over the last 4 to 8 seconds. After those come the connection that has sent a response's `stream` longest with no handler running, then the one taken over through `upgrade` longest ago, then the one whose handler has run longest past `handler_timeout`. Displacing a connection cancels the token of its requests and closes it. Connections of the last two kinds are displaced only while the handlers still running on displaced ones number at most an eighth of the limit, and at least one, or belong to a single connection. A connection with a handler running inside `handler_timeout` is never displaced; when nothing can be displaced, the new connection is closed. Below the limit no connection is displaced. |
+| `max_connections_per_address`: the connections of one call from one socket peer address, never a header | 0, off | A new connection from that address displaces one of that address's own connections, chosen as `max_connections` chooses, or is closed. Each whole address counts on its own, so a client that holds an IPv6 prefix has a limit for every address in it. Leave it off behind a proxy, where every client shares one address. |
+| `handler_timeout`: the time a handler runs | 0, off | `Request.token` is cancelled. The limit is cooperative: a handler that ignores its token runs on. On HTTP/1 and HTTP/2 its connection can then be displaced at `max_connections`; on HTTP/3 only the token is cancelled. A handler that called `upgrade` is not timed. On a connection served through `serve_duplex_conn_with` or `serve_duplex_conn_in`, and so for a gRPC call, the time runs until the response ends. |
+
+These hold whatever the `Limits`:
+
+| Limit | What happens past it |
+| --- | --- |
+| 100 header lines, 64 KiB of header lines | `413`. |
+| A `transfer-encoding` other than `chunked`, more than one, one beside a `content-length`, or `content-length` headers that differ | `400`. |
+| 128 `CONTINUATION` frames in a header block, or an empty one that does not end it | `GOAWAY` with `ENHANCE_YOUR_CALM`. |
+| 200 streams reset by the client before any part of their response is sent, or reset by the server with an error, refilled at 20 a second | `GOAWAY` with `ENHANCE_YOUR_CALM`. |
+| An HPACK integer of more than 5 continuation bytes | `GOAWAY` with `COMPRESSION_ERROR`. |
+
+Each entry applies these fields:
+
+| Entry | Fields |
+| --- | --- |
+| `serve`, `serve_on`, `serve_with`, `serve_tls`, `serve_tls_on`, `serve_tls_with` | All, shared by the connections of the call. |
+| `serve_conn_with` | All but `max_connections`. `max_body` bounds one body and the bodies of the connection together, so `max_bodies` binds only when it is the smaller. |
+| `serve_conn`, `serve_conn_on`, `serve_stream` | The default `max_body`, for one body and for the bodies of the connection together, and no time limit. |
+| `serve_stream_with` | `max_body`, for one body and for the bodies of the stream together, and no time limit. |
+| `serve_duplex_conn_on`, `serve_duplex_tls_conn_on` | The default `head_timeout` and `write_timeout`, and for an HTTP/1 request body `body_timeout`, `body_rate` and `max_body`. An idle connection or stream is never closed, and an HTTP/2 request body, which the handler reads, has no limit. |
+| `serve_duplex_conn_with`, `serve_duplex_tls_conn_with`, and a `grpc.Server` through `ServerOptions.limits` | `head_timeout`, `write_timeout` and `idle_timeout`, and for an HTTP/1 request body `body_timeout`, `body_rate`, `max_body` and `max_bodies`. An HTTP/2 request body, which the handler reads, has no limit. `ServerOptions.limits` defaults to an `idle_timeout` of zero, and its `max_connections` and `max_connections_per_address` are shared by the server's connections through `serve_duplex_conn_in`. `handler_timeout` is the longest a call may last: past it the call is cancelled and ends with `Cancelled`, and a connection whose calls are all past it can be displaced. With it off, a connection with a call in progress is never displaced, so clients that hold a call on every connection keep new connections out. |
+| `serve_quic`, `serve_quic_on`, `serve_quic_with` | All, shared by the connections of the call, as the HTTP/3 rows below apply them. |
+
+Over HTTP/3 the limits bound request streams and connections. A request stream is reset with `H3_EXCESSIVE_LOAD` when its header section outlasts `head_timeout`, its body arrives below `body_rate` or grows past `max_body`, or the client takes longer than `write_timeout` for 64 KiB of the response, and with `H3_REQUEST_REJECTED` when its body passes `max_bodies`, which counts every byte of an HTTP/3 body. A connection is closed with `H3_EXCESSIVE_LOAD` when it opens no request within `head_timeout` of being accepted or has had no request open for `idle_timeout`. `max_connections` is 4096 when zero; at it a new connection displaces the one that has had no request open the longest, or else the one that has waited longest to open its first, or else the slowest of the connections that only send responses whose handlers have returned, or else the one that has only sent a `stream` longest, and is itself closed while every connection has a handler running. A response the handler has returned stays in the QUIC connection until the client acknowledges it, bounded by `quic.Config.max_send_buffer` and `quic.Config.send_timeout` of the listener, not by `Limits`.
+
+With the defaults and 4096 connections, the bodies being received hold at most 256 MiB and the 64 KiB of each connection another 256 MiB. A body holds memory only while it arrives at 16 KiB a second or more, so one 64 MiB body lasts 68 minutes at most, and keeping the 256 MiB full takes eight connections that each upload at that rate, 128 KiB a second together, for as long as the denial lasts. While it is full a request of at most 64 KiB is still served, and a larger one gets `503`. A server whose requests are small sets `max_body`: at 1 MiB the same takes 512 connections and 8 MiB a second. The concurrent uploads of one HTTP/2 connection share one `max_body`, so a proxy that carries many clients on one connection to the server needs a `max_body` sized for them together. A body that has reached its handler is outside every count: what the handlers hold is the rate of requests times the time a handler runs. At `max_connections`, a request whose line and headers are still arriving is closed only after every connection that waits for a request and every connection longer in its head has gone, so it is served when it sends its head faster than new connections arrive in the number of `max_connections`.
+
+The time a handler runs is not limited, nor is the time a response takes while the client keeps reading it. A body leaves the `max_bodies` count when its handler is called. One green thread per call closes the connections past a time limit, at a fifteenth of the shortest time limit and at least once a second. An accept that fails for want of descriptors, buffers or memory, or because the client aborted, is tried again after 50 milliseconds, so `serve` returns only when the listener is closed or fails for good.
+
 #### HTTP/2 coverage
 
 HTTP/2 covers:
@@ -3636,7 +3681,7 @@ A handler's `Response.trailers` are sent as a final HEADERS frame over HTTP/2; H
 
 #### HTTP/3 server
 
-HTTP/3 (RFC 9114) is served by `serve_quic` and `serve_quic_on` over a `quic.Listener` whose ALPN is `h3`. A connection that negotiated another protocol is closed with `H3_GENERAL_PROTOCOL_ERROR`.
+HTTP/3 (RFC 9114) is served by `serve_quic`, `serve_quic_on` and `serve_quic_with` over a `quic.Listener` whose ALPN is `h3`. A connection that negotiated another protocol is closed with `H3_GENERAL_PROTOCOL_ERROR`.
 
 ##### HTTP/3 server control and QPACK streams
 
@@ -5015,7 +5060,7 @@ A client accepts one Retry. It ignores Retry and Version Negotiation once it has
 
 #### QUIC stateless reset
 
-A short-header datagram of at least 42 bytes for no connection gets a smaller stateless reset. Its token is an HMAC of the connection ID.
+A short-header datagram of at least 22 bytes for no connection gets a stateless reset one byte smaller, of 43 bytes at most. Its token is an HMAC of the connection ID. A reset answers a packet (RFC 9000 section 10.3), so a client that sends nothing learns that its connection is gone at its idle timeout, or at the next ping when it sets `Config.keep_alive`.
 
 #### QUIC handshake buffers and keys
 
@@ -5074,7 +5119,7 @@ Connection migration is not supported.
 Flow control applies per stream and per connection in both directions, and the receive windows are credited as the application reads.
 
 - Data past the flow control limit, a changed final size and an offset plus length over 2^62-1 fail the connection with the matching error.
-- `write` parks while the stream's 1 MiB send buffer or the peer's credit is exhausted.
+- `write` parks while the stream's 1 MiB send buffer is full or the streams of the connection together hold `Config.max_send_buffer` (2 MiB) of unacknowledged data. Each stream may hold 16 KiB whatever the connection holds. A peer that acknowledges neither 64 KiB of the held data nor all of what was held when the count started, within `Config.send_timeout` (60 seconds), has its connection closed with `NO_ERROR`, and the calls on it fail `TimedOut`.
 
 #### QUIC stream receive buffer
 
@@ -8777,6 +8822,8 @@ Every codec has buffer functions, a streaming decoder and a streaming encoder. T
 | `get`, `post`, `put`, `patch`, `del` and `route` | Add handlers for paths with `:name` parameters and a trailing `*`. |
 | `group` | Makes a sub-application with a prefix and more middleware that registers its routes on the same router. |
 
+Routes are tried in registration order and a middleware wraps the routes registered after it. `route` panics for a `*` that is not the last segment, and for a route that could never run because one registered before it matches every request it matches. `GET /files/:name` before `GET /files/new` is such a pair, and so is a `GET` route before a `HEAD` route of the same path.
+
 | Request | Answer |
 | --- | --- |
 | An unknown path | A 404. |
@@ -8793,14 +8840,24 @@ Middleware is a struct of a `run` closure and an optional security scheme.
 | Middleware | Behaviour |
 | --- | --- |
 | `api_key`, `basic` and `bearer` | Authenticate requests and set `Context.user`. |
-| `sessions` | Keeps a map in a cookie sealed with AES-256-GCM, with the cookie name as associated data and an expiry inside. |
+| `sessions` | Keeps a map in a cookie sealed with AES-256-GCM, with the cookie name as associated data and an expiry, a random session id and its issue time inside. |
 | `csrf` | Requires the session's token in `X-CSRF-Token` on unsafe methods. |
 | `require_session`, `cors` (with the request headers it allows), `logger` and `compress` | Complete the set. |
 | `compress` | Picks Zstandard, Brotli or gzip, in that order, from what `Accept-Encoding` allows. |
 
+#### Web session revocation
+
+`session_clear` and a sign-in through `oidc_login` revoke the session's id in the `SessionStore` of `SessionOptions.store` until the cookie would have expired. `sessions` asks the store when it opens a cookie and again before it sends one, so a copy of a signed-out cookie gives an empty session and a request that was running at sign-out cannot set the cookie again. A session whose id has never held a value in `Session.values` is not recorded, so a visitor who never held a value of the application adds nothing to the store, and a request running while such a session is cleared can set its cookie again. What `csrf_token` and `oidc_login` keep is sealed in the cookie apart from `Session.values`, so no value name is special. A new session takes an id the store does not report revoked.
+
+A `SessionStore` is two functions. `revoke` records a key until a time and reports whether this call recorded it, and `revoked` reports whether a key is revoked. An application supplies its own over a database it shares between processes. The key of a session is its id, and the key of a sign-in state starts with `oidc_state:`.
+
+`memory_session_store` is the default, one for each `sessions` call, so two `sessions` middlewares that share a key and a cookie name must be given one store. An entry leaves at its expiry. Sessions and sign-in states are counted apart, in a table of 1,048,576 entries each. A new entry that finds its table full of live ones makes the store set the table aside, start an empty one and build a Bloom filter of 2 MiB from the one set aside on a green thread, so nobody is signed out and lookups and new entries wait for none of it; the table set aside answers lookups until its filter takes its place. A filter leaves once its last entry has expired. It reports about 1 in 2,000 keys it never held as revoked, among sessions issued and sign-ins started before it was made, so with all 16 filters of a table live about 0.7% of those sessions are signed out by a false match. A table holds 16 filters at most. A full table that finds all 16 in use makes the store revoke every session issued up to that moment, or for sign-in states refuse every sign-in started up to that moment, which signs nobody out. That takes about 17.8 million live entries in one table: 206 sign-outs a second for a day at the default `max_age`, each of a session that held a value, so about 412 requests a second where a visitor gets such a session without signing in. A store the application supplies has none of these bounds or filters and keeps entries by its own rules. It holds nothing a process before it recorded, so it refuses every session issued and every sign-in started more than a second before it was made: a restart signs every user out, and no cookie revoked before the restart is accepted. `file_session_store` keeps users signed in across a restart.
+
+`file_session_store` keeps the same tables and filters in a file as well, for one process on one host, so revocations outlast the process. It flushes each entry before `revoke` reports `true`. A file that is empty, cut short or altered makes it revoke every session issued up to the moment it is opened, and a file it cannot write makes it report every key revoked. It appends each entry to the file and reads the file line by line when it opens. It writes the file anew on a green thread once the file holds 1,024 more lines than live entries and after a full table has moved into its filter, while entries go on being appended. A table set aside whose filter never reached the file is read back as entries. The file holds at most about 250 MiB, and about 400 MiB until it is written anew.
+
 #### Web JWT and OpenID Connect verification
 
-`jwt` verifies bearer tokens against a key set with `std/crypto/jose`. `oidc` does the same for an OpenID Connect issuer. It reads the discovery document and the JWKS and refreshes them hourly. It refreshes early, at most once a minute, when a token names a key it does not know.
+`jwt` verifies bearer tokens against a key set with `std/crypto/jose`. `oidc` does the same for the issuer, audience and token type of an `OidcResource`. It reads the discovery document and the JWKS and refreshes them hourly. It refreshes early, at most once a minute, when a token names a key it does not know. One request fetches at a time, without following redirects and within five seconds, while the others verify against the cached keys. When a fetch fails, the cached keys serve for up to a day after the last fetch that succeeded and the next fetch waits ten seconds. A token must carry `exp` and a `sub` that is not empty, and its `iss` and the discovery document's `issuer` must equal the configured issuer exactly. Its header must carry the `typ` of `OidcResource.typ`, which defaults to `at+jwt` (RFC 9068), so an ID token issued to the same client is refused. An empty `typ` accepts every type. `oidc` fails with `Invalid` for an empty issuer or audience.
 
 #### Web OpenID Connect login routes
 
@@ -8808,8 +8865,10 @@ Middleware is a struct of a `run` closure and an optional security scheme.
 
 | Route | Behaviour |
 | --- | --- |
-| Sign-in | Redirects to the issuer with `state`, `nonce` and a PKCE S256 challenge kept in the session. |
-| Callback | Checks the state, exchanges the code and verifies the ID token and its nonce. It hands the claims to the application. |
+| Sign-in | Redirects to the issuer with `state`, `nonce` and a PKCE S256 challenge kept in the session with the time. |
+| Callback | Checks the state and removes it from the session, refuses a callback later than `OidcClient.max_login_age` (ten minutes by default), refuses a state the `SessionStore` reports revoked, records the state as spent and refuses one already spent, so a copy of the sign-in cookie reaches no second code exchange. It refuses an `iss` parameter that names another issuer, exchanges the code and verifies the ID token and its nonce. It refuses an ID token without a `sub` or with the `typ` of an access token. It revokes the session when its id has held a value of the application, starts an empty one under a new id and hands the claims to the application. |
+
+`oidc_login` fails with `Invalid` for an empty issuer or client identifier.
 
 #### Web streaming responses
 
@@ -9866,6 +9925,7 @@ A fixture program is a `.low` file or a directory with a `main.low`. Its expecta
 - The `fail` and `lint` suites check every `testdata/fail` and `testdata/lint` program against its sidecar.
 - The `test` suite runs `low test --notime --nocache` on every `testdata/test` directory. It compares stdout, stderr and the exit status with the directory's sidecars. It runs on both hosts. A test build cannot be expressed in a `testdata/fail` program, so the rejected test shapes are fixtures here. The fixtures also cover these cases: a crashing test, a test that times out, skipped tests, `--run` on a subtest, `--skip`, `--failfast`, `--count`, `--shuffle`, `--json` on a passing module and on one that fails to build, `--list`, selection by `file:line`, a test file for each operating system that defines the same test, a `...` walk that leaves out `testdata`, `examples`, dot and underscore directories while another module fails to build, a module with no test files and a test that reads a file beside its module. `testdata/run/test_files_left_out` holds a test file that does not compile, which shows that `low build` and `low run` leave test files out.
 - `low test std/...` runs the unit tests in the `_test.low` files of the standard library modules, built against the standard library embedded in `low`. Each file tests one module through its private code, so it uses the module's names without an import. Each file covers one area of its module:
+  - `std/http`: the time limits of `serve` with limits of a few hundred milliseconds: a silent client and a request head sent in pieces are closed at the head limit, a body that stops is closed at the stall limit and one that keeps arriving is served, a handler outlasts every limit, and an idle HTTP/1 connection and an HTTP/2 connection without requests are closed at the idle limit.
   - `std/testing`: `selected` for each `/` level of a filter, `settings_from` for every flag and each flag error, the failure message of each assertion that returns, and `sub`, `table` and `table_of` against a `T` the test builds.
   - `std/path`: `clean`, `join`, `base`, `dir`, `ext`, `stem`, `is_absolute` and `matches` over empty paths, `.`, `..`, repeated and trailing separators and the root.
   - `std/filepath`: every function against `std/path` on paths without a volume, with `/` turned into the target's separator, and on Windows `volume`, `is_absolute`, `clean`, `join`, `base` and `dir` over drives, drive-relative paths, shares and device paths.

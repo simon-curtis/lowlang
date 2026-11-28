@@ -1,0 +1,240 @@
+import std/header
+import std/http
+import std/testing
+import std/text
+import std/time
+
+fn visited(store: SessionStore) -> fn(http.Request) -> http.Response {
+    var key: u8[] = []
+    for i in 0..32 {
+        key.push(u8(i))
+    }
+    let a = app()
+    use(a, sessions(SessionOptions { key, store }) or panic("sessions"))
+    let _ = get(a, "/token", fn(c) { text(200, csrf_token(c)) })
+    let _ = get(a, "/in", fn(c) {
+        session_set(c, "user", query(c, "as") ?? "")
+        text(200, "in")
+    })
+    let _ = get(a, "/who", fn(c) { text(200, session_get(c, "user") ?? "nobody") })
+    let _ = get(a, "/forget", fn(c) {
+        current(c).values.delete("user")
+        text(200, csrf_token(c))
+    })
+    let _ = get(a, "/token-in", fn(c) {
+        current(c).values["csrf"] = query(c, "as") ?? ""
+        current(c).changed = true
+        text(200, "in")
+    })
+    let _ = get(a, "/token-who", fn(c) { text(200, session_get(c, "csrf") ?? "nobody") })
+    let _ = get(a, "/out", fn(c) {
+        session_clear(c)
+        no_content()
+    })
+    handler(a)
+}
+
+fn asked(h: fn(http.Request) -> http.Response, target: str, cookie: str) -> http.Response {
+    var req = http.new_request("GET", target)
+    if cookie.len > 0 {
+        req.headers = [header.Header { name: "cookie", value: cookie }]
+    }
+    h(req)
+}
+
+fn cookie_from(resp: http.Response) -> str {
+    let set = header.get(resp.headers, "set-cookie") ?? ""
+    let semi = text.index_byte(set, ';')
+    if semi < 0 { set } else { set[..semi] }
+}
+
+fn who(h: fn(http.Request) -> http.Response, cookie: str) -> str {
+    str(asked(h, "/who", cookie).body)
+}
+
+fn bounded(limit: i64, generations: i64) -> SessionStore {
+    let r = tables(limit, none)
+    r.generations = generations
+    store_of(r)
+}
+
+fn quiet(r: *Revocations) {
+    for {
+        r.lock <- true
+        let busy = r.sessions.settling || r.states.settling || match r.journal {
+            some(j) => j.compacting
+            none => false
+        }
+        <-r.lock
+        if !busy {
+            return
+        }
+        sleep(1)
+    }
+}
+
+fn signed_out(h: fn(http.Request) -> http.Response, n: i64) -> str[] {
+    var cookies: str[] = []
+    for i in 0..n {
+        let next = cookie_from(asked(h, "/in?as=user{i}", ""))
+        let _ = asked(h, "/out", next)
+        cookies.push(next)
+    }
+    cookies
+}
+
+fn test_visitors_who_never_signed_in_cannot_sign_a_user_out(t: *testing.T) {
+    let h = visited(bounded(4, 0))
+    let ada = cookie_from(asked(h, "/in?as=ada", ""))
+    for _ in 0..10 {
+        let anonymous = cookie_from(asked(h, "/token", ""))
+        testing.equal(t, asked(h, "/out", anonymous).status, 204)
+    }
+    testing.equal(t, who(h, ada), "ada")
+}
+
+fn test_a_value_under_a_name_the_framework_uses_is_signed_out_like_any_other(t: *testing.T) {
+    let h = visited(bounded(4, 0))
+    let ada = cookie_from(asked(h, "/token-in?as=ada", ""))
+    testing.equal(t, str(asked(h, "/token-who", ada).body), "ada")
+    testing.equal(t, asked(h, "/out", ada).status, 204)
+    testing.equal(t, str(asked(h, "/token-who", ada).body), "nobody")
+}
+
+fn test_sign_in_states_cannot_sign_a_user_out(t: *testing.T) {
+    let store = bounded(4, 0)
+    let h = visited(store)
+    let ada = cookie_from(asked(h, "/in?as=ada", ""))
+    let started = time.now()
+    for i in 0..10 {
+        testing.is_true(t, store.revoke("{state_prefix}{i}", started + 600))
+    }
+    testing.equal(t, who(h, ada), "ada")
+    testing.is_true(t, store.revoked("{state_prefix}0", started))
+    testing.is_true(t, store.revoked("{state_prefix}unseen", started))
+}
+
+fn test_signing_out_after_the_values_left_refuses_the_cookie_that_had_them(t: *testing.T) {
+    let h = visited(revocations(4))
+    let ada = cookie_from(asked(h, "/in?as=ada", ""))
+    let emptied = cookie_from(asked(h, "/forget", ada))
+    testing.equal(t, who(h, emptied), "nobody")
+    testing.equal(t, asked(h, "/out", emptied).status, 204)
+    testing.equal(t, who(h, ada), "nobody")
+}
+
+fn test_a_full_table_signs_nobody_out_and_forgets_no_sign_out(t: *testing.T) {
+    let h = visited(bounded(4, 8))
+    let ada = cookie_from(asked(h, "/in?as=ada", ""))
+    let gone = signed_out(h, 30)
+    testing.equal(t, who(h, ada), "ada")
+    for cookie in gone {
+        testing.equal(t, who(h, cookie), "nobody")
+    }
+    testing.equal(t, who(h, cookie_from(asked(h, "/in?as=late", ""))), "late")
+}
+
+fn test_past_the_last_generation_every_session_is_signed_out(t: *testing.T) {
+    let h = visited(bounded(4, 2))
+    let ada = cookie_from(asked(h, "/in?as=ada", ""))
+    let gone = signed_out(h, 30)
+    testing.equal(t, who(h, ada), "nobody")
+    for cookie in gone {
+        testing.equal(t, who(h, cookie), "nobody")
+    }
+}
+
+fn test_a_key_that_left_the_table_is_not_recorded_twice(t: *testing.T) {
+    let store = bounded(4, 8)
+    let far = time.now() + 600
+    testing.is_true(t, store.revoke("first", far))
+    for i in 0..9 {
+        testing.is_true(t, store.revoke("other{i}", far))
+    }
+    testing.is_false(t, store.revoke("first", far))
+    testing.is_true(t, store.revoked("first", far))
+    testing.is_false(t, store.revoked("unseen", far))
+}
+
+fn test_a_generation_leaves_once_its_last_entry_has_lapsed(t: *testing.T) {
+    let r = tables(4, none)
+    let store = store_of(r)
+    let now = time.now()
+    for i in 0..5 {
+        testing.is_true(t, store.revoke("key{i}", now + 600))
+    }
+    quiet(r)
+    testing.equal(t, r.sessions.spilled.len, 1)
+    sweep(r.sessions, now + 600)
+    testing.equal(t, r.sessions.spilled.len, 1)
+    sweep(r.sessions, now + 601)
+    testing.equal(t, r.sessions.spilled.len, 0)
+}
+
+struct Unlucky {
+    first: str
+    asked: i64
+}
+
+fn test_a_new_session_takes_an_id_the_store_does_not_report_revoked(t: *testing.T) {
+    let seen = new(Unlucky { first: "", asked: 0 })
+    let store = SessionStore {
+        revoke: fn(key: str, until: i64) -> bool { true }
+        revoked: fn(key: str, issued: i64) -> bool {
+            seen.asked += 1
+            if seen.first.len == 0 {
+                seen.first = key
+            }
+            key == seen.first
+        }
+    }
+    let h = visited(store)
+    testing.equal(t, who(h, cookie_from(asked(h, "/in?as=ada", ""))), "ada")
+    testing.is_true(t, seen.asked >= 2)
+}
+
+fn test_a_full_table_of_sign_in_states_forgets_no_spent_state(t: *testing.T) {
+    let c = new_context(http.new_request("GET", "/"), [:])
+    c.session = new(Session { values: [:], own: [:], changed: false, cleared: false, kept: false, id: "", issued: 0, lifetime: 0, store: revocations(2) })
+    let started = time.now()
+    testing.is_true(t, spend(c, "{state_prefix}first", started, started + 600))
+    testing.is_false(t, spend(c, "{state_prefix}first", started, started + 600))
+    testing.is_true(t, spend(c, "{state_prefix}second", started, started + 600))
+    testing.is_true(t, spend(c, "{state_prefix}third", started, started + 600))
+    testing.is_false(t, spend(c, "{state_prefix}first", started, started + 600))
+}
+
+fn test_the_entry_that_finds_its_table_full_does_not_wait_for_the_filter(t: *testing.T) {
+    let limit = 1 << 17
+    let r = tables(limit, none)
+    let store = store_of(r)
+    let now = time.now()
+    let far = now + 600
+    for i in 0..limit {
+        let _ = store.revoke("key{i}", far)
+    }
+    let started = time.monotonic()
+    testing.is_true(t, store.revoke("one more", far))
+    let entry = time.monotonic() - started
+    testing.is_true(t, store.revoked("key0", now))
+    quiet(r)
+    testing.equal(t, r.sessions.spilled.len, 1)
+    testing.is_true(t, store.revoked("key0", now))
+    testing.is_false(t, store.revoked("unseen", now))
+    var held: [str: i64] = [:]
+    for i in 0..limit {
+        held["key{i}"] = far
+    }
+    let timed = time.monotonic()
+    let _ = filter_of(held, limit, far)
+    let filter = time.monotonic() - timed
+    testing.error_if(t, entry * 2 > filter, "the entry took {entry / 1000} us beside a filter of {filter / 1000} us")
+}
+
+fn test_the_memory_store_refuses_what_was_issued_before_it_was_made(t: *testing.T) {
+    let store = memory_session_store()
+    let now = time.now()
+    testing.error_if(t, !store.revoked("earlier", now - 2), "a session issued before the store was made is accepted")
+    testing.error_if(t, !store.revoked("oidc_state:earlier", now - 2), "a sign-in started before the store was made is accepted")
+    testing.error_if(t, store.revoked("fresh", now), "a session issued now is refused")
+}

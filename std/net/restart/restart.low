@@ -1,0 +1,349 @@
+import std/base64
+import std/crypto
+import std/io
+import std/net
+import std/os
+import signals = std/os/signal
+import std/process
+import std/sys
+import std/text
+import std/time
+
+const parent_variable = "LOW_RESTART_PARENT"
+const sockets_variable = "LOW_RESTART_SOCKETS"
+const seal_variable = "LOW_RESTART_SEAL"
+const secret_size = 32
+const report_variable = "LOW_RESTART_REPORT"
+
+/// The timing of `serve_with`, in milliseconds.
+pub struct Options {
+    /// The pause before the server is started again after it ends abnormally.
+    pub first_pause: i64 = 100
+    /// The longest pause. The pause doubles each time the server ends abnormally until it reaches this.
+    pub longest_pause: i64 = 5000
+    /// How long the server must have run for its abnormal end to be followed by `first_pause` again.
+    pub settled: i64 = 10000
+    /// How long the server has to end after `Terminate` reaches it on the way out, before it is killed. Windows ends the server at once and does not use it.
+    pub grace: i64 = 10000
+}
+
+enum Outcome {
+    Finished
+    Crashed
+    Stopped
+}
+
+/// Returns whether this process is the server that `serve` started, as opposed to the process that watches it.
+pub fn worker() -> bool {
+    match os.env(parent_variable) {
+        some(pid) => pid == "{os.ppid()}"
+        none => false
+    }
+}
+
+/// What a watching process keeps open for the servers it starts.
+pub struct Kept {
+    /// The TCP and Unix listeners, each from `listen`, `listen_with` or `listen_unix`.
+    pub listeners: net.ListenerHandle[] = []
+    /// The UDP sockets, each from `bind_udp`.
+    pub sockets: net.SocketHandle[] = []
+    /// In the server, 32 bytes that every server of one watching process receives alike and no other process is given. `serve` fills it in, whatever the caller set. A server passes it to `quic.listen_on`, so that the server started after it ends the QUIC connections it held. It reaches the server on a pipe that `serve` reads and closes, so it is in no environment and a process the server starts after `serve` has called its function cannot read it. Empty on Windows.
+    pub secret: u8[] = []
+}
+
+struct Passed {
+    kind: str
+    fd: i64
+    name: str
+    port: i64
+}
+
+fn described(kind: str, fd: i64, a: net.Addr) -> str {
+    let name = if a.path.len > 0 { a.path } else { net.format_ip(a.ip) }
+    "{kind} {fd} {base64.encode_url(bytes(name))} {a.port}"
+}
+
+fn listed(kept: Kept) -> str {
+    var sockets: str[] = []
+    for l in kept.listeners {
+        sockets.push(described(if l.addr.path.len > 0 { "unix" } else { "tcp" }, l.fd, l.addr))
+    }
+    for s in kept.sockets {
+        sockets.push(described("udp", s.fd, s.addr))
+    }
+    text.join(sockets, ",")
+}
+
+fn passed(list: str) -> Passed[] {
+    var out: Passed[] = []
+    for entry in text.split(list, ',') {
+        let parts = text.split(entry, ' ')
+        if parts.len != 4 {
+            continue
+        }
+        let fd = text.parse_int(parts[1]) or continue
+        let name = base64.decode_url(parts[2]) or continue
+        let port = text.parse_int(parts[3]) or continue
+        out.push(Passed { kind: parts[0], fd, name: str(name), port })
+    }
+    out
+}
+
+fn chosen(sockets: Passed[], kind: str, name: str, port: i64) -> Passed ! io.Error {
+    var found: Passed[] = []
+    for socket in sockets {
+        if socket.kind == kind && socket.name == name && (port == 0 || socket.port == port) {
+            found.push(socket)
+        }
+    }
+    if found.len != 1 {
+        fail Invalid
+    }
+    found[0]
+}
+
+fn tell_watcher() {
+    let parts = text.split(os.env(report_variable) ?? "", ' ')
+    if parts.len != 2 {
+        return
+    }
+    let port = text.parse_int(parts[0]) or return
+    using s = net.bind_udp("127.0.0.1", 0) or return
+    let _ = net.send_to(s, bytes(parts[1]), net.Addr { ip: [127, 0, 0, 1], port }) or 0
+}
+
+fn told(report: net.Socket, token: str) -> bool {
+    net.set_receive_timeout(report, 1)
+    let buf = io.buffer(64)
+    for {
+        let packet = net.receive_from(report, buf) or return false
+        if str(buf[..packet.size]) == token {
+            return true
+        }
+    }
+}
+
+fn mismatch(e: io.Error) -> io.Error {
+    tell_watcher()
+    e
+}
+
+fn inherited(kind: str, name: str, port: i64) -> i64 ! io.Error {
+    let socket = chosen(passed(os.env(sockets_variable) ?? ""), kind, name, port) catch {
+        e => fail mismatch(e)
+    }
+    socket.fd
+}
+
+fn local_name(host: str) -> str ! io.Error {
+    net.format_ip(if host.len == 0 { net.parse_ip("0.0.0.0")? } else { net.lookup(host)?[0] })
+}
+
+/// Listens for TCP connections on `host` and `port` in the watching process, and takes over that listening socket in the server it starts.
+///
+/// Does the same as `listen_with` with the default options.
+pub fn listen(host: str, port: i64) -> net.Listener ! io.Error {
+    listen_with(host, port, net.ListenOptions {})?
+}
+
+/// Listens as `net.listen_with` does in the watching process, and in the server takes over the socket the watching process listens on for the same `host` and `port`.
+///
+/// The server finds its socket by address, not by the order of the calls: among the listeners given to `serve`, it takes the TCP one bound to the address of `host` and, when `port` is not 0, to `port`. `options` is not read there. With a `port` of 0 the address alone decides, so two listeners on one address that both ask for port 0 cannot be told apart. In the server this fails with `Invalid` when no listener given to `serve` matches, when more than one does, and when the matching one is already taken, so a server never receives the socket of another address. Fails as `net.listen_with` does in the watching process and as `net.lookup` and `net.inherit_listener` do in the server.
+pub fn listen_with(host: str, port: i64, options: net.ListenOptions) -> net.Listener ! io.Error {
+    if !worker() {
+        return net.listen_with(host, port, options)?
+    }
+    net.inherit_listener(inherited("tcp", local_name(host)?, port)?) catch {
+        e => fail mismatch(e)
+    }
+}
+
+/// Listens as `net.listen_unix` does in the watching process, and in the server takes over the socket the watching process listens on at the same `path`.
+///
+/// The server takes, among the listeners given to `serve`, the Unix one bound to `path`, and fails as `listen_with` does there when none matches or it is already taken. The watching process owns the socket file and removes it when it closes the listener; the server leaves it in place.
+pub fn listen_unix(path: str) -> net.Listener ! io.Error {
+    if !worker() {
+        return net.listen_unix(path)?
+    }
+    net.inherit_listener(inherited("unix", net.unix_addr(path)?.path, 0)?) catch {
+        e => fail mismatch(e)
+    }
+}
+
+/// Binds a UDP socket as `net.bind_udp` does in the watching process, and in the server takes over the socket the watching process bound for the same `host` and `port`.
+///
+/// The server takes, among the sockets given to `serve`, the one bound to the address of `host` and, when `port` is not 0, to `port`, and fails as `listen_with` does there when none or more than one matches or it is already taken. Datagrams that arrive while no server runs wait in the socket's buffer, which drops them once it is full. A QUIC server runs on the socket through `quic.listen_on` with `Kept.secret` as its reset key.
+pub fn bind_udp(host: str, port: i64) -> net.Socket ! io.Error {
+    if !worker() {
+        return net.bind_udp(host, port)?
+    }
+    net.inherit_socket(inherited("udp", local_name(host)?, port)?) catch {
+        e => fail mismatch(e)
+    }
+}
+
+fn sealed(secret: u8[]) -> i64 ! io.Error {
+    let ends = sys.pipe(false)?
+    using writer = sys.own(ends.second)
+    sys.write_all(ends.second, secret) catch {
+        e => {
+            sys.close_fd(ends.first)
+            fail e
+        }
+    }
+    ends.first
+}
+
+fn unsealed() -> u8[] ! io.Error {
+    let named = text.parse_int(os.env(seal_variable) ?? "") or fail Invalid
+    using pipe = sys.own(sys.take_inherited(named)?)
+    let secret = io.buffer(secret_size)
+    var filled = 0
+    for filled < secret_size {
+        let n = sys.read(pipe.handle.fd, secret[filled..])?
+        if n <= 0 {
+            fail Invalid
+        }
+        filled += n
+    }
+    secret
+}
+
+/// Runs `run` on `kept` in a process that is started again whenever it ends abnormally.
+///
+/// Does the same as `serve_with` with the default options.
+pub fn serve(kept: Kept, run: fn(Kept) ! io.Error) ! io.Error {
+    serve_with(kept, Options {}, run)?
+}
+
+fn only_tcp(kept: Kept) -> bool {
+    for l in kept.listeners {
+        if l.addr.path.len > 0 {
+            return false
+        }
+    }
+    kept.sockets.len == 0
+}
+
+/// Runs `run` on `kept` in a process that is started again whenever it ends abnormally, such as by a panic.
+///
+/// Each listener and socket of `kept` comes from `listen`, `listen_with`, `listen_unix` or `bind_udp`. The calling process keeps them open and starts its own executable again with the same arguments, environment and standard streams as the server, which reaches the same calls and this call through the same `main` and runs `run` there with the `kept` of that process. A listener or socket that is not in `kept` does not reach the server, whose call for it fails. When the server exits with status 0 this returns. When it ends any other way, by a panic, another exit status, a failing `run` or `listen`, or a signal, it is started again after a pause that starts at `options.first_pause` and doubles up to `options.longest_pause` while the server keeps ending before it has run for `options.settled`. Connections that arrive while no server runs wait in the queues of the listeners and the next server accepts them. `Terminate` or `Interrupt` sent to the calling process is passed to the server as `Terminate`, the server is killed if it has not ended `options.grace` later, and this returns. The server also ends when the calling process ends for any other reason.
+///
+/// The first server that ends abnormally after one of its `listen`, `listen_with`, `listen_unix` or `bind_udp` calls found no socket of its own makes this fail with `Invalid` in place of starting it again, since every later server would ask for the same socket. A later server that does so is started again like any other.
+///
+/// On Windows the calling process catches Ctrl+C and shutdown in place of the two signals and ends the server and every process it started at once, with status 1 and no time to finish, and this fails with `Unsupported` for a Unix listener or a UDP socket. Windows support is experimental.
+///
+/// This is recovery, not isolation. A panic in one request ends the whole server, so every request in flight is lost with it and its clients see their connections closed. The new server starts with empty memory: sessions, caches, rate limit counts and an in-memory session revocation store are gone, so state that must survive belongs outside the process.
+///
+/// Fails with `Invalid` when `kept` is empty, with the error of watching the signals and with the error of the first start of the server. A later start that fails counts as an abnormal end.
+pub fn serve_with(kept: Kept, options: Options, run: fn(Kept) ! io.Error) ! io.Error {
+    if worker() {
+        var given = kept
+        given.secret = if tcp_only { [] } else { unsealed()? }
+        run(given)?
+        return
+    }
+    if kept.listeners.len + kept.sockets.len == 0 {
+        fail Invalid
+    }
+    if tcp_only && !only_tcp(kept) {
+        fail Unsupported
+    }
+    let program = os.executable()?
+    using watch = signals.notify([Terminate, Interrupt])?
+    let watcher = Watcher { program, kept, secret: crypto.random(secret_size), watch: watch.handle, grace: options.grace }
+    let started = time.monotonic()
+    var outcome = first_run(watcher)?
+    var waited = pause_after(options, 0, (time.monotonic() - started) / 1000000)
+    for outcome == Crashed {
+        if signals.wait_timeout_on(watch.handle, waited) != none {
+            return
+        }
+        let again = time.monotonic()
+        outcome = supervise(watcher, "") or Outcome.Crashed
+        waited = pause_after(options, waited, (time.monotonic() - again) / 1000000)
+    }
+}
+
+struct Watcher {
+    program: str
+    kept: Kept
+    secret: u8[]
+    watch: signals.WatchHandle
+    grace: i64
+}
+
+fn first_run(w: Watcher) -> Outcome ! io.Error {
+    using report = net.bind_udp("127.0.0.1", 0)?
+    let token = base64.encode_url(crypto.random(16))
+    let outcome = supervise(w, "{report.handle.addr.port} {token}")?
+    if outcome == Crashed && told(report, token) {
+        fail Invalid
+    }
+    outcome
+}
+
+fn pause_after(options: Options, waited: i64, ran: i64) -> i64 {
+    if waited == 0 || ran >= options.settled {
+        return options.first_pause
+    }
+    if waited * 2 > options.longest_pause {
+        return options.longest_pause
+    }
+    waited * 2
+}
+
+fn started(w: Watcher, report: str) -> process.Child ! io.Error {
+    if tcp_only {
+        return process.start(worker_command(w, -1, report))?
+    }
+    using seal = sys.own(sealed(w.secret)?)
+    process.start(worker_command(w, seal.handle.fd, report))?
+}
+
+fn supervise(w: Watcher, report: str) -> Outcome ! io.Error {
+    using child = started(w, report)?
+    let ended = chan[bool](1)
+    spawn report_end(ended, child.handle)
+    select {
+        clean = <-ended => {
+            if clean ?? false {
+                return Finished
+            }
+            Crashed
+        }
+        <-w.watch.signals => {
+            process.kill_on(child.handle, Terminate) or {}
+            select {
+                <-ended => {}
+                after(w.grace) => {}
+            }
+            Stopped
+        }
+    }
+}
+
+fn report_end(ended: chan[bool], child: *process.ChildHandle) {
+    let exit = process.wait_on(child) or process.Exit.Exited(-1)
+    ended <- process.success(exit)
+}
+
+fn worker_command(w: Watcher, seal: i64, report: str) -> process.Command {
+    let arguments = os.args()
+    let env = os.environment()
+    var keep: i64[] = []
+    for l in w.kept.listeners {
+        keep.push(l.fd)
+    }
+    for s in w.kept.sockets {
+        keep.push(s.fd)
+    }
+    if seal >= 0 {
+        keep.push(seal)
+    }
+    env[parent_variable] = "{os.pid()}"
+    env[sockets_variable] = listed(w.kept)
+    env[seal_variable] = "{seal}"
+    env[report_variable] = report
+    process.Command { program: w.program, args: arguments[1..], env, keep, group: true, arg0: arguments[0] }
+}

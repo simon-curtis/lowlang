@@ -2,22 +2,68 @@ import std/cancel
 import std/header
 import std/http/qpack
 import std/io
+import std/net
 import std/quic
 import std/text
 
 /// Accepts QUIC connections from `l` and serves each on its own green thread over HTTP/3, calling `handler` for every request.
 ///
-/// Blocks until accepting fails and returns that error, which is `NotConnected` once the listener is closed. The listener's `config.tls.alpn` should be `["h3"]`; a connection that negotiated another protocol is closed with `H3_GENERAL_PROTOCOL_ERROR`. Each request stream runs on its own green thread, and a connection runs at most the listener's `config.max_streams` handlers at a time: the next request stream is not accepted until one of them has returned and written its response, so the QUIC stream credit of the peer stays held back meanwhile. A request that is malformed, or that carries a body over 64 MiB, is answered by resetting its stream with `H3_MESSAGE_ERROR` or `H3_EXCESSIVE_LOAD` and the handler is not called; a field section over 64 KiB is answered with `431`; a protocol violation on a connection closes that connection with the matching HTTP/3 error code. `Request.token` is cancelled when the response is complete, when a write of the response fails because the client stopped or reset the stream, and when the connection ends; a client that stops the stream while the handler is still running is not noticed until the handler's response is written. The server sends no push, accepts no extended `CONNECT` and no HTTP datagrams, and uses only the static QPACK table for the field sections it sends. Errors on one connection never reach the caller.
+/// Blocks until accepting fails and returns that error, which is `NotConnected` once the listener is closed. The listener's `config.tls.alpn` should be `["h3"]`; a connection that negotiated another protocol is closed with `H3_GENERAL_PROTOCOL_ERROR`. Each request stream runs on its own green thread, and a connection runs at most the listener's `config.max_streams` handlers at a time: the next request stream is not accepted until one of them has returned and written its response, so the QUIC stream credit of the peer stays held back meanwhile. A request that is malformed is answered by resetting its stream with `H3_MESSAGE_ERROR` and the handler is not called; a field section over 64 KiB is answered with `431`; a protocol violation on a connection closes that connection with the matching HTTP/3 error code. `Request.token` is cancelled when the response is complete, when a write of the response fails because the client stopped or reset the stream, and when the connection ends; a client that stops the stream while the handler is still running is not noticed until the handler's response is written. The server sends no push, accepts no extended `CONNECT` and no HTTP datagrams, and uses only the static QPACK table for the field sections it sends. Errors on one connection never reach the caller.
+///
+/// The default `Limits` apply, shared by the connections of this call. A request stream is reset with `H3_EXCESSIVE_LOAD` when its header section takes longer than `head_timeout`, when its body arrives below `body_rate` over `body_timeout` or grows past `max_body`, and when the client takes longer than `write_timeout` for 64 KiB of the response; a body past `max_bodies`, which counts every byte of an HTTP/3 body, is reset with `H3_REQUEST_REJECTED`. A connection is closed with `H3_EXCESSIVE_LOAD` when it opens no request within `head_timeout` of being accepted or has had no request open for `idle_timeout`. At `max_connections`, which is 4096 when the field is zero, a new connection displaces the one that has had no request open the longest, then the one that has waited longest to open its first, then, among the connections whose handlers have all returned and that only send their responses, the one that has sent the fewest bytes a second over the last 4 to 8 seconds, then the one longest with nothing but responses that have a `stream` in progress. It is itself closed with `H3_EXCESSIVE_LOAD` while every connection has a handler running. `max_connections_per_address` applies as it does to `serve`. Past `handler_timeout` the token of a request is cancelled, and a connection with a handler running is never displaced.
 pub fn serve_quic(l: quic.Listener, handler: fn(Request) -> Response) ! io.Error {
     serve_quic_on(l.handle, handler)?
 }
 
 /// Serves HTTP/3 as `serve_quic` does, accepting from a `ListenerHandle`.
 pub fn serve_quic_on(l: *quic.ListenerHandle, handler: fn(Request) -> Response) ! io.Error {
+    serve_quic_with(l, Limits {}, handler)?
+}
+
+/// Serves HTTP/3 as `serve_quic_on` does, under `limits` in place of the defaults.
+pub fn serve_quic_with(l: *quic.ListenerHandle, limits: Limits, handler: fn(Request) -> Response) ! io.Error {
+    var held = untimed(limits)
+    held.head_timeout = limits.head_timeout
+    held.idle_timeout = limits.idle_timeout
+    if held.max_connections <= 0 {
+        held.max_connections = most_derived_connections
+    }
+    let connections = watchdog(held)
+    defer stop(connections)
+    spawn patrol(connections)
+    let requests = watchdog(limits)
+    requests.allowance = 0
+    defer stop(requests)
+    spawn patrol(requests)
+    let server = H3Server { requests, handler, max_handlers: l.config.max_streams }
     for {
         let h = quic.accept_handle(l)?
-        spawn serve_h3(h, handler, l.config.max_streams)
+        match admit(connections, net.format_ip(h.remote.ip), fn() { quic.close_on(h, h3_excessive_load, "") }) {
+            some(pace) => {
+                spawn serve_h3(h, pace, server)
+            }
+            none => {
+                spawn refuse_h3(h)
+            }
+        }
     }
+}
+
+struct H3Server {
+    requests: *Watchdog
+    handler: fn(Request) -> Response
+    max_handlers: i64
+}
+
+struct H3Session {
+    c: *H3
+    server: H3Server
+    pace: *Pace
+    lock: chan[bool]
+    open: i64
+    running: i64
+    streams: i64
+    slots: chan[bool]
 }
 
 enum RequestPhase {
@@ -33,14 +79,24 @@ enum ReadStep {
 }
 
 struct InboundRequest {
+    pace: *Pace
+    load: *Pace
+    returned: bool
+    streamed: bool
     id: i64
     phase: RequestPhase
     fields: header.Header[]
     body: u8[]
 }
 
-fn serve_h3(h: *quic.ConnectionHandle, handler: fn(Request) -> Response, max_handlers: i64) {
+fn refuse_h3(h: *quic.ConnectionHandle) {
     using owner = quic.adopt(h)
+    quic.close_on(h, h3_excessive_load, "")
+}
+
+fn serve_h3(h: *quic.ConnectionHandle, pace: *Pace, server: H3Server) {
+    using owner = quic.adopt(h)
+    using watch = Watch { pace }
     if h.protocol != "h3" {
         quic.close_on(h, h3_general_protocol_error, "")
         return
@@ -49,7 +105,8 @@ fn serve_h3(h: *quic.ConnectionHandle, handler: fn(Request) -> Response, max_han
         _ => return
     }
     spawn watch_peer_streams(c)
-    accept_requests(c, handler, max_handlers)
+    let capacity = if server.max_handlers < 1 { 1 } else { server.max_handlers }
+    accept_requests(new(H3Session { c, server, pace, lock: chan[bool](1), open: 0, running: 0, streams: 0, slots: chan[bool](capacity) }))
     cancel.cancel(c.token)
 }
 
@@ -58,35 +115,81 @@ fn watch_peer_streams(c: *H3) {
     cancel.cancel(c.token)
 }
 
-fn accept_requests(c: *H3, handler: fn(Request) -> Response, max_handlers: i64) {
-    let capacity = if max_handlers < 1 { 1 } else { max_handlers }
-    let slots = chan[bool](capacity)
-    let gone = cancel.done(c.token)
+fn accept_requests(n: *H3Session) {
+    let gone = cancel.done(n.c.token)
     for {
         select {
-            slots <- true => {}
+            n.slots <- true => {}
             <-gone => return
         }
-        let s = quic.accept_stream_on(c.handle) catch {
+        let s = quic.accept_stream_on(n.c.handle) catch {
             _ => {
-                <-slots
+                <-n.slots
                 return
             }
         }
-        spawn serve_request(c, s, handler, slots)
+        request_opened(n)
+        spawn serve_request(n, s)
     }
 }
 
-fn release_handler(slots: chan[bool]) {
-    <-slots
+fn request_opened(n: *H3Session) {
+    n.lock <- true
+    n.open += 1
+    n.running += 1
+    unbound(some(n.pace))
+    <-n.lock
 }
 
-fn serve_request(c: *H3, s: quic.Stream, handler: fn(Request) -> Response, slots: chan[bool]) {
-    defer release_handler(slots)
+fn request_returned(n: *H3Session, p: *InboundRequest, streamed: bool) {
+    n.lock <- true
+    p.returned = true
+    p.streamed = streamed
+    n.running -= 1
+    if streamed {
+        n.streams += 1
+    }
+    quiesce(n)
+    <-n.lock
+}
+
+fn quiesce(n: *H3Session) {
+    if n.running > 0 {
+        return
+    }
+    if n.streams > 0 {
+        flowing(some(n.pace))
+    } else {
+        sending(some(n.pace))
+    }
+}
+
+fn request_closed(n: *H3Session, p: *InboundRequest) {
+    n.lock <- true
+    n.open -= 1
+    if !p.returned {
+        n.running -= 1
+    }
+    if p.streamed {
+        n.streams -= 1
+    }
+    if n.open == 0 {
+        resting(some(n.pace))
+    } else {
+        quiesce(n)
+    }
+    <-n.lock
+    <-n.slots
+}
+
+fn serve_request(n: *H3Session, s: quic.Stream) {
+    let c = n.c
     let token = cancel.child(c.token)
     defer cancel.cancel(token)
+    using watch = Watch { pace: enrol(n.server.requests, "", fn() { abort_stream(c, s, h3_excessive_load) }) }
     let r = io.reader(quic.stream(s))
-    let p = new(InboundRequest { id: s.id, phase: Start, fields: [], body: [] })
+    let p = new(InboundRequest { pace: watch.pace, load: n.pace, returned: false, streamed: false, id: s.id, phase: Start, fields: [], body: [] })
+    defer request_closed(n, p)
     for {
         match read_step(c, s, r, p) {
             More => {}
@@ -94,7 +197,9 @@ fn serve_request(c: *H3, s: quic.Stream, handler: fn(Request) -> Response, slots
             Abandoned => return
         }
     }
-    answer(c, s, p, token, handler)
+    working(some(p.pace), token)
+    free_body(some(p.pace), p.body.len)
+    answer(n, s, p, token)
 }
 
 fn interrupted(c: *H3, s: quic.Stream, e: io.Error) -> ReadStep {
@@ -138,11 +243,15 @@ fn step_data(c: *H3, s: quic.Stream, r: *io.Reader, p: *InboundRequest, length: 
         close_with(c, h3_frame_unexpected)
         return Abandoned
     }
-    if p.body.len + length > max_body {
+    if p.body.len + length > p.pace.limits.max_body {
         abort_stream(c, s, h3_excessive_load)
         return Abandoned
     }
-    read_h3_data(r, length, mut p.body) catch {
+    read_h3_data(r, length, mut p.body, some(p.pace)) catch {
+        NoSpace => {
+            abort_stream(c, s, h3_request_rejected)
+            return Abandoned
+        }
         e => return interrupted(c, s, e)
     }
     More
@@ -161,7 +270,7 @@ fn step_headers(c: *H3, s: quic.Stream, r: *io.Reader, p: *InboundRequest, lengt
         e => return interrupted(c, s, e)
     }
     let fields = decode_fields(c, s.id, block, chan[bool]()) catch {
-        TooLarge => return oversized_section(c, s)
+        TooLarge => return oversized_section(c, s, p)
         _ => return Abandoned
     }
     if p.phase == Start {
@@ -171,6 +280,7 @@ fn step_headers(c: *H3, s: quic.Stream, r: *io.Reader, p: *InboundRequest, lengt
         }
         p.fields = fields
         p.phase = Body
+        stalling(some(p.pace))
         return More
     }
     if !valid_h3_trailers(fields) {
@@ -181,9 +291,9 @@ fn step_headers(c: *H3, s: quic.Stream, r: *io.Reader, p: *InboundRequest, lengt
     More
 }
 
-fn oversized_section(c: *H3, s: quic.Stream) -> ReadStep {
+fn oversized_section(c: *H3, s: quic.Stream, p: *InboundRequest) -> ReadStep {
     let denied = response(431, status_text(431))
-    send_response(c, s, "GET", denied, cancel.token()) catch {
+    send_response(c, paced_h3(s, p), "GET", denied, cancel.token()) catch {
         _ => {}
     }
     quic.stop(s, h3_no_error)
@@ -191,7 +301,8 @@ fn oversized_section(c: *H3, s: quic.Stream) -> ReadStep {
     Abandoned
 }
 
-fn answer(c: *H3, s: quic.Stream, p: *InboundRequest, token: *cancel.Token, handler: fn(Request) -> Response) {
+fn answer(n: *H3Session, s: quic.Stream, p: *InboundRequest, token: *cancel.Token) {
+    let c = n.c
     if p.phase == Start || !h3_length_matches(p.fields, p.body.len) {
         abort_stream(c, s, h3_message_error)
         return
@@ -204,14 +315,42 @@ fn answer(c: *H3, s: quic.Stream, p: *InboundRequest, token: *cancel.Token, hand
     }
     req.remote = c.remote
     req.token = token
-    let produced = traced(handler, req)
+    let produced = traced(n.server.handler, req)
     let outgoing = unstreamed(req.method, produced, token)
-    send_response(c, s, req.method, outgoing, token) catch {
+    request_returned(n, p, streaming(outgoing))
+    send_response(c, paced_h3(s, p), req.method, outgoing, token) catch {
         _ => {}
     }
 }
 
-fn send_response(c: *H3, s: quic.Stream, method: str, resp: Response, token: *cancel.Token) ! io.Error {
+struct H3Sink {
+    stream: quic.Stream
+    pace: *Pace
+    load: *Pace
+}
+
+fn paced_h3(stream: quic.Stream, p: *InboundRequest) -> H3Sink {
+    H3Sink { stream, pace: p.pace, load: p.load }
+}
+
+fn write_paced(k: H3Sink, data: u8[]) ! io.Error {
+    var rest = data
+    for rest.len > 0 {
+        let piece = if rest.len > write_piece { rest[..write_piece] } else { rest }
+        k.pace.busy = due(k.pace.limits.write_timeout)
+        quic.write(k.stream, piece) catch {
+            e => {
+                k.pace.busy = 0
+                fail e
+            }
+        }
+        k.pace.busy = 0
+        tally(k.load, piece.len)
+        rest = rest[piece.len..]
+    }
+}
+
+fn send_response(c: *H3, s: H3Sink, method: str, resp: Response, token: *cancel.Token) ! io.Error {
     var body = resp.body
     if bodiless(method, resp.status) {
         body = []
@@ -232,9 +371,9 @@ fn send_response(c: *H3, s: quic.Stream, method: str, resp: Response, token: *ca
     if body.len > 0 {
         put_h3_head(mut out, h3_frame_data, body.len)
     }
-    quic.write(s, out)?
+    write_paced(s, out)?
     if body.len > 0 {
-        quic.write(s, body)?
+        write_paced(s, body)?
     }
     match chunks {
         some(channel) => relay_chunks(s, channel, token)?
@@ -250,12 +389,12 @@ fn send_response(c: *H3, s: quic.Stream, method: str, resp: Response, token: *ca
     if trailers.len > 0 {
         var tail: u8[] = []
         put_h3_frame(mut tail, h3_frame_headers, qpack.encode(c.encoder, trailers))
-        quic.write(s, tail)?
+        write_paced(s, tail)?
     }
-    quic.finish(s)?
+    quic.finish(s.stream)?
 }
 
-fn relay_chunks(s: quic.Stream, chunks: chan[u8[]], token: *cancel.Token) ! io.Error {
+fn relay_chunks(s: H3Sink, chunks: chan[u8[]], token: *cancel.Token) ! io.Error {
     let gone = cancel.done(token)
     for {
         select {
@@ -268,12 +407,12 @@ fn relay_chunks(s: quic.Stream, chunks: chan[u8[]], token: *cancel.Token) ! io.E
     }
 }
 
-fn send_chunk(s: quic.Stream, data: u8[]) ! io.Error {
+fn send_chunk(s: H3Sink, data: u8[]) ! io.Error {
     if data.len == 0 {
         return
     }
     var head: u8[] = []
     put_h3_head(mut head, h3_frame_data, data.len)
-    quic.write(s, head)?
-    quic.write(s, data)?
+    write_paced(s, head)?
+    write_paced(s, data)?
 }

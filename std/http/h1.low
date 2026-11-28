@@ -3,15 +3,19 @@ import std/io
 import std/text
 
 const max_body = 1 << 26
+const max_fields = 1 << 16
+const max_response_head = 100 << 14
 
-fn read_headers(r: *io.Reader) -> header.Header[] ! io.Error {
+fn read_headers(r: *io.Reader, limit: i64) -> header.Header[] ! io.Error {
     var headers: header.Header[] = []
+    var size = 0
     for {
         let line = io.read_line(r)?
         if line.len == 0 {
             return headers
         }
-        if headers.len == 100 {
+        size += line.len
+        if headers.len == 100 || size > limit {
             fail TooLarge
         }
         let colon = text.index_byte(line, ':')
@@ -48,9 +52,9 @@ fn declared_length(headers: header.Header[]) -> i64 ! io.Error {
     text.parse_uint(value, 10) or fail Malformed
 }
 
-fn content_length(headers: header.Header[]) -> i64 ! io.Error {
+fn content_length(headers: header.Header[], most: i64) -> i64 ! io.Error {
     let n = declared_length(headers)?
-    if n > max_body {
+    if n > most {
         fail TooLarge
     }
     n
@@ -125,7 +129,7 @@ fn framed_read(f: *Framing, buf: u8[]) -> i64 ! io.Error {
                 f.first = false
                 let size = read_chunk_size(f.reader)?
                 if size == 0 {
-                    f.trailers = read_headers(f.reader)?
+                    f.trailers = read_headers(f.reader, max_fields)?
                     f.done = true
                     return 0
                 }
@@ -146,34 +150,39 @@ fn framed_read(f: *Framing, buf: u8[]) -> i64 ! io.Error {
     n
 }
 
-fn read_body(f: *Framing) -> u8[] ! io.Error {
-    if f.mode == Length {
-        let out: u8[] = __make(f.left)
-        var got = 0
-        for got < out.len {
-            got += framed_read(f, out[got..])?
-        }
-        return out
-    }
+fn read_body(f: *Framing, pace: *Pace?) -> u8[] ! io.Error {
     var body: u8[] = []
     let chunk = io.buffer(16384)
+    let most = body_limit(pace)
     for {
         let n = framed_read(f, chunk)?
         if n == 0 {
             return body
         }
-        if body.len + n > max_body {
+        if body.len + n > most {
             fail TooLarge
         }
+        hold_body(pace, n)?
+        progress(pace, n)
         io.append(mut body, chunk[..n])
     }
 }
 
-fn request_framing(headers: header.Header[]) -> BodyFraming ! io.Error {
-    if chunked(headers) {
+fn request_framing(headers: header.Header[], most: i64) -> BodyFraming ! io.Error {
+    let codings = header.values(headers, "transfer-encoding")
+    let lengths = header.values(headers, "content-length")
+    if codings.len > 0 {
+        if codings.len > 1 || lengths.len > 0 || !text.equal_fold(codings[0], "chunked") {
+            fail Malformed
+        }
         return BodyFraming { mode: Chunked, length: -1 }
     }
-    let n = content_length(headers)?
+    for v in lengths {
+        if v != lengths[0] {
+            fail Malformed
+        }
+    }
+    let n = content_length(headers, most)?
     if n > 0 {
         return BodyFraming { mode: Length, length: n }
     }
@@ -193,31 +202,32 @@ fn parse_request_line(line: str) -> Request ! io.Error {
     req
 }
 
-fn read_request_rest(r: *io.Reader, line: str) -> Request ! io.Error {
+fn read_request_rest(r: *io.Reader, line: str, pace: *Pace?) -> Request ! io.Error {
     var req = parse_request_line(line)?
-    req.headers = read_headers(r)?
+    req.headers = read_headers(r, max_fields)?
     req.authority = header.get(req.headers, "host") ?? ""
     req.connection = r
+    let shape = request_framing(req.headers, body_limit(pace))?
     if text.has_token(header.get(req.headers, "expect") ?? "", "100-continue") {
         io.write_str(io.reader_stream(r), "HTTP/1.1 100 Continue\r\n\r\n")?
     }
-    let shape = request_framing(req.headers)?
+    stalling(pace)
     let framing = framing_of(r, shape)
-    req.body = read_body(framing)?
+    req.body = read_body(framing, pace)?
     req
 }
 
 /// Reads one HTTP/1 request from `r`, including its whole body.
 ///
-/// Blocks until the request is complete. Blank lines before the request line are skipped. The returned request has `version` `Http1`, `http10` set when the request line says `HTTP/1.0`, its `authority` taken from the `host` header, and `connection` set to `r`. The body is read from `chunked` transfer coding, or from `content-length` bytes; a request with neither has an empty body. When the request carries `expect: 100-continue`, `HTTP/1.1 100 Continue` is written to the stream beneath `r` before the body is read.
+/// Blocks until the request is complete. Blank lines before the request line are skipped. The returned request has `version` `Http1`, `http10` set when the request line says `HTTP/1.0`, its `authority` taken from the `host` header, and `connection` set to `r`. The body is read from `chunked` transfer coding, or from `content-length` bytes; a request with neither has an empty body. When the request carries `expect: 100-continue` and its framing is accepted, `HTTP/1.1 100 Continue` is written to the stream beneath `r` before the body is read.
 ///
-/// Fails with `Eof` when the input ends before a complete request, `Malformed` for a request line that is not `METHOD target HTTP/1.x`, a header line without a valid name and `:`, a bad chunk size or a `content-length` that is not a number, `Unsupported` when the version is not `HTTP/1.0` or `HTTP/1.1`, and `TooLarge` for more than 100 headers, a line longer than the reader's buffer, or a body over 64 MiB. Header names are lowercased.
+/// Fails with `Eof` when the input ends before a complete request, `Malformed` for a request line that is not `METHOD target HTTP/1.x`, a header line without a valid name and `:`, a bad chunk size, a `content-length` that is not a number, `content-length` headers that differ, more than one `transfer-encoding` header, a `transfer-encoding` other than `chunked` or one beside a `content-length`, `Unsupported` when the version is not `HTTP/1.0` or `HTTP/1.1`, and `TooLarge` for more than 100 headers, header lines or trailer lines over 64 KiB together, a line longer than the reader's buffer, or a body over 64 MiB. Header names are lowercased.
 pub fn read_request(r: *io.Reader) -> Request ! io.Error {
     var line = io.read_line(r)?
     for line.len == 0 {
         line = io.read_line(r)?
     }
-    read_request_rest(r, line)
+    read_request_rest(r, line, none)
 }
 
 fn keep_alive(http10: bool, headers: header.Header[]) -> bool {
@@ -232,7 +242,7 @@ fn read_response_head(r: *io.Reader) -> ResponseHead ! io.Error {
     for {
         let line = io.read_line(r)?
         let status = parse_status_line(line)?
-        let headers = read_headers(r)?
+        let headers = read_headers(r, max_response_head)?
         if status >= 100 && status < 200 && status != 101 {
             continue
         }
@@ -324,6 +334,6 @@ pub fn read_response(r: *io.Reader, method: str) -> Response ! io.Error {
         fail TooLarge
     }
     let framing = framing_of(r, shape)
-    let body = read_body(framing)?
+    let body = read_body(framing, none)?
     Response { status: head.status, headers: head.headers, body, trailers: framing.trailers }
 }

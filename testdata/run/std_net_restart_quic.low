@@ -1,0 +1,159 @@
+import std/crypto/x509
+import std/io
+import std/net
+import std/net/restart
+import std/base64
+import std/os
+import std/process
+import std/quic
+import std/sys
+import std/text
+import std/time
+import std/tls
+
+fn server_config() -> quic.Config ! io.Error {
+    let pem = embed("std_tls_ec.pem")
+    let certificates = x509.pem_certificates(pem)
+    let key = x509.pem_private_key(pem)?
+    quic.Config { tls: tls.Config { certificates, key, alpn: ["line"] } }
+}
+
+fn client_config(keep_alive: i64) -> quic.Config {
+    var roots: x509.Certificate[] = []
+    for der in x509.pem_certificates(embed("std_tls_ca.pem")) {
+        roots.push(x509.parse(der) or continue)
+    }
+    quic.Config { tls: tls.Config { roots, alpn: ["line"], server_name: "localhost" }, keep_alive }
+}
+
+const probe_variable = "STD_NET_RESTART_PROBE"
+
+fn in_environment(secret: u8[]) -> bool {
+    for _, value in os.environment() {
+        for form in [str(secret), base64.encode_url(secret), base64.encode(secret)] {
+            if text.contains(value, form) {
+                return true
+            }
+        }
+    }
+    false
+}
+
+fn probe() {
+    var open = 0
+    for fd in 3..256 {
+        let _ = sys.take_inherited(fd) or continue
+        open += 1
+    }
+    print("{open} descriptors reach a process the server starts")
+}
+
+fn probed(secret: u8[]) -> str ! io.Error {
+    let env = os.environment()
+    env[probe_variable] = "1"
+    let out = process.run(process.Command { program: os.executable()?, env }, [])?
+    "{secret.len} secret bytes, in the environment: {in_environment(secret)}, {text.trim(str(out.stdout))}"
+}
+
+fn answer(s: quic.Stream, secret: u8[]) {
+    let line = str(io.read_all(quic.stream(s)) or return)
+    if line == "crash" {
+        os.exit(3)
+    }
+    if line == "probe" {
+        let found = probed(secret) catch {
+            e => "{e}"
+        }
+        let _ = quic.write(s, bytes(found)) or return
+        quic.finish(s) or {}
+        return
+    }
+    if line == "stop" {
+        os.exit(0)
+    }
+    let _ = quic.write(s, bytes("{os.pid()}")) or return
+    quic.finish(s) or {}
+}
+
+fn converse(h: *quic.ConnectionHandle, secret: u8[]) {
+    using owner = quic.adopt(h)
+    for {
+        spawn answer(quic.accept_stream_on(h) or return, secret)
+    }
+}
+
+fn accept_loop(kept: restart.Kept) ! io.Error {
+    using l = quic.listen_on(kept.sockets[0], kept.secret, server_config()?)?
+    for {
+        spawn converse(quic.accept_handle(l.handle)?, kept.secret)
+    }
+}
+
+fn ask(h: *quic.ConnectionHandle, line: str) -> str ! io.Error {
+    let s = quic.open_stream_on(h)?
+    let _ = quic.write(s, bytes(line))?
+    quic.finish(s)?
+    str(io.read_all(quic.stream(s))?)
+}
+
+fn ended(h: *quic.ConnectionHandle, line: str, limit: i64) -> str {
+    let started = time.monotonic()
+    let reply = ask(h, line) catch {
+        e => return "{e}, within {limit} ms: {(time.monotonic() - started) / 1000000 < limit}"
+    }
+    "answered {reply.len > 0}"
+}
+
+fn tell(h: *quic.ConnectionHandle, line: str) ! io.Error {
+    let s = quic.open_stream_on(h)?
+    let _ = quic.write(s, bytes(line))?
+    quic.finish(s)?
+}
+
+fn report(h: *quic.ConnectionHandle, line: str, result: chan[str]) {
+    result <- ended(h, line, 5000)
+}
+
+fn requests(port: i64) ! io.Error {
+    let to = net.Addr { ip: [127, 0, 0, 1], port }
+    let waiting = quic.connect_handle(to, client_config(500))?
+    let held = quic.connect_handle(to, client_config(0))?
+    let brief = quic.connect_handle(to, client_config(0))?
+    let first = ask(waiting, "who")?
+    print("answered: {first.len > 0 && ask(held, "who")? == first}")
+    let result = chan[str](1)
+    spawn report(waiting, "crash", result)
+    sleep(300)
+    let fresh = quic.connect_handle(to, client_config(0))?
+    let second = ask(fresh, "who")?
+    print("a new connection is answered by a new process: {second.len > 0 && second != first}")
+    print("a held connection that sends a long request: {ended(held, text.repeat("w", 64), 1000)}")
+    print("a held connection that sends a short request: {ended(brief, "w", 1000)}")
+    let waited = (<-result) ?? "no result"
+    print("a held connection that waits for an answer and pings every 500 ms: {waited}")
+    print("the new connection after that: {ended(fresh, "who", 1000)}")
+    print("the secret of the server: {ask(fresh, "probe")?}")
+    tell(fresh, "stop")?
+}
+
+fn client(port: i64, done: chan[bool]) {
+    requests(port) catch {
+        e => print("the client failed: {e}")
+    }
+    done <- true
+}
+
+/// Serves QUIC from a server that is started again after it exits with status 3, on the UDP socket the watching process keeps.
+fn main() ! io.Error {
+    if os.env(probe_variable) != none {
+        probe()
+        return
+    }
+    using socket = restart.bind_udp("127.0.0.1", 0)?
+    let done = chan[bool](1)
+    if !restart.worker() {
+        spawn client(socket.handle.addr.port, done)
+    }
+    restart.serve(restart.Kept { sockets: [socket.handle] }, accept_loop)?
+    <-done
+}

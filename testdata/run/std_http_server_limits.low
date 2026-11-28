@@ -1,0 +1,188 @@
+import std/cancel
+import std/http
+import std/io
+import std/net
+import std/text
+
+fn handle(req: http.Request) -> http.Response {
+    if req.path == "/held" {
+        cancel.pause(req.token, 5000)
+    }
+    http.response(200, "{req.method} {req.path} {str(req.body)}")
+}
+
+fn serve(l: net.ListenerHandle) {
+    http.serve_on(l, handle) or {}
+}
+
+fn exchange(addr: net.Addr, request: str) -> str ! io.Error {
+    using c = net.connect(addr)?
+    net.set_read_timeout(c, 2000)
+    net.write_all(c, bytes(request))?
+    let all = io.read_all(net.stream(c)) or []
+    var lines: str[] = []
+    for line in text.split(str(all), '\n') {
+        if text.starts_with(line, "HTTP/1.1 ") {
+            lines.push(text.trim(line))
+        }
+    }
+    text.join(lines, ", ")
+}
+
+fn framing(addr: net.Addr) ! io.Error {
+    let tail = "connection: close\r\n\r\n"
+    let cases = [
+        ["length", "POST /a HTTP/1.1\r\ncontent-length: 2\r\n{tail}hi"],
+        ["equal lengths", "POST /a HTTP/1.1\r\ncontent-length: 2\r\ncontent-length: 2\r\n{tail}hi"],
+        ["chunked", "POST /a HTTP/1.1\r\ntransfer-encoding: Chunked\r\n{tail}2\r\nhi\r\n0\r\n\r\n"],
+        ["differing lengths", "POST /a HTTP/1.1\r\ncontent-length: 0\r\ncontent-length: 44\r\n{tail}GET /smuggled HTTP/1.1\r\nconnection: close\r\n\r\n"],
+        ["length beside coding", "POST /a HTTP/1.1\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n{tail}0\r\n\r\n"],
+        ["two codings", "POST /a HTTP/1.1\r\ntransfer-encoding: identity\r\ntransfer-encoding: chunked\r\n{tail}0\r\n\r\n"],
+        ["coding list", "POST /a HTTP/1.1\r\ntransfer-encoding: gzip, chunked\r\n{tail}0\r\n\r\n"],
+        ["unknown coding", "POST /a HTTP/1.1\r\ntransfer-encoding: xchunked\r\n{tail}0\r\n\r\n"],
+        ["expect, accepted", "POST /a HTTP/1.1\r\nexpect: 100-continue\r\ncontent-length: 2\r\n{tail}hi"],
+        ["expect, refused length", "POST /a HTTP/1.1\r\nexpect: 100-continue\r\ncontent-length: 67108865\r\n{tail}"],
+        ["expect, refused framing", "POST /a HTTP/1.1\r\nexpect: 100-continue\r\ncontent-length: 2\r\ntransfer-encoding: chunked\r\n{tail}"],
+    ]
+    for c in cases {
+        print("{c[0]}: {exchange(addr, c[1])?}")
+    }
+    let filler = text.repeat("v", 8000)
+    for count in [8, 9] {
+        var request = "GET /a HTTP/1.1\r\n"
+        for i in 0..count {
+            request = "{request}x-{i}: {filler}\r\n"
+        }
+        print("{count} headers of 8000 bytes: {exchange(addr, "{request}{tail}")?}")
+    }
+}
+
+fn frame(kind: i64, flags: i64, stream: i64, payload: u8[]) -> u8[] {
+    var out: u8[] = []
+    io.put_be24(mut out, payload.len)
+    out.push(u8(kind))
+    out.push(u8(flags))
+    io.put_be32(mut out, stream)
+    io.append(mut out, payload)
+    out
+}
+
+fn greet(c: net.Conn) ! io.Error {
+    net.set_read_timeout(c, 2000)
+    net.write_all(c, bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))?
+    net.write_all(c, frame(4, 0, 0, []))?
+}
+
+fn outcome(c: net.Conn) -> str {
+    let r = io.reader(net.stream(c))
+    for {
+        let head = io.read_exact(r, 9) or return "closed"
+        let payload = io.read_exact(r, (i64(head[0]) << 16) | (i64(head[1]) << 8) | i64(head[2])) or return "closed"
+        if head[3] == 7 {
+            return "GOAWAY {io.be32(payload, 4)}"
+        }
+        if head[3] == 1 {
+            return "answered"
+        }
+    }
+}
+
+fn get_block() -> u8[] {
+    [0x82, 0x86, 0x84]
+}
+
+fn oversized_length(addr: net.Addr) ! io.Error {
+    using c = net.connect(addr)?
+    greet(c)?
+    var block = get_block()
+    io.append(mut block, [0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x78])
+    net.write_all(c, frame(1, 5, 1, block))?
+    print("header length past 63 bits: {outcome(c)}")
+}
+
+fn continuations(addr: net.Addr, label: str, count: i64, size: i64) ! io.Error {
+    using c = net.connect(addr)?
+    greet(c)?
+    var out = frame(1, 1, 1, get_block())
+    for _ in 0..count {
+        io.append(mut out, frame(9, 0, 1, io.buffer(size)))
+    }
+    net.write_all(c, out)?
+    print("{label}: {outcome(c)}")
+}
+
+fn answered(addr: net.Addr, count: i64) ! io.Error {
+    using c = net.connect(addr)?
+    greet(c)?
+    let field: u8[] = [0x00, 0x01, 0x78, 0x01, 0x79]
+    var out = frame(1, 1, 1, get_block())
+    for i in 0..count {
+        io.append(mut out, frame(9, if i == count - 1 { 4 } else { 0 }, 1, field))
+    }
+    net.write_all(c, out)?
+    print("{count} continuations: {outcome(c)}")
+}
+
+fn resets(addr: net.Addr, count: i64) ! io.Error {
+    using c = net.connect(addr)?
+    greet(c)?
+    var block: u8[] = [0x82, 0x86, 0x04, 0x05]
+    io.append(mut block, bytes("/held"))
+    let cancelled: u8[] = [0, 0, 0, 8]
+    var out: u8[] = []
+    for i in 0..count {
+        io.append(mut out, frame(1, 5, 2 * i + 1, block))
+        io.append(mut out, frame(3, 0, 2 * i + 1, cancelled))
+    }
+    io.append(mut out, frame(1, 5, 2 * count + 1, get_block()))
+    net.write_all(c, out)?
+    print("{count} resets: {outcome(c)}")
+}
+
+fn refusals(addr: net.Addr, count: i64) ! io.Error {
+    using c = net.connect(addr)?
+    greet(c)?
+    var out: u8[] = []
+    for i in 0..count {
+        let id = 2 * i + 1
+        io.append(mut out, frame(2, 0, id, [u8(id >> 24), u8(id >> 16), u8(id >> 8), u8(id), 0]))
+    }
+    io.append(mut out, frame(1, 5, 2 * count + 1, get_block()))
+    net.write_all(c, out)?
+    print("{count} streams the server resets: {outcome(c)}")
+}
+
+fn serve_small(l: net.ListenerHandle) {
+    http.serve_with(l, http.Limits { max_body: 4, head_timeout: 200 }, handle) or {}
+}
+
+fn chosen() ! io.Error {
+    using l = net.listen("127.0.0.1", 0)?
+    spawn serve_small(l.handle)
+    let tail = "connection: close\r\n\r\n"
+    print("body at the chosen cap: {exchange(l.handle.addr, "POST /a HTTP/1.1\r\ncontent-length: 4\r\n{tail}four")?}")
+    print("body past the chosen cap: {exchange(l.handle.addr, "POST /a HTTP/1.1\r\ncontent-length: 5\r\n{tail}")?}")
+    using c = net.connect(l.handle.addr)?
+    net.set_read_timeout(c, 2000)
+    let silent = io.read_all(net.stream(c)) catch {
+        _ => bytes("open")
+    }
+    print("silent past the chosen head limit: {silent.len} bytes")
+}
+
+fn main() ! io.Error {
+    chosen()?
+    using l = net.listen("127.0.0.1", 0)?
+    spawn serve(l.handle)
+    let addr = l.handle.addr
+    framing(addr)?
+    oversized_length(addr)?
+    answered(addr, 128)?
+    continuations(addr, "129 continuations", 129, 1)?
+    continuations(addr, "empty continuation", 1, 0)?
+    resets(addr, 200)?
+    resets(addr, 300)?
+    refusals(addr, 200)?
+    refusals(addr, 300)?
+    print("still serving: {exchange(addr, "GET /b HTTP/1.1\r\nconnection: close\r\n\r\n")?}")
+}

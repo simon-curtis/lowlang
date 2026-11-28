@@ -1,0 +1,188 @@
+import std/http
+import std/io
+import std/net
+import std/net/restart
+import std/os
+import std/process
+import std/text
+import std/time
+
+const quiet_variable = "STD_NET_RESTART_QUIET"
+const counter_variable = "STD_NET_RESTART_COUNTER"
+
+struct Reply {
+    connected: i64
+    ended: i64
+    body: str
+}
+
+fn handle(req: http.Request) -> http.Response {
+    if req.path == "/panic" {
+        panic("the handler failed")
+    }
+    if req.path == "/quit" {
+        os.exit(0)
+    }
+    http.response(200, "public {os.pid()}")
+}
+
+fn manage(req: http.Request) -> http.Response {
+    http.response(200, "admin {os.pid()}")
+}
+
+fn serve_admin(admin: net.ListenerHandle) {
+    http.serve_on(admin, manage) or {}
+}
+
+fn millis() -> i64 {
+    time.monotonic() / 1000000
+}
+
+fn ask(a: net.Addr, path: str) -> Reply ! io.Error {
+    using c = net.connect(a)?
+    let connected = millis()
+    net.set_read_timeout(c, 20000)
+    net.write_all(c, bytes("GET {path} HTTP/1.1\r\nconnection: close\r\n\r\n"))?
+    let all = str(io.read_all(net.stream(c)) or [])
+    let head = text.index(all, "\r\n\r\n")
+    var body = ""
+    if head >= 0 {
+        body = all[head + 4..]
+    }
+    Reply { connected, ended: millis(), body }
+}
+
+fn process_of(body: str, label: str) -> str {
+    if text.starts_with(body, "{label} ") { body[label.len + 1..] } else { "" }
+}
+
+fn requests(a: net.Addr, admin: net.Addr) ! io.Error {
+    var server = process_of(ask(a, "/")?.body, "public")
+    print("answered: {server.len > 0}")
+    print("the second listener has its own handler in the same process: {process_of(ask(admin, "/")?.body, "admin") == server}")
+    for pause in [200, 400, 800] {
+        let dropped = ask(a, "/panic")?
+        let next = ask(a, "/")?
+        let now = process_of(next.body, "public")
+        print("the panic closed the connection without an answer: {dropped.body.len == 0}")
+        print("connected while no server ran: {next.connected - dropped.ended < pause / 2}")
+        print("answered by a new process: {now.len > 0 && now != server}")
+        print("answered after a pause of {pause} ms: {next.ended - dropped.ended >= pause * 9 / 10}")
+        print("the second listener kept its handler in the new process: {process_of(ask(admin, "/")?.body, "admin") == now}")
+        server = now
+    }
+    ask(a, "/quit")?
+}
+
+fn client(a: net.Addr, admin: net.Addr, done: chan[bool]) {
+    requests(a, admin) catch {
+        e => print("the client failed: {e}")
+    }
+    done <- true
+}
+
+fn refused(host: str) -> str {
+    using l = restart.listen(host, 0) catch {
+        e => return "{e}"
+    }
+    "taken"
+}
+
+fn mismatched() ! io.Error {
+    using given = restart.listen("127.0.0.1", 0)?
+    if !restart.worker() {
+        using kept = net.listen("127.0.0.2", 0)?
+        restart.serve(restart.Kept { listeners: [given.handle] }, fn(kept: restart.Kept) ! io.Error {})?
+        return
+    }
+    print("a listener the server was not given: {refused("127.0.0.2")}")
+    print("a listener taken twice: {refused("127.0.0.1")}")
+}
+
+fn recovering() ! io.Error {
+    using l = restart.listen("127.0.0.1", 0)?
+    using admin = restart.listen("127.0.0.2", 0)?
+    let done = chan[bool](1)
+    if !restart.worker() {
+        spawn client(l.handle.addr, admin.handle.addr, done)
+    }
+    restart.serve_with(restart.Kept { listeners: [l.handle, admin.handle] }, restart.Options { first_pause: 200, longest_pause: 800 }, fn(kept: restart.Kept) ! io.Error {
+        spawn serve_admin(kept.listeners[1])
+        http.serve_on(kept.listeners[0], handle)?
+    })?
+    <-done
+}
+
+fn unmatched() ! io.Error {
+    if restart.worker() {
+        using other = restart.listen("127.0.0.2", 0)?
+        return
+    }
+    using l = restart.listen("127.0.0.1", 0)?
+    restart.serve(restart.Kept { listeners: [l.handle] }, fn(kept: restart.Kept) ! io.Error {}) catch {
+        e => {
+            print("a first server that fails for a listener it was not given ends the watching process: {e}")
+            return
+        }
+    }
+    print("a first server that fails for a listener it was not given ends the watching process: served")
+}
+
+struct Starts {
+    count: i64
+}
+
+fn count_starts(counter: net.ListenerHandle, starts: *Starts) {
+    for {
+        using c = net.adopt(net.accept_handle(counter) or return)
+        starts.count += 1
+        net.write_all(c, bytes("{starts.count}")) or {}
+    }
+}
+
+fn start_number() -> i64 ! io.Error {
+    let port = text.parse_int(os.env(counter_variable) ?? "") or fail Invalid
+    using c = net.dial("127.0.0.1", port)?
+    text.parse_int(str(io.read_all(net.stream(c))?)) or fail Invalid
+}
+
+fn mismatched_later() ! io.Error {
+    if restart.worker() {
+        let start = start_number()?
+        using l = restart.listen(if start == 2 { "127.0.0.2" } else { "127.0.0.1" }, 0)?
+        if start == 1 {
+            os.exit(3)
+        }
+        return
+    }
+    using counter = net.listen("127.0.0.1", 0)?
+    let starts = new(Starts { count: 0 })
+    spawn count_starts(counter.handle, starts)
+    os.set_env(counter_variable, "{counter.handle.addr.port}")?
+    using l = restart.listen("127.0.0.1", 0)?
+    restart.serve_with(restart.Kept { listeners: [l.handle] }, restart.Options { first_pause: 50, longest_pause: 50 }, fn(kept: restart.Kept) ! io.Error {})?
+    print("a second server that fails for a listener it was not given is started again: {starts.count} starts")
+}
+
+fn quietly(scenario: str) ! io.Error {
+    let env = os.environment()
+    env[quiet_variable] = scenario
+    using child = process.start(process.Command { program: os.executable()?, env, stderr: Null })?
+    print("{scenario} exited cleanly: {process.success(process.wait(child)?)}")
+}
+
+/// Runs itself once for each scenario with standard error discarded, so the panic messages of the servers stay out of the output. The first run watches a server on two listeners whose handler panics on `/panic` and is its client; the second watches a server that asks for listeners it cannot have and goes on; the third and fourth watch a server that fails for one, on its first start and on its second.
+fn main() ! io.Error {
+    match os.env(quiet_variable) ?? "" {
+        "recovering" => recovering()?
+        "mismatched" => mismatched()?
+        "unmatched" => unmatched()?
+        "mismatched later" => mismatched_later()?
+        _ => {
+            quietly("recovering")?
+            quietly("mismatched")?
+            quietly("unmatched")?
+            quietly("mismatched later")?
+        }
+    }
+}

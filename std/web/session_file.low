@@ -1,0 +1,439 @@
+import std/base64
+import std/file
+import std/hash
+import std/io
+import std/path
+import std/simd
+import std/text
+import std/time
+
+const journal_slack = 1024
+const read_piece = 1 << 16
+const longest_line = 1 << 26
+
+struct Disk {
+    append: fn(str, str) ! io.Error
+    write: fn(str, str[]) ! io.Error
+    rename: fn(str, str) ! io.Error
+}
+
+fn device() -> Disk {
+    Disk {
+        append: fn(target: str, line: str) ! io.Error {
+            using f = file.append(target)?
+            file.write_all(f, bytes(line))?
+            file.sync(f)?
+        }
+        write: fn(target: str, pieces: str[]) ! io.Error {
+            using f = file.create_mode(target, 0o600)?
+            for piece in pieces {
+                file.write_all(f, bytes(piece))?
+            }
+            file.sync(f)?
+        }
+        rename: fn(from: str, to: str) ! io.Error { file.rename(from, to)? }
+    }
+}
+
+struct Journal {
+    disk: Disk
+    path: str
+    locked: bool
+    stale: bool
+    appended: i64
+    slack: i64
+    compacting: bool
+    untidy: bool
+    tail: str[]
+}
+
+struct Shot {
+    name: str
+    spilled: Generation[]
+    aside: [str: i64]
+    settling: bool
+    keys: str[]
+    untils: i64[]
+}
+
+fn sum(seed: *hash.Crc32, body: str) -> u32 {
+    let c = new(*seed)
+    hash.crc32_update(c, bytes(body))
+    hash.crc32_sum(c)
+}
+
+fn sealed(seed: *hash.Crc32, body: str) -> str {
+    "{sum(seed, body)} {body}\n"
+}
+
+fn checked(body: str) -> str {
+    sealed(hash.crc32_new(), body)
+}
+
+fn header_line(r: *Revocations) -> str {
+    checked("floors {r.sessions.floor} {r.states.floor}")
+}
+
+fn entry(key: str, until: i64) -> str {
+    "{until} {base64.encode_url(bytes(key))}"
+}
+
+fn entry_line(key: str, until: i64) -> str {
+    checked(entry(key, until))
+}
+
+fn freeze_line(table: str) -> str {
+    checked("freeze {table}")
+}
+
+fn filter_line(table: str, g: Generation) -> str {
+    checked("filter {table} {g.at} {g.until} {base64.encode_url(g.bits)}")
+}
+
+fn shot(t: *Revoked) -> Shot {
+    var keys: str[] = []
+    var untils: i64[] = []
+    for key, until in t.until {
+        keys.push(key)
+        untils.push(until)
+    }
+    Shot { name: t.name, spilled: t.spilled, aside: t.aside, settling: t.settling, keys, untils }
+}
+
+fn shots(r: *Revocations) -> Shot[] {
+    [shot(r.sessions), shot(r.states)]
+}
+
+fn lines_of(mut pieces: str[], s: Shot) {
+    for g in s.spilled {
+        pieces.push(filter_line(s.name, g))
+    }
+    var entries: u8[] = []
+    let seed = hash.crc32_new()
+    if s.settling {
+        for key, until in s.aside {
+            text.append(mut entries, sealed(seed, entry(key, until)))
+        }
+        text.append(mut entries, freeze_line(s.name))
+    }
+    for i, key in s.keys {
+        text.append(mut entries, sealed(seed, entry(key, s.untils[i])))
+    }
+    pieces.push(str(entries))
+}
+
+fn snapshot(header: str, tables: Shot[]) -> str[] {
+    var pieces: str[] = [header]
+    for s in tables {
+        lines_of(mut pieces, s)
+    }
+    pieces
+}
+
+fn table_named(r: *Revocations, name: str) -> *Revoked ! io.Error {
+    if name == r.states.name {
+        return r.states
+    }
+    if name != r.sessions.name {
+        fail Malformed
+    }
+    r.sessions
+}
+
+fn raise_floor(t: *Revoked, floor: i64) {
+    if floor <= t.floor {
+        return
+    }
+    t.floor = floor
+    t.until = [:]
+    t.aside = [:]
+    t.spilled = []
+}
+
+fn restore_floors(r: *Revocations, fields: str[]) ! io.Error {
+    if fields.len != 3 {
+        fail Malformed
+    }
+    raise_floor(r.sessions, text.parse_int(fields[1]) or fail Malformed)
+    raise_floor(r.states, text.parse_int(fields[2]) or fail Malformed)
+}
+
+fn restore_freeze(r: *Revocations, fields: str[]) ! io.Error {
+    if fields.len != 2 {
+        fail Malformed
+    }
+    let t = table_named(r, fields[1])?
+    for key, until in t.until {
+        t.aside[key] = until
+    }
+    t.until = [:]
+}
+
+fn restore_filter(r: *Revocations, fields: str[], now: i64) ! io.Error {
+    if fields.len != 5 {
+        fail Malformed
+    }
+    let t = table_named(r, fields[1])?
+    let at = text.parse_int(fields[2]) or fail Malformed
+    let until = text.parse_int(fields[3]) or fail Malformed
+    let bits = base64.decode_url(fields[4]) or fail Malformed
+    if bits.len == 0 {
+        fail Malformed
+    }
+    t.aside = [:]
+    if until >= now {
+        t.spilled.push(Generation { bits, at, until })
+    }
+}
+
+fn restore_entry(r: *Revocations, body: str, now: i64) ! io.Error {
+    let entry = text.cut(body, " ")
+    let until = text.parse_int(entry.before) or fail Malformed
+    let key = str(base64.decode_url(entry.after) or fail Malformed)
+    if !entry.found || key.len == 0 {
+        fail Malformed
+    }
+    if until >= now {
+        table_of(r, key).until[key] = until
+    }
+}
+
+fn restore_line(r: *Revocations, seed: *hash.Crc32, line: str, first: bool, now: i64) ! io.Error {
+    let parts = text.cut(line, " ")
+    if !parts.found || "{sum(seed, parts.after)}" != parts.before {
+        fail Malformed
+    }
+    let body = parts.after
+    if text.starts_with(body, "floors ") {
+        restore_floors(r, text.fields(body))?
+    } else if first {
+        fail Malformed
+    } else if text.starts_with(body, "freeze ") {
+        restore_freeze(r, text.fields(body))?
+    } else if text.starts_with(body, "filter ") {
+        restore_filter(r, text.fields(body), now)?
+    } else {
+        restore_entry(r, body, now)?
+    }
+}
+
+fn unfreeze(t: *Revoked) {
+    for key, until in t.aside {
+        if t.until[key] == none {
+            t.until[key] = until
+        }
+    }
+    t.aside = [:]
+}
+
+fn restore(r: *Revocations, target: str, now: i64) -> i64 ! io.Error {
+    using f = file.open(target)?
+    let chunk = io.buffer(read_piece)
+    var pending: u8[] = []
+    var count = 0
+    let seed = hash.crc32_new()
+    for {
+        let n = file.read(f, chunk)?
+        if n == 0 {
+            break
+        }
+        var from = 0
+        for {
+            let end = simd.find_byte(chunk, from, n, '\n')
+            if end < 0 {
+                break
+            }
+            io.append(mut pending, chunk[from..end])
+            restore_line(r, seed, str(pending), count == 0, now)?
+            pending = []
+            count += 1
+            from = end + 1
+        }
+        io.append(mut pending, chunk[from..n])
+        if pending.len > longest_line {
+            fail Malformed
+        }
+    }
+    if count == 0 || pending.len > 0 {
+        fail Malformed
+    }
+    unfreeze(r.sessions)
+    unfreeze(r.states)
+    count - 1
+}
+
+fn distrust(r: *Revocations, j: *Journal, now: i64) {
+    for t in [r.sessions, r.states] {
+        t.until = [:]
+        t.aside = [:]
+        t.spilled = []
+        t.floor = now
+    }
+    j.stale = true
+}
+
+fn held(j: *Journal) -> bool {
+    if j.locked {
+        return true
+    }
+    let got = chan[bool](1)
+    spawn keep_lock("{j.path}.lock", got)
+    j.locked = (<-got) ?? false
+    j.locked
+}
+
+fn keep_lock(target: str, got: chan[bool]) {
+    if !locked_for_good(target, got) {
+        got <- false
+    }
+}
+
+fn locked_for_good(target: str, got: chan[bool]) -> bool {
+    using f = file.update(target) or return false
+    if !(file.try_lock(f, true) or false) {
+        return false
+    }
+    got <- true
+    <-chan[bool]()
+    true
+}
+
+fn sync_dir(dir: str) {
+    using d = file.open(dir) or return
+    file.sync(d) or {}
+}
+
+fn staged(j: *Journal, pieces: str[]) -> bool {
+    let fresh = "{j.path}.new"
+    j.disk.write(fresh, pieces) catch {
+        _ => {
+            file.remove(fresh) or {}
+            return false
+        }
+    }
+    true
+}
+
+fn swapped(j: *Journal, tail: str[]) -> bool {
+    let fresh = "{j.path}.new"
+    if tail.len > 0 {
+        j.disk.append(fresh, text.join(tail, "")) or return false
+    }
+    j.disk.rename(fresh, j.path) or return false
+    sync_dir(path.dir(j.path))
+    true
+}
+
+fn replaced(r: *Revocations, j: *Journal) -> bool {
+    if !staged(j, snapshot(header_line(r), shots(r))) {
+        return false
+    }
+    if !swapped(j, []) {
+        file.remove("{j.path}.new") or {}
+        return false
+    }
+    j.stale = false
+    j.appended = 0
+    true
+}
+
+fn compact(r: *Revocations, j: *Journal, header: str, tables: Shot[]) {
+    let ready = staged(j, snapshot(header, tables))
+    r.lock <- true
+    defer <-r.lock
+    let tail = j.tail
+    j.tail = []
+    j.compacting = false
+    j.appended = 0
+    if !ready {
+        return
+    }
+    if j.stale || !swapped(j, tail) {
+        file.remove("{j.path}.new") or {}
+        return
+    }
+    j.appended = tail.len
+    if j.untidy {
+        tidy(r, j)
+    }
+}
+
+fn tidy(r: *Revocations, j: *Journal) {
+    j.compacting = true
+    j.untidy = false
+    spawn compact(r, j, header_line(r), shots(r))
+}
+
+fn emptied(j: *Journal) -> bool {
+    j.disk.write(j.path, []) or return false
+    j.stale = true
+    true
+}
+
+fn recorded(r: *Revocations) -> i64 {
+    r.sessions.until.len + r.sessions.aside.len + r.states.until.len + r.states.aside.len
+}
+
+fn written(r: *Revocations, j: *Journal, lines: str, dead: bool) -> bool {
+    if !held(j) {
+        r.failed = true
+        return false
+    }
+    if j.stale {
+        if j.compacting {
+            return false
+        }
+        if replaced(r, j) {
+            return true
+        }
+        r.failed = !emptied(j)
+        return false
+    }
+    j.disk.append(j.path, lines) catch {
+        _ => {
+            r.failed = !emptied(j)
+            return false
+        }
+    }
+    j.appended += 1
+    if j.compacting {
+        j.tail.push(lines)
+        j.untidy = j.untidy || dead
+    } else if dead || j.appended >= j.slack + recorded(r) {
+        tidy(r, j)
+    }
+    true
+}
+
+/// Returns a `SessionStore` that keeps revocations in memory and in the file at `path`, so that they outlast the process.
+///
+/// One process on one host uses a file at a time. The store reads the file here, and takes an exclusive lock on `path` followed by `.lock` when it first records an entry, so a process that only watches another, as the caller of `restart.serve` does, may open the same file. A second process that records while the first holds the lock gets a store that reports every key revoked.
+///
+/// Each entry is appended and flushed to the device before `revoke` reports `true`. The file is written anew on a green thread once it holds 1,024 more lines than live entries and after a full table has moved into its filter, into `path` followed by `.new`, which takes the entries appended meanwhile and then the place of `path`. It has the limits of `memory_session_store` and keeps the filters and what a table past its last filter revoked, so the file holds at most about 250 MiB, about 400 MiB until it is written anew, and a few kilobytes for each thousand live entries otherwise. Opening reads the file line by line, and a table set aside whose filter never reached the file is read back as entries.
+///
+/// The store never accepts a cookie because of a fault. A file that does not exist is an empty store. A file that is empty, cut short or altered makes the store revoke every session issued and refuse every sign-in started up to this call. When an entry cannot be written, `revoke` reports `false`, the entry holds for the life of the process and the file is emptied, so the next process to open it revokes every session issued up to then; when the file cannot be emptied either, the store reports every key revoked from then on. Fails with the error of reading a file that exists.
+pub fn file_session_store(path: str) -> SessionStore ! io.Error {
+    file_revocations(path, revocation_limit)?
+}
+
+fn file_revocations(path: str, limit: i64) -> SessionStore ! io.Error {
+    store_of(file_tables(path, limit)?)
+}
+
+fn file_tables(path: str, limit: i64) -> *Revocations ! io.Error {
+    let j = new(Journal { disk: device(), path, locked: false, stale: true, appended: 0, slack: journal_slack, compacting: false, untidy: false, tail: [] })
+    let r = tables(limit, some(j))
+    if !file.exists(path) {
+        return r
+    }
+    let now = time.now()
+    j.appended = restore(r, path, now) catch {
+        Malformed => {
+            distrust(r, j, now)
+            return r
+        }
+        e => fail e
+    }
+    j.stale = false
+    r
+}

@@ -1,6 +1,7 @@
 import std/crypto/x509
 import std/io
 import std/quic
+import std/time
 import std/tls
 
 fn limits(secure: tls.Config, max_streams: i64, max_stream_data: i64, max_data: i64) -> quic.Config {
@@ -375,6 +376,148 @@ fn check_key_update_limits() ! io.Error {
     print("key update limits: update after traffic {third}")
 }
 
+fn sending(max_send_buffer: i64, send_timeout: i64) -> quic.Config ! io.Error {
+    var config = server_config(100, 1048576, 16777216)?
+    config.max_send_buffer = max_send_buffer
+    config.send_timeout = send_timeout
+    config
+}
+
+fn taking(max_stream_data: i64) -> quic.Config {
+    var config = client_config(max_stream_data, 16777216)
+    config.keep_alive = 100
+    config
+}
+
+fn answer(s: quic.Stream, size: i64, written: chan[bool]) {
+    let n = quic.write(s, io.buffer(size)) or -1
+    quic.finish(s) or {}
+    written <- n == size
+}
+
+fn answer_each(h: *quic.ConnectionHandle, size: i64, written: chan[bool]) {
+    for {
+        let s = quic.accept_stream_on(h) or return
+        spawn answer(s, size, written)
+    }
+}
+
+fn returned(written: chan[bool], wait: i64) -> i64 {
+    var count = 0
+    for {
+        select {
+            <-written => {
+                count += 1
+            }
+            after(wait) => return count
+        }
+    }
+}
+
+fn ask(h: *quic.ConnectionHandle) -> quic.Stream ! io.Error {
+    let s = quic.open_stream_on(h)?
+    let _ = quic.write(s, [1])?
+    quic.finish(s)?
+    s
+}
+
+fn drained(s: quic.Stream, total: chan[i64]) {
+    let data = io.read_all(quic.stream(s)) or []
+    total <- data.len
+}
+
+fn check_send_buffer() ! io.Error {
+    using l = quic.listen("127.0.0.1", 0, sending(65536, 0)?)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, taking(1024))?
+    let server = quic.accept_handle(l.handle)?
+    let written = chan[bool](8)
+    spawn answer_each(server, 40000, written)
+    var streams: quic.Stream[] = []
+    for _ in 0..4 {
+        streams.push(ask(client.handle)?)
+        sleep(50)
+    }
+    print("writes of 40000 that returned behind shut windows, with 65536 held: {returned(written, 400)} of 4")
+    let small = quic.open_uni_stream_on(server)?
+    let n = quic.write(small, io.buffer(100)) or -1
+    print("write of 100 on another stream meanwhile: {n}")
+    let total = chan[i64](4)
+    for s in streams {
+        spawn drained(s, total)
+    }
+    var received = 0
+    for _ in 0..4 {
+        received += (<-total) ?? 0
+    }
+    print("after the peer reads: {returned(written, 400)} more returned, {received} bytes received")
+}
+
+fn closed(h: *quic.ConnectionHandle, started: i64, least: i64, most: i64) -> str {
+    for _ in 0..300 {
+        let _ = quic.stats_on(h) catch {
+            _ => {
+                let took = (time.monotonic() - started) / 1000000
+                let timely = took >= least && took <= most
+                return "code={h.close_code} by_peer={h.closed_by_peer} application={h.application_close} reason={h.close_reason} timely={timely}"
+            }
+        }
+        sleep(20)
+    }
+    "still open"
+}
+
+fn check_untaken() ! io.Error {
+    using l = quic.listen("127.0.0.1", 0, sending(2097152, 500)?)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, taking(1024))?
+    let server = quic.accept_handle(l.handle)?
+    let written = chan[bool](1)
+    let started = time.monotonic()
+    let _ = ask(client.handle)?
+    let s = quic.accept_stream_on(server)?
+    spawn answer(s, 5000, written)
+    print("write of 5000 behind a shut window returned: {returned(written, 200)} of 1")
+    print("peer that takes 1024 and no more: {closed(client.handle, started, 400, 4000)}")
+    let late = quic.write(s, [1]) catch {
+        e => {
+            print("write on the server afterwards: {e}")
+            return
+        }
+    }
+    print("write on the server afterwards: {late}")
+}
+
+fn sip(s: quic.Stream, total: chan[i64]) {
+    var count = 0
+    let buf = io.buffer(8192)
+    for {
+        let n = quic.read(s, buf) or break
+        if n == 0 {
+            break
+        }
+        count += n
+        sleep(20)
+    }
+    total <- count
+}
+
+fn check_taken() ! io.Error {
+    using l = quic.listen("127.0.0.1", 0, sending(2097152, 1000)?)?
+    using client = quic.dial("127.0.0.1", l.handle.addr.port, taking(8192))?
+    let server = quic.accept_handle(l.handle)?
+    let written = chan[bool](8)
+    spawn answer_each(server, 614400, written)
+    let started = time.monotonic()
+    let total = chan[i64](1)
+    spawn sip(ask(client.handle)?, total)
+    let received = (<-total) ?? 0
+    let outlasted = (time.monotonic() - started) / 1000000 > 1000
+    print("peer that takes 8192 at a time: {received} bytes received, longer than send_timeout={outlasted}")
+    sleep(1300)
+    let again = chan[i64](1)
+    spawn drained(ask(client.handle)?, again)
+    print("after a rest longer than send_timeout: {(<-again) ?? 0} bytes received")
+}
+
 fn main() ! io.Error {
     check_echo()?
     check_uni()?
@@ -385,4 +528,7 @@ fn main() ! io.Error {
     check_accept_credit()?
     check_key_update()?
     check_key_update_limits()?
+    check_send_buffer()?
+    check_untaken()?
+    check_taken()?
 }

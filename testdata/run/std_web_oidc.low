@@ -18,6 +18,18 @@ struct Idp {
     signing: jose.Jwk
     challenge: str
     nonce: str
+    key_fetches: i64
+    held: bool
+    gate: chan[bool]
+    refusals: i64
+    typ: str
+    subject: str
+    exchanges: i64
+}
+
+struct Started {
+    cookie: header.Header
+    state: str
 }
 
 struct Config {
@@ -58,7 +70,26 @@ fn identity_provider(idp: *Idp) -> *web.App {
             jwks_uri: "{idp.issuer}/jwks"
         })
     })
-    let _ = web.get(app, "/jwks", fn(c) { web.text(200, jose.jwks_json(idp.keys)) })
+    let _ = web.get(app, "/jwks", fn(c) {
+        idp.key_fetches += 1
+        if idp.held {
+            <-idp.gate
+        }
+        web.text(200, jose.jwks_json(idp.keys))
+    })
+    let _ = web.get(app, "/moved/.well-known/openid-configuration", fn(c) {
+        web.json_response(200, Config {
+            issuer: "{idp.issuer}/moved"
+            authorization_endpoint: "{idp.issuer}/authorize"
+            token_endpoint: "{idp.issuer}/token"
+            jwks_uri: "{idp.issuer}/moved/jwks"
+        })
+    })
+    let _ = web.get(app, "/moved/jwks", fn(c) { web.redirect("{idp.issuer}/jwks", 302) })
+    let _ = web.get(app, "/down/.well-known/openid-configuration", fn(c) {
+        idp.refusals += 1
+        web.text(500, "down")
+    })
     let _ = web.post(app, "/token", fn(c) {
         let raw = str(c.request.body)
         if !text.contains(raw, "&redirect_uri=http%3A%2F%2Fapp%2Fcallback&") {
@@ -70,7 +101,8 @@ fn identity_provider(idp: *Idp) -> *web.App {
         if form["code"] ?? "" != "the-code" || challenge != idp.challenge {
             return web.text(400, "bad exchange")
         }
-        let id_token = jose.sign("ES256", idp.signing.kid, idp.signing.key, claims(idp.issuer, "client", "alice", idp.nonce, time.now() + 600)) or return web.text(500, "signing failed")
+        idp.exchanges += 1
+        let id_token = jose.sign_typed("ES256", idp.typ, idp.signing.kid, idp.signing.key, claims(idp.issuer, "client", idp.subject, idp.nonce, time.now() + 600)) or return web.text(500, "signing failed")
         web.json_response(200, Tokens { id_token, access_token: "opaque" })
     })
     app
@@ -92,19 +124,52 @@ fn cookie_of(resp: http.Response) -> str {
     if semi < 0 { set } else { set[..semi] }
 }
 
+fn access(kid: str, key: jose.Key, payload: json.Value) -> str ! io.Error {
+    jose.sign_typed("ES256", "at+jwt", kid, key, payload)
+}
+
+fn built(issuer: str, audience: str) -> str {
+    let _ = web.oidc(web.OidcResource { issuer, audience }) catch {
+        Invalid => return "Invalid"
+        _ => return "other"
+    }
+    "ok"
+}
+
+fn registered(client: web.OidcClient) -> str {
+    web.oidc_login(web.app(), "/login", "/callback", client, fn(c, signed) { web.text(200, "unreachable") }) catch {
+        Invalid => return "Invalid"
+        _ => return "other"
+    }
+    "ok"
+}
+
+fn start(h: fn(http.Request) -> http.Response, idp: *Idp, cookies: header.Header[]) -> Started {
+    let login = call(h, "GET", "/login", cookies)
+    let location = header.get(login.headers, "location") ?? ""
+    let q = uri.parse_query(location[text.index_byte(location, '?') + 1..])
+    idp.challenge = q["code_challenge"] ?? ""
+    idp.nonce = q["nonce"] ?? ""
+    Started { cookie: header.Header { name: "cookie", value: cookie_of(login) }, state: q["state"] ?? "" }
+}
+
+fn cookie(resp: http.Response) -> header.Header[] {
+    [header.Header { name: "cookie", value: cookie_of(resp) }]
+}
+
 fn main() ! io.Error {
     using l = net.listen("127.0.0.1", 0)?
     let served = l.handle
     let issuer = "http://127.0.0.1:{served.addr.port}"
     let first = ec_key("k1")?
-    let idp = new(Idp { issuer, keys: [first], signing: first, challenge: "", nonce: "" })
+    let idp = new(Idp { issuer, keys: [first], signing: first, challenge: "", nonce: "", key_fetches: 0, held: false, gate: chan[bool](1), refusals: 0, typ: "JWT", subject: "alice", exchanges: 0 })
     let provider = web.handler(identity_provider(idp))
     spawn fn() {
         http.serve_on(served, provider) or {}
     }()
 
     let app = web.app()
-    let api = web.group(app, "/api", [web.oidc(issuer, "client")])
+    let api = web.group(app, "/api", [web.oidc(web.OidcResource { issuer, audience: "client" })?])
     let _ = web.get(api, "/me", fn(c) { web.text(200, "hello {c.user}") })
     var secret: u8[] = []
     for i in 0..32 {
@@ -121,23 +186,55 @@ fn main() ! io.Error {
     web.oidc_login(site, "/login", "/callback", web.OidcClient { issuer, client_id: "client", redirect_uri: "http://app/callback" }, fn(c, signed) {
         web.session_set(c, "user", signed.sub ?? "")
         web.text(200, "welcome {signed.sub ?? "?"}")
+    })?
+    let _ = web.get(site, "/seed", fn(c) {
+        web.session_set(c, "role", "admin")
+        web.text(200, "seeded")
     })
+    let _ = web.get(site, "/blank", fn(c) {
+        web.session_set(c, "user", "")
+        web.text(200, "blank")
+    })
+    let _ = web.get(site, "/role", fn(c) { web.text(200, "{web.session_get(c, "user") ?? "-"} {web.session_get(c, "role") ?? "-"}") })
+    let members = web.group(site, "/members", [web.require_session("user")])
+    let _ = web.get(members, "/me", fn(c) { web.text(200, c.user) })
+    let slash = web.group(app, "/slash", [web.oidc(web.OidcResource { issuer: "{issuer}/", audience: "client" })?])
+    let _ = web.get(slash, "/me", fn(c) { web.text(200, c.user) })
+    let moved = web.group(app, "/moved", [web.oidc(web.OidcResource { issuer: "{issuer}/moved", audience: "client" })?])
+    let _ = web.get(moved, "/me", fn(c) { web.text(200, c.user) })
+    let down = web.group(app, "/down", [web.oidc(web.OidcResource { issuer: "{issuer}/down", audience: "client" })?])
+    let _ = web.get(down, "/me", fn(c) { web.text(200, c.user) })
+    let untyped = web.group(app, "/untyped", [web.oidc(web.OidcResource { issuer, audience: "client", typ: "" })?])
+    let _ = web.get(untyped, "/me", fn(c) { web.text(200, c.user) })
+    let hurried = web.group(app, "/hurried", [web.sessions(web.SessionOptions { key, secure: false })?])
+    web.oidc_login(hurried, "/login", "/callback", web.OidcClient { issuer, client_id: "client", redirect_uri: "http://app/callback", max_login_age: -1 }, fn(c, signed) { web.text(200, "unreachable") })?
+    let held = web.group(app, "/held", [web.oidc(web.OidcResource { issuer, audience: "client" })?])
+    let _ = web.get(held, "/me", fn(c) { web.text(200, c.user) })
     let h = web.handler(app)
 
     let now = time.now()
-    let good = jose.sign("ES256", "k1", first.key, claims(issuer, "client", "bob", "", now + 600))?
-    let wrong_audience = jose.sign("ES256", "k1", first.key, claims(issuer, "other", "bob", "", now + 600))?
-    let wrong_issuer = jose.sign("ES256", "k1", first.key, claims("http://evil", "client", "bob", "", now + 600))?
-    let expired = jose.sign("ES256", "k1", first.key, claims(issuer, "client", "bob", "", now - 3600))?
+    let good = access("k1", first.key, claims(issuer, "client", "bob", "", now + 600))?
+    let wrong_audience = access("k1", first.key, claims(issuer, "other", "bob", "", now + 600))?
+    let wrong_issuer = access("k1", first.key, claims("http://evil", "client", "bob", "", now + 600))?
+    let expired = access("k1", first.key, claims(issuer, "client", "bob", "", now - 3600))?
     for token in [good, wrong_audience, wrong_issuer, expired, "not.a.token"] {
         let resp = call(h, "GET", "/api/me", bearer(token))
         print("api {resp.status} {str(resp.body)}")
     }
     print("api anonymous {call(h, "GET", "/api/me", []).status}")
+    let id_token = jose.sign("ES256", "k1", first.key, claims(issuer, "client", "bob", "", now + 600))?
+    print("id token as access token {call(h, "GET", "/api/me", bearer(id_token)).status} where any type is accepted {call(h, "GET", "/untyped/me", bearer(id_token)).status}")
+    let nobody = access("k1", first.key, claims(issuer, "client", "", "", now + 600))?
+    let subjectless = access("k1", first.key, json.Value.Object([
+        json.Member { name: "iss", value: json.Value.Str(issuer) }
+        json.Member { name: "aud", value: json.Value.Str("client") }
+        json.Member { name: "exp", value: json.Value.Int(now + 600) }
+    ]))?
+    print("empty sub {call(h, "GET", "/api/me", bearer(nobody)).status} no sub {call(h, "GET", "/api/me", bearer(subjectless)).status}")
 
     let rotated = ec_key("k2")?
     idp.keys = [first, rotated]
-    let fresh = jose.sign("ES256", "k2", rotated.key, claims(issuer, "client", "carol", "", now + 600))?
+    let fresh = access("k2", rotated.key, claims(issuer, "client", "carol", "", now + 600))?
     let after_rotation = call(h, "GET", "/api/me", bearer(fresh))
     print("rotated key {after_rotation.status} {str(after_rotation.body)}")
 
@@ -161,9 +258,88 @@ fn main() ! io.Error {
     print("forged state {forged.status}")
     let done = call(h, "GET", "/callback?code=the-code&state={q["state"] ?? ""}", [session])
     print("callback {done.status} {str(done.body)}")
+    let replayed = call(h, "GET", "/callback?code=the-code&state={q["state"] ?? ""}", [session])
+    print("login cookie replayed {replayed.status} exchanges {idp.exchanges}")
+
+
+    print("empty issuer {built("", "client")}")
+    print("empty audience {built(issuer, "")}")
+    print("empty client id {registered(web.OidcClient { issuer, client_id: "", redirect_uri: "http://app/callback" })}")
+    print("empty login issuer {registered(web.OidcClient { issuer: "", client_id: "client", redirect_uri: "http://app/callback" })}")
+
+    let unexpiring = access("k1", first.key, json.Value.Object([
+        json.Member { name: "iss", value: json.Value.Str(issuer) }
+        json.Member { name: "aud", value: json.Value.Str("client") }
+        json.Member { name: "sub", value: json.Value.Str("bob") }
+    ]))?
+    print("no exp {call(h, "GET", "/api/me", bearer(unexpiring)).status}")
+
+    let slashed = access("k1", first.key, claims("{issuer}/", "client", "bob", "", now + 600))?
+    print("issuer with slash {call(h, "GET", "/slash/me", bearer(good)).status} {call(h, "GET", "/slash/me", bearer(slashed)).status}")
+
+    let elsewhere = access("k1", first.key, claims("{issuer}/moved", "client", "bob", "", now + 600))?
+    print("redirected jwks {call(h, "GET", "/moved/me", bearer(elsewhere)).status}")
+
+    for i in 0..5 {
+        let _ = call(h, "GET", "/down/me", bearer(good))
+    }
+    print("failing provider asked {idp.refusals}")
+
+    print("held warm {call(h, "GET", "/held/me", bearer(good)).status}")
+    let unknown = access("k9", first.key, claims(issuer, "client", "bob", "", now + 600))?
+    let before = idp.key_fetches
+    idp.held = true
+    let stalled = chan[i64](1)
+    spawn fn() {
+        stalled <- call(h, "GET", "/held/me", bearer(unknown)).status
+    }()
+    for idp.key_fetches == before {
+        sleep(1)
+    }
+    print("during refresh {call(h, "GET", "/held/me", bearer(good)).status}")
+    idp.held = false
+    idp.gate <- true
+    print("after refresh {(<-stalled) ?? 0}")
+
+    let seeded = call(h, "GET", "/seed", [])
+    let carried = start(h, idp, cookie(seeded))
+    let entered = call(h, "GET", "/callback?code=the-code&state={carried.state}", [carried.cookie])
+    print("values from before sign-in {str(call(h, "GET", "/role", cookie(entered)).body)}")
+    let again = start(h, idp, cookie(entered))
+    let reentered = call(h, "GET", "/callback?code=the-code&state={again.state}", [again.cookie])
+    print("second sign-in {str(call(h, "GET", "/role", cookie(reentered)).body)} session before it {str(call(h, "GET", "/role", cookie(entered)).body)}")
+
+    let other = start(h, idp, [])
+    let mixed = call(h, "GET", "/callback?code=the-code&state={other.state}&iss=http%3A%2F%2Fevil", [other.cookie])
+    print("other issuer {mixed.status} then {call(h, "GET", "/callback?code=the-code&state={other.state}", cookie(mixed)).status}")
+    let named = start(h, idp, [])
+    let same = uri.encode_form([uri.Field { name: "iss", value: issuer }])
+    print("same issuer {call(h, "GET", "/callback?code=the-code&state={named.state}&{same}", [named.cookie]).status}")
+
+    let refused = start(h, idp, [])
+    let failed = call(h, "GET", "/callback?code=wrong&state={refused.state}", [refused.cookie])
+    print("failed exchange {failed.status} then {call(h, "GET", "/callback?code=the-code&state={refused.state}", cookie(failed)).status}")
+    let spent = idp.exchanges
+    print("login cookie replayed after a failure {call(h, "GET", "/callback?code=the-code&state={refused.state}", [refused.cookie]).status} exchanges {idp.exchanges - spent}")
+
+    idp.typ = "at+jwt"
+    let mistyped = start(h, idp, [])
+    print("access token as id token {call(h, "GET", "/callback?code=the-code&state={mistyped.state}", [mistyped.cookie]).status}")
+    idp.typ = "JWT"
+    idp.subject = ""
+    let unnamed = start(h, idp, [])
+    print("id token without sub {call(h, "GET", "/callback?code=the-code&state={unnamed.state}", [unnamed.cookie]).status}")
+    idp.subject = "alice"
+
+    let slow = call(h, "GET", "/hurried/login", [])
+    let slow_query = uri.parse_query((header.get(slow.headers, "location") ?? "")[text.index_byte(header.get(slow.headers, "location") ?? "", '?') + 1..])
+    let waited = idp.exchanges
+    print("late callback {call(h, "GET", "/hurried/callback?code=the-code&state={slow_query["state"] ?? ""}", cookie(slow)).status} exchanges {idp.exchanges - waited}")
+
+    print("empty session user {call(h, "GET", "/members/me", cookie(call(h, "GET", "/blank", []))).status}")
 
     let bare = web.app()
-    web.oidc_login(bare, "/login", "/callback", web.OidcClient { issuer, client_id: "client", redirect_uri: "http://app/callback" }, fn(c, signed) { web.text(200, "unreachable") })
+    web.oidc_login(bare, "/login", "/callback", web.OidcClient { issuer, client_id: "client", redirect_uri: "http://app/callback" }, fn(c, signed) { web.text(200, "unreachable") })?
     let bare_handler = web.handler(bare)
     print("login without sessions {call(bare_handler, "GET", "/login", []).status}")
     print("callback without sessions {call(bare_handler, "GET", "/callback?code=c&state=s", []).status}")

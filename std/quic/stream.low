@@ -1,5 +1,6 @@
 import std/io
 import std/quic/wire
+import std/time
 import std/tls
 
 struct Span {
@@ -89,11 +90,18 @@ struct Streams {
     received: i64 = 0
     consumed: i64 = 0
     failed: bool = false
+    held: i64 = 0
+    crowded: bool = false
+    owed: i64 = 0
+    owed_since: i64 = -1
+    taken: i64 = 0
 }
 
 const max_i62 = 4611686018427387903
 const max_i60 = 1152921504606846976
 const write_cap = 1048576
+const stream_reserve = 16384
+const send_quota = 65536
 const max_ranges = 256
 const min_recv_buffer = 1024
 const stream_cap = 4096
@@ -255,8 +263,70 @@ fn maybe_remove(c: *Conn, s: *StreamState) {
 
 fn refresh(c: *Conn, s: *StreamState) {
     serve_readers(c, s)
-    serve_writers(s)
+    serve_writers(c, s)
     maybe_remove(c, s)
+}
+
+fn send_room(c: *Conn, s: *StreamState) -> i64 {
+    let own = write_cap - s.send_buf.len
+    if c.config.max_send_buffer <= 0 {
+        return own
+    }
+    let shared = most(c.config.max_send_buffer - c.streams.held, stream_reserve - s.send_buf.len)
+    if shared < own {
+        c.streams.crowded = true
+        return shared
+    }
+    own
+}
+
+fn owe(st: *Streams) {
+    st.owed = least(send_quota, st.held)
+    st.owed_since = if st.held > 0 { time.monotonic() } else { -1 }
+    st.taken = 0
+}
+
+fn hold_sent(st: *Streams, n: i64) {
+    st.held += n
+    if st.owed_since < 0 {
+        owe(st)
+    }
+}
+
+fn release_sent(c: *Conn, n: i64) {
+    let st = c.streams
+    st.held -= n
+    st.taken += n
+    if st.held == 0 || st.taken >= st.owed {
+        owe(st)
+    }
+    if !st.crowded {
+        return
+    }
+    st.crowded = false
+    for other in st.order {
+        if other.writers.len > 0 {
+            serve_writers(c, other)
+        }
+    }
+}
+
+fn send_deadline(c: *Conn) -> i64 {
+    if c.streams.owed_since < 0 || c.config.send_timeout <= 0 {
+        return -1
+    }
+    c.streams.owed_since + ms_to_ns(c.config.send_timeout)
+}
+
+fn send_overdue(c: *Conn, now: i64) -> bool {
+    if !due(send_deadline(c), now) {
+        return false
+    }
+    let reason = "peer takes no stream data"
+    record_close(c, wire.no_error, reason, false, false)
+    answer_ready(c, some(TimedOut))
+    enter_closing(c, wire.CloseFrame { application: false, code: wire.no_error, frame_type: 0, reason }, TimedOut)
+    true
 }
 
 fn known_stream(c: *Conn, id: i64) -> bool {
@@ -490,14 +560,16 @@ fn reset_send(c: *Conn, s: *StreamState, code: i64) {
     s.reset_code = code
     s.reset_final = s.send_next
     s.reset_pending = true
+    let dropped = s.send_buf.len
     s.send_buf = []
+    release_sent(c, dropped)
     s.resend = []
     s.acked = []
     s.fin_resend = false
     refresh(c, s)
 }
 
-fn serve_writers(s: *StreamState) {
+fn serve_writers(c: *Conn, s: *StreamState) {
     for s.writers.len > 0 {
         let w = s.writers[0]
         if s.reset_requested {
@@ -516,13 +588,14 @@ fn serve_writers(s: *StreamState) {
             reply_error(w.reply, BrokenPipe)
             continue
         }
-        let room = write_cap - s.send_buf.len
+        let room = send_room(c, s)
         if room <= 0 {
             return
         }
         let n = least(room, w.data.len - w.done)
         let end = w.done + n
         io.append(mut s.send_buf, w.data[w.done..end])
+        hold_sent(c.streams, n)
         s.send_total += n
         w.done = end
         if w.done < w.data.len {
@@ -1027,7 +1100,7 @@ fn next_resend(s: *StreamState) -> Span? {
     none
 }
 
-fn advance_base(s: *StreamState) {
+fn advance_base(c: *Conn, s: *StreamState) {
     for s.acked.len > 0 && s.acked[0].start <= s.send_base {
         let top = s.acked[0].end
         s.acked = s.acked[1..]
@@ -1035,6 +1108,7 @@ fn advance_base(s: *StreamState) {
             let freed = top - s.send_base
             s.send_buf = s.send_buf[freed..]
             s.send_base = top
+            release_sent(c, freed)
         }
     }
 }
@@ -1061,7 +1135,7 @@ fn ack_stream(c: *Conn, id: i64, offset: i64, length: i64, fin: bool) {
         let top = offset + length
         if top > s.send_base {
             s.acked = add_span(s.acked, most(offset, s.send_base), top)
-            advance_base(s)
+            advance_base(c, s)
         }
     }
     if fin {
